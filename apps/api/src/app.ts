@@ -56,6 +56,7 @@ import {
 } from './modules/billing/webhooks/index.js';
 import { meRoutes } from './routes/me.js';
 import { usersMeRoutes } from './routes/users-me.js';
+import { usersRoutes } from './routes/users.js';
 import {
   tenantAuthRoutes,
   tenantAuthAuthenticatedRoutes,
@@ -559,6 +560,9 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
   await app.register(devicesUserRoutes, { prefix: '/api/v1/users/me/devices' });
   // Secret-key surface over any end-user's devices, for the customer's backend.
   await app.register(devicesServerRoutes, { prefix: '/api/v1/devices' });
+  // Secret-key end-user lookup by id / exact email (routes/users.ts). Mounted
+  // AFTER /users/me so the literal segment wins over the :id parameter.
+  await app.register(usersRoutes, { prefix: '/api/v1/users' });
   // End-user organizations — gated by `authConfig.organizationsEnabled`
   // at the service layer. Routes are mounted regardless; the service
   // refuses on apps that didn't opt in.
