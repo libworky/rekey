@@ -28,7 +28,7 @@ import type { Application, EndUser } from '@prisma/client';
 import { prisma } from '../../lib/prisma.js';
 import { RekeyError } from '../../lib/error.js';
 import { devicesService } from '../devices/devices.service.js';
-import { hashPassword, verifyPassword } from '../../lib/passwords.js';
+import { hashPassword, needsRehash, verifyPassword } from '../../lib/passwords.js';
 import { checkPasswordBreached } from '../../lib/breached-password.js';
 import { env } from '../../config/env.js';
 import {
@@ -799,6 +799,20 @@ export const authService = {
     // Single error code — never disclose whether email or password was wrong.
     const valid =
       endUser !== null && (await verifyPassword(endUser.passwordHash, input.password));
+    if (valid && endUser !== null && endUser.passwordHash && needsRehash(endUser.passwordHash)) {
+      // An imported bcrypt hash just verified: this is the one moment the
+      // plaintext is in hand, so upgrade to argon2id now. Best-effort — a
+      // failed upgrade leaves a working bcrypt hash for next time and must
+      // not turn a correct password into a failed sign-in.
+      try {
+        await prisma.endUser.update({
+          where: { id: endUser.id },
+          data: { passwordHash: await hashPassword(input.password) },
+        });
+      } catch {
+        /* keep the bcrypt hash; retried on the next sign-in */
+      }
+    }
     if (!valid || endUser === null) {
       if (endUser) {
         const failure = await registerFailure(lockScope, LOGIN_POLICY);

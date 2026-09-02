@@ -393,6 +393,21 @@ Both return the same shape as `GET /users/me`. For what that user is entitled
 to, `GET /api/v1/billing/entitlements/for-user?endUserId=` returns the same
 union as `/billing/entitlements` (SDK: `rekey.billing.getEntitlementsFor(id)`).
 
+## Migrating users from another auth system
+
+`POST /api/v1/users/import` (secret key, `auth:write`; SDK
+`rekey.users.import(users)`) takes up to 500 users per call: email, the
+password hash your current system holds, whether the address was verified, a
+role, metadata, and any OAuth identities already linked so a Google or
+Discord user is not re-prompted.
+
+Hashes are accepted as **argon2id** or **bcrypt** (`$2a$`, `$2b$`, `$2y$`)
+and verified as-is at sign-in. Rekey never creates bcrypt hashes; an imported
+one is upgraded to argon2id on the user's first successful sign-in, the one
+moment the plaintext is in hand. Existing addresses are skipped, never
+updated — an import is not a way to overwrite a live account's password — and
+the whole batch is validated before any row is written.
+
 ## Operator end-user management
 
 Operators manage end-users from the panel (or the `/api/v1/tenant/applications/:id/end-users*` routes): seed users manually, edit role/metadata/verified flag, grant credits, impersonate (audited, 5-minute token), and delete.
