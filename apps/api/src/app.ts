@@ -57,6 +57,7 @@ import {
 import { meRoutes } from './routes/me.js';
 import { usersMeRoutes } from './routes/users-me.js';
 import { usersRoutes } from './routes/users.js';
+import { usersImportRoutes } from './routes/users-import.js';
 import {
   tenantAuthRoutes,
   tenantAuthAuthenticatedRoutes,
@@ -563,6 +564,8 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
   // Secret-key end-user lookup by id / exact email (routes/users.ts). Mounted
   // AFTER /users/me so the literal segment wins over the :id parameter.
   await app.register(usersRoutes, { prefix: '/api/v1/users' });
+  // Bulk import from another auth system (routes/users-import.ts).
+  await app.register(usersImportRoutes, { prefix: '/api/v1/users' });
   // End-user organizations — gated by `authConfig.organizationsEnabled`
   // at the service layer. Routes are mounted regardless; the service
   // refuses on apps that didn't opt in.

@@ -18,6 +18,7 @@
 
 import { randomBytes } from 'node:crypto';
 import argon2 from 'argon2';
+import bcrypt from 'bcryptjs';
 
 const TYPE = argon2.argon2id;
 
@@ -33,6 +34,31 @@ export function hashPassword(plain: string): Promise<string> {
 }
 
 /**
+ * A bcrypt hash as produced by every mainstream bcrypt library (`$2a$`,
+ * `$2b$`, `$2y$`). Rekey never CREATES these — `hashPassword` is argon2id
+ * only — but it accepts them at verify time so an application migrating its
+ * users from another auth system can import the hashes it already holds and
+ * let each user keep their password. The first successful sign-in re-hashes
+ * to argon2id (`needsRehash`), so the bcrypt hash lives exactly as long as it
+ * has to.
+ */
+const BCRYPT_RE = /^\$2[aby]\$\d{2}\$/;
+
+export function isBcryptHash(hash: string): boolean {
+  return BCRYPT_RE.test(hash);
+}
+
+/**
+ * True when a hash that just verified should be replaced with a fresh
+ * argon2id one. Today that means "it was bcrypt". Callers re-hash with
+ * `hashPassword` and store the result; the plaintext is in hand at exactly
+ * that moment and never again.
+ */
+export function needsRehash(hash: string): boolean {
+  return isBcryptHash(hash);
+}
+
+/**
  * Verify a plaintext password against an encoded hash. Returns `false` for
  * any failure — wrong password, malformed hash, missing hash. Never throws.
  *
@@ -43,6 +69,7 @@ export function hashPassword(plain: string): Promise<string> {
 export async function verifyPassword(hash: string | null, plain: string): Promise<boolean> {
   if (!hash) return false;
   try {
+    if (isBcryptHash(hash)) return await bcrypt.compare(plain, hash);
     return await argon2.verify(hash, plain);
   } catch {
     return false;
