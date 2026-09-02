@@ -82,6 +82,10 @@ export const KNOWN_WEBHOOK_EVENTS = [
   'device.blocked',
   'device.unblocked',
   'device.limit_reached',
+  // A machine gave its license seat back (POST /licenses/deactivate or an
+  // operator release). `license.activated` is deliberately absent: verify is
+  // called at every launch, and announcing each one would be noise.
+  'license.deactivated',
 ] as const;
 
 /**
