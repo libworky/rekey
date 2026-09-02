@@ -377,6 +377,22 @@ Headers: Authorization: Bearer rp_live_…  +  X-Rekey-User-Token: <jwt>
 
 Replay-chain revocation and sign-out-everywhere both shipped — see the refresh-token bullets above and `POST /auth/sign-out-everywhere`.
 
+## Server-side lookup with a secret key
+
+Your own backend often holds a secret key but not the user's token — a
+licence server, a support tool, a migration script. Two routes answer "who is
+this" without a session, secret key only (the publishable key is refused, so a
+browser can never enumerate accounts through them):
+
+- `GET /api/v1/users?email=` — exact, case-insensitive match in the calling
+  Application. SDK: `rekey.users.getByEmail(email)`.
+- `GET /api/v1/users/:id` — by id, scoped to the Application. SDK:
+  `rekey.users.get(id)`.
+
+Both return the same shape as `GET /users/me`. For what that user is entitled
+to, `GET /api/v1/billing/entitlements/for-user?endUserId=` returns the same
+union as `/billing/entitlements` (SDK: `rekey.billing.getEntitlementsFor(id)`).
+
 ## Operator end-user management
 
 Operators manage end-users from the panel (or the `/api/v1/tenant/applications/:id/end-users*` routes): seed users manually, edit role/metadata/verified flag, grant credits, impersonate (audited, 5-minute token), and delete.
