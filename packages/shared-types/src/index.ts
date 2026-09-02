@@ -1580,6 +1580,46 @@ export const LicenseVerifyResultDtoSchema = z.discriminatedUnion('ok', [
 ]);
 export type LicenseVerifyResultDto = z.infer<typeof LicenseVerifyResultDtoSchema>;
 
+/**
+ * One machine's hold on a license seat. `releasedAt` set means the seat was
+ * given back (POST /licenses/deactivate, or an operator release) and no
+ * longer counts toward `seatsAllowed`; `deviceId` is the Device the same
+ * fingerprint resolved to under the license holder, when one exists.
+ */
+export const LicenseActivationDtoSchema = z.object({
+  id: z.string(),
+  applicationId: z.string(),
+  licenseId: z.string(),
+  machineFingerprint: z.string(),
+  label: z.string().nullable(),
+  deviceId: z.string().nullable(),
+  firstSeenAt: z.string().datetime(),
+  lastSeenAt: z.string().datetime(),
+  releasedAt: z.string().datetime().nullable(),
+});
+export type LicenseActivationDto = z.infer<typeof LicenseActivationDtoSchema>;
+
+/**
+ * Result of POST /api/v1/licenses/deactivate. Always HTTP 200 — branch on
+ * `ok`, like verify. `released: false` on `ok: true` means the machine held
+ * no seat (idempotent).
+ */
+export const LicenseDeactivateResultDtoSchema = z.discriminatedUnion('ok', [
+  z.object({ ok: z.literal(true), released: z.boolean() }),
+  z.object({
+    ok: z.literal(false),
+    reason: z.enum(['unknown', 'wrong_application', 'revoked', 'expired']),
+  }),
+]);
+export type LicenseDeactivateResultDto = z.infer<typeof LicenseDeactivateResultDtoSchema>;
+
+/** Body of POST /api/v1/licenses/deactivate. */
+export const LicenseDeactivateRequestSchema = z.object({
+  key: z.string().min(1).max(256),
+  machineFingerprint: z.string().min(1).max(256),
+});
+export type LicenseDeactivateRequest = z.infer<typeof LicenseDeactivateRequestSchema>;
+
 // ============================================================================
 // Usage metering
 // ============================================================================
@@ -1759,6 +1799,11 @@ export const WEBHOOK_EVENTS = [
     name: 'device.unblocked',
     description:
       'An operator lifted a block. The device comes back as RELEASED and takes a slot again only on its next sign-in, subject to the limit. Payload: `data.device`.',
+  },
+  {
+    name: 'license.deactivated',
+    description:
+      'A machine gave back its seat on a license — the customer\'s software called POST /licenses/deactivate, or an operator released the activation (`data.releasedBy`). Payload: `data.license` (id, endUserId, kind) and `data.machineFingerprint`.',
   },
   {
     name: 'device.limit_reached',

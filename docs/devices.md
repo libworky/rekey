@@ -148,6 +148,51 @@ next sign-in needs. Set it from the panel, `PATCH
 | `DEVICE_FINGERPRINT_REQUIRED` | 400 | `deviceBinding` is `required` and the body had no `device`. | — |
 | `REFRESH_TOKEN_DEVICE_MISMATCH` | 401 | A bound chain was refreshed from a different fingerprint. All sessions revoked. | — |
 
+## Managing devices
+
+Three surfaces over one service. Every one scopes by (application, end-user)
+and answers 404 across either boundary, so a device id from another user or
+another Application is indistinguishable from a typo.
+
+| Surface | Credential | Routes |
+|---|---|---|
+| End-user | publishable key + user JWT | `GET /api/v1/users/me/devices` (redacted: no IP, no operator notes) · `DELETE /api/v1/users/me/devices/:id` |
+| Your backend | secret key (`auth:read` / `auth:write`) | `GET /api/v1/devices?endUserId=` · `POST /api/v1/devices/:id/release` `{ endUserId }` |
+| Operator | panel session | `GET …/end-users/:euid/devices` · `POST …/devices/:id/release` · `POST …/devices/:id/block` `{ reason? }` · `POST …/devices/:id/unblock` under `/api/v1/tenant/applications/:id` |
+
+**Release** gives the slot back and revokes every session minted on the
+device, in one transaction — including the caller's own session when it is
+the same device. It is idempotent. A blocked device is not its owner's to
+release.
+
+**Block** and **unblock** are operator decisions and exist on the operator
+surface only. The `reason` never reaches the end-user, who sees
+`DEVICE_BLOCKED` and nothing else. Unblocking returns the device to RELEASED.
+
+Node SDK: `rekey.devices.list(endUserId, { status })` and
+`rekey.devices.release(deviceId, endUserId)` for the secret-key surface.
+
+## License seats and devices
+
+A license activation is a machine's hold on a seat, keyed by the same
+opaque fingerprint. Since 2.1.0 it has always been possible to *take* a seat
+(`POST /licenses/verify`); it is now possible to give one back:
+
+- `POST /api/v1/licenses/deactivate` `{ key, machineFingerprint }` — the
+  customer's software calls it before a re-image or on uninstall. Same
+  deterministic body as verify (`ok: false` + `reason` for an unknown, revoked
+  or expired key, never an HTTP error), idempotent (`released: false` when the
+  machine held no seat). SDK: `rekey.licenses.deactivate(...)`.
+- Operators see every activation at `GET …/licenses/:licenseId/activations`
+  (`releasedAt` marks freed seats) and can release one at
+  `POST …/licenses/:licenseId/activations/:activationId/release`.
+
+A released activation stops counting toward `seatsAllowed`; the next verify
+from the same machine reactivates it in place rather than inserting a second
+row. When the license holder has a Device with the same fingerprint, the
+activation's `deviceId` points at it, so the seat list and the device list
+describe the same machines. Emits `license.deactivated`.
+
 ## Webhook events
 
 | Event | When |
@@ -157,20 +202,14 @@ next sign-in needs. Set it from the panel, `PATCH
 | `device.blocked` | An operator blocked the device; its sessions were revoked. |
 | `device.unblocked` | An operator lifted the block. The device is RELEASED. |
 | `device.limit_reached` | A new device was refused. `data.devices` lists the active devices filling the cap. |
+| `license.deactivated` | A machine gave back its license seat — `POST /licenses/deactivate` or an operator release (`data.releasedBy`). `data.license` and `data.machineFingerprint`. |
 
 Every payload except `device.limit_reached` carries `data.device` with `id`,
 `endUserId`, `fingerprint`, `label`, `status` and the timestamps. See
 [webhooks.md](webhooks.md) for the envelope and signature.
 
-## What lands in this series
+## What is still to come
 
-This page describes the model, the service and session binding. The rest of
-the device work ships as the following steps of the same series, and this page
-grows with them:
-
-1. **Management routes.** End-user (`/users/me/devices`), operator
-   (`/tenant/applications/:id/end-users/:euid/devices`) and secret-key surfaces,
-   plus `POST /licenses/deactivate` to give a seat back.
-2. **License integration.** Activations link to the device the same
-   fingerprint resolved to; released activations stop counting toward
-   `seatsAllowed`; `max_devices` also bounds `PERPETUAL` and `TIMED` licenses.
+`max_devices` bounding `PERPETUAL` and `TIMED` licenses (today only `SEATS`
+licenses have a cap), secret-key entitlement and user lookup for backends that
+hold no user token, and MCP tools over these routes.
