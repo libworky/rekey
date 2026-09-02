@@ -19,6 +19,7 @@
 
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
+import { DeviceBindingRequestSchema } from '@rekey.dev/shared-types';
 import { oauthService } from './oauth.service.js';
 import { requirePublishableOrSecretKey, requireScope } from '../../middleware/api-key-auth.js';
 import { requireUserSession } from '../../middleware/user-session.js';
@@ -27,7 +28,10 @@ import { ok, okArray, errs, ref } from '../../lib/openapi.js';
 
 const ProviderParam = z.object({ provider: z.string().min(1).max(40) });
 const StartBody = z.object({ state: z.string().min(1).max(512) });
-const CallbackBody = z.object({ code: z.string().min(1).max(4096) });
+const CallbackBody = z.object({
+  code: z.string().min(1).max(4096),
+  device: DeviceBindingRequestSchema.optional(),
+});
 
 /**
  * Errors from `requirePublishableOrSecretKey` + `requireScope('auth:write')`
@@ -125,7 +129,20 @@ export async function oauthRoutes(app: FastifyInstance): Promise<void> {
         body: {
           type: 'object',
           required: ['code'],
-          properties: { code: { type: 'string', minLength: 1, maxLength: 4096 } },
+          properties: {
+            code: { type: 'string', minLength: 1, maxLength: 4096 },
+            device: {
+              type: 'object',
+              required: ['fingerprint'],
+              description:
+                'Bind the session to a device (docs/devices.md). Optional unless the Application ' +
+                'sets `authConfig.deviceBinding = "required"`.',
+              properties: {
+                fingerprint: { type: 'string', minLength: 8, maxLength: 256 },
+                label: { type: 'string', minLength: 1, maxLength: 120 },
+              },
+            },
+          },
         },
         security: [{ apiKey: [] }, { publishableKey: [] }],
         response: {
@@ -170,6 +187,8 @@ export async function oauthRoutes(app: FastifyInstance): Promise<void> {
         device: {
           userAgent: typeof ua === 'string' && ua.length > 0 ? ua : null,
           ip: req.ip || null,
+          fingerprint: body.device?.fingerprint ?? null,
+          label: body.device?.label ?? null,
         },
         // Signup policy: refuse OAuth-first user creation via a pub key in
         // `secret_only` apps (and entirely in `invite_only`).

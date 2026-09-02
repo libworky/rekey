@@ -55,6 +55,7 @@ import type {
   ResetPasswordRequest,
   SignInOutcomeDto,
   SignInRequest,
+  DeviceBindingRequest,
   SignUpRequest,
   SubscriptionDto,
   UsageAggregateDto,
@@ -78,6 +79,7 @@ export type {
   MfaVerifyRequest,
   SignInOutcomeDto,
   SignInRequest,
+  DeviceBindingRequest,
   SignUpRequest,
   RefreshRequest,
   ForgotPasswordRequest,
@@ -909,11 +911,19 @@ class AuthClient {
    *   This is a strong signal the original was leaked; treat as compromise.
    * @throws {RekeyError} `REFRESH_TOKEN_EXPIRED` (401) after the 30-day refresh window.
    */
-  refresh(refreshToken: string): Promise<AuthResultDto> {
+  refresh(
+    refreshToken: string,
+    options: { device?: DeviceBindingRequest } = {},
+  ): Promise<AuthResultDto> {
     // /auth/refresh returns the same shape as /auth/mfa-verify — always a
     // full session (refresh requires a prior MFA-verified session by
-    // definition).
-    return this.client.send('POST', '/api/v1/auth/refresh', { refreshToken });
+    // definition). `device` identifies the machine presenting the token: a
+    // chain bound at sign-in refuses a different fingerprint, and an unbound
+    // one becomes bound (docs/devices.md).
+    return this.client.send('POST', '/api/v1/auth/refresh', {
+      refreshToken,
+      ...(options.device && { device: options.device }),
+    });
   }
 
   /**

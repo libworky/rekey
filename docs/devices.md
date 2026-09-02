@@ -92,6 +92,62 @@ When a new device is refused, the refusal carries the ACTIVE devices that fill
 the cap — id, label, first and last seen — so your client can show the user
 which machine to release rather than a dead end.
 
+## Binding a session to a device
+
+Every endpoint that mints a session — `POST /auth/sign-in`, `/auth/sign-up`,
+`/auth/mfa-verify`, `/auth/refresh`, `/auth/oauth/:provider/callback`,
+`/auth/magic-link/verify`, `/auth/passkey/authenticate/complete` — accepts an
+optional `device` object:
+
+```json
+{ "email": "…", "password": "…", "device": { "fingerprint": "sha256:…", "label": "Work laptop" } }
+```
+
+When present, the device is registered (or refreshed) through the limit
+described above **before** any token is issued, so a machine over the cap
+never gets a session. The result is a session that knows its machine:
+
+- `AuthResult.deviceId` names the device.
+- The access token carries a `dev` claim with the same id. It is a claim, not
+  an authorization: `requireUserSession` surfaces it as `request.deviceId`,
+  and anything that needs to trust it resolves the row and checks `status`,
+  the way `oid` is re-confirmed against membership.
+- The refresh token records `deviceId`, and every rotation carries it.
+- `GET /auth/sessions` lists `deviceId` per session, so "sign out this
+  laptop" is `DELETE /auth/sessions/:id` for the session on that device — or
+  release the device, which revokes every session on it at once.
+
+Clients that send no `device` see no change at all: `deviceId` is `null`,
+there is no claim, and nothing is registered. Browser SDKs never send one.
+
+### Refresh and the stolen-token case
+
+A chain bound at sign-in stays bound. If a refresh **also** carries a
+`device`, it must be the same fingerprint — a refresh token presented from a
+different machine is treated like a replayed one: `401
+REFRESH_TOKEN_DEVICE_MISMATCH`, and every session for that user is revoked. A
+chain that was never bound may be bound by the first refresh that identifies
+itself (a client that started sending fingerprints mid-session), and one that
+stays unbound is left alone.
+
+### Requiring a binding
+
+`authConfig.deviceBinding` is `optional` by default. Set it to `required` and
+the primary sign-in flows refuse without a `device` (`400
+DEVICE_FINGERPRINT_REQUIRED`). Refresh is never gated by it, so flipping the
+switch on a running Application does not sign anyone out; it changes what the
+next sign-in needs. Set it from the panel, `PATCH
+/tenant/applications/:id/auth-config`, or the `update_auth_config` MCP tool.
+
+### Errors a client should handle
+
+| Code | Status | When | `details` |
+|---|---|---|---|
+| `DEVICE_LIMIT_REACHED` | 403 | A new (or released) device would exceed `max_devices`. | `{ limit, devices: [{ id, label, firstSeenAt, lastSeenAt }] }` — the active devices to release. |
+| `DEVICE_BLOCKED` | 403 | An operator blocked this fingerprint. | — |
+| `DEVICE_FINGERPRINT_REQUIRED` | 400 | `deviceBinding` is `required` and the body had no `device`. | — |
+| `REFRESH_TOKEN_DEVICE_MISMATCH` | 401 | A bound chain was refreshed from a different fingerprint. All sessions revoked. | — |
+
 ## Webhook events
 
 | Event | When |
@@ -108,17 +164,13 @@ Every payload except `device.limit_reached` carries `data.device` with `id`,
 
 ## What lands in this series
 
-This page describes the model and the service. The rest of the device work
-ships as the following steps of the same series, and this page grows with
-them:
+This page describes the model, the service and session binding. The rest of
+the device work ships as the following steps of the same series, and this page
+grows with them:
 
-1. **Device-bound sessions.** Session-minting endpoints accept
-   `device: { fingerprint, label }`, the refresh token records the device, and
-   the access token carries a `dev` claim. `authConfig.deviceBinding` says
-   whether a fingerprint is optional or required.
-2. **Management routes.** End-user (`/users/me/devices`), operator
+1. **Management routes.** End-user (`/users/me/devices`), operator
    (`/tenant/applications/:id/end-users/:euid/devices`) and secret-key surfaces,
    plus `POST /licenses/deactivate` to give a seat back.
-3. **License integration.** Activations link to the device the same
+2. **License integration.** Activations link to the device the same
    fingerprint resolved to; released activations stop counting toward
    `seatsAllowed`; `max_devices` also bounds `PERPETUAL` and `TIMED` licenses.
