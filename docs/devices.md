@@ -208,8 +208,17 @@ Every payload except `device.limit_reached` carries `data.device` with `id`,
 `endUserId`, `fingerprint`, `label`, `status` and the timestamps. See
 [webhooks.md](webhooks.md) for the envelope and signature.
 
+### The limit also bounds licenses
+
+A `SEATS` license carries its own cap (`seatsAllowed`, what was bought). A
+`PERPETUAL` or `TIMED` license held by an end-user is bounded by that user's
+`max_devices` entitlement, when their plans grant one — the same number that
+bounds their sessions — and refuses further machines with
+`seats_exhausted`. Holders whose plans grant no such feature stay uncapped,
+as every deployment was before the entitlement existed. Org-pooled licenses
+have no single end-user to resolve for and follow only `seatsAllowed`.
+
 ## What is still to come
 
-`max_devices` bounding `PERPETUAL` and `TIMED` licenses (today only `SEATS`
-licenses have a cap), secret-key entitlement and user lookup for backends that
-hold no user token, and MCP tools over these routes.
+Secret-key entitlement and user lookup for backends that hold no user token,
+and MCP tools over these routes.
