@@ -1449,6 +1449,66 @@ export const OrganizationInvitationDtoSchema = z.object({
 export type OrganizationInvitationDto = z.infer<typeof OrganizationInvitationDtoSchema>;
 
 // ============================================================================
+// Devices — the machines an end-user signs in from
+// ============================================================================
+
+/**
+ * The FEATURE entitlement key that caps ACTIVE devices per end-user. Put it on
+ * a plan as `{ kind: 'FEATURE', key: 'max_devices', valueType: 'INT', value: '3' }`
+ * and the devices service enforces it at sign-in and licence verification. It
+ * resolves through the ordinary entitlement union — MAX across the end-user's
+ * active subscriptions, with the Application's default plan supplying the free
+ * tier — so a plan upgrade raises the cap without touching a device row. An
+ * end-user whose plans grant no such feature is uncapped.
+ */
+export const DEVICE_LIMIT_FEATURE_KEY = 'max_devices';
+
+export const DeviceStatusSchema = z.enum(['ACTIVE', 'RELEASED', 'BLOCKED']);
+export type DeviceStatusType = z.infer<typeof DeviceStatusSchema>;
+
+/**
+ * A device as returned by every device-listing route. `fingerprint` is the
+ * opaque value the client supplied; `blockedReason` is operator-facing and is
+ * omitted on end-user routes (see `EndUserDeviceDtoSchema`).
+ */
+export const DeviceDtoSchema = z.object({
+  id: z.string(),
+  applicationId: z.string(),
+  endUserId: z.string(),
+  fingerprint: z.string(),
+  label: z.string().nullable(),
+  status: DeviceStatusSchema,
+  firstSeenAt: z.string().datetime(),
+  lastSeenAt: z.string().datetime(),
+  lastSeenIp: z.string().nullable(),
+  releasedAt: z.string().datetime().nullable(),
+  blockedAt: z.string().datetime().nullable(),
+  blockedReason: z.string().nullable(),
+  metadata: z.unknown(),
+  createdAt: z.string().datetime(),
+  updatedAt: z.string().datetime(),
+});
+export type DeviceDto = z.infer<typeof DeviceDtoSchema>;
+
+/** What an end-user sees of their own devices: no operator notes, no IP. */
+export const EndUserDeviceDtoSchema = DeviceDtoSchema.omit({ blockedReason: true, lastSeenIp: true });
+export type EndUserDeviceDto = z.infer<typeof EndUserDeviceDtoSchema>;
+
+/**
+ * Body accepted by the session-minting endpoints (sign-in, sign-up,
+ * mfa-verify, refresh, OAuth callback, magic-link verify, passkey complete)
+ * to bind the resulting session to a device. Optional everywhere unless the
+ * Application sets `authConfig.deviceBinding = 'required'`.
+ */
+export const DeviceBindingRequestSchema = z.object({
+  /** Opaque, client-computed, stable across launches. 8–256 characters. */
+  fingerprint: z.string().min(8).max(256),
+  /** Human-readable hint shown in device lists ("Work laptop"). */
+  label: z.string().min(1).max(120).optional(),
+});
+export type DeviceBindingRequest = z.infer<typeof DeviceBindingRequestSchema>;
+
+// ============================================================================
 // Licenses — keys issued by LICENSE-kind plans
 // ============================================================================
 
@@ -1643,6 +1703,34 @@ export const WEBHOOK_EVENTS = [
     name: 'dunning.case_exhausted',
     description:
       'No recovery within 14 days — the dunning case closed as EXHAUSTED and the subscription was canceled (a `subscription.canceled` event accompanies this). Payload: `data.dunningCase`.',
+  },
+  // Devices — the machines an end-user signs in from. Payloads carry
+  // `data.device` (id, endUserId, fingerprint, label, status, timestamps)
+  // except `device.limit_reached`, which has no row to describe.
+  {
+    name: 'device.registered',
+    description:
+      'A device was registered for an end-user — a new fingerprint at sign-in or licence verification, or a previously released device coming back (`data.reactivated`). A sign-in from an already-active device emits nothing. Payload: `data.device`.',
+  },
+  {
+    name: 'device.released',
+    description:
+      'A device gave its slot back — the end-user or an operator released it — and every session minted on it was revoked (`data.sessionsRevoked`). Payload: `data.device`, `data.releasedBy` (`end_user` | `operator`).',
+  },
+  {
+    name: 'device.blocked',
+    description:
+      'An operator blocked a device: sign-in from that fingerprint is refused until it is unblocked, and its sessions were revoked. Payload: `data.device`, `data.sessionsRevoked`.',
+  },
+  {
+    name: 'device.unblocked',
+    description:
+      'An operator lifted a block. The device comes back as RELEASED and takes a slot again only on its next sign-in, subject to the limit. Payload: `data.device`.',
+  },
+  {
+    name: 'device.limit_reached',
+    description:
+      'A new device was refused because the end-user is at their `max_devices` entitlement. Payload: `data.endUserId`, `data.limit`, the refused `data.fingerprint`, and `data.devices` — the active devices filling the cap, so you can prompt the user to release one.',
   },
 ] as const;
 
