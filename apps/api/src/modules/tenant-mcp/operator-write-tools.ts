@@ -741,6 +741,14 @@ export const operatorWriteTools: OperatorTool[] = [
             'against GET /.well-known/jwks.json; HS256 (default) requires the API. ' +
             'Switching never breaks outstanding tokens, since the API verifies both.',
         },
+        deviceBinding: {
+          type: 'string',
+          enum: ['optional', 'required'],
+          description:
+            'Whether primary sign-in flows must carry a device binding. "optional" (default) ' +
+            'records a device when the client sends one; "required" refuses sign-in without ' +
+            'one. Refresh is never gated.',
+        },
         passwordBreachCheckEnabled: { type: 'boolean' },
         sendVerificationEmailOnSignUp: {
           type: 'boolean',
@@ -779,6 +787,9 @@ export const operatorWriteTools: OperatorTool[] = [
         ...(args.mfa !== undefined && { mfa: args.mfa as 'off' | 'optional' | 'required' }),
         ...(args.mcpEnabled !== undefined && { mcpEnabled: args.mcpEnabled === true }),
         ...(args.tokenAlg !== undefined && { tokenAlg: args.tokenAlg as 'HS256' | 'RS256' }),
+        ...(args.deviceBinding !== undefined && {
+          deviceBinding: args.deviceBinding as 'optional' | 'required',
+        }),
         ...(args.passwordBreachCheckEnabled !== undefined && {
           passwordBreachCheckEnabled: args.passwordBreachCheckEnabled === true,
         }),

@@ -27,6 +27,7 @@ import { Prisma } from '@prisma/client';
 import type { Application, EndUser } from '@prisma/client';
 import { prisma } from '../../lib/prisma.js';
 import { RekeyError } from '../../lib/error.js';
+import { devicesService } from '../devices/devices.service.js';
 import { hashPassword, verifyPassword } from '../../lib/passwords.js';
 import { checkPasswordBreached } from '../../lib/breached-password.js';
 import { env } from '../../config/env.js';
@@ -234,6 +235,11 @@ export interface AuthResult {
   refreshToken: string;
   /** Absolute expiry timestamp of the refresh token. */
   refreshTokenExpiresAt: Date;
+  /**
+   * The device this session is bound to (the access token's `dev` claim), or
+   * null when the client sent no fingerprint.
+   */
+  deviceId: string | null;
 }
 
 /**
@@ -261,6 +267,104 @@ export type SignInOutcome =
 export interface DeviceContext {
   userAgent?: string | null;
   ip?: string | null;
+  /**
+   * Client-computed device fingerprint from the request body's `device`
+   * object. Present → the session is bound to that device (registered or
+   * refreshed through `devicesService.touch`, limit enforced).
+   */
+  fingerprint?: string | null;
+  label?: string | null;
+  /**
+   * An ALREADY-bound device, for flows that re-mint a session from an existing
+   * one (org switch, refresh) and therefore know the device by id rather than
+   * by fingerprint. Ignored when `fingerprint` is present.
+   */
+  deviceId?: string | null;
+  /**
+   * Whether this is a primary sign-in (the flows `authConfig.deviceBinding =
+   * 'required'` gates) or a re-mint of an existing session. Defaults to
+   * primary; `refresh` and org switch pass `false`.
+   */
+  primary?: boolean;
+}
+
+/**
+ * Resolve the device a new session should be bound to, or null.
+ *
+ * Three inputs, one outcome: a fingerprint registers/refreshes the device
+ * (the limit is enforced here, so a new machine over the cap never gets a
+ * token); a bare `deviceId` re-touches a device the session was already bound
+ * to (a blocked one still refuses); neither leaves the session unbound —
+ * unless the Application requires binding and this is a primary sign-in.
+ *
+ * Refusals are thrown as the errors the route documents. The device list on
+ * DEVICE_LIMIT_REACHED rides in `details` so a client can offer "release one"
+ * rather than a dead end.
+ */
+async function bindDevice(
+  application: Application,
+  endUser: EndUser,
+  device: DeviceContext | undefined,
+): Promise<string | null> {
+  let fingerprint = device?.fingerprint ?? null;
+  let via: 'sign_in' | 'refresh' = device?.primary === false ? 'refresh' : 'sign_in';
+  if (!fingerprint && device?.deviceId) {
+    // Re-mint from an existing binding: the row is the source of the
+    // fingerprint. A device that no longer exists (deleted with its user)
+    // simply leaves the new session unbound.
+    const bound = await prisma.device.findUnique({ where: { id: device.deviceId } });
+    if (bound && bound.endUserId === endUser.id && bound.applicationId === application.id) {
+      fingerprint = bound.fingerprint;
+      via = 'refresh';
+    }
+  }
+  if (!fingerprint) {
+    const { deviceBinding } = AuthConfigSchema.parse(application.authConfig);
+    if (deviceBinding === 'required' && device?.primary !== false) {
+      throw new RekeyError({
+        statusCode: 400,
+        code: 'DEVICE_FINGERPRINT_REQUIRED',
+        message: 'This Application requires a device binding on sign-in.',
+        fix: 'Send `device: { fingerprint, label? }` in the request body — see docs/devices.md.',
+      });
+    }
+    return null;
+  }
+
+  const outcome = await devicesService.touch({
+    applicationId: application.id,
+    endUserId: endUser.id,
+    fingerprint,
+    label: device?.label ?? undefined,
+    ip: device?.ip ?? null,
+    via,
+  });
+  if (outcome.kind === 'blocked') {
+    throw new RekeyError({
+      statusCode: 403,
+      code: 'DEVICE_BLOCKED',
+      message: 'Sign-in from this device has been blocked.',
+      fix: 'Contact the application\'s support — only an operator can unblock a device.',
+    });
+  }
+  if (outcome.kind === 'limit_reached') {
+    throw new RekeyError({
+      statusCode: 403,
+      code: 'DEVICE_LIMIT_REACHED',
+      message: `This account is already signed in on ${outcome.limit} device${outcome.limit === 1 ? '' : 's'}, the most its plan allows.`,
+      fix: 'Release one of the devices listed in `details.devices` (DELETE /api/v1/users/me/devices/:id) or upgrade the plan.',
+      details: {
+        limit: outcome.limit,
+        devices: outcome.devices.map((d) => ({
+          id: d.id,
+          label: d.label,
+          firstSeenAt: d.firstSeenAt.toISOString(),
+          lastSeenAt: d.lastSeenAt.toISOString(),
+        })),
+      },
+    });
+  }
+  return outcome.device.id;
 }
 
 async function issuePair(
@@ -277,16 +381,21 @@ async function issuePair(
   // exactly the population the flag exists for: an attacker who registers an
   // address they cannot read never had to open the mailbox.
   ensureEmailVerified(application, endUser);
+  // Device binding sits at the same chokepoint for the same reason: every
+  // session passes through here, so the device limit cannot be bypassed by
+  // picking a different sign-in method. It runs AFTER the verification gate so
+  // an unconfirmed address does not register devices it cannot use.
+  const deviceId = await bindDevice(application, endUser, device);
   // Honours the app's `authConfig.tokenAlg` (HS256 default, RS256 = JWKS).
-  const access = await issueUserAccessTokenForApp(
-    application,
-    endUser.id,
-    activeOrganizationId ? { activeOrganizationId } : {},
-  );
+  const access = await issueUserAccessTokenForApp(application, endUser.id, {
+    ...(activeOrganizationId && { activeOrganizationId }),
+    ...(deviceId && { deviceId }),
+  });
   const refresh = await issueRefreshToken(application.id, endUser.id, {
     userAgent: device?.userAgent ?? null,
     ip: device?.ip ?? null,
     activeOrganizationId: activeOrganizationId ?? null,
+    deviceId,
   });
   return {
     endUser: redact(endUser),
@@ -294,6 +403,7 @@ async function issuePair(
     accessTokenExpiresAt: access.expiresAt,
     refreshToken: refresh.raw,
     refreshTokenExpiresAt: refresh.record.expiresAt,
+    deviceId,
   };
 }
 
@@ -817,7 +927,11 @@ export const authService = {
    * Cross-application guard: the refresh token's `applicationId` must
    * match the calling secret key's Application.
    */
-  async refresh(application: Application, presentedRaw: string): Promise<AuthResult> {
+  async refresh(
+    application: Application,
+    presentedRaw: string,
+    device?: DeviceContext,
+  ): Promise<AuthResult> {
     const outcome = await lookupRefreshToken(presentedRaw);
     if (outcome.kind === 'unknown') {
       throw new RekeyError({
@@ -945,17 +1059,55 @@ export const authService = {
         });
       }
     }
-    const access = await issueUserAccessTokenForApp(
-      application,
-      endUser.id,
-      oid ? { activeOrganizationId: oid } : {},
-    );
+    // Device binding across the rotation.
+    //
+    // A chain bound at sign-in stays bound: the rotated row already carries
+    // `deviceId`. If the caller ALSO sent a fingerprint it must be the same
+    // machine — a refresh token replayed from a different device is the
+    // stolen-token case, and it is treated like a reuse: the whole family is
+    // revoked. A chain that was never bound may be bound now (a client
+    // upgraded to send fingerprints mid-session); one that stays unbound is
+    // left alone — `deviceBinding: required` gates primary sign-in only, so
+    // flipping it never signs existing users out.
+    let deviceId = replacement.record.deviceId;
+    if (deviceId && device?.fingerprint) {
+      const bound = await prisma.device.findUnique({ where: { id: deviceId } });
+      if (bound && bound.fingerprint !== device.fingerprint) {
+        await revokeAllForEndUser(endUser.id);
+        throw new RekeyError({
+          statusCode: 401,
+          code: 'REFRESH_TOKEN_DEVICE_MISMATCH',
+          message:
+            'This session is bound to a different device. All sessions for this user have been revoked as a precaution.',
+          fix: 'Sign the user in again from this device.',
+        });
+      }
+    }
+    const rebound = await bindDevice(application, endUser, {
+      ...device,
+      deviceId,
+      primary: false,
+    });
+    if (rebound !== deviceId) {
+      // Unbound chain that just identified itself: persist the binding so the
+      // next rotation carries it without the client repeating the fingerprint.
+      await prisma.refreshToken.update({
+        where: { id: replacement.record.id },
+        data: { deviceId: rebound },
+      });
+      deviceId = rebound;
+    }
+    const access = await issueUserAccessTokenForApp(application, endUser.id, {
+      ...(oid && { activeOrganizationId: oid }),
+      ...(deviceId && { deviceId }),
+    });
     return {
       endUser: redact(endUser),
       accessToken: access.token,
       accessTokenExpiresAt: access.expiresAt,
       refreshToken: replacement.raw,
       refreshTokenExpiresAt: replacement.record.expiresAt,
+      deviceId,
     };
   },
 

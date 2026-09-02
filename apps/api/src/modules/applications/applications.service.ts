@@ -93,6 +93,9 @@ const DEFAULT_AUTH_CONFIG: AuthConfig = {
   dynamicClientRegistration: true,
   // HS256 (per-app derived key) by default; RS256/JWKS is per-app opt-in.
   tokenAlg: 'HS256',
+  // Devices are recorded when a client identifies itself and never demanded;
+  // requiring a binding is a per-app decision for native clients only.
+  deviceBinding: 'optional',
 };
 
 function defaultBillingConfig(provider: BillingProvider): BillingConfig {

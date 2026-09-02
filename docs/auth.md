@@ -290,6 +290,15 @@ login screen's problem.
 session has no active organization, or when membership lapsed since the token
 was minted. A stale `oid` claim degrades to "no org", it never grants access.
 
+## Devices
+
+A native, desktop or CLI client can bind the session it mints to the machine
+it runs on by sending `device: { fingerprint, label }` on any session-minting
+endpoint. The session then carries a `dev` claim, the refresh chain is bound
+to that device, and the number of active devices per end-user can be capped by
+the `max_devices` entitlement on the plan. Browser SDKs never send it and see
+no change. See [devices.md](devices.md).
+
 ## Tokens — access + refresh
 
 Sign-up and sign-in return **two** tokens, used for different jobs:
