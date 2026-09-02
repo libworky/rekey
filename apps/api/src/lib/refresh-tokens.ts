@@ -54,6 +54,12 @@ export interface IssueRefreshTokenOptions {
   scope?: string | null;
   /** Active organization for this session — re-emitted as the `oid` claim on refresh. */
   activeOrganizationId?: string | null;
+  /**
+   * Device the session was minted on (`devices.id`), when the client sent a
+   * fingerprint. Carried across rotations; the refresh grant refuses a
+   * different fingerprint for a bound chain (see auth.service `refresh`).
+   */
+  deviceId?: string | null;
 }
 
 /**
@@ -86,6 +92,7 @@ export async function issueRefreshToken(
       clientId: options.clientId ?? null,
       scope: options.scope ?? null,
       activeOrganizationId: options.activeOrganizationId ?? null,
+      deviceId: options.deviceId ?? null,
     },
   });
   return { raw, record };
@@ -160,6 +167,10 @@ export async function rotateRefreshToken(
         // Carry the active org forward so it survives refresh (the refresh
         // handler re-confirms membership and clears it if the user left).
         activeOrganizationId: presented.activeOrganizationId,
+        // And the device: a rotation is the same session on the same machine.
+        // The refresh handler is what refuses a rotation presented from a
+        // different fingerprint; here the binding is simply preserved.
+        deviceId: presented.deviceId,
       },
     });
 
@@ -225,6 +236,8 @@ export interface SessionSummary {
   expiresAt: Date;
   userAgent: string | null;
   ip: string | null;
+  /** Bound device, or null for sessions minted without a fingerprint. */
+  deviceId: string | null;
 }
 
 export async function listActiveSessions(
@@ -247,6 +260,7 @@ export async function listActiveSessions(
         expiresAt: true,
         userAgent: true,
         ip: true,
+        deviceId: true,
       },
       ...(opts.take !== undefined && { take: opts.take }),
       ...(opts.skip !== undefined && { skip: opts.skip }),

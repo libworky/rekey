@@ -65,6 +65,13 @@ export const RekeyErrorSchema = z.object({
    * conflict; it was simply never declared here, so it arrived untyped.
    */
   retryAfterSeconds: z.number().int().nonnegative().optional(),
+  /**
+   * Structured, code-specific context a client can act on without parsing
+   * `message`. Shape is documented per code; today `DEVICE_LIMIT_REACHED`
+   * carries `{ limit, devices[] }` so an app can offer "release one" instead of
+   * a dead end. Absent on every other error.
+   */
+  details: z.record(z.unknown()).optional(),
 });
 
 // The schema and the hand-written interface must not drift. Splitting them
@@ -467,6 +474,15 @@ export const AuthConfigSchema = z.object({
    */
   tokenAlg: TokenAlgSchema.default('HS256'),
   /**
+   * Whether primary sign-in flows (password, OAuth, magic link, passkey,
+   * MFA verify) must carry a `device` binding. `optional` (default) records a
+   * device when the client sends one and changes nothing otherwise;
+   * `required` refuses those flows without one (`DEVICE_FINGERPRINT_REQUIRED`).
+   * Refresh is never gated by this: a session bound at sign-in stays bound.
+   * See docs/devices.md.
+   */
+  deviceBinding: z.enum(['optional', 'required']).default('optional'),
+  /**
    * WebAuthn / passkey configuration. Both fields are required when
    * `"passkey"` appears in `methods` — the registration ceremony needs
    * to bind credentials to a specific Relying Party. `rpId` is the
@@ -654,16 +670,34 @@ export type ApiKeyDto = z.infer<typeof ApiKeyDtoSchema>;
 // Auth requests + responses
 // ============================================================================
 
+/**
+ * Body accepted by every session-minting endpoint (sign-in, sign-up,
+ * mfa-verify, refresh, OAuth callback, magic-link verify, passkey complete) to
+ * bind the resulting session to a device — see docs/devices.md. Optional
+ * everywhere unless the Application sets `authConfig.deviceBinding =
+ * 'required'`, in which case the primary sign-in flows refuse without it
+ * (`DEVICE_FINGERPRINT_REQUIRED`). Browser SDKs never send it.
+ */
+export const DeviceBindingRequestSchema = z.object({
+  /** Opaque, client-computed, stable across launches. 8–256 characters. */
+  fingerprint: z.string().min(8).max(256),
+  /** Human-readable hint shown in device lists ("Work laptop"). */
+  label: z.string().min(1).max(120).optional(),
+});
+export type DeviceBindingRequest = z.infer<typeof DeviceBindingRequestSchema>;
+
 export const SignUpRequestSchema = z.object({
   email: z.string().email().max(254),
   password: z.string().min(1).max(256),
   metadata: z.record(z.unknown()).optional(),
+  device: DeviceBindingRequestSchema.optional(),
 });
 export type SignUpRequest = z.infer<typeof SignUpRequestSchema>;
 
 export const SignInRequestSchema = z.object({
   email: z.string().email().max(254),
   password: z.string().min(1).max(256),
+  device: DeviceBindingRequestSchema.optional(),
 });
 export type SignInRequest = z.infer<typeof SignInRequestSchema>;
 
@@ -687,6 +721,12 @@ export const AuthResultDtoSchema = z.object({
   /** Long-lived refresh token. Use to mint new access tokens via auth.refresh(). */
   refreshToken: z.string(),
   refreshTokenExpiresAt: z.string().datetime(),
+  /**
+   * The device this session is bound to (the access token's `dev` claim), or
+   * null when the client sent no fingerprint. Optional in the schema so an SDK
+   * one version ahead still parses a response from an older deployment.
+   */
+  deviceId: z.string().nullable().optional(),
 });
 export type AuthResultDto = z.infer<typeof AuthResultDtoSchema>;
 
@@ -723,11 +763,18 @@ export type SignInOutcomeDto = z.infer<typeof SignInOutcomeDtoSchema>;
 export const MfaVerifyRequestSchema = z.object({
   mfaChallengeToken: z.string().min(1).max(2048),
   code: z.string().min(1).max(64),
+  device: DeviceBindingRequestSchema.optional(),
 });
 export type MfaVerifyRequest = z.infer<typeof MfaVerifyRequestSchema>;
 
 export const RefreshRequestSchema = z.object({
   refreshToken: z.string().min(1).max(512),
+  /**
+   * The device presenting the token. When the session is already bound to a
+   * device, a different fingerprint is refused (`REFRESH_TOKEN_DEVICE_MISMATCH`)
+   * and the chain revoked; when it is not yet bound, this binds it.
+   */
+  device: DeviceBindingRequestSchema.optional(),
 });
 export type RefreshRequest = z.infer<typeof RefreshRequestSchema>;
 
@@ -1493,20 +1540,6 @@ export type DeviceDto = z.infer<typeof DeviceDtoSchema>;
 /** What an end-user sees of their own devices: no operator notes, no IP. */
 export const EndUserDeviceDtoSchema = DeviceDtoSchema.omit({ blockedReason: true, lastSeenIp: true });
 export type EndUserDeviceDto = z.infer<typeof EndUserDeviceDtoSchema>;
-
-/**
- * Body accepted by the session-minting endpoints (sign-in, sign-up,
- * mfa-verify, refresh, OAuth callback, magic-link verify, passkey complete)
- * to bind the resulting session to a device. Optional everywhere unless the
- * Application sets `authConfig.deviceBinding = 'required'`.
- */
-export const DeviceBindingRequestSchema = z.object({
-  /** Opaque, client-computed, stable across launches. 8–256 characters. */
-  fingerprint: z.string().min(8).max(256),
-  /** Human-readable hint shown in device lists ("Work laptop"). */
-  label: z.string().min(1).max(120).optional(),
-});
-export type DeviceBindingRequest = z.infer<typeof DeviceBindingRequestSchema>;
 
 // ============================================================================
 // Licenses — keys issued by LICENSE-kind plans
