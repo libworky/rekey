@@ -1608,6 +1608,39 @@ class UsersClient {
   get(endUserId: string): Promise<EndUserDto> {
     return this.client.send('GET', `/api/v1/users/${encodeURIComponent(endUserId)}`);
   }
+
+  /**
+   * Import up to 500 users from another auth system in one call. Password
+   * hashes (argon2id or bcrypt) are stored as given and verified as-is at
+   * sign-in; bcrypt is upgraded to argon2id on first success. Existing
+   * addresses are skipped, never updated.
+   *
+   * @example
+   * ```ts
+   * const { created, skipped } = await rekey.users.import([
+   *   { email: 'a@example.com', passwordHash: '$2b$10$…', emailVerified: true },
+   *   { email: 'b@example.com', oauthIdentities: [{ provider: 'google', providerAccountId: '1234' }] },
+   * ]);
+   * ```
+   */
+  import(users: ImportUserInput[]): Promise<ImportUsersResult> {
+    return this.client.send('POST', '/api/v1/users/import', { users });
+  }
+}
+
+export interface ImportUserInput {
+  email: string;
+  /** `$argon2id$…` or `$2a$`/`$2b$`/`$2y$…`. Omit for OAuth-only users. */
+  passwordHash?: string;
+  emailVerified?: boolean;
+  role?: string;
+  metadata?: Record<string, unknown>;
+  oauthIdentities?: Array<{ provider: string; providerAccountId: string; email?: string }>;
+}
+
+export interface ImportUsersResult {
+  created: Array<{ id: string; email: string }>;
+  skipped: Array<{ email: string; reason: string }>;
 }
 
 class UsageClient {
