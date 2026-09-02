@@ -8,9 +8,13 @@
  *
  * Activation tracking:
  *   - PERPETUAL / TIMED:  one row per unique (license, machineFingerprint).
- *     No upper bound today.
+ *     Bounded by the holder's `max_devices` FEATURE entitlement when their
+ *     plans grant one (the same cap that bounds their sessions — see
+ *     modules/devices); uncapped otherwise, which is what every deployment
+ *     had before the entitlement existed.
  *   - SEATS:              same shape, but verification refuses if
- *     `seatsAllowed` would be exceeded.
+ *     `seatsAllowed` would be exceeded. `seatsAllowed` is what was bought and
+ *     is not raised or lowered by `max_devices`.
  *
  * An activation with `releasedAt` set has given its seat back: it does not
  * count toward `seatsAllowed`, and a later verify from the same machine
@@ -24,6 +28,7 @@ import { prisma } from '../../lib/prisma.js';
 import { RekeyError } from '../../lib/error.js';
 import { generateLicenseKey, hashLicenseKey } from '../../lib/license-keys.js';
 import { emitDetached } from '../webhooks/webhook.service.js';
+import { devicesService } from '../devices/devices.service.js';
 
 export type PublicLicense = Omit<License, 'keyHash'>;
 
@@ -267,6 +272,20 @@ export const licensesService = {
       return { ok: false, reason: 'expired', license: redactLicense(license) };
     }
 
+    // The cap for this license. SEATS licenses carry their own; the other
+    // kinds borrow the holder's `max_devices` entitlement, when any. Resolved
+    // BEFORE the transaction for the reason devicesService.maxDevicesFor
+    // documents: the entitlement union reads through the global client, and
+    // doing that while holding a transaction's connection is how a pool
+    // deadlocks under load. Org-pooled licenses (`organizationId` set) have no
+    // single end-user to resolve for and stay uncapped unless SEATS.
+    let cap: number | null = null;
+    if (license.kind === 'SEATS' && license.seatsAllowed !== null) {
+      cap = license.seatsAllowed;
+    } else if (license.organizationId === null) {
+      cap = await devicesService.maxDevicesFor(license.applicationId, license.endUserId);
+    }
+
     // Atomic seat allocation + activation upsert.
     //
     // Previously the seat count was read OUTSIDE a transaction, then the
@@ -285,7 +304,7 @@ export const licensesService = {
     const result = await prisma.$transaction(async (tx) => {
       await tx.$queryRaw`SELECT id FROM licenses WHERE id = ${license.id} FOR UPDATE`;
 
-      if (license.kind === 'SEATS' && license.seatsAllowed !== null) {
+      if (cap !== null) {
         const existing = await tx.licenseActivation.findUnique({
           where: {
             licenseId_machineFingerprint: {
@@ -300,7 +319,7 @@ export const licensesService = {
           const used = await tx.licenseActivation.count({
             where: { licenseId: license.id, releasedAt: null },
           });
-          if (used >= license.seatsAllowed) {
+          if (used >= cap) {
             return { kind: 'seats_exhausted' as const };
           }
         }
