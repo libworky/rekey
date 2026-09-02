@@ -193,6 +193,18 @@ row. When the license holder has a Device with the same fingerprint, the
 activation's `deviceId` points at it, so the seat list and the device list
 describe the same machines. Emits `license.deactivated`.
 
+## Erasure and throttling
+
+A fingerprint is a machine identifier the person supplied, so GDPR erasure
+deletes their devices outright and tombstones the fingerprint on any license
+activation that is retained for seat accounting — see
+[data-erasure.md](data-erasure.md).
+
+`POST /licenses/verify` and `/deactivate` are throttled per
+(application, license key, fingerprint), both hashed, rather than per IP: an
+office behind one NAT no longer shares a bucket, and a leaked key cannot be
+enumerated faster by rotating exit nodes.
+
 ## Webhook events
 
 | Event | When |

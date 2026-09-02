@@ -55,6 +55,8 @@ export interface EraseResult {
     subscriptionsScrubbed: number;
     paymentsScrubbed: number;
     licensesScrubbed: number;
+    devicesDeleted: number;
+    licenseActivationsScrubbed: number;
     creditLedgerScrubbed: number;
     usageRecordsScrubbed: number;
   };
@@ -93,6 +95,7 @@ export async function eraseEndUser(args: {
           magicLinkTokens: 0, passwordResetTokens: 0, emailVerificationTokens: 0,
           oauthAuthCodes: 0,
           subscriptionsScrubbed: 0, paymentsScrubbed: 0, licensesScrubbed: 0,
+          devicesDeleted: 0, licenseActivationsScrubbed: 0,
           creditLedgerScrubbed: 0, usageRecordsScrubbed: 0,
         },
       } satisfies EraseResult;
@@ -125,6 +128,26 @@ export async function eraseEndUser(args: {
       // have just promised to forget.
       tx.oAuthAuthCode.deleteMany({ where: { endUserId } }),
     ]);
+
+    // ── 1b. DEVICES and license activations: the fingerprint is a machine
+    // identifier the person supplied and can be re-derived from their
+    // hardware, so it is personal data in the same sense a MAC address is.
+    // Devices are deleted outright (sessions and activations SET NULL their
+    // pointer). Activations are RETAINED for seat accounting like the license
+    // rows they hang off, but the fingerprint and label are tombstoned to a
+    // per-row value — the (license, fingerprint) unique index needs each row
+    // to stay distinct.
+    const devices = await tx.device.deleteMany({ where: { applicationId, endUserId } });
+    const activations = await tx.licenseActivation.findMany({
+      where: { applicationId, license: { endUserId } },
+      select: { id: true },
+    });
+    for (const a of activations) {
+      await tx.licenseActivation.update({
+        where: { id: a.id },
+        data: { machineFingerprint: `erased:${a.id}`, label: null, deviceId: null },
+      });
+    }
 
     // ── 2. ANONYMIZE / scrub PII duplicated onto RETAINED financial rows ────
     // The canonical email lives on the EndUser (tombstoned below); these rows
@@ -187,6 +210,8 @@ export async function eraseEndUser(args: {
         subscriptionsScrubbed: subs.count,
         paymentsScrubbed: payments.count,
         licensesScrubbed: licenses.count,
+        devicesDeleted: devices.count,
+        licenseActivationsScrubbed: activations.length,
         creditLedgerScrubbed: ledger.count,
         usageRecordsScrubbed: usage.count,
       },
