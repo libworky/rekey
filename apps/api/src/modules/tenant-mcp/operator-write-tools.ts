@@ -62,6 +62,7 @@ import {
 import { tenantWorkspacesService } from '../tenant-workspaces/tenant-workspaces.service.js';
 import { organizationRolesService } from '../organization-roles/organization-roles.service.js';
 import { AuthConfigSchema } from '@rekey.dev/shared-types';
+import { devicesService } from '../devices/devices.service.js';
 import {
   accessibleApplicationIds,
   type OperatorTool,
@@ -189,7 +190,153 @@ function assertOrganizationsEnabled(app: Application): void {
   }
 }
 
+/** Shared by the device tools: the end-user must be in an app the operator can read. */
+async function loadEndUserInApp(
+  ctx: OperatorToolContext,
+  applicationId: string,
+  endUserId: string,
+): Promise<Application> {
+  const app = await loadAppInTenant(ctx, applicationId);
+  const endUser = await prisma.endUser.findUnique({
+    where: { id: endUserId },
+    select: { applicationId: true },
+  });
+  if (!endUser || endUser.applicationId !== app.id) {
+    throw new RekeyError({
+      statusCode: 404,
+      code: 'END_USER_NOT_FOUND',
+      message: `End-user "${endUserId}" not found in this Application.`,
+      fix: 'Use get_end_user to find the id.',
+    });
+  }
+  return app;
+}
+
+function deviceView(d: {
+  id: string;
+  fingerprint: string;
+  label: string | null;
+  status: string;
+  firstSeenAt: Date;
+  lastSeenAt: Date;
+  lastSeenIp: string | null;
+  releasedAt: Date | null;
+  blockedAt: Date | null;
+  blockedReason: string | null;
+}) {
+  return {
+    id: d.id,
+    fingerprint: d.fingerprint,
+    label: d.label,
+    status: d.status,
+    firstSeenAt: d.firstSeenAt.toISOString(),
+    lastSeenAt: d.lastSeenAt.toISOString(),
+    lastSeenIp: d.lastSeenIp,
+    releasedAt: d.releasedAt?.toISOString() ?? null,
+    blockedAt: d.blockedAt?.toISOString() ?? null,
+    blockedReason: d.blockedReason,
+  };
+}
+
+const DEVICE_TOOL_ARGS = {
+  applicationId: { type: 'string', minLength: 1 },
+  endUserId: { type: 'string', minLength: 1 },
+  deviceId: { type: 'string', minLength: 1 },
+} as const;
+
 export const operatorWriteTools: OperatorTool[] = [
+  {
+    name: 'list_devices',
+    description:
+      "List an end-user's devices — the machines they have signed in from — newest activity " +
+      'first, including released and blocked ones. Read-only. See docs/devices.md.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        applicationId: DEVICE_TOOL_ARGS.applicationId,
+        endUserId: DEVICE_TOOL_ARGS.endUserId,
+        status: { type: 'string', enum: ['ACTIVE', 'RELEASED', 'BLOCKED'] },
+      },
+      required: ['applicationId', 'endUserId'],
+      additionalProperties: false,
+    },
+    handler: async (ctx, args) => {
+      const app = await loadEndUserInApp(ctx, String(args.applicationId), String(args.endUserId));
+      const status = args.status === undefined ? undefined : (String(args.status) as 'ACTIVE' | 'RELEASED' | 'BLOCKED');
+      const { items, total } = await devicesService.listForEndUser(app.id, String(args.endUserId), { status, take: 100 });
+      return { total, devices: items.map(deviceView) };
+    },
+  },
+  {
+    name: 'release_device',
+    description:
+      "Release one of an end-user's devices: gives the slot back against max_devices and revokes " +
+      'every session minted on it. Idempotent. A BLOCKED device must be unblocked first.',
+    write: true,
+    inputSchema: {
+      type: 'object',
+      properties: DEVICE_TOOL_ARGS,
+      required: ['applicationId', 'endUserId', 'deviceId'],
+      additionalProperties: false,
+    },
+    handler: async (ctx, args) => {
+      const app = await loadEndUserInApp(ctx, String(args.applicationId), String(args.endUserId));
+      const r = await devicesService.release({
+        applicationId: app.id,
+        endUserId: String(args.endUserId),
+        deviceId: String(args.deviceId),
+        actor: { type: 'operator', id: ctx.tenantUserId },
+      });
+      return { device: deviceView(r.device), sessionsRevoked: r.sessionsRevoked };
+    },
+  },
+  {
+    name: 'block_device',
+    description:
+      'Block a device: sign-in from that fingerprint is refused (DEVICE_BLOCKED) until unblocked, ' +
+      'and its sessions are revoked now. The reason is operator-facing only. Idempotent.',
+    write: true,
+    inputSchema: {
+      type: 'object',
+      properties: { ...DEVICE_TOOL_ARGS, reason: { type: 'string', maxLength: 500 } },
+      required: ['applicationId', 'endUserId', 'deviceId'],
+      additionalProperties: false,
+    },
+    handler: async (ctx, args) => {
+      const app = await loadEndUserInApp(ctx, String(args.applicationId), String(args.endUserId));
+      const r = await devicesService.block({
+        applicationId: app.id,
+        endUserId: String(args.endUserId),
+        deviceId: String(args.deviceId),
+        reason: args.reason === undefined ? undefined : String(args.reason),
+        operatorUserId: ctx.tenantUserId,
+      });
+      return { device: deviceView(r.device), sessionsRevoked: r.sessionsRevoked };
+    },
+  },
+  {
+    name: 'unblock_device',
+    description:
+      'Lift a block. The device comes back as RELEASED and takes a slot again only on its next ' +
+      'sign-in, subject to max_devices. Idempotent.',
+    write: true,
+    inputSchema: {
+      type: 'object',
+      properties: DEVICE_TOOL_ARGS,
+      required: ['applicationId', 'endUserId', 'deviceId'],
+      additionalProperties: false,
+    },
+    handler: async (ctx, args) => {
+      const app = await loadEndUserInApp(ctx, String(args.applicationId), String(args.endUserId));
+      const device = await devicesService.unblock({
+        applicationId: app.id,
+        endUserId: String(args.endUserId),
+        deviceId: String(args.deviceId),
+        operatorUserId: ctx.tenantUserId,
+      });
+      return { device: deviceView(device) };
+    },
+  },
   {
     name: 'list_organization_roles',
     description:

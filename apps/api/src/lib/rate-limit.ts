@@ -26,6 +26,7 @@
  * down the app.
  */
 
+import { createHash } from 'node:crypto';
 import type { FastifyRequest } from 'fastify';
 import { RekeyError } from './error.js';
 
@@ -233,6 +234,34 @@ export function authRateLimit(maxPerMinute: number): AuthRateLimitConfig {
  * endpoints) while the tight per-identity cap is what actually throttles a
  * credential-guesser.
  */
+/**
+ * Bucket for POST /licenses/verify and /deactivate.
+ *
+ * These routes take the PUBLISHABLE key, so `req.apiKey` is unset and the
+ * global limiter fell back to `req.ip`: a whole office behind one NAT shared
+ * one bucket, while a botnet enumerating a leaked key had a fresh bucket per
+ * exit node. The right unit is the thing being guessed — the license key —
+ * and the thing doing the guessing — the machine — so the key is
+ * (application, sha256(key), sha256(fingerprint)). Both hashed: the raw
+ * license key is a credential and must never sit in a rate-limit store.
+ */
+export function licenseRateLimitKey(req: FastifyRequest): string {
+  const body = (typeof req.body === 'object' && req.body !== null ? req.body : {}) as Record<string, unknown>;
+  const key = typeof body.key === 'string' ? body.key : '-';
+  const fp = typeof body.machineFingerprint === 'string' ? body.machineFingerprint : '-';
+  const app = req.application?.id ?? 'anon';
+  return `license:${app}:${sha256(key)}:${sha256(fp)}`;
+}
+
+function sha256(s: string): string {
+  return createHash('sha256').update(s).digest('hex').slice(0, 32);
+}
+
+/** Per-route config for the licence endpoints; neutered under test like `authRateLimit`. */
+export function licenseRateLimit(maxPerMinute: number): AuthRateLimitConfig {
+  return { ...authRateLimit(maxPerMinute), keyGenerator: licenseRateLimitKey };
+}
+
 export function wantsAuthCeiling(rateLimitConfig: unknown): boolean {
   if (typeof rateLimitConfig !== 'object' || rateLimitConfig === null) return false;
   return (rateLimitConfig as Record<string, unknown>)[AUTH_CEILING_MARKER] === true;

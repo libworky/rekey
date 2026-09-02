@@ -49,6 +49,8 @@ For an erasure of end-user `E` in application `A`:
 | `Subscription` | **retain + scrub** | Rows kept (FK to tombstone). `metadata` JSON cleared (`{}`). Status/plan/amounts untouched. |
 | `Payment` | **retain + scrub** | Rows kept. `metadata` cleared, `description` → null. Amount/currency/status/provider ref untouched. |
 | `License` | **retain + scrub** | Rows kept. `metadata` cleared. Key hash/prefix/status untouched. |
+| `LicenseActivation` | **retain + scrub** | Rows kept for seat accounting. `machineFingerprint` tombstoned to `erased:<id>`, `label` and `deviceId` cleared. |
+| `Device` | **hard-delete** | A machine fingerprint the person supplied is personal data; sessions and activations that pointed at the device are SET NULL. |
 | `CreditLedger` | **retain + scrub** | Append-only journal kept. `metadata` cleared, `description` → null. Deltas/balances untouched. |
 | `CreditBalance` | **retain** | Numeric balance only — no free-form PII to scrub. Kept via FK. |
 | `UsageRecord` | **retain + scrub** | Kept (scalar `endUserId`, scoped by meter). `metadata` cleared. Quantities/timestamps untouched. |
