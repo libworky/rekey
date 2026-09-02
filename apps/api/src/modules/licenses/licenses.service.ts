@@ -11,6 +11,12 @@
  *     No upper bound today.
  *   - SEATS:              same shape, but verification refuses if
  *     `seatsAllowed` would be exceeded.
+ *
+ * An activation with `releasedAt` set has given its seat back: it does not
+ * count toward `seatsAllowed`, and a later verify from the same machine
+ * reactivates the row in place rather than inserting a second one. Rows also
+ * carry `applicationId` (denormalised from the license) so app-scoped
+ * listings and erasure can address them without a join.
  */
 
 import type { Application, EndUser, License, LicenseKind } from '@prisma/client';
@@ -275,8 +281,12 @@ export const licensesService = {
             },
           },
         });
-        if (!existing) {
-          const used = await tx.licenseActivation.count({ where: { licenseId: license.id } });
+        // A released activation holds no seat, so it is "not existing" for
+        // the count and needs a free seat to come back.
+        if (!existing || existing.releasedAt !== null) {
+          const used = await tx.licenseActivation.count({
+            where: { licenseId: license.id, releasedAt: null },
+          });
           if (used >= license.seatsAllowed) {
             return { kind: 'seats_exhausted' as const };
           }
@@ -291,12 +301,15 @@ export const licensesService = {
           },
         },
         create: {
+          applicationId: license.applicationId,
           licenseId: license.id,
           machineFingerprint: input.machineFingerprint,
           ...(input.label !== undefined && { label: input.label }),
         },
         update: {
           lastSeenAt: new Date(),
+          // Reactivate in place if this machine had released its seat.
+          releasedAt: null,
           ...(input.label !== undefined && { label: input.label }),
         },
       });
