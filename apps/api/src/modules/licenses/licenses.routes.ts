@@ -15,6 +15,7 @@ import { z } from 'zod';
 import { licensesService } from './licenses.service.js';
 import { requirePublishableOrSecretKey, requireScope } from '../../middleware/api-key-auth.js';
 import { requireBillingEnabled } from '../../middleware/billing-enabled.js';
+import { licenseRateLimit } from '../../lib/rate-limit.js';
 import { ok, errs, ref } from '../../lib/openapi.js';
 
 const VerifyBody = z.object({
@@ -43,6 +44,9 @@ export async function licensesPublicRoutes(app: FastifyInstance): Promise<void> 
   app.post(
     '/verify',
     {
+      // Per (application, key, machine) bucket — see licenseRateLimitKey.
+      // 30/min is generous for a launch-time check and hostile to enumeration.
+      config: { rateLimit: licenseRateLimit(30) },
       schema: {
         tags: ['Public · Licenses'],
         summary: 'Verify a license key + record an activation for this machine',
@@ -95,6 +99,7 @@ export async function licensesPublicRoutes(app: FastifyInstance): Promise<void> 
   app.post(
     '/deactivate',
     {
+      config: { rateLimit: licenseRateLimit(30) },
       schema: {
         tags: ['Public · Licenses'],
         summary: 'Give back the seat this machine holds on a license',
