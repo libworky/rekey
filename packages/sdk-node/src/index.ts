@@ -271,6 +271,7 @@ export class Rekey {
   /** License key verification + activation. */
   public readonly licenses: LicensesClient;
   public readonly devices: DevicesClient;
+  public readonly users: UsersClient;
   /** Usage metering — record events, aggregate windows. */
   public readonly usage: UsageClient;
   /** Prepaid credits — balance reads, idempotent drawdown, ledger. */
@@ -312,6 +313,7 @@ export class Rekey {
     this.organizations = new OrganizationsClient(this);
     this.licenses = new LicensesClient(this);
     this.devices = new DevicesClient(this);
+    this.users = new UsersClient(this);
     this.usage = new UsageClient(this);
     this.credits = new CreditsClient(this);
     this.mcp = new McpClient(this);
@@ -1589,6 +1591,25 @@ class DevicesClient {
   }
 }
 
+/**
+ * Server-side end-user lookup (secret key only). `/users/me` answers "who is
+ * this token"; these answer "who is this id / email" for a backend that holds
+ * no token.
+ */
+class UsersClient {
+  constructor(private readonly client: Rekey) {}
+
+  /** Exact, case-insensitive email match in the calling Application. Throws END_USER_NOT_FOUND. */
+  getByEmail(email: string): Promise<EndUserDto> {
+    return this.client.send('GET', `/api/v1/users?email=${encodeURIComponent(email)}`);
+  }
+
+  /** By id, scoped to the calling Application. Throws END_USER_NOT_FOUND. */
+  get(endUserId: string): Promise<EndUserDto> {
+    return this.client.send('GET', `/api/v1/users/${encodeURIComponent(endUserId)}`);
+  }
+}
+
 class UsageClient {
   constructor(private readonly client: Rekey) {}
 
@@ -2227,6 +2248,23 @@ class BillingClient {
     return this.client.send('GET', `/api/v1/billing/entitlements${qs}`, undefined, {
       'X-Rekey-User-Token': accessToken,
     });
+  }
+
+  /**
+   * The same union as `getEntitlements`, for an end-user you name rather than
+   * one whose token you hold. Secret key only — for a licence server, a
+   * support tool or a batch job.
+   *
+   * @example
+   * ```ts
+   * const { features } = await rekey.billing.getEntitlementsFor(endUserId);
+   * if (features.max_devices !== undefined) capDevices(features.max_devices);
+   * ```
+   */
+  getEntitlementsFor(endUserId: string, opts?: { organizationId?: string }): Promise<EntitlementsDto> {
+    const q = new URLSearchParams({ endUserId });
+    if (opts?.organizationId) q.set('organizationId', opts.organizationId);
+    return this.client.send('GET', `/api/v1/billing/entitlements/for-user?${q.toString()}`);
   }
 
   /**
