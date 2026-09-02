@@ -89,6 +89,8 @@ import {
   JwksDtoSchema,
   LicenseDtoSchema,
   LicenseVerifyResultDtoSchema,
+  DeviceDtoSchema,
+  EndUserDeviceDtoSchema,
   MfaChallengeResultDtoSchema,
   MonthlyRevenuePointSchema,
   OAuthAuthServerMetadataSchema,
@@ -771,6 +773,9 @@ const ZOD_COMPONENTS: Record<string, z.ZodTypeAny> = {
 
   License: LicenseDtoSchema,
   LicenseVerifyResult: LicenseVerifyResultDtoSchema,
+
+  Device: DeviceDtoSchema,
+  EndUserDevice: EndUserDeviceDtoSchema,
 
   UsageRecord: UsageRecordDtoSchema,
   UsageAggregate: UsageAggregateDtoSchema,

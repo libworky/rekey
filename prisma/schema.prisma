@@ -571,6 +571,7 @@ model Application {
   coupons             Coupon[]
   oauthIdentities     OAuthIdentity[]
   licenses            License[]
+  devices             Device[]
   usageMeters         UsageMeter[]
   billingCredentials  BillingCredentials[]
   applicationRoles    ApplicationRole[]
@@ -1139,6 +1140,7 @@ model EndUser {
   oauthIdentities         OAuthIdentity[]
   mfaCredential           MfaCredential?
   licenses                License[]
+  devices                 Device[]
   creditBalance           CreditBalance[]
   creditLedger            CreditLedger[]
 
@@ -1307,6 +1309,10 @@ model License {
 
 model LicenseActivation {
   id                 String   @id @default(cuid())
+  // Denormalised from the license. Every domain row carries its application so
+  // app-scoped listings and erasure can address activations directly instead
+  // of joining through licenses.
+  applicationId      String   @map("application_id")
   licenseId          String   @map("license_id")
   // Customer-provided device/machine fingerprint (their format, opaque to us).
   machineFingerprint String   @map("machine_fingerprint")
@@ -1314,12 +1320,92 @@ model LicenseActivation {
   lastSeenAt         DateTime @default(now()) @map("last_seen_at")
   // Human-readable hint from the activator (hostname, app version, etc.).
   label              String?
+  // The Device row the same fingerprint resolved to under the license holder,
+  // when one exists. Lets the device list and the seat list agree about which
+  // machine is which; null for activations recorded before devices existed.
+  deviceId           String?  @map("device_id")
+  // Set when the seat was given back (POST /licenses/deactivate, or an operator
+  // releasing the machine). A released activation no longer counts toward
+  // seatsAllowed; a later verify from the same machine reactivates it in place
+  // rather than inserting a second row.
+  releasedAt         DateTime? @map("released_at")
 
   license License @relation(fields: [licenseId], references: [id], onDelete: Cascade)
+  device  Device? @relation(fields: [deviceId], references: [id], onDelete: SetNull)
 
   @@unique([licenseId, machineFingerprint])
   @@index([licenseId])
+  @@index([applicationId, machineFingerprint])
+  @@index([deviceId])
   @@map("license_activations")
+}
+
+// ============================================================================
+// Devices — the machines an end-user signs in from.
+//
+// A Device is an (application, end-user, fingerprint) triple. The fingerprint
+// is computed by the customer's client and is opaque here, exactly like
+// LicenseActivation.machineFingerprint — Rekey never derives, parses or
+// compares its parts. It is unique PER END-USER, not per application: the same
+// fingerprint under two accounts is two devices, and cross-account reuse is a
+// signal for the security-events trail rather than a constraint.
+//
+// What a device is for:
+//   - Sessions can be bound to one (RefreshToken.deviceId, the `dev` access
+//     token claim), so an app can say "sign out this laptop" and mean it.
+//   - The number of ACTIVE devices per end-user can be capped by the
+//     `max_devices` FEATURE entitlement on their plan.
+//   - License seats point at devices, so the seat list and the device list are
+//     the same machines.
+//
+// Lifecycle: ACTIVE <-> RELEASED (the user or an operator gave the slot back; a
+// later sign-in from the same fingerprint reactivates it, subject to the
+// limit), and either -> BLOCKED (operator decision; refuses sign-in from that
+// fingerprint until unblocked). Rows are never deleted by the API — a released
+// device is history the operator can still see.
+// ============================================================================
+
+enum DeviceStatus {
+  ACTIVE
+  RELEASED
+  BLOCKED
+}
+
+model Device {
+  id            String       @id @default(cuid())
+  applicationId String       @map("application_id")
+  endUserId     String       @map("end_user_id")
+  // Customer-provided, opaque. Max 256 chars at the API boundary.
+  fingerprint   String
+  // Human-readable hint from the client (hostname, "Work laptop"). Overwritten
+  // on every sign-in that supplies one.
+  label         String?
+  status        DeviceStatus @default(ACTIVE)
+  firstSeenAt   DateTime     @default(now()) @map("first_seen_at")
+  lastSeenAt    DateTime     @default(now()) @map("last_seen_at")
+  lastSeenIp    String?      @map("last_seen_ip")
+  releasedAt    DateTime?    @map("released_at")
+  blockedAt     DateTime?    @map("blocked_at")
+  // Operator-supplied, surfaced to the operator only — never to the end-user,
+  // who sees DEVICE_BLOCKED and nothing else.
+  blockedReason String?      @map("blocked_reason")
+  // Free-form per-device data the customer's app keeps (OS, app version...).
+  // Rekey never interprets it.
+  metadata      Json         @default("{}")
+  createdAt     DateTime     @default(now()) @map("created_at")
+  updatedAt     DateTime     @updatedAt @map("updated_at")
+
+  application Application         @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  endUser     EndUser             @relation(fields: [endUserId], references: [id], onDelete: Cascade)
+  sessions    RefreshToken[]
+  activations LicenseActivation[]
+
+  @@unique([applicationId, endUserId, fingerprint])
+  // Cross-account reuse lookup ("which users have this fingerprint?").
+  @@index([applicationId, fingerprint])
+  // The ACTIVE count that the device limit is enforced against.
+  @@index([endUserId, status])
+  @@map("devices")
 }
 
 // ============================================================================
@@ -1476,15 +1562,23 @@ model RefreshToken {
   // callers may lack them.
   userAgent     String?   @map("user_agent")
   ip            String?   @map("ip")
+  // The Device this session was minted on, when the client identified itself
+  // (see Device). Nullable: browser SDKs and older clients send no fingerprint,
+  // and nothing about their sessions changes. SetNull rather than Cascade so
+  // deleting a device row never signs anyone out by accident — releasing or
+  // blocking a device revokes its sessions explicitly.
+  deviceId      String?   @map("device_id")
 
   application        Application   @relation(fields: [applicationId], references: [id], onDelete: Cascade)
   endUser            EndUser       @relation(fields: [endUserId], references: [id], onDelete: Cascade)
   activeOrganization Organization? @relation(fields: [activeOrganizationId], references: [id], onDelete: SetNull)
+  device             Device?       @relation(fields: [deviceId], references: [id], onDelete: SetNull)
 
   @@index([applicationId])
   @@index([endUserId])
   @@index([expiresAt])
   @@index([activeOrganizationId])
+  @@index([deviceId])
   // The super-admin retention dashboard counts distinct end-users with a
   // refresh-token created inside a 24h/7d/30d window (groupBy endUserId).
   // Without this index the query is a sequential scan over the full token
