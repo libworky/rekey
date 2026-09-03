@@ -105,14 +105,15 @@ const WebhookApplyFailed: JsonSchema = {
 const WEBHOOK_ERRORS = {
   400:
     'WEBHOOK_RAW_BODY_MISSING — internal: fastify-raw-body did not run for this route; or ' +
-    'WEBHOOK_PAYLOAD_INVALID — (PayPal only) the body is not a recognisable event shape; or ' +
+    'WEBHOOK_PAYLOAD_INVALID — (PayPal, external) the body is not a recognisable event shape, or an external event fails envelope validation; or ' +
     'WEBHOOK_APPLICATION_MISMATCH — the event names a different Application than the one whose ' +
     'BYO credentials verified the signature.',
   401:
     'WEBHOOK_APPLICATION_UNRESOLVED — (Stripe/Razorpay, slug-less route only) no application ' +
     'slug in the URL and none resolvable from the payload; or WEBHOOK_SIGNATURE_MISSING / ' +
     "WEBHOOK_SIGNATURE_INVALID — the provider signature header is absent or does not verify " +
-    "against this Application's BYO secret.",
+    "against this Application's BYO secret; or WEBHOOK_SIGNATURE_STALE — (external only) the " +
+    'signature timestamp is outside the five-minute window.',
   404:
     'WEBHOOK_PROVIDER_UNKNOWN — the `:provider` segment is not a registered billing provider; or ' +
     'APPLICATION_NOT_FOUND — no Application matches the resolved slug/id.',

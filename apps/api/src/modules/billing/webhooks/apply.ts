@@ -40,8 +40,9 @@
 
 import type { FastifyBaseLogger } from 'fastify';
 import type { Subscription } from '@prisma/client';
-import { isEntitlingStatus, ENTITLING_SUBSCRIPTION_STATUSES } from '@rekey.dev/shared-types';
+import { isEntitlingStatus, ENTITLING_SUBSCRIPTION_STATUSES, BillingConfigSchema } from '@rekey.dev/shared-types';
 import { prisma } from '../../../lib/prisma.js';
+import { RekeyError } from '../../../lib/error.js';
 import { entitlementsService } from '../entitlements.service.js';
 import { dunningService } from '../dunning.service.js';
 import {
@@ -55,7 +56,11 @@ import { advanceBillingPeriod } from './period.js';
 import { enqueuePaymentEvent, enqueueSubscriptionEvent } from './billing-events.js';
 import { kickDeliveries } from '../../webhooks/webhook.service.js';
 import { openUnappliedPaymentCase } from '../unapplied-payments.service.js';
+import { subscriptionGrantsService } from '../grant.service.js';
+import { subscriberService } from '../subscriber.service.js';
+import { plansService } from '../../plans/plans.service.js';
 import type {
+  SubscriptionGrantedEvent,
   CheckoutApprovedEvent,
   CheckoutCompletedEvent,
   DomainBillingEvent,
@@ -308,6 +313,8 @@ async function redeemSessionCoupon(
 /** Dispatch one normalized event to its applier. Used by the pipeline. */
 export async function applyBillingEvent(ev: DomainBillingEvent, ctx: ApplyContext): Promise<void> {
   switch (ev.type) {
+    case 'subscription.granted':
+      return applySubscriptionGranted(ev, ctx);
     case 'checkout.completed':
       return applyCheckoutCompleted(ev, ctx);
     case 'checkout.approved':
@@ -327,6 +334,280 @@ export async function applyBillingEvent(ev: DomainBillingEvent, ctx: ApplyContex
     case 'subscription.period_advanced':
       return applySubscriptionPeriodAdvanced(ev, ctx);
   }
+}
+
+/**
+ * A subscription sold by a system Rekey never called (SubscriptionGrantedEvent).
+ *
+ * Four outcomes, decided by what the row already says:
+ *
+ *   - no row, or a row in a non-entitling state (PENDING, CANCELED, EXPIRED):
+ *     the GRANT path. `grantSubscription` creates or reopens it, provisions
+ *     the plan's entitlements and announces `subscription.activated`, with the
+ *     sender's provider and subscription id bound onto the row so the status
+ *     mirror finds it later.
+ *   - an entitled row and a LATER `currentPeriodEnd`: a renewal. The period
+ *     moves forward and entitlements are provisioned for it (idempotent per
+ *     period anchor: credits refill once, a timed licence rolls once).
+ *   - a PAST_DUE row: recovery. Status returns to ACTIVE, the dunning case
+ *     closes as recovered, and `subscription.activated` is announced, exactly
+ *     as the status mirror does for a hosted provider.
+ *   - an entitled row and nothing new: a replay. The binding is refreshed and
+ *     nothing else is written or announced.
+ *
+ * Before any of that, the sender's subscription id is checked against every
+ * row in the Application. Found on a row for a DIFFERENT plan or a different
+ * end-user, that row is retired (cancelled if it was live, the id released)
+ * because the sender has told us the subscription now means something else:
+ * a plan change, or an account the subscription moved to.
+ *
+ * A period end already in the past is stale news and is ignored, loudly. A
+ * grant for it would be refused with SUBSCRIPTION_PERIOD_END_IN_PAST, the
+ * pipeline would answer 5xx, and the sender would retry an event that can
+ * never succeed.
+ */
+export async function applySubscriptionGranted(
+  ev: SubscriptionGrantedEvent,
+  ctx: ApplyContext,
+): Promise<void> {
+  const now = new Date();
+  if (ev.currentPeriodEnd instanceof Date && ev.currentPeriodEnd <= now) {
+    ctx.log.warn(
+      {
+        applicationId: ev.applicationId,
+        providerSubscriptionId: ev.providerSubscriptionId,
+        currentPeriodEnd: ev.currentPeriodEnd,
+        providerEventId: ev.providerEventId,
+      },
+      'subscription.granted names a period that has already ended — ignored',
+    );
+    return;
+  }
+
+  const application = await prisma.application.findUniqueOrThrow({
+    where: { id: ev.applicationId },
+  });
+  const plan = await plansService.getBySlug(application.id, ev.planSlug);
+  // The organization preconditions `grantSubscription` enforces, checked here
+  // BEFORE anything is written: an event that would fail them must not first
+  // create the subscriber or retire the row its subscription id was bound to.
+  const billingConfig = BillingConfigSchema.parse(application.billingConfig);
+  if (billingConfig.billingSubject === 'org' && ev.organizationId === undefined) {
+    throw new RekeyError({
+      statusCode: 400,
+      code: 'BILLING_ORGANIZATION_REQUIRED',
+      message: 'This Application bills per organization, but the event names no organization.',
+      fix: 'Send `subscriber.organizationId` on subscription.activated for this Application.',
+    });
+  }
+  if (ev.organizationId !== undefined) {
+    const org = await prisma.organization.findFirst({
+      where: { id: ev.organizationId, applicationId: application.id },
+      select: { id: true },
+    });
+    if (!org) {
+      throw new RekeyError({
+        statusCode: 404,
+        code: 'ORGANIZATION_NOT_FOUND',
+        message: `Organization "${ev.organizationId}" not found in this application.`,
+        fix: 'Send an organization id that belongs to this Application.',
+      });
+    }
+  }
+  const subscriber = await subscriberService.resolveOrCreate({
+    application,
+    subscriber: ev.subscriber,
+    provider: ev.provider,
+    providerEventId: ev.providerEventId,
+    log: ctx.log,
+  });
+
+  const holder = await prisma.subscription.findUnique({
+    where: {
+      applicationId_providerSubId: {
+        applicationId: application.id,
+        providerSubId: ev.providerSubscriptionId,
+      },
+    },
+  });
+  if (holder && (holder.planId !== plan.id || holder.endUserId !== subscriber.id)) {
+    await retireReplacedSubscription(holder, ev, ctx);
+  }
+
+  const key = { applicationId: application.id, endUserId: subscriber.id, planId: plan.id };
+  const existing = await prisma.subscription.findUnique({
+    where: { applicationId_endUserId_planId: key },
+  });
+
+  if (!existing || !isEntitlingStatus(existing.status)) {
+    const result = await subscriptionGrantsService.grantSubscription({
+      application,
+      planSlug: plan.slug,
+      endUserId: subscriber.id,
+      ...(ev.organizationId !== undefined && { organizationId: ev.organizationId }),
+      ...(ev.currentPeriodEnd instanceof Date && { currentPeriodEnd: ev.currentPeriodEnd }),
+      ...(ev.trialEndsAt !== undefined && { trialEndsAt: ev.trialEndsAt }),
+      note: `Activated by ${ev.provider} event ${ev.providerEventId}`,
+      providerBinding: { provider: ev.provider, providerSubId: ev.providerSubscriptionId },
+    });
+    ctx.log.info(
+      {
+        subscriptionId: result.subscription.id,
+        activated: result.activated,
+        subscriberCreated: subscriber.created,
+        providerEventId: ev.providerEventId,
+      },
+      'subscription.granted — activated',
+    );
+    return;
+  }
+
+  // Already entitled: renewal, recovery, rebind, or replay.
+  //
+  // Unless the live subscription belongs to a HOSTED provider. A row with a
+  // Stripe id and a Stripe provider is still being charged by Stripe; taking
+  // its id away would orphan every later Stripe event and hand the buyer a
+  // subscription they can no longer cancel from Rekey while Stripe keeps
+  // billing. The event is recorded on the row and otherwise ignored; the
+  // operator resolves which system owns this customer.
+  if (existing.provider !== null && existing.provider !== ev.provider && existing.providerSubId !== null) {
+    ctx.log.error(
+      {
+        subscriptionId: existing.id,
+        currentProvider: existing.provider,
+        currentProviderSubId: existing.providerSubId,
+        provider: ev.provider,
+        providerSubscriptionId: ev.providerSubscriptionId,
+        providerEventId: ev.providerEventId,
+      },
+      'subscription.granted names a subscriber whose live subscription belongs to another provider — not rebound',
+    );
+    const previous =
+      typeof existing.metadata === 'object' && existing.metadata !== null && !Array.isArray(existing.metadata)
+        ? (existing.metadata as Record<string, unknown>)
+        : {};
+    const refused = Array.isArray(previous.refusedGrants) ? previous.refusedGrants.slice(-19) : [];
+    await prisma.subscription.update({
+      where: { id: existing.id },
+      data: {
+        metadata: {
+          ...previous,
+          refusedGrants: [
+            ...refused,
+            {
+              provider: ev.provider,
+              providerSubId: ev.providerSubscriptionId,
+              providerEventId: ev.providerEventId,
+              at: now.toISOString(),
+            },
+          ],
+        } as never,
+      },
+    });
+    return;
+  }
+  const periodAdvanced =
+    ev.currentPeriodEnd instanceof Date &&
+    (existing.currentPeriodEnd === null || ev.currentPeriodEnd > existing.currentPeriodEnd);
+  const recovering = existing.status === 'PAST_DUE';
+  // A term that runs past a scheduled cancellation says the subscription
+  // continues. Anything shorter leaves the schedule alone, so a re-delivered
+  // activation cannot quietly undo a cancellation the sender has since posted.
+  const clearsCancellation =
+    ev.currentPeriodEnd instanceof Date &&
+    existing.cancelAt !== null &&
+    ev.currentPeriodEnd > existing.cancelAt;
+
+  const deliveryIds = await prisma.$transaction(async (tx) => {
+    // Conditional on the row STILL being entitled: a cancellation applied
+    // between the read above and this write must win.
+    const { count } = await tx.subscription.updateMany({
+      where: { id: existing.id, status: { in: [...ENTITLING_SUBSCRIPTION_STATUSES] } },
+      data: {
+        ...(recovering && { status: 'ACTIVE' as const }),
+        provider: ev.provider,
+        providerSubId: ev.providerSubscriptionId,
+        // Only ever forward. An older-but-future period end is a delayed
+        // delivery, not a shortening, and an explicit null on a live termed
+        // row is not a request to make it open-ended.
+        ...(periodAdvanced && { currentPeriodEnd: ev.currentPeriodEnd }),
+        ...(ev.trialEndsAt !== undefined && { trialEndsAt: ev.trialEndsAt }),
+        ...(clearsCancellation && clearedOnReactivation),
+      },
+    });
+    if (count === 0 || !recovering) return [];
+    return enqueueSubscriptionEvent(tx, 'subscription.activated', existing.id);
+  });
+  kickDeliveries(deliveryIds);
+  if (recovering) await dunningService.recoverForSubscription(existing.id);
+  if (periodAdvanced || recovering) {
+    const row = await prisma.subscription.findUniqueOrThrow({ where: { id: existing.id } });
+    await entitlementsService.provision({ subscription: row, log: ctx.log });
+  }
+  ctx.log.info(
+    {
+      subscriptionId: existing.id,
+      periodAdvanced,
+      recovering,
+      rebound: existing.providerSubId !== ev.providerSubscriptionId,
+      providerEventId: ev.providerEventId,
+    },
+    'subscription.granted — already entitled',
+  );
+}
+
+/**
+ * The sender's subscription id was bound to a row this event does not
+ * describe. Release the id and, if that row was live, cancel it: the
+ * external system has said the subscription now buys a different plan, or
+ * belongs to a different account. Announced as a cancellation because that
+ * is what happened to THAT row; the activation of its replacement follows
+ * from the caller.
+ */
+async function retireReplacedSubscription(
+  holder: Subscription,
+  ev: SubscriptionGrantedEvent,
+  ctx: ApplyContext,
+): Promise<void> {
+  const now = new Date();
+  const wasEntitled = isEntitlingStatus(holder.status);
+  const previous =
+    typeof holder.metadata === 'object' && holder.metadata !== null && !Array.isArray(holder.metadata)
+      ? (holder.metadata as Record<string, unknown>)
+      : {};
+  const deliveryIds = await prisma.$transaction(async (tx) => {
+    await tx.subscription.update({
+      where: { id: holder.id },
+      data: {
+        providerSubId: null,
+        ...(wasEntitled && { status: 'CANCELED' as const, cancelAt: now, canceledAt: now }),
+        metadata: {
+          ...previous,
+          replacedBy: {
+            providerSubId: ev.providerSubscriptionId,
+            planSlug: ev.planSlug,
+            providerEventId: ev.providerEventId,
+            at: now.toISOString(),
+          },
+        } as never,
+      },
+    });
+    return wasEntitled ? enqueueSubscriptionEvent(tx, 'subscription.canceled', holder.id) : [];
+  });
+  kickDeliveries(deliveryIds);
+  if (wasEntitled) await dunningService.closeForCanceledSubscription(holder.id);
+  ctx.log.info(
+    {
+      subscriptionId: holder.id,
+      previousPlanId: holder.planId,
+      previousEndUserId: holder.endUserId,
+      providerSubscriptionId: ev.providerSubscriptionId,
+      providerEventId: ev.providerEventId,
+    },
+    wasEntitled
+      ? 'subscription.granted — retired the row previously bound to this subscription id'
+      : 'subscription.granted — released the subscription id from a dormant row',
+  );
 }
 
 /**
@@ -1209,13 +1490,15 @@ async function applySubscriptionStatusMirror(
     where,
     select: { id: true, status: true, cancelAt: true },
   });
-  const transitioned = Boolean(existing && existing.status !== ev.status);
+  // No status on the event means "timestamps only": nothing transitions,
+  // nothing is announced, dunning is left alone.
+  const transitioned = Boolean(existing && ev.status !== undefined && existing.status !== ev.status);
   // A terminal subscription is not reopened by a later-arriving event. This
   // gates the WRITE, not just the announcement: gating only the announcement is
   // how a stale `ACTIVE` re-delivery used to resurrect a CANCELED subscription,
   // entitlements and all, while the outbox stayed silent about it. See
   // transitionAllowed.
-  if (existing && !transitionAllowed(existing.status, ev.status)) {
+  if (existing && ev.status !== undefined && !transitionAllowed(existing.status, ev.status)) {
     ctx.log.warn(
       {
         subscriptionId: existing.id,
@@ -1276,7 +1559,7 @@ async function applySubscriptionStatusMirror(
     await tx.subscription.updateMany({
       where,
       data: {
-        status: ev.status,
+        ...(ev.status !== undefined && { status: ev.status }),
         ...(ev.currentPeriodEnd !== undefined && { currentPeriodEnd: ev.currentPeriodEnd }),
         ...(ev.trialEndsAt !== undefined && { trialEndsAt: ev.trialEndsAt }),
         ...(ev.cancelAt !== undefined && { cancelAt: ev.cancelAt }),

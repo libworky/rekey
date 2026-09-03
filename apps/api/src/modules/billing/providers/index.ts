@@ -23,6 +23,7 @@ import { RekeyError } from '../../../lib/error.js';
 import { RealStripeProvider } from './stripe-real.js';
 import { RealPaypalProvider } from './paypal.js';
 import { RealRazorpayProvider } from './razorpay.js';
+import { ExternalBillingProvider } from './external.js';
 import {
   billingCredentialsService,
   type BillingProviderName,
@@ -65,6 +66,13 @@ export async function getProviderForApplication(
       if (!creds) throw credentialsNotConfigured(application, 'razorpay');
       return new RealRazorpayProvider(creds as RazorpayCredentials);
     }
+    case 'external': {
+      // Nothing to decrypt: this provider dials nobody. Every outbound call
+      // on it refuses with a named error (see external.ts), which is what a
+      // row stamped `provider: 'external'` should get when a checkout or a
+      // cancellation path reaches for its processor.
+      return new ExternalBillingProvider();
+    }
   }
 }
 
@@ -99,7 +107,9 @@ export async function pickProvider(args: {
   country?: string | undefined;
   preferred?: BillingProviderName | undefined;
 }): Promise<BillingProviderName> {
-  const enabled = await billingCredentialsService.listEnabled(args.application.id);
+  // Checkout-capable only. An inbound-only provider is enabled so that its
+  // webhooks verify, not so that buyers are sent to it.
+  const enabled = await billingCredentialsService.listCheckoutEnabled(args.application.id);
   if (enabled.length === 0) {
     // No enabled credentials at all. This used to fall through to the legacy
     // `billingConfig.provider` hint and land on the Stripe stub, which made an

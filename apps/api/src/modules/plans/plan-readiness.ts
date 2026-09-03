@@ -95,7 +95,13 @@ export async function planCheckoutReadiness(
       // exists to surface, so it belongs here rather than as a create-time
       // refusal that would also block an operator who is mid-way through
       // setting providers up.
-      if ((plan.trialDays ?? 0) > 0 && module?.capabilities.trials !== true) {
+      // Only for modules buyers can be routed to; an inbound-only module has
+      // already said, above, that it hosts no checkout at all.
+      if (
+        module?.capabilities.checkout !== false &&
+        (plan.trialDays ?? 0) > 0 &&
+        module?.capabilities.trials !== true
+      ) {
         blockers.push({
           provider,
           code: 'PLAN_TRIAL_UNSUPPORTED',

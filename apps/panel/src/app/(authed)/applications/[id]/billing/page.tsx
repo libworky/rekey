@@ -13,6 +13,7 @@ import { emptyPage, type Page } from '@/lib/paginate';
 import { Modal } from '@/components/Modal';
 import { BillingModeAutodetect } from '@/components/BillingModeAutodetect';
 import { BillingModeNotice } from '@/components/BillingModeBanner';
+import { ExternalIngressSetup } from '@/components/ExternalIngressSetup';
 import { Card, SectionHeader } from '@/components/Card';
 import { Table, THead, TBody, TR, TH, TD } from '@/components/Table';
 import { Badge, type BadgeTone } from '@/components/Badge';
@@ -327,11 +328,36 @@ export default async function BillingPage({
   // /billing/webhook/:provider/:slug for every registered module.
   const webhookUrlFor = (name: string): string | null =>
     apiBase ? `${apiBase}/api/v1/billing/webhook/${encodeURIComponent(name)}/${app.slug}` : null;
+  // An inbound-only module has no legacy alias URL; it lives on the generic
+  // pipeline route only.
+  const ingressUrlFor = (name: string): string | null =>
+    apiBase ? `${apiBase}/api/v1/webhooks/billing/${encodeURIComponent(name)}/${app.slug}` : null;
+  const inboundOnly = (d: BillingProviderDescriptor): boolean => d.capabilities.checkout === false;
+  const checkoutProviders = providers.filter((d) => !inboundOnly(d));
+  const inboundProviders = providers.filter(inboundOnly);
+  // Every live plan blocked for the one reason "this Application sells through
+  // an external system" is a configuration, not a broken registration, and
+  // gets a note rather than the red banner.
+  const soldExternally =
+    unbuyablePlans.length > 0 &&
+    unbuyablePlans.every((p) =>
+      (p.checkout?.blockers ?? []).every((b) => b.code === 'PROVIDER_INBOUND_ONLY'),
+    );
 
   return (
     <div className="space-y-5">
       {billingEnabled && <BillingModeNotice rows={list} />}
-      {unbuyablePlans.length > 0 && (
+      {soldExternally && (
+        <div className="rounded-md border border-[var(--color-border)] bg-[var(--color-surface-muted)] px-3 py-2.5 text-sm text-[var(--color-fg)]">
+          <p className="font-medium">Plans are sold through your external billing system.</p>
+          <p className="mt-1 text-xs text-[var(--color-muted-fg)]">
+            Rekey checkout is off for {unbuyablePlans.length === 1 ? 'the one live plan' : `all ${unbuyablePlans.length} live plans`}:
+            subscriptions are activated by the events that system posts. Connect Stripe, PayPal or
+            Razorpay as well if you also want self-serve checkout here.
+          </p>
+        </div>
+      )}
+      {unbuyablePlans.length > 0 && !soldExternally && (
         <div className="rounded-md border border-[var(--color-danger)] bg-[color-mix(in_srgb,var(--color-danger)_8%,transparent)] px-3 py-2.5 text-sm text-[var(--color-fg)]">
           <p className="font-medium">
             {unbuyablePlans.length === 1
@@ -491,11 +517,19 @@ export default async function BillingPage({
           title="Billing providers"
           description={
             <>
-              Configure any subset of {providers.map((d) => d.label).join(' / ')}. End-users pick one
+              Configure any subset of {checkoutProviders.map((d) => d.label).join(' / ')}. End-users pick one
               at checkout, or the geo router picks based on their country (CF-IPCountry header). After
               payment, checkout returns to the <code className="text-xs">successUrl</code> /{' '}
               <code className="text-xs">cancelUrl</code> your app passes on each checkout call — set
               those to your production URLs (a localhost value sends users to localhost).
+              {inboundProviders.length > 0 && (
+                <>
+                  {' '}
+                  {inboundProviders.map((d) => d.label).join(' / ')} is different: it hosts no checkout.
+                  Your own billing system posts signed events and Rekey activates, renews and cancels
+                  subscriptions from them, creating the subscriber when it has not seen them yet.
+                </>
+              )}
             </>
           }
         />
@@ -520,7 +554,14 @@ export default async function BillingPage({
             const row = d.status;
             return (
               <TR key={p} hover>
-                <TD className="font-medium">{d.label}</TD>
+                <TD className="font-medium">
+                  {d.label}
+                  {inboundOnly(d) && (
+                    <span className="mt-0.5 block text-[11px] font-normal text-[var(--color-muted-fg)]">
+                      inbound only, no checkout
+                    </span>
+                  )}
+                </TD>
                 <TD>
                   {!row ? (
                     <span className="text-xs text-[var(--color-muted-fg)]">not configured</span>
@@ -540,10 +581,10 @@ export default async function BillingPage({
                   )}
                 </TD>
                 <TD muted className="text-xs">
-                  {!row ? '—' : row.countries.length === 0 ? 'all (global)' : row.countries.join(', ')}
+                  {!row || inboundOnly(d) ? '—' : row.countries.length === 0 ? 'all (global)' : row.countries.join(', ')}
                 </TD>
                 <TD align="right" muted className="text-xs">
-                  {row ? row.priority : '—'}
+                  {row && !inboundOnly(d) ? row.priority : '—'}
                 </TD>
                 <TD className="text-xs">
                   {!row ? (
@@ -555,7 +596,13 @@ export default async function BillingPage({
                     // → always a manual dashboard paste, so no Auto-configure.
                     // The "how" + the why live in the Edit modal; the tooltip
                     // hints it here.
-                    <span title={`${d.label} has no webhook API — set it up manually in Edit (no Auto-configure).`}>
+                    <span
+                      title={
+                        inboundOnly(d)
+                          ? 'Save a signing secret in Configure; your billing system signs its events with it.'
+                          : `${d.label} has no webhook API — set it up manually in Edit (no Auto-configure).`
+                      }
+                    >
                       <Badge tone="warning" dot>not set up</Badge>
                     </span>
                   ) : (
@@ -575,7 +622,7 @@ export default async function BillingPage({
                     <ProviderEditModal
                       descriptor={d}
                       applicationId={id}
-                      webhookUrl={webhookUrlFor(p)}
+                      webhookUrl={inboundOnly(d) ? ingressUrlFor(p) : webhookUrlFor(p)}
                       error={edit === p ? error : undefined}
                       errorDetail={errorDetail}
                       errorFix={errorFix}
@@ -594,7 +641,11 @@ export default async function BillingPage({
                           <TypedConfirmButton
                             expected={d.label.toLowerCase()}
                             title={`Remove ${d.label} credentials?`}
-                            description={`Existing subscriptions keep running but no new checkouts can use ${d.label}. You'll need to re-paste the API keys from the ${d.label} dashboard to restore.`}
+                            description={
+                              inboundOnly(d)
+                                ? 'Existing subscriptions keep running, but events from your billing system are refused (503) until a signing secret is saved again.'
+                                : `Existing subscriptions keep running but no new checkouts can use ${d.label}. You'll need to re-paste the API keys from the ${d.label} dashboard to restore.`
+                            }
                             triggerLabel="Remove"
                             confirmLabel={`Remove ${d.label}`}
                           />
@@ -897,6 +948,7 @@ function ProviderEditModal({
   errorFix?: string | undefined;
 }): React.JSX.Element {
   const { name: provider, label, credentialFields } = descriptor;
+  const inbound = descriptor.capabilities.checkout === false;
   const existing = descriptor.status;
   const action = saveProviderCredentials.bind(
     null,
@@ -913,9 +965,13 @@ function ProviderEditModal({
       modalValue={provider}
       title={`${existing ? 'Edit' : 'Configure'} ${label}`}
       description={
-        existing
-          ? 'Rotate keys or change routing. Leave a field blank to keep its stored value.'
-          : `Connect your ${label} account. Credentials are AES-256-GCM encrypted at rest; never returned in any API response.`
+        inbound
+          ? existing
+            ? 'Rotate the signing secret. Leave it blank to keep the stored value.'
+            : 'Connect your own billing system. It signs every event with this secret, which is AES-256-GCM encrypted at rest and never returned by any API response.'
+          : existing
+            ? 'Rotate keys or change routing. Leave a field blank to keep its stored value.'
+            : `Connect your ${label} account. Credentials are AES-256-GCM encrypted at rest; never returned in any API response.`
       }
       trigger={existing ? 'Edit' : 'Configure'}
       triggerClassName="cursor-pointer rounded text-xs font-medium text-[var(--color-fg)] hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[color-mix(in_srgb,var(--color-primary)_50%,transparent)]"
@@ -943,29 +999,52 @@ function ProviderEditModal({
           </Field>
         ))}
 
-        {/* Webhook setup — numbered, copy-first; auto-configure where supported. */}
-        <WebhookSetup
-          descriptor={descriptor}
-          webhookUrl={webhookUrl}
-          configured={existing?.webhookConfigured ?? false}
-        />
+        {/* Webhook setup — numbered, copy-first; auto-configure where supported.
+            An inbound-only provider has no dashboard, so it gets the ingress
+            recipe instead. */}
+        {inbound ? (
+          <ExternalIngressSetup
+            descriptor={descriptor}
+            ingressUrl={webhookUrl}
+            configured={existing?.webhookConfigured ?? false}
+          />
+        ) : (
+          <WebhookSetup
+            descriptor={descriptor}
+            webhookUrl={webhookUrl}
+            configured={existing?.webhookConfigured ?? false}
+          />
+        )}
 
-        <div className="grid grid-cols-3 gap-3 pt-2 border-t border-[var(--color-border)]">
-          <Field label="Mode" hint="live = real charges; test = sandbox, no real money. Stay in test until you're ready. Auto-detected from the key prefix.">
+        {/* Routing (countries, priority) only means something for a provider
+            buyers can be sent to; an inbound-only one keeps just the mode. */}
+        <div className={`grid ${inbound ? 'grid-cols-1' : 'grid-cols-3'} gap-3 pt-2 border-t border-[var(--color-border)]`}>
+          <Field
+            label="Mode"
+            hint={
+              inbound
+                ? 'live = the events describe real sales; test = a sandbox of your billing system. Revenue views read it.'
+                : "live = real charges; test = sandbox, no real money. Stay in test until you're ready. Auto-detected from the key prefix."
+            }
+          >
             <select name="mode" defaultValue={existing?.mode ?? 'test'} className={inputCls}>
               <option value="test">Test</option>
               <option value="live">Live</option>
             </select>
           </Field>
-          <BillingModeAutodetect names={credentialFields.map((f) => f.key)} />
-          <Field label="Countries" hint="Empty = global">
-            <input type="text" name="countries" defaultValue={existing?.countries.join(', ') ?? ''}
-              placeholder="US, CA" className={`${inputCls} font-mono`} />
-          </Field>
-          <Field label="Priority" hint="Lower = first">
-            <input type="number" name="priority" min={0} max={1000} step={1}
-              defaultValue={existing?.priority ?? 100} className={`${inputCls} font-mono`} />
-          </Field>
+          {!inbound && (
+            <>
+              <BillingModeAutodetect names={credentialFields.map((f) => f.key)} />
+              <Field label="Countries" hint="Empty = global">
+                <input type="text" name="countries" defaultValue={existing?.countries.join(', ') ?? ''}
+                  placeholder="US, CA" className={`${inputCls} font-mono`} />
+              </Field>
+              <Field label="Priority" hint="Lower = first">
+                <input type="number" name="priority" min={0} max={1000} step={1}
+                  defaultValue={existing?.priority ?? 100} className={`${inputCls} font-mono`} />
+              </Field>
+            </>
+          )}
         </div>
 
         <SubmitButton pendingLabel="Saving…">{existing ? 'Save changes' : 'Save credentials'}</SubmitButton>
