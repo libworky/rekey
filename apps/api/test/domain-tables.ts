@@ -83,6 +83,11 @@ export const DOMAIN_TABLES = [
  *   dependency-outage  the 5-minute per-(subsystem, tenant) suppression window
  *                      on outage security events.
  *   oauth/oidc         cached OIDC discovery documents, on a 24h TTL.
+ *   security-events    application→tenant memo, used to scope an event whose
+ *                      writer named only an Application. Immutable per row and
+ *                      keyed by cuid, so a stale entry cannot mislead a later
+ *                      test; listed because this is the category, not because
+ *                      it has bitten.
  */
 const RESET_MODULES = [
   '../src/lib/brute-force.js',
@@ -90,6 +95,7 @@ const RESET_MODULES = [
   '../src/lib/signing-keys.js',
   '../src/lib/request-log.js',
   '../src/lib/dependency-outage.js',
+  '../src/lib/security-events.js',
   '../src/modules/oauth/providers/oidc.js',
 ] as const;
 
