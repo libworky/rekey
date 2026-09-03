@@ -97,6 +97,7 @@ All zero-argument; scoped to `(applicationId, endUserId)` of the access token.
 | `get_subscription` | `{ status, provider, currentPeriodEnd, cancelAt, plan } \| null` (ACTIVE or PAST_DUE only) |
 | `get_credits` | `{ balance }` (unit-less) |
 | `list_licenses` | `{ licenses: [{ id, kind, status, seatsAllowed, expiresAt, createdAt }] }` (no keys) |
+| `list_my_devices` | `{ devices: [{ id, label, status, firstSeenAt, lastSeenAt, releasedAt }] }` (no IPs, no operator notes) |
 
 No tool returns license keys, password hashes, provider credentials, or any
 other Application's data.
@@ -188,6 +189,7 @@ being handed a long-lived secret to paste.
 | `recent_failed_webhook_deliveries` | last-N FAILED outbound deliveries |
 | `application_health` | per-app payment success rate (30d) + outbound webhook success rate (24h), sorted by failure count |
 | `get_end_user` | one end-user: verification state, app environment, current subscription |
+| `list_devices` | an end-user's devices, newest activity first, optionally filtered by `status` |
 | `list_organization_roles` | an application's organization-role catalog + each role's `baseRole` tier. Also reports `organizationsEnabled`, and when it is false returns a note naming `update_auth_config`, so an agent asking about roles on an app without organizations gets the next step rather than an empty list |
 
 No read tool returns refresh tokens, password hashes, license keys, or provider
@@ -216,9 +218,16 @@ Assigning an *organization* role to an end-user is not an operator action at
 all. An org OWNER/ADMIN does it from your app with their own end-user session.
 There is deliberately no MCP tool for it.
 
+Three write tools act on an end-user's devices: `release_device` (gives the
+slot back and revokes the device's sessions), `block_device` (refuses sign-in
+from that fingerprint until unblocked) and `unblock_device`. See
+[devices.md](devices.md).
+
 Two more are flagged `admin`, needing `mcp:operator:admin` rather than plain
-write: `configure_billing_provider` (the secret travels through the MCP client)
-and `cancel_subscription` (irreversible).
+write: `configure_billing_provider` (the secret travels through the MCP client;
+its `provider` enum comes from the billing-provider registry, so it includes
+`external`, which takes only `webhookSecret`) and `cancel_subscription`
+(irreversible).
 
 Still not exposed at any tier: delete application, refund, webhook-secret
 rotation.

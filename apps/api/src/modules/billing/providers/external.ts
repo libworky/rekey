@@ -24,6 +24,7 @@
 
 import type { Plan } from '@prisma/client';
 import { RekeyError } from '../../../lib/error.js';
+import { EXTERNAL_PROVIDER_NAME } from './modules/external/index.js';
 import type {
   BillingProvider,
   CancelSubscriptionInput,
@@ -32,14 +33,12 @@ import type {
   ProviderPlanRef,
 } from './types.js';
 
-export const EXTERNAL_PROVIDER_NAME = 'external';
-
 function inboundOnly(operation: string): RekeyError {
   return new RekeyError({
     statusCode: 400,
     code: 'BILLING_PROVIDER_INBOUND_ONLY',
     message: `The external billing provider cannot perform ${operation}; it only receives events.`,
-    fix: 'Do this in your billing system, which then posts the resulting subscription.* event to Rekey. For self-serve checkout, connect Stripe, PayPal or Razorpay.',
+    fix: 'Do this in your billing system, which then posts the resulting subscription.* event to Rekey. For self-serve checkout, connect a hosted payment provider.',
   });
 }
 

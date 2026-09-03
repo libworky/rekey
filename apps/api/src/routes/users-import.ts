@@ -33,7 +33,7 @@ const MAX_BATCH = 500;
 
 const ImportUser = z.object({
   email: z.string().email().max(254),
-  /** argon2id PHC string, or bcrypt (`$2a$`/`$2b$`/`$2y$`) at cost 14 or below. Omit for OAuth-only users. */
+  /** argon2id PHC string within the parameter budget, or bcrypt (`$2a$`/`$2b$`/`$2y$`) at cost 12 or below. Omit for OAuth-only users. */
   passwordHash: z.string().min(20).max(512).optional(),
   /** Defaults to false: an address is verified only when the caller says so. */
   emailVerified: z.boolean().optional(),
@@ -156,8 +156,10 @@ export async function usersImportRoutes(app: FastifyInstance): Promise<void> {
           throw new RekeyError({
             statusCode: 400,
             code: 'PASSWORD_HASH_UNSUPPORTED',
-            message: `The password hash for "${email}" is not a well-formed argon2id hash or a bcrypt hash at cost ${MAX_BCRYPT_COST} or below.`,
-            fix: 'Send hashes as your current system stores them ($argon2id$v=19$m=…,t=…,p=…$salt$hash, or $2a$/$2b$/$2y$ at cost <= ' + MAX_BCRYPT_COST + '), or omit passwordHash and let the user reset.',
+            message: `The password hash for "${email}" is not a well-formed argon2id hash within the parameter budget, or a bcrypt hash at cost ${MAX_BCRYPT_COST} or below.`,
+            fix:
+              'Send hashes as your current system stores them: $argon2id$v=19$m=…,t=…,p=…$salt$hash with m <= 262144 KiB, t <= 10, p <= 8, ' +
+              'or $2a$/$2b$/$2y$ at cost <= ' + MAX_BCRYPT_COST + '. Otherwise omit passwordHash and let the user reset.',
           });
         }
         if (u.metadata !== undefined) assertMetadataWithinLimit(u.metadata);
@@ -196,48 +198,48 @@ export async function usersImportRoutes(app: FastifyInstance): Promise<void> {
         let row;
         try {
           row = await prisma.$transaction(async (tx) => {
-          const endUser = await tx.endUser.create({
-            data: {
-              applicationId: application.id,
-              email,
-              passwordHash: u.passwordHash ?? null,
-              role: u.role ?? defaultRole,
-              // Unverified unless the caller says otherwise. An Application
-              // that requires verification would otherwise trust every
-              // imported address on the strength of an omitted field.
-              emailVerified: u.emailVerified ?? false,
-              ...(u.metadata !== undefined && { metadata: u.metadata as never }),
-            },
-            select: { id: true, email: true },
-          });
-          for (const ident of u.oauthIdentities ?? []) {
-            // A provider account already linked elsewhere is not re-linked;
-            // the row is still created so the user can sign in another way.
-            const taken = await tx.oAuthIdentity.findUnique({
-              where: {
-                applicationId_provider_providerAccountId: {
-                  applicationId: application.id,
-                  provider: ident.provider,
-                  providerAccountId: ident.providerAccountId,
-                },
-              },
-              select: { id: true },
-            });
-            if (taken) {
-              unlinked.push({ email, provider: ident.provider, providerAccountId: ident.providerAccountId });
-              continue;
-            }
-            await tx.oAuthIdentity.create({
+            const endUser = await tx.endUser.create({
               data: {
                 applicationId: application.id,
-                endUserId: endUser.id,
-                provider: ident.provider,
-                providerAccountId: ident.providerAccountId,
-                email: ident.email?.toLowerCase() ?? email,
+                email,
+                passwordHash: u.passwordHash ?? null,
+                role: u.role ?? defaultRole,
+                // Unverified unless the caller says otherwise. An Application
+                // that requires verification would otherwise trust every
+                // imported address on the strength of an omitted field.
+                emailVerified: u.emailVerified ?? false,
+                ...(u.metadata !== undefined && { metadata: u.metadata as never }),
               },
+              select: { id: true, email: true },
             });
-          }
-          return endUser;
+            for (const ident of u.oauthIdentities ?? []) {
+              // A provider account already linked elsewhere is not re-linked;
+              // the row is still created so the user can sign in another way.
+              const taken = await tx.oAuthIdentity.findUnique({
+                where: {
+                  applicationId_provider_providerAccountId: {
+                    applicationId: application.id,
+                    provider: ident.provider,
+                    providerAccountId: ident.providerAccountId,
+                  },
+                },
+                select: { id: true },
+              });
+              if (taken) {
+                unlinked.push({ email, provider: ident.provider, providerAccountId: ident.providerAccountId });
+                continue;
+              }
+              await tx.oAuthIdentity.create({
+                data: {
+                  applicationId: application.id,
+                  endUserId: endUser.id,
+                  provider: ident.provider,
+                  providerAccountId: ident.providerAccountId,
+                  email: ident.email?.toLowerCase() ?? email,
+                },
+              });
+            }
+            return endUser;
           });
         } catch (e) {
           // A sign-up for the same address landed between the existence check
@@ -250,7 +252,7 @@ export async function usersImportRoutes(app: FastifyInstance): Promise<void> {
         emitDetached({
           applicationId: application.id,
           type: 'user.created',
-          data: { user: { id: row.id, email: row.email, imported: true } },
+          data: { user: { id: row.id, email: row.email }, via: 'import' },
         });
       }
       return { success: true, data: { created, skipped, unlinked } };

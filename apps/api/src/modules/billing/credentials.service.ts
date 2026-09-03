@@ -43,7 +43,7 @@ import type { ProviderModule } from './providers/module-types.js';
 export type BillingProviderName = 'stripe' | 'paypal' | 'razorpay' | 'external';
 
 /**
- * Typed handles on the three built-in credential shapes. The *authoritative*
+ * Typed handles on the built-in credential shapes. The *authoritative*
  * declaration is each module's `credentialSchema` (that is what validates and
  * what the registry-integrity test pins); these exist so the `Real*Provider`
  * constructors take something better than `Record<string, string>`. Not

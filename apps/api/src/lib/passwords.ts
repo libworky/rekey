@@ -52,10 +52,40 @@ const BCRYPT_RE = /^\$2[aby]\$(\d{2})\$[./A-Za-z0-9]{53}$/;
  * is a secret-key surface, so without a ceiling any tenant could turn their
  * own sign-in into a CPU sink for the deployment.
  */
-export const MAX_BCRYPT_COST = 14;
+export const MAX_BCRYPT_COST = 12;
+
+/**
+ * Ceilings on the argon2id parameters an imported hash may carry. The same
+ * hole the bcrypt cost closes, in the other primitive: `argon2.verify` runs
+ * with whatever `m`, `t` and `p` the encoded string names, so a hash
+ * declaring four gigabytes and sixty-four lanes would have every sign-in
+ * attempt for that address allocate four gigabytes before answering false.
+ * 256 MiB is four times the production default; 10 passes and 8 lanes are
+ * well above anything OWASP recommends.
+ */
+export const MAX_ARGON2_MEMORY_KIB = 262_144;
+export const MAX_ARGON2_TIME_COST = 10;
+export const MAX_ARGON2_PARALLELISM = 8;
 
 /** A full PHC-format argon2id string, the only argon2 shape Rekey accepts. */
-const ARGON2ID_RE = /^\$argon2id\$v=\d+\$m=\d+,t=\d+,p=\d+\$[A-Za-z0-9+/]+\$[A-Za-z0-9+/]+$/;
+const ARGON2ID_RE = /^\$argon2id\$v=\d+\$m=(\d+),t=(\d+),p=(\d+)\$[A-Za-z0-9+/]+\$[A-Za-z0-9+/]+$/;
+
+/** The argon2id parameters of a hash, or null when it is not a well-formed one. */
+export function argon2Params(hash: string): { memoryKib: number; timeCost: number; parallelism: number } | null {
+  const m = ARGON2ID_RE.exec(hash);
+  if (!m) return null;
+  return { memoryKib: Number(m[1]), timeCost: Number(m[2]), parallelism: Number(m[3]) };
+}
+
+function argon2WithinBudget(hash: string): boolean {
+  const p = argon2Params(hash);
+  return (
+    p !== null &&
+    p.memoryKib <= MAX_ARGON2_MEMORY_KIB &&
+    p.timeCost <= MAX_ARGON2_TIME_COST &&
+    p.parallelism <= MAX_ARGON2_PARALLELISM
+  );
+}
 
 export function isBcryptHash(hash: string): boolean {
   return BCRYPT_RE.test(hash);
@@ -75,7 +105,7 @@ export function bcryptCost(hash: string): number | null {
  * can never verify.
  */
 export function isSupportedPasswordHash(hash: string): boolean {
-  if (ARGON2ID_RE.test(hash)) return true;
+  if (hash.startsWith('$argon2id$')) return argon2WithinBudget(hash);
   const cost = bcryptCost(hash);
   return cost !== null && cost <= MAX_BCRYPT_COST;
 }
@@ -106,6 +136,11 @@ export async function verifyPassword(hash: string | null, plain: string): Promis
       if ((bcryptCost(hash) ?? Infinity) > MAX_BCRYPT_COST) return false;
       return await bcrypt.compare(plain, hash);
     }
+    // Rekey's own hashes are always within budget; an imported one that is
+    // not was refused at import, so this only ever refuses a row written
+    // before the ceiling existed. Refusing is the point: the verify would
+    // otherwise honour whatever the string asks for.
+    if (hash.startsWith('$argon2id$') && !argon2WithinBudget(hash)) return false;
     return await argon2.verify(hash, plain);
   } catch {
     return false;

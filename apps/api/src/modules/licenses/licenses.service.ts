@@ -23,7 +23,7 @@
  * listings and erasure can address them without a join.
  */
 
-import type { Application, EndUser, License, LicenseKind } from '@prisma/client';
+import type { Application, EndUser, License, LicenseActivation, LicenseKind } from '@prisma/client';
 import { prisma } from '../../lib/prisma.js';
 import { RekeyError } from '../../lib/error.js';
 import { generateLicenseKey, hashLicenseKey } from '../../lib/license-keys.js';
@@ -425,7 +425,7 @@ export const licensesService = {
     applicationId: string;
     licenseId: string;
     activationId: string;
-  }): Promise<import('@prisma/client').LicenseActivation> {
+  }): Promise<LicenseActivation> {
     const activation = await prisma.licenseActivation.findUnique({ where: { id: args.activationId } });
     if (
       !activation ||
