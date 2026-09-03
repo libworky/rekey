@@ -1,5 +1,5 @@
 /**
- * Device-bound sessions — the second step of the device series.
+ * Device-bound sessions.
  *
  * Every session-minting flow funnels through one chokepoint (`issuePair`), so
  * the assertions here go through the public routes and prove the behaviour a
@@ -24,6 +24,10 @@ import jwt from 'jsonwebtoken';
 import { buildApp } from '../src/app.js';
 import { prisma } from '../src/lib/prisma.js';
 import { devicesService } from '../src/modules/devices/devices.service.js';
+import {
+  makeEndUser as makeEndUserFor,
+  setDefaultDeviceLimit as setDefaultDeviceLimitFor,
+} from './device-fixtures.js';
 
 const PASSWORD = 'pw-one-two-three';
 
@@ -71,38 +75,10 @@ describe('device-bound sessions', () => {
       .then((r) => (r.json().data as { rawKey: string }).rawKey);
   });
 
-  async function makeEndUser(email: string): Promise<string> {
-    return app
-      .inject({
-        method: 'POST',
-        url: `/api/v1/tenant/applications/${appId}/end-users`,
-        headers: auth(),
-        payload: { email, password: PASSWORD },
-      })
-      .then((r) => (r.json().data as { id: string }).id);
-  }
 
-  async function setDefaultDeviceLimit(limit: number): Promise<void> {
-    const slug = `free-${limit}`;
-    await app.inject({
-      method: 'POST',
-      url: `/api/v1/tenant/applications/${appId}/plans`,
-      headers: auth(),
-      payload: { slug, name: slug, amount: 0, kind: 'SUBSCRIPTION' },
-    });
-    const put = await app.inject({
-      method: 'PUT',
-      url: `/api/v1/tenant/applications/${appId}/plans/${slug}/entitlements`,
-      headers: auth(),
-      payload: { kind: 'FEATURE', key: 'max_devices', valueType: 'INT', value: String(limit) },
-    });
-    expect(put.statusCode).toBe(200);
-    const application = await prisma.application.findUniqueOrThrow({ where: { id: appId } });
-    await prisma.application.update({
-      where: { id: appId },
-      data: { billingConfig: { ...(application.billingConfig as object), defaultPlanSlug: slug } as never },
-    });
-  }
+
+  const makeEndUser = (email: string) => makeEndUserFor(app, token, appId, email, PASSWORD);
+  const setDefaultDeviceLimit = (limit: number) => setDefaultDeviceLimitFor(app, token, appId, limit);
 
   async function setDeviceBinding(mode: 'optional' | 'required'): Promise<void> {
     const res = await app.inject({

@@ -8,10 +8,10 @@
  * window, and a sender of the external provider's events is told to retry
  * with backoff and give up; nobody re-presents a month-old event id.
  *
- * Nothing pruned these before. With hosted providers the growth was bounded
- * by how much a processor has to say; with an external billing system the
- * sender is arbitrary software posting bodies of up to a mebibyte under fresh
- * ids, and a table that only grows is a disk that only fills.
+ * Nothing else prunes these. With hosted providers the growth is bounded by
+ * how much a processor has to say; with an external billing system the sender
+ * is arbitrary software posting bodies of up to a mebibyte under fresh ids,
+ * and a table that only grows is a disk that only fills.
  *
  * Processed rows and failed rows alike are pruned past the window: a failed
  * dispatch that old is not going to be retried by anyone, and if it is, the

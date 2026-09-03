@@ -18,7 +18,9 @@
  */
 
 import { lookup } from 'node:dns/promises';
+import type { LookupAddress, LookupOptions } from 'node:dns';
 import { isIP } from 'node:net';
+import { Agent } from 'undici';
 import { env } from '../config/env.js';
 import { RekeyError } from './error.js';
 
@@ -271,6 +273,54 @@ export async function assertSafeUrlResolved(
 }
 
 /** Back-compat wrapper for callers that do not pin the connection. */
+/**
+ * Fetch options that pin the connection to a pre-validated address set.
+ *
+ * `assertSafeUrlResolved` resolves the host and approves its addresses; the
+ * socket must then go to one of THEM, not to whatever a second DNS query
+ * answers a moment later (rebinding: a short-TTL record that flips from a
+ * public address to an internal one between the check and the connect). The
+ * dispatcher's `lookup` answers only from the validated set. TLS still
+ * validates against the original hostname, because undici keeps the URL's
+ * servername; pinning the address is not the same as connecting by IP.
+ *
+ * Built per call rather than cached: the validated set is specific to this
+ * attempt, and a pool keyed on the host would outlive it. Spread the result
+ * into the `fetch` init. An empty set (the guard returned nothing to pin,
+ * which only happens when the host is a literal IP it already approved)
+ * yields no override.
+ */
+export function pinnedFetchInit(allowed: readonly string[]): RequestInit {
+  if (allowed.length === 0) return {};
+  const dispatcher = new Agent({
+    connect: {
+      lookup: (
+        _hostname: string,
+        options: LookupOptions,
+        callback: (
+          err: NodeJS.ErrnoException | null,
+          address: string | LookupAddress[],
+          family?: number,
+        ) => void,
+      ): void => {
+        const entries = allowed.map((address) => ({
+          address,
+          family: address.includes(':') ? 6 : 4,
+        }));
+        if (options.all) {
+          callback(null, entries);
+          return;
+        }
+        const first = entries[0]!;
+        callback(null, first.address, first.family);
+      },
+    },
+  });
+  // `dispatcher` is not in the DOM RequestInit that TS resolves here; Node's
+  // fetch accepts it and undici reads it.
+  return { dispatcher } as unknown as RequestInit;
+}
+
 export async function assertSafeUrl(
   rawUrl: string,
   options: SafeUrlOptions = {},

@@ -1,5 +1,6 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
+import { assertMetadataWithinLimit } from '../../lib/metadata-limit.js';
 import { CouponDiscountType } from '@prisma/client';
 import { couponsService } from './coupons.service.js';
 import { applicationsService } from '../applications/applications.service.js';
@@ -126,6 +127,7 @@ export async function couponsAdminRoutes(app: FastifyInstance): Promise<void> {
     async (req, reply) => {
       const { id } = Params.parse(req.params);
       const body = CreateBody.parse(req.body);
+      if (body.metadata !== undefined) assertMetadataWithinLimit(body.metadata);
       await applicationsService.get(id);
       const coupon = await couponsService.create({
         applicationId: id,

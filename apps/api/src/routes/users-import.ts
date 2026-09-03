@@ -195,7 +195,7 @@ export async function usersImportRoutes(app: FastifyInstance): Promise<void> {
           }
           throw e;
         }
-        let row;
+        let row: { id: string; email: string };
         try {
           row = await prisma.$transaction(async (tx) => {
             const endUser = await tx.endUser.create({

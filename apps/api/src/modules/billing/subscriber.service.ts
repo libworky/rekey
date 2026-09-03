@@ -99,7 +99,14 @@ export const subscriberService = {
       emailVerified: input.subscriber.emailVerified ?? true,
     };
 
-    let created;
+    let created: {
+      id: string;
+      email: string;
+      emailVerified: boolean;
+      role: string;
+      createdAt: Date;
+      metadata: Prisma.JsonValue | null;
+    };
     try {
       created = await prisma.endUser.create({
         data,

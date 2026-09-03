@@ -1,6 +1,6 @@
 /**
- * Device management routes and licence seat release — the third step of the
- * device series. Three surfaces over one service, each proven through HTTP:
+ * Device management routes and licence seat release. Three surfaces over one
+ * service, each proven through HTTP:
  *
  *   - end-user (`/users/me/devices`): list is redacted (no IP, no operator
  *     notes), release revokes the device's sessions including the caller's

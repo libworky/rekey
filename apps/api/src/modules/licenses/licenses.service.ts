@@ -351,8 +351,10 @@ export const licensesService = {
     if (result.kind === 'ok') {
       // Point the activation at the holder's Device row for the same
       // fingerprint, when one exists, so the seat list and the device list
-      // agree about which machine is which. Best-effort and outside the
-      // seat transaction: a missing device is not a verification failure.
+      // agree about which machine is which. Outside the seat transaction
+      // because it is not part of the seat decision; a missing device is not
+      // a verification failure, and a retry after a failure here finds the
+      // seat already held and links again.
       const device = await prisma.device.findUnique({
         where: {
           applicationId_endUserId_fingerprint: {
