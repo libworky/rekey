@@ -4131,19 +4131,22 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
     },
   );
 
-  // DELETE /:id/end-users/:euid           → plain delete (back-compat, unchanged)
+  // DELETE /:id/end-users/:euid           → plain delete (cascade)
   // DELETE /:id/end-users/:euid?erasure=true → GDPR erasure (tombstone + retain)
   //
+  // BOTH are workspace-OWNER only. See the gate in the handler for why they are
+  // now the same floor rather than two.
+  //
   // Plain delete relies on the schema's onDelete:Cascade FKs: the EndUser row
-  // and EVERY dependent row (including financial records) are removed. Kept for
-  // back-compat — same behavior as before this feature.
+  // and EVERY dependent row (including the financial records) are removed. It
+  // predates erasure and is the more destructive of the two, which is the
+  // opposite of how the two floors used to read.
   //
   // Erasure (roadmap §10) is the GDPR-correct path: it hard-deletes PII/auth
   // rows, TOMBSTONES the EndUser (email anonymized, passwordHash cleared,
   // `erasedAt` set — the user can never authenticate again), and RETAINS but
   // PII-scrubs financial rows (Payment/Subscription/License/CreditLedger/Usage)
-  // so accounting/legal-retention obligations are met. OWNER/ADMIN only (same
-  // gate as the DSAR export — this is an irreversible, PII-dense operation).
+  // so accounting/legal-retention obligations are met.
   // See docs/data-erasure.md for the per-model matrix.
   app.delete(
     '/:id/end-users/:euid',
@@ -4154,8 +4157,13 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
         summary:
           'Delete an end-user (cascade), or GDPR-erase them with ?erasure=true (tombstone + retain financials)',
         description:
-          'Requires **write** access to this Application — OWNER/ADMIN, or a MEMBER with an ' +
-          '`APP_ADMIN` grant on it.',
+          'Requires the **workspace OWNER** role, for both forms. No application grant unlocks ' +
+          'either, and neither does ADMIN.\n\n' +
+          'A plain delete cascades: the end-user and every dependent row go, including payments, ' +
+          'subscriptions, licenses, the credit ledger and usage. It is unrecoverable and it ' +
+          'destroys the accounting record. An erasure (`?erasure=true`) tombstones the account and ' +
+          '**retains** those rows, anonymized — it is what a data-subject request actually asks ' +
+          'for, and the one to reach for.',
         params: {
           type: 'object',
           properties: { id: { type: 'string' }, euid: { type: 'string' } },
@@ -4169,7 +4177,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
               enum: ['true', 'false'],
               description:
                 'When "true", performs a GDPR erasure (tombstone + anonymized financial retention) ' +
-                'instead of a hard cascade delete. OWNER/ADMIN only.',
+                'instead of a hard cascade delete. Both forms are workspace-OWNER only.',
             },
           },
         },
@@ -4200,7 +4208,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
           ...errs({
             403:
               APP_WRITE_ERRORS[403] +
-              ' Or TENANT_ROLE_INSUFFICIENT — `?erasure=true` requires the OWNER or ADMIN workspace role (no grant unlocks it).',
+              ' Or TENANT_ROLE_INSUFFICIENT — both forms require the workspace OWNER role (no grant unlocks either, and ADMIN does not).',
             404: 'END_USER_NOT_FOUND — no end-user with that id in this Application.',
             401: APP_WRITE_ERRORS[401],
             502: 'PROVIDER_CANCEL_FAILED — a plain delete (not erasure) is refused when the billing provider will not cancel the end-user\'s active subscription (avoids leaving a live charge behind).',
@@ -4217,16 +4225,38 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
         .parse(req.query);
       const isErasure = query.erasure === 'true';
 
+      // Access check first, so a MEMBER with no grant on this Application gets
+      // the 404 non-disclosure answer rather than learning from a 403 that the
+      // end-user id it named is real.
       await ensureAppAccess(req, params.id, 'write');
 
-      // Erasure is irreversible + PII-dense — gate it to OWNER/ADMIN, matching
-      // the DSAR export. (Plain delete keeps the 'write' grant authz.)
-      if (isErasure && req.tenantRole !== 'OWNER' && req.tenantRole !== 'ADMIN') {
+      // BOTH branches are OWNER-only.
+      //
+      // Erasure was already OWNER/ADMIN here. The plain delete was the 'write'
+      // grant and nothing else — so the path that RETAINS the accounting record
+      // was gated harder than the path that destroys it, and the more
+      // destructive of the two was reachable by the least privileged role that
+      // can reach the Application at all: a MEMBER holding `APP_ADMIN` could
+      // cascade an end-user and every payment, subscription, licence,
+      // credit-ledger and usage row with them, unrecoverably. That asymmetry
+      // was not a decision anyone made. It is what you get when a floor is
+      // added to the newer verb and the older, plainer one keeps whatever it
+      // started with.
+      //
+      // Neither is routine support work: one answers a legal request, the other
+      // cannot be undone. Both answer to the workspace owner. Breaking for
+      // deployments that had an ADMIN or a granted MEMBER doing this, and
+      // deliberately so.
+      if (req.tenantRole !== 'OWNER') {
         throw new RekeyError({
           statusCode: 403,
           code: 'TENANT_ROLE_INSUFFICIENT',
-          message: 'Only workspace owners and admins can erase (GDPR) an end-user.',
-          fix: 'Ask an OWNER or ADMIN to process the erasure request.',
+          message: isErasure
+            ? 'Only the workspace owner can erase (GDPR) an end-user.'
+            : 'Only the workspace owner can delete an end-user.',
+          fix: isErasure
+            ? 'Ask an OWNER to process the erasure request.'
+            : 'Ask an OWNER to delete this end-user. If you are answering a data-subject request, erasure (?erasure=true) is the operation you want, and it retains the financial record.',
         });
       }
 

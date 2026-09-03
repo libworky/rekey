@@ -8,8 +8,17 @@ guarantees. Pick the right one:
 | **Plain delete** (back-compat) | `DELETE …/end-users/:euid` | Cascade-deletes the EndUser row **and every dependent row**, including financial records, via the schema's `onDelete: Cascade` FKs. Use only when you genuinely want everything gone (e.g. test data). |
 | **Erasure** (GDPR Art. 17) | `DELETE …/end-users/:euid?erasure=true` | **Tombstones** the user: hard-deletes PII/auth material, **retains anonymized** financial records. The GDPR-correct default for a data-subject erasure request. |
 
-Both are OWNER/ADMIN-only for erasure (plain delete keeps the per-app `write`
-grant). Erasure is **irreversible**.
+Both require the **workspace OWNER** role. No per-application grant unlocks
+either, and neither does ADMIN.
+
+That is a change. Erasure used to be OWNER/ADMIN, and the plain delete used to
+be the per-application `write` grant alone — which a MEMBER holding `APP_ADMIN`
+satisfies. So the operation that *retains* the accounting record was gated
+harder than the one that destroys it, and the more destructive of the two was
+reachable by the least privileged role that can reach the Application at all.
+
+Erasure is **irreversible**. A plain delete is irreversible *and* takes the
+financial history with it.
 
 ## Why tombstone instead of hard-delete?
 
