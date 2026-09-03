@@ -655,7 +655,9 @@ export async function billingRoutes(app: FastifyInstance): Promise<void> {
     },
     async (req) => {
       const country = countryFromRequest(req.headers);
-      const visible = await billingCredentialsService.listEnabled(req.application!.id, country);
+      // "Where can I pay" is the question; an inbound-only provider is not an
+      // answer to it, so it is left out even when configured and enabled.
+      const visible = await billingCredentialsService.listCheckoutEnabled(req.application!.id, country);
       return {
         success: true,
         data: {

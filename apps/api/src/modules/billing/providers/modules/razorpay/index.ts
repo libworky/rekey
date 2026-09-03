@@ -318,6 +318,7 @@ export const razorpayModule: ProviderModule = {
     priority: 100,
   },
   capabilities: {
+    checkout: true,
     // No per-checkout trial on Subscriptions; the plan would need its own
     // intro cycle. Declared false so the discovery contract stays uniform.
     trials: false,

@@ -58,7 +58,9 @@ import { billingService } from '../billing/billing.service.js';
 import {
   billingCredentialsService,
   type BillingMode,
+  type BillingProviderName,
 } from '../billing/credentials.service.js';
+import { getModule, registryNames } from '../billing/providers/registry.js';
 import { tenantWorkspacesService } from '../tenant-workspaces/tenant-workspaces.service.js';
 import { organizationRolesService } from '../organization-roles/organization-roles.service.js';
 import { AuthConfigSchema } from '@rekey.dev/shared-types';
@@ -1381,17 +1383,21 @@ export const operatorWriteTools: OperatorTool[] = [
   {
     name: 'configure_billing_provider',
     description:
-      "Set an application's billing-provider credentials (Stripe / PayPal / Razorpay). " +
-      'Credentials are AES-256-GCM encrypted at rest and never returned by any tool. ' +
+      "Set an application's billing-provider credentials. Providers: " +
+      registryNames.map((n) => `${n} (${getModule(n)!.credentialSchema.map((f) => f.key).join(', ')})`).join('; ') +
+      '. Credentials are AES-256-GCM encrypted at rest and never returned by any tool. ' +
       'SECURITY: the secret you pass travels through the MCP client — only use this from a ' +
-      'trusted client. Leave webhook secrets blank to auto-configure them later in the panel.',
+      'trusted client. Omit a field to keep its stored value on an edit; leave webhook secrets ' +
+      'blank to auto-configure them later in the panel where the provider supports it. ' +
+      '"external" is an inbound-only provider for your own billing system: it takes only ' +
+      'webhookSecret, the HMAC key that system signs events with (see docs/external-billing.md).',
     write: true,
     admin: true,
     inputSchema: {
       type: 'object',
       properties: {
         applicationId: { type: 'string', minLength: 1 },
-        provider: { type: 'string', enum: ['stripe', 'paypal', 'razorpay'] },
+        provider: { type: 'string', enum: registryNames },
         // Stripe
         apiKey: { type: 'string', description: 'Stripe secret key (sk_…).' },
         // PayPal
@@ -1400,7 +1406,8 @@ export const operatorWriteTools: OperatorTool[] = [
         // Razorpay
         keyId: { type: 'string' },
         keySecret: { type: 'string' },
-        // Shared optional webhook secret/id (provider-specific meaning)
+        // Shared webhook secret/id (provider-specific meaning; the only field
+        // the external provider takes)
         webhookSecret: { type: 'string' },
         webhookId: { type: 'string' },
         mode: { type: 'string', enum: ['test', 'live'] },
@@ -1412,43 +1419,34 @@ export const operatorWriteTools: OperatorTool[] = [
     },
     handler: async (ctx, args) => {
       const app = await loadAppInTenant(ctx, String(args.applicationId));
-      const provider = String(args.provider) as 'stripe' | 'paypal' | 'razorpay';
+      const provider = String(args.provider) as BillingProviderName;
+      const module = getModule(provider);
+      if (!module) {
+        throw new RekeyError({
+          statusCode: 400,
+          code: 'BILLING_PROVIDER_UNKNOWN',
+          message: `"${provider}" is not a registered billing provider.`,
+          fix: `Use one of: ${registryNames.join(', ')}.`,
+        });
+      }
       const mode = args.mode === 'test' || args.mode === 'live' ? (args.mode as BillingMode) : undefined;
       const options = {
         ...(args.countries !== undefined && { countries: args.countries as string[] }),
         ...(args.enabled !== undefined && { enabled: args.enabled === true }),
         ...(mode !== undefined && { mode }),
       };
-      if (provider === 'stripe') {
-        await billingCredentialsService.upsertCredentials(
-          app.id,
-          'stripe',
-          { apiKey: String(args.apiKey ?? ''), webhookSecret: String(args.webhookSecret ?? '') },
-          options,
-        );
-      } else if (provider === 'paypal') {
-        await billingCredentialsService.upsertCredentials(
-          app.id,
-          'paypal',
-          {
-            clientId: String(args.clientId ?? ''),
-            clientSecret: String(args.clientSecret ?? ''),
-            webhookId: String(args.webhookId ?? ''),
-          },
-          options,
-        );
-      } else {
-        await billingCredentialsService.upsertCredentials(
-          app.id,
-          'razorpay',
-          {
-            keyId: String(args.keyId ?? ''),
-            keySecret: String(args.keySecret ?? ''),
-            webhookSecret: String(args.webhookSecret ?? ''),
-          },
-          options,
-        );
+      // The field set is whatever the module declares, so a fourth provider is
+      // not a fourth branch. A field the caller omits is omitted from the
+      // request, and the credentials service keeps its stored value; a field
+      // passed as "" is cleared, which is what a blank optional webhook field
+      // has always meant. The old per-provider branches sent "" for every
+      // omitted key, so an edit through MCP wiped the fields it did not name.
+      const data: Record<string, string> = {};
+      for (const field of module.credentialSchema) {
+        const value = args[field.key];
+        if (value !== undefined) data[field.key] = String(value);
       }
+      await billingCredentialsService.upsertCredentials(app.id, provider, data, options);
       // Audit records only that creds were set — NEVER the secret values.
       audit(ctx, 'app.billing_credentials_configured', app.id, { provider, mode: mode ?? 'inferred' });
       return { applicationId: app.id, provider, configured: true };

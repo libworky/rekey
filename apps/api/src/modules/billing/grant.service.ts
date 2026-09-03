@@ -103,6 +103,20 @@ export interface GrantSubscriptionInput {
   currentPeriodEnd?: Date;
   /** Free-text reason, kept on the row and in the audit trail. */
   note?: string;
+  /**
+   * Bind the row to an inbound-only provider instead of leaving it
+   * provider-less.
+   *
+   * The module docblock argues for nulling the provider, and that argument
+   * is about a provider NOBODY is talking to. An external billing system
+   * (providers/modules/external) is somebody: it posted this activation and
+   * will post the cancellation, so the row must carry its subscription id or
+   * those later events find nothing. Only the granted-event applier passes
+   * this; the admin route never does.
+   */
+  providerBinding?: { provider: string; providerSubId: string };
+  /** Mirrored when the sender runs the trial; `null` clears a stale one. */
+  trialEndsAt?: Date | null;
 }
 
 export interface GrantSubscriptionResult {
@@ -304,8 +318,9 @@ export const subscriptionGrantsService = {
 
         const data = {
           status: 'ACTIVE' as const,
-          provider: null,
-          providerSubId: null,
+          provider: input.providerBinding?.provider ?? null,
+          providerSubId: input.providerBinding?.providerSubId ?? null,
+          ...(input.trialEndsAt !== undefined && { trialEndsAt: input.trialEndsAt }),
           currentPeriodEnd,
           // A re-grant of a subscription that was scheduled to end, or had
           // ended, must not carry the old termination forward: `expireIfDue`
@@ -365,6 +380,12 @@ export const subscriptionGrantsService = {
       // reports the winner's result rather than a 500, because from the
       // caller's side the two are one idempotent request.
       if ((e as { code?: string }).code !== 'P2002') throw e;
+      // Only the (applicationId, endUserId, planId) key is the benign race.
+      // With a provider binding the same code can name
+      // (applicationId, providerSubId): the sender's id is already on another
+      // row, which is a conflict the caller must see, not a win to report.
+      const target = (e as { meta?: { target?: unknown } }).meta?.target;
+      if (Array.isArray(target) && target.some((t) => String(t).includes('provider_sub'))) throw e;
       const won = await prisma.subscription.findUniqueOrThrow({
         where: { applicationId_endUserId_planId: key },
       });
