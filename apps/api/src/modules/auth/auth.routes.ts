@@ -1,5 +1,6 @@
 import type { FastifyInstance, FastifyRequest } from 'fastify';
 import { z } from 'zod';
+import { DeviceBindingRequestSchema } from '@rekey.dev/shared-types';
 import { authService } from './auth.service.js';
 import {
   requireApiKey,
@@ -68,17 +69,48 @@ const WEBAUTHN_OPTIONS: JsonSchema = {
 };
 
 /**
- * Extract device fingerprint from a Fastify request for session tracking.
- * Returns `null` fields when the headers are missing; the refresh-token
- * lib treats nulls as "unknown" and the panel renders accordingly.
+ * Everything the session lib wants to know about the caller's machine: the
+ * User-Agent and IP for the session list, and — when the body carried a
+ * `device` binding — the fingerprint and label that bind the session to a
+ * Device row (docs/devices.md). Returns `null` fields when absent; the
+ * refresh-token lib treats nulls as "unknown" and the panel renders accordingly.
  */
-function deviceContext(req: FastifyRequest): { userAgent: string | null; ip: string | null } {
+function deviceContext(
+  req: FastifyRequest,
+  binding?: { fingerprint: string; label?: string | undefined },
+): { userAgent: string | null; ip: string | null; fingerprint: string | null; label: string | null } {
   const ua = req.headers['user-agent'];
   return {
     userAgent: typeof ua === 'string' && ua.length > 0 ? ua : null,
     ip: req.ip || null,
+    fingerprint: binding?.fingerprint ?? null,
+    label: binding?.label ?? null,
   };
 }
+
+/** JSON-schema twin of `DeviceBindingRequestSchema`, for the OpenAPI document. */
+const DEVICE_BODY_SCHEMA = {
+  type: 'object',
+  required: ['fingerprint'],
+  description:
+    'Bind the session to a device (docs/devices.md). Optional unless the Application sets ' +
+    '`authConfig.deviceBinding = "required"`.',
+  properties: {
+    fingerprint: {
+      type: 'string',
+      minLength: 8,
+      maxLength: 256,
+      description: 'Opaque, client-computed, stable across launches.',
+    },
+    label: { type: 'string', minLength: 1, maxLength: 120, description: 'Shown in device lists.' },
+  },
+} as const;
+
+const DEVICE_ERRORS_403 =
+  ' Or DEVICE_LIMIT_REACHED — the account is at its `max_devices` entitlement; `details.devices` ' +
+  'lists the active devices to release; or DEVICE_BLOCKED — an operator blocked this device.';
+const DEVICE_ERRORS_400 =
+  ' Or DEVICE_FINGERPRINT_REQUIRED — the Application requires a `device` binding on sign-in.';
 
 /**
  * Append an end-user activity event to the security-events log. Fire-and-forget
@@ -109,15 +141,18 @@ const SignUpBody = z.object({
   email: z.string().email().max(254),
   password: z.string().min(1).max(256),
   metadata: z.record(z.unknown()).optional(),
+  device: DeviceBindingRequestSchema.optional(),
 });
 
 const SignInBody = z.object({
   email: z.string().email().max(254),
   password: z.string().min(1).max(256),
+  device: DeviceBindingRequestSchema.optional(),
 });
 
 const RefreshBody = z.object({
   refreshToken: z.string().min(1).max(512),
+  device: DeviceBindingRequestSchema.optional(),
 });
 
 const SignOutBody = z.object({
@@ -166,6 +201,7 @@ const MagicLinkRequestBody = z.object({
 
 const MagicLinkVerifyBody = z.object({
   token: z.string().min(1).max(512),
+  device: DeviceBindingRequestSchema.optional(),
 });
 
 const PasskeyAuthStartBody = z.object({
@@ -177,6 +213,7 @@ const PasskeyAuthCompleteBody = z.object({
   // record; SimpleWebAuthn's verifier validates the shape.
   response: z.record(z.unknown()),
   expectedChallenge: z.string().min(1).max(1024),
+  device: DeviceBindingRequestSchema.optional(),
 });
 
 const PasskeyRegisterCompleteBody = z.object({
@@ -198,6 +235,7 @@ const ChangePasswordBody = z.object({
 const MfaVerifyBody = z.object({
   mfaChallengeToken: z.string().min(1).max(2048),
   code: z.string().min(1).max(64),
+  device: DeviceBindingRequestSchema.optional(),
 });
 
 export function shapeAuthResult(result: import('./auth.service.js').AuthResult): {
@@ -207,6 +245,7 @@ export function shapeAuthResult(result: import('./auth.service.js').AuthResult):
   accessTokenExpiresAt: string;
   refreshToken: string;
   refreshTokenExpiresAt: string;
+  deviceId: string | null;
 } {
   return {
     mfaRequired: false,
@@ -215,6 +254,7 @@ export function shapeAuthResult(result: import('./auth.service.js').AuthResult):
     accessTokenExpiresAt: result.accessTokenExpiresAt.toISOString(),
     refreshToken: result.refreshToken,
     refreshTokenExpiresAt: result.refreshTokenExpiresAt.toISOString(),
+    deviceId: result.deviceId,
   };
 }
 
@@ -300,6 +340,7 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
               additionalProperties: true,
               description: 'Free-form per-app metadata (display name, avatar, custom fields).',
             },
+            device: DEVICE_BODY_SCHEMA,
           },
         },
         response: {
@@ -311,9 +352,11 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
               'PASSWORD_TOO_SHORT — shorter than `authConfig.passwordMinLength`; or ' +
               'PASSWORD_BREACHED — the password appears in a known breach corpus; or ' +
               'METADATA_TOO_LARGE — `metadata` exceeds the 16KB limit; or ' +
-              'METADATA_KEY_RESERVED — a publishable caller set the reserved `metadata.oidc` key.',
+              'METADATA_KEY_RESERVED — a publishable caller set the reserved `metadata.oidc` key.' +
+              DEVICE_ERRORS_400,
             403:
               BOOTSTRAP_403 +
+              DEVICE_ERRORS_403 +
               ' Also: SIGNUP_DISABLED — public sign-up is off for this Application; or ' +
               'SIGNUP_REQUIRES_SECRET_KEY — the Application only allows creating end-users with ' +
               "a secret key; or TENANT_QUOTA_EXCEEDED — the workspace's end-user limit is " +
@@ -331,7 +374,7 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
         email: body.email,
         password: body.password,
         ...(body.metadata !== undefined && { metadata: body.metadata }),
-        device: deviceContext(req),
+        device: deviceContext(req, body.device),
         // Signup policy: a `secret_only` app refuses creation via a pub key.
         ...(req.authKind !== undefined && { authKind: req.authKind }),
       });
@@ -361,6 +404,7 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
           properties: {
             email: { type: 'string', format: 'email', maxLength: 254 },
             password: { type: 'string', minLength: 1, maxLength: 256 },
+            device: DEVICE_BODY_SCHEMA,
           },
         },
         response: {
@@ -370,11 +414,14 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
           ),
           ...errs({
             ...BOOTSTRAP_ERRORS,
-            400: 'AUTH_METHOD_DISABLED — password sign-in is disabled for this Application.',
+            400: 'AUTH_METHOD_DISABLED — password sign-in is disabled for this Application.' + DEVICE_ERRORS_400,
             401:
               BOOTSTRAP_401 +
               ' Or INVALID_CREDENTIALS — the email or password is wrong (we never disclose which).',
-            403: BOOTSTRAP_403 + ' Or EMAIL_NOT_VERIFIED — the password was correct but the address is unconfirmed.',
+            403:
+              BOOTSTRAP_403 +
+              ' Or EMAIL_NOT_VERIFIED — the password was correct but the address is unconfirmed.' +
+              DEVICE_ERRORS_403,
             429:
               RATE_LIMITED +
               ' Or TOO_MANY_FAILED_ATTEMPTS — this (Application, email) pair is locked out after ' +
@@ -389,7 +436,7 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
         application: req.application!,
         email: body.email,
         password: body.password,
-        device: deviceContext(req),
+        device: deviceContext(req, body.device),
       });
       if (!outcome.mfaRequired) {
         recordEndUserEvent(req, 'user.signed_in', outcome.endUser.id, { via: 'password' });
@@ -414,17 +461,20 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
           properties: {
             mfaChallengeToken: { type: 'string', minLength: 1, maxLength: 2048 },
             code: { type: 'string', minLength: 1, maxLength: 64 },
+            device: DEVICE_BODY_SCHEMA,
           },
         },
         response: {
           200: ok(ref('AuthResult'), 'A finished session.'),
           ...errs({
             ...BOOTSTRAP_ERRORS,
+            400: 'VALIDATION_ERROR — the body failed schema validation.' + DEVICE_ERRORS_400,
             401:
               BOOTSTRAP_401 +
               ' Or MFA_CHALLENGE_INVALID — the challenge token is invalid or expired; or ' +
               'MFA_CHALLENGE_WRONG_APPLICATION — issued for a different Application; or ' +
               'MFA_CODE_INVALID — the TOTP/backup code did not verify.',
+            403: BOOTSTRAP_403 + DEVICE_ERRORS_403,
           }),
         },
       },
@@ -435,7 +485,7 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
         application: req.application!,
         mfaChallengeToken: body.mfaChallengeToken,
         code: body.code,
-        device: deviceContext(req),
+        device: deviceContext(req, body.device),
       });
       recordEndUserEvent(req, 'user.signed_in', result.endUser.id, { via: 'mfa' });
       return { success: true, data: shapeAuthResult(result) };
@@ -455,7 +505,10 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
         body: {
           type: 'object',
           required: ['refreshToken'],
-          properties: { refreshToken: { type: 'string', minLength: 1, maxLength: 512 } },
+          properties: {
+            refreshToken: { type: 'string', minLength: 1, maxLength: 512 },
+            device: DEVICE_BODY_SCHEMA,
+          },
         },
         response: {
           200: ok(ref('AuthResult'), 'A fresh {access, refresh} pair.'),
@@ -467,8 +520,13 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
               'REFRESH_TOKEN_REUSED — a rotated-out token was replayed (every session for this ' +
               'user has been revoked as a precaution); or REFRESH_TOKEN_REVOKED — this session ' +
               'was revoked; or REFRESH_TOKEN_EXPIRED — the token has expired; or ' +
-              'REFRESH_TOKEN_WRONG_APPLICATION — the token belongs to a different Application.',
-            403: BOOTSTRAP_403 + ' Or EMAIL_NOT_VERIFIED — re-checked on every refresh.',
+              'REFRESH_TOKEN_WRONG_APPLICATION — the token belongs to a different Application; or ' +
+              'REFRESH_TOKEN_DEVICE_MISMATCH — the session is bound to a different device than ' +
+              'the one presenting it (every session for this user has been revoked as a precaution).',
+            403:
+              BOOTSTRAP_403 +
+              ' Or EMAIL_NOT_VERIFIED — re-checked on every refresh.' +
+              ' Or DEVICE_BLOCKED — an operator blocked the device this session is bound to.',
             410: 'END_USER_ERASED — this end-user was erased (GDPR) since the token was issued.',
           }),
         },
@@ -476,7 +534,11 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
     },
     async (req) => {
       const body = RefreshBody.parse(req.body);
-      const result = await authService.refresh(req.application!, body.refreshToken);
+      const result = await authService.refresh(
+        req.application!,
+        body.refreshToken,
+        deviceContext(req, body.device),
+      );
       return { success: true, data: shapeAuthResult(result) };
     },
   );
@@ -646,13 +708,16 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
         body: {
           type: 'object',
           required: ['token'],
-          properties: { token: { type: 'string', minLength: 1, maxLength: 512 } },
+          properties: {
+            token: { type: 'string', minLength: 1, maxLength: 512 },
+            device: DEVICE_BODY_SCHEMA,
+          },
         },
         response: {
           200: ok(ref('SignInOutcome'), 'A finished session, or an MFA challenge.'),
           ...errs({
             ...BOOTSTRAP_ERRORS,
-            400: 'AUTH_METHOD_DISABLED — magic-link sign-in is disabled for this Application.',
+            400: 'AUTH_METHOD_DISABLED — magic-link sign-in is disabled for this Application.' + DEVICE_ERRORS_400,
             401:
               BOOTSTRAP_401 +
               ' Or MAGIC_LINK_INVALID — the token is unknown; or MAGIC_LINK_USED — already ' +
@@ -673,7 +738,7 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
       const outcome = await authService.verifyMagicLink({
         application: req.application!,
         token: body.token,
-        device: deviceContext(req),
+        device: deviceContext(req, body.device),
         // Signup policy: refuse creation via a pub key in `secret_only` apps.
         ...(req.authKind !== undefined && { authKind: req.authKind }),
       });
@@ -742,13 +807,14 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
           properties: {
             response: { type: 'object' },
             expectedChallenge: { type: 'string', minLength: 1, maxLength: 1024 },
+            device: DEVICE_BODY_SCHEMA,
           },
         },
         response: {
           200: ok(ref('SignInOutcome'), 'A finished session (passkeys bypass the MFA challenge).'),
           ...errs({
             ...BOOTSTRAP_ERRORS,
-            400: 'WEBAUTHN_AUTH_INVALID — the response is missing a credential id.',
+            400: 'WEBAUTHN_AUTH_INVALID — the response is missing a credential id.' + DEVICE_ERRORS_400,
             401:
               BOOTSTRAP_401 +
               ' Or WEBAUTHN_AUTH_INVALID — the credential is unknown to this Application, the ' +
@@ -764,7 +830,7 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
         application: req.application!,
         expectedChallenge: body.expectedChallenge,
         response: body.response as never,
-        device: deviceContext(req),
+        device: deviceContext(req, body.device),
       });
       if (!outcome.mfaRequired) {
         recordEndUserEvent(req, 'user.signed_in', outcome.endUser.id, { via: 'passkey' });
@@ -1355,8 +1421,13 @@ export async function authenticatedAuthRoutes(app: FastifyInstance): Promise<voi
                 expiresAt: { type: 'string', format: 'date-time' },
                 userAgent: { type: 'string', nullable: true },
                 ip: { type: 'string', nullable: true },
+                deviceId: {
+                  type: 'string',
+                  nullable: true,
+                  description: 'The device this session is bound to, when the client sent a fingerprint.',
+                },
               },
-              required: ['id', 'createdAt', 'expiresAt', 'userAgent', 'ip'],
+              required: ['id', 'createdAt', 'expiresAt', 'userAgent', 'ip', 'deviceId'],
             },
             "A page of the current user's active sessions (live refresh tokens), newest first.",
           ),
@@ -1379,6 +1450,7 @@ export async function authenticatedAuthRoutes(app: FastifyInstance): Promise<voi
             expiresAt: r.expiresAt.toISOString(),
             userAgent: r.userAgent,
             ip: r.ip,
+            deviceId: r.deviceId,
           })),
           total,
           take,

@@ -143,6 +143,15 @@ export interface EndUserClaims<TType extends EndUserTokenType = EndUserTokenType
    * always re-confirmed server-side — a stale `oid` never grants access.
    */
   oid?: string;
+  /**
+   * Device id the session is bound to (`devices.id`), present when the client
+   * identified itself at sign-in or refresh. A claim, not an authorization:
+   * `requireUserSession` surfaces it as `request.deviceId`, and anything that
+   * needs to trust it resolves the row and checks `status` — a device blocked
+   * after the token was minted is still blocked. The 15-minute access lifetime
+   * bounds that window exactly as it does for `gen`.
+   */
+  dev?: string;
   iat: number;
   exp: number;
 }
@@ -160,6 +169,8 @@ export interface IssueOptions {
   lifetimeSeconds?: number;
   /** Active organization id → embedded as the `oid` claim (access tokens only). */
   activeOrganizationId?: string;
+  /** Bound device id → embedded as the `dev` claim (access tokens only). */
+  deviceId?: string;
 }
 
 function signEndUserToken(
@@ -169,9 +180,16 @@ function signEndUserToken(
   tokenGeneration: number,
   lifetimeSeconds: number,
   activeOrganizationId?: string,
+  deviceId?: string,
 ): { token: string; expiresAt: Date } {
   const token = jwt.sign(
-    { typ, sub: endUserId, applicationId, ...(activeOrganizationId && { oid: activeOrganizationId }) },
+    {
+      typ,
+      sub: endUserId,
+      applicationId,
+      ...(activeOrganizationId && { oid: activeOrganizationId }),
+      ...(deviceId && { dev: deviceId }),
+    },
     appSigningKey(applicationId, tokenGeneration),
     { expiresIn: lifetimeSeconds, algorithm: 'HS256' },
   );
@@ -191,6 +209,7 @@ export function issueUserAccessToken(
     tokenGeneration,
     options.lifetimeSeconds ?? DEFAULT_ACCESS_LIFETIME_SECONDS,
     options.activeOrganizationId,
+    options.deviceId,
   );
 }
 
@@ -215,6 +234,7 @@ export function issueUserAccessTokenRS256(
       applicationId,
       gen: tokenGeneration,
       ...(options.activeOrganizationId && { oid: options.activeOrganizationId }),
+      ...(options.deviceId && { dev: options.deviceId }),
     },
     key.privatePem,
     { expiresIn: lifetime, algorithm: 'RS256', keyid: key.kid },

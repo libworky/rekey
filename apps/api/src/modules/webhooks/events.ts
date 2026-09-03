@@ -70,6 +70,22 @@ export const KNOWN_WEBHOOK_EVENTS = [
   'dunning.case_opened',
   'dunning.case_recovered',
   'dunning.case_exhausted',
+  // Devices — the machines an end-user signs in from (modules/devices). Emitted
+  // by the devices service after its transaction commits. `device.registered`
+  // fires for a NEW device and for a RELEASED one coming back (`data.reactivated`
+  // says which); a sign-in from an already-ACTIVE device announces nothing.
+  // `device.limit_reached` is the one event here with no device row behind it:
+  // the machine was refused, and `data.devices` lists the ACTIVE ones that
+  // filled the cap so a consumer can prompt the user to release one.
+  'device.registered',
+  'device.released',
+  'device.blocked',
+  'device.unblocked',
+  'device.limit_reached',
+  // A machine gave its license seat back (POST /licenses/deactivate or an
+  // operator release). `license.activated` is deliberately absent: verify is
+  // called at every launch, and announcing each one would be noise.
+  'license.deactivated',
 ] as const;
 
 /**

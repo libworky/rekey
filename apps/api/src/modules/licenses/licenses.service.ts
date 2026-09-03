@@ -8,15 +8,27 @@
  *
  * Activation tracking:
  *   - PERPETUAL / TIMED:  one row per unique (license, machineFingerprint).
- *     No upper bound today.
+ *     Bounded by the holder's `max_devices` FEATURE entitlement when their
+ *     plans grant one (the same cap that bounds their sessions — see
+ *     modules/devices); uncapped otherwise, which is what every deployment
+ *     had before the entitlement existed.
  *   - SEATS:              same shape, but verification refuses if
- *     `seatsAllowed` would be exceeded.
+ *     `seatsAllowed` would be exceeded. `seatsAllowed` is what was bought and
+ *     is not raised or lowered by `max_devices`.
+ *
+ * An activation with `releasedAt` set has given its seat back: it does not
+ * count toward `seatsAllowed`, and a later verify from the same machine
+ * reactivates the row in place rather than inserting a second one. Rows also
+ * carry `applicationId` (denormalised from the license) so app-scoped
+ * listings and erasure can address them without a join.
  */
 
 import type { Application, EndUser, License, LicenseKind } from '@prisma/client';
 import { prisma } from '../../lib/prisma.js';
 import { RekeyError } from '../../lib/error.js';
 import { generateLicenseKey, hashLicenseKey } from '../../lib/license-keys.js';
+import { emitDetached } from '../webhooks/webhook.service.js';
+import { devicesService } from '../devices/devices.service.js';
 
 export type PublicLicense = Omit<License, 'keyHash'>;
 
@@ -77,6 +89,18 @@ export interface VerifyResult {
     | 'seats_exhausted'
     | 'wrong_application';
 }
+
+export interface DeactivateInput {
+  applicationId: string;
+  rawKey: string;
+  machineFingerprint: string;
+}
+
+export type DeactivateResult =
+  /** The seat was given back (or was already free — idempotent). */
+  | { ok: true; released: boolean }
+  /** Same reasons as verify, minus seat exhaustion: releasing never needs a seat. */
+  | { ok: false; reason: 'unknown' | 'wrong_application' | 'revoked' | 'expired' };
 
 export const licensesService = {
   async listForApplication(
@@ -248,6 +272,20 @@ export const licensesService = {
       return { ok: false, reason: 'expired', license: redactLicense(license) };
     }
 
+    // The cap for this license. SEATS licenses carry their own; the other
+    // kinds borrow the holder's `max_devices` entitlement, when any. Resolved
+    // BEFORE the transaction for the reason devicesService.maxDevicesFor
+    // documents: the entitlement union reads through the global client, and
+    // doing that while holding a transaction's connection is how a pool
+    // deadlocks under load. Org-pooled licenses (`organizationId` set) have no
+    // single end-user to resolve for and stay uncapped unless SEATS.
+    let cap: number | null = null;
+    if (license.kind === 'SEATS' && license.seatsAllowed !== null) {
+      cap = license.seatsAllowed;
+    } else if (license.organizationId === null) {
+      cap = await devicesService.maxDevicesFor(license.applicationId, license.endUserId);
+    }
+
     // Atomic seat allocation + activation upsert.
     //
     // Previously the seat count was read OUTSIDE a transaction, then the
@@ -266,7 +304,7 @@ export const licensesService = {
     const result = await prisma.$transaction(async (tx) => {
       await tx.$queryRaw`SELECT id FROM licenses WHERE id = ${license.id} FOR UPDATE`;
 
-      if (license.kind === 'SEATS' && license.seatsAllowed !== null) {
+      if (cap !== null) {
         const existing = await tx.licenseActivation.findUnique({
           where: {
             licenseId_machineFingerprint: {
@@ -275,9 +313,13 @@ export const licensesService = {
             },
           },
         });
-        if (!existing) {
-          const used = await tx.licenseActivation.count({ where: { licenseId: license.id } });
-          if (used >= license.seatsAllowed) {
+        // A released activation holds no seat, so it is "not existing" for
+        // the count and needs a free seat to come back.
+        if (!existing || existing.releasedAt !== null) {
+          const used = await tx.licenseActivation.count({
+            where: { licenseId: license.id, releasedAt: null },
+          });
+          if (used >= cap) {
             return { kind: 'seats_exhausted' as const };
           }
         }
@@ -291,21 +333,127 @@ export const licensesService = {
           },
         },
         create: {
+          applicationId: license.applicationId,
           licenseId: license.id,
           machineFingerprint: input.machineFingerprint,
           ...(input.label !== undefined && { label: input.label }),
         },
         update: {
           lastSeenAt: new Date(),
+          // Reactivate in place if this machine had released its seat.
+          releasedAt: null,
           ...(input.label !== undefined && { label: input.label }),
         },
       });
       return { kind: 'ok' as const };
     });
 
+    if (result.kind === 'ok') {
+      // Point the activation at the holder's Device row for the same
+      // fingerprint, when one exists, so the seat list and the device list
+      // agree about which machine is which. Best-effort and outside the
+      // seat transaction: a missing device is not a verification failure.
+      const device = await prisma.device.findUnique({
+        where: {
+          applicationId_endUserId_fingerprint: {
+            applicationId: license.applicationId,
+            endUserId: license.endUserId,
+            fingerprint: input.machineFingerprint,
+          },
+        },
+        select: { id: true },
+      });
+      if (device) {
+        await prisma.licenseActivation.updateMany({
+          where: { licenseId: license.id, machineFingerprint: input.machineFingerprint, deviceId: null },
+          data: { deviceId: device.id },
+        });
+      }
+    }
+
     if (result.kind === 'seats_exhausted') {
       return { ok: false, reason: 'seats_exhausted', license: redactLicense(license) };
     }
     return { ok: true, license: redactLicense(license) };
+  },
+
+  /**
+   * Give a seat back from the machine that holds it — the customer's software
+   * calling "deactivate this install" before a re-image, or on uninstall.
+   *
+   * Same deterministic-body contract as `verify`: an invalid key is `ok:
+   * false` + reason, never an HTTP error, so a client can call it from an
+   * uninstaller without try/catch. Releasing is idempotent and never needs a
+   * seat, so `seats_exhausted` cannot occur here. A revoked or expired license
+   * is refused rather than silently "released": there is nothing to give back,
+   * and the client should learn the license is dead.
+   */
+  async deactivate(input: DeactivateInput): Promise<DeactivateResult> {
+    const license = await prisma.license.findUnique({
+      where: { keyHash: hashLicenseKey(input.rawKey) },
+    });
+    if (!license) return { ok: false, reason: 'unknown' };
+    if (license.applicationId !== input.applicationId) return { ok: false, reason: 'wrong_application' };
+    if (license.status === 'REVOKED' || license.revokedAt !== null) return { ok: false, reason: 'revoked' };
+    if (license.expiresAt !== null && license.expiresAt <= new Date()) return { ok: false, reason: 'expired' };
+
+    const now = new Date();
+    const updated = await prisma.licenseActivation.updateMany({
+      where: { licenseId: license.id, machineFingerprint: input.machineFingerprint, releasedAt: null },
+      data: { releasedAt: now },
+    });
+    const released = updated.count === 1;
+    if (released) {
+      emitDetached({
+        applicationId: license.applicationId,
+        type: 'license.deactivated',
+        data: {
+          license: { id: license.id, endUserId: license.endUserId, kind: license.kind },
+          machineFingerprint: input.machineFingerprint,
+          releasedBy: 'client',
+        },
+      });
+    }
+    return { ok: true, released };
+  },
+
+  /**
+   * Operator-side seat release by activation id. Idempotent. Scoped to
+   * (application, license) so an id from elsewhere 404s.
+   */
+  async releaseActivation(args: {
+    applicationId: string;
+    licenseId: string;
+    activationId: string;
+  }): Promise<import('@prisma/client').LicenseActivation> {
+    const activation = await prisma.licenseActivation.findUnique({ where: { id: args.activationId } });
+    if (
+      !activation ||
+      activation.licenseId !== args.licenseId ||
+      activation.applicationId !== args.applicationId
+    ) {
+      throw new RekeyError({
+        statusCode: 404,
+        code: 'LICENSE_ACTIVATION_NOT_FOUND',
+        message: `Activation "${args.activationId}" not found on that license in this application.`,
+        fix: 'List the license\'s activations to see what exists.',
+      });
+    }
+    if (activation.releasedAt !== null) return activation;
+    const released = await prisma.licenseActivation.update({
+      where: { id: activation.id },
+      data: { releasedAt: new Date() },
+    });
+    const license = await prisma.license.findUniqueOrThrow({ where: { id: released.licenseId } });
+    emitDetached({
+      applicationId: args.applicationId,
+      type: 'license.deactivated',
+      data: {
+        license: { id: license.id, endUserId: license.endUserId, kind: license.kind },
+        machineFingerprint: released.machineFingerprint,
+        releasedBy: 'operator',
+      },
+    });
+    return released;
   },
 };

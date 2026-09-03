@@ -701,7 +701,14 @@ export async function organizationsAuthenticatedRoutes(app: FastifyInstance): Pr
         application: req.application!,
         endUserId: req.endUser!.id,
         activeOrganizationId: id,
-        device: { userAgent: req.headers['user-agent'] ?? null, ip: req.ip },
+        // Re-mint on the device the current session is bound to (the `dev`
+        // claim), never a new one — switching teams is not a sign-in.
+        device: {
+          userAgent: req.headers['user-agent'] ?? null,
+          ip: req.ip,
+          deviceId: req.deviceId ?? null,
+          primary: false,
+        },
       });
       return { success: true, data: result };
     },
@@ -725,7 +732,12 @@ export async function organizationsAuthenticatedRoutes(app: FastifyInstance): Pr
         application: req.application!,
         endUserId: req.endUser!.id,
         activeOrganizationId: null,
-        device: { userAgent: req.headers['user-agent'] ?? null, ip: req.ip },
+        device: {
+          userAgent: req.headers['user-agent'] ?? null,
+          ip: req.ip,
+          deviceId: req.deviceId ?? null,
+          primary: false,
+        },
       });
       return { success: true, data: result };
     },

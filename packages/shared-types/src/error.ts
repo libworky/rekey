@@ -44,6 +44,12 @@ export interface RekeyErrorShape {
    * idempotency in-flight conflict. Absent on errors that retrying will not fix.
    */
   retryAfterSeconds?: number | undefined;
+  /**
+   * Structured, code-specific context a client can act on without parsing
+   * `message`. Documented per code (DEVICE_LIMIT_REACHED carries
+   * `{ limit, devices[] }`); absent on every other error.
+   */
+  details?: Record<string, unknown> | undefined;
 }
 
 /**
@@ -68,6 +74,8 @@ export class RekeyError extends Error implements RekeyErrorShape {
   public readonly requestId: string | undefined;
   /** Seconds to wait before retrying, when the server said so (see the shape docs). */
   public readonly retryAfterSeconds: number | undefined;
+  /** Code-specific context, when the server attached any (see the shape docs). */
+  public readonly details: Record<string, unknown> | undefined;
 
   constructor(
     error: RekeyErrorShape & {
@@ -85,5 +93,6 @@ export class RekeyError extends Error implements RekeyErrorShape {
     this.statusCode = error.statusCode;
     this.requestId = error.requestId;
     this.retryAfterSeconds = error.retryAfterSeconds;
+    this.details = error.details;
   }
 }

@@ -233,6 +233,35 @@ export function authRateLimit(maxPerMinute: number): AuthRateLimitConfig {
  * endpoints) while the tight per-identity cap is what actually throttles a
  * credential-guesser.
  */
+/**
+ * Bucket for POST /licenses/verify and /deactivate.
+ *
+ * These routes take the PUBLISHABLE key, so `req.apiKey` is unset and the
+ * global limiter fell back to `req.ip` alone, which put every Application's
+ * licence traffic from one address in one bucket. The unit that bounds a
+ * guesser is (application, IP): a client trying keys against one Application
+ * gets its cap per address, and one Application's launch traffic cannot be
+ * throttled by another's. An earlier version keyed on the key and fingerprint
+ * themselves, which bounded nothing, because every guess is a new key and so
+ * a new bucket. Neither the key nor the fingerprint belongs in a rate-limit
+ * store in any form.
+ */
+export function licenseRateLimitKey(req: FastifyRequest): string {
+  const app = req.application?.id ?? 'anon';
+  return `license:${app}:${req.ip}`;
+}
+
+/**
+ * Per-route config for the licence endpoints; neutered under test like
+ * `authRateLimit`. Unlike the credential routes it FAILS OPEN when the
+ * limiter's store is unreachable: verify is what every desktop client calls
+ * at launch, and a Redis blip should not lock every user out of software they
+ * have paid for. The auth ceiling still rides along.
+ */
+export function licenseRateLimit(maxPerMinute: number): AuthRateLimitConfig {
+  return { ...authRateLimit(maxPerMinute), keyGenerator: licenseRateLimitKey, skipOnError: true };
+}
+
 export function wantsAuthCeiling(rateLimitConfig: unknown): boolean {
   if (typeof rateLimitConfig !== 'object' || rateLimitConfig === null) return false;
   return (rateLimitConfig as Record<string, unknown>)[AUTH_CEILING_MARKER] === true;
