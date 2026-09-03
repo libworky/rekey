@@ -1,15 +1,14 @@
 /**
- * `max_devices` bounds PERPETUAL and TIMED licenses — the fourth step of the
- * device series. Before it, those kinds accepted unlimited activations
- * (documented as "no upper bound today"). Now the holder's entitlement is the
- * bound; SEATS keeps its own `seatsAllowed`; org-pooled licenses and holders
- * with no such entitlement are unchanged.
+ * `max_devices` bounds PERPETUAL and TIMED licenses. The holder's entitlement
+ * is the bound; SEATS keeps its own `seatsAllowed`; org-pooled licenses and
+ * holders with no such entitlement stay uncapped.
  */
 
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import type { FastifyInstance } from 'fastify';
 import { buildApp } from '../src/app.js';
 import { prisma } from '../src/lib/prisma.js';
+import { setDefaultDeviceLimit as setDefaultDeviceLimitFor } from './device-fixtures.js';
 import { licensesService } from '../src/modules/licenses/licenses.service.js';
 
 describe('max_devices bounds perpetual and timed licenses', () => {
@@ -46,6 +45,8 @@ describe('max_devices bounds perpetual and timed licenses', () => {
       .then((r) => (r.json().data as { id: string }).id);
   });
 
+  const setDefaultDeviceLimit = (limit: number) => setDefaultDeviceLimitFor(app, token, appId, limit);
+
   async function makeEndUser(email: string): Promise<{ id: string }> {
     const id = await app
       .inject({
@@ -58,31 +59,16 @@ describe('max_devices bounds perpetual and timed licenses', () => {
     return { id };
   }
 
-  async function setDefaultDeviceLimit(limit: number): Promise<void> {
-    const slug = `free-${limit}`;
-    await app.inject({
-      method: 'POST',
-      url: `/api/v1/tenant/applications/${appId}/plans`,
-      headers: auth(),
-      payload: { slug, name: slug, amount: 0, kind: 'SUBSCRIPTION' },
-    });
-    await app.inject({
-      method: 'PUT',
-      url: `/api/v1/tenant/applications/${appId}/plans/${slug}/entitlements`,
-      headers: auth(),
-      payload: { kind: 'FEATURE', key: 'max_devices', valueType: 'INT', value: String(limit) },
-    });
-    const application = await prisma.application.findUniqueOrThrow({ where: { id: appId } });
-    await prisma.application.update({
-      where: { id: appId },
-      data: { billingConfig: { ...(application.billingConfig as object), defaultPlanSlug: slug } as never },
-    });
-  }
 
-  async function issue(endUserId: string, kind: 'PERPETUAL' | 'TIMED' | 'SEATS', extra: Record<string, unknown> = {}) {
+  type IssueInput = Parameters<typeof licensesService.issue>[0];
+  async function issue(
+    endUserId: string,
+    kind: IssueInput['kind'],
+    extra: Partial<Omit<IssueInput, 'application' | 'endUser' | 'kind'>> = {},
+  ) {
     const application = await prisma.application.findUniqueOrThrow({ where: { id: appId } });
     const endUser = await prisma.endUser.findUniqueOrThrow({ where: { id: endUserId } });
-    return licensesService.issue({ application, endUser, kind, ...extra } as never);
+    return licensesService.issue({ application, endUser, kind, ...extra });
   }
 
   const verify = (rawKey: string, fp: string) =>

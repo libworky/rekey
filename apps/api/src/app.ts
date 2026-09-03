@@ -80,6 +80,7 @@ import {
 import { tenantOAuthPublicRoutes } from './modules/tenant-oauth/index.js';
 import { licensesPublicRoutes } from './modules/licenses/index.js';
 import { devicesServerRoutes, devicesUserRoutes, tenantDevicesRoutes } from './modules/devices/index.js';
+import { tenantLicenseActivationRoutes } from './modules/licenses/index.js';
 import { portalConfigRoutes } from './modules/portal/index.js';
 import { usagePublicRoutes } from './modules/usage/index.js';
 import { creditsPublicRoutes } from './modules/credits/index.js';
@@ -650,6 +651,7 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
   await app.register(tenantEmailRoutes, { prefix: '/api/v1/tenant/applications' });
   await app.register(tenantWebhookRoutes, { prefix: '/api/v1/tenant/applications' });
   await app.register(tenantDevicesRoutes, { prefix: '/api/v1/tenant/applications' });
+  await app.register(tenantLicenseActivationRoutes, { prefix: '/api/v1/tenant/applications' });
   await app.register(tenantMfaRoutes, { prefix: '/api/v1/tenant/auth/mfa' });
   await app.register(securityEventsRoutes, { prefix: '/api/v1/tenant/security-events' });
   await app.register(tenantPasskeysAuthenticatedRoutes, { prefix: '/api/v1/tenant/auth' });

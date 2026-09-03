@@ -12,7 +12,7 @@
 
 import { createHash } from 'node:crypto';
 import { decodeJwtPayload, emailFromClaims, fetchJsonWithTimeout } from './_oauth2-base.js';
-import { assertSafeUrl } from '../../../lib/ssrf-guard.js';
+import { assertSafeUrlResolved, pinnedFetchInit } from '../../../lib/ssrf-guard.js';
 import { RekeyError } from '../../../lib/error.js';
 import type {
   BuildAuthUrlInput,
@@ -87,6 +87,32 @@ export function __resetForTests(): void {
   discoveryCache.clear();
 }
 
+/** The claim checks an ID token must pass before its `sub` names an account. */
+function assertIdTokenClaims(
+  claims: Record<string, unknown>,
+  expected: { issuer: string; clientId: string },
+): void {
+  const refuse = (what: string): never => {
+    throw new RekeyError({
+      statusCode: 502,
+      code: 'OAUTH_ID_TOKEN_INVALID',
+      message: `The identity provider returned an ID token that ${what}.`,
+      fix: 'Check the issuer URL and client id configured for this provider; the token must be issued by that issuer for that client.',
+    });
+  };
+  const sub = claims['sub'];
+  if (typeof sub !== 'string' || sub.length === 0) refuse('carries no subject');
+  const iss = claims['iss'];
+  if (typeof iss !== 'string' || iss.replace(/\/$/, '') !== expected.issuer.replace(/\/$/, '')) {
+    refuse('names a different issuer');
+  }
+  const aud = claims['aud'];
+  const audiences = Array.isArray(aud) ? aud : [aud];
+  if (!audiences.includes(expected.clientId)) refuse('was issued for a different client');
+  const exp = claims['exp'];
+  if (typeof exp !== 'number' || exp * 1000 <= Date.now()) refuse('has expired');
+}
+
 async function discover(issuerUrl: string): Promise<DiscoveryDoc> {
   const url = issuerUrl.replace(/\/$/, '') + '/.well-known/openid-configuration';
   const cached = discoveryCache.get(url);
@@ -94,11 +120,13 @@ async function discover(issuerUrl: string): Promise<DiscoveryDoc> {
   if (cached) discoveryCache.delete(url);
   const promise = (async (): Promise<DiscoveryDoc> => {
     // SSRF guard: `issuerUrl` is tenant-controlled (Application.oauthConfig).
-    // Reject internal/loopback/metadata targets before fetching.
-    await assertSafeUrl(url);
+    // Reject internal/loopback/metadata targets, and connect only to the
+    // addresses the guard approved so a rebinding record cannot swap in an
+    // internal one between the check and the connect (see pinnedFetchInit).
     const res = await fetchJsonWithTimeout(url, {
       headers: { Accept: 'application/json' },
       redirect: 'error',
+      ...pinnedFetchInit(await assertSafeUrlResolved(url)),
     });
     if (!res.ok) {
       throw new Error(`OIDC discovery failed for ${url}: HTTP ${res.status}`);
@@ -182,12 +210,12 @@ export class OidcProvider implements OAuthProvider {
     }
     // Discovered endpoints are attacker-influenceable too (a malicious
     // discovery doc can point them anywhere) — validate before fetching.
-    await assertSafeUrl(doc.token_endpoint);
     const tokenRes = await fetchJsonWithTimeout(doc.token_endpoint, {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded', Accept: 'application/json' },
       body: tokenBody.toString(),
       redirect: 'error',
+      ...pinnedFetchInit(await assertSafeUrlResolved(doc.token_endpoint)),
     });
     if (!tokenRes.ok) {
       // The authorization server says why in the body (RFC 6749 §5.2:
@@ -219,20 +247,28 @@ export class OidcProvider implements OAuthProvider {
 
     if (tokenData.id_token) {
       const claims = decodeJwtPayload(tokenData.id_token);
+      // The token came back over TLS from the issuer's own token endpoint in
+      // exchange for our code and client secret, so its signature is not
+      // re-verified here; the claims that bind it to THIS exchange are. An
+      // issuer that answers for a different issuer, for another client, with
+      // an expired token, or without a subject is not one to create an
+      // account from: an empty `sub` would fold every user of the provider
+      // onto one identity.
+      assertIdTokenClaims(claims, { issuer: doc.issuer, clientId: input.config.clientId });
       return {
-        providerAccountId: String(claims['sub'] ?? ''),
+        providerAccountId: String(claims['sub']),
         ...emailFromClaims(claims),
       };
     }
 
     if (doc.userinfo_endpoint && tokenData.access_token) {
-      await assertSafeUrl(doc.userinfo_endpoint);
       const userRes = await fetchJsonWithTimeout(doc.userinfo_endpoint, {
         headers: {
           Authorization: `Bearer ${tokenData.access_token}`,
           Accept: 'application/json',
         },
         redirect: 'error',
+        ...pinnedFetchInit(await assertSafeUrlResolved(doc.userinfo_endpoint)),
       });
       if (!userRes.ok) {
         throw new Error(`OIDC userinfo failed: HTTP ${userRes.status}`);

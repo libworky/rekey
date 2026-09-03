@@ -224,16 +224,6 @@ export function authRateLimit(maxPerMinute: number): AuthRateLimitConfig {
 }
 
 /**
- * Does this matched route want the per-Application auth ceiling?
- *
- * The ceiling reuses the global budget (`RATE_LIMIT_MAX` per
- * `RATE_LIMIT_WINDOW_MS`) — precisely what auth routes lost by overriding the
- * global limiter with their own config. So the aggregate posture is unchanged
- * (one Application still can't exceed the deployment's per-key budget on auth
- * endpoints) while the tight per-identity cap is what actually throttles a
- * credential-guesser.
- */
-/**
  * Bucket for POST /licenses/verify and /deactivate.
  *
  * These routes take the PUBLISHABLE key, so `req.apiKey` is unset and the
@@ -241,10 +231,9 @@ export function authRateLimit(maxPerMinute: number): AuthRateLimitConfig {
  * licence traffic from one address in one bucket. The unit that bounds a
  * guesser is (application, IP): a client trying keys against one Application
  * gets its cap per address, and one Application's launch traffic cannot be
- * throttled by another's. An earlier version keyed on the key and fingerprint
- * themselves, which bounded nothing, because every guess is a new key and so
- * a new bucket. Neither the key nor the fingerprint belongs in a rate-limit
- * store in any form.
+ * throttled by another's. Keying on the licence key or the fingerprint would
+ * bound nothing, because every guess is a new key and so a new bucket; and
+ * neither belongs in a rate-limit store in any form.
  */
 export function licenseRateLimitKey(req: FastifyRequest): string {
   const app = req.application?.id ?? 'anon';
@@ -268,6 +257,16 @@ export function licenseRateLimit(maxPerMinute: number): Omit<AuthRateLimitConfig
   return { ...base, keyGenerator: licenseRateLimitKey, skipOnError: true };
 }
 
+/**
+ * Does this matched route want the per-Application auth ceiling?
+ *
+ * The ceiling reuses the global budget (`RATE_LIMIT_MAX` per
+ * `RATE_LIMIT_WINDOW_MS`) — precisely what auth routes lost by overriding the
+ * global limiter with their own config. So the aggregate posture is unchanged
+ * (one Application still can't exceed the deployment's per-key budget on auth
+ * endpoints) while the tight per-identity cap is what actually throttles a
+ * credential-guesser.
+ */
 export function wantsAuthCeiling(rateLimitConfig: unknown): boolean {
   if (typeof rateLimitConfig !== 'object' || rateLimitConfig === null) return false;
   return (rateLimitConfig as Record<string, unknown>)[AUTH_CEILING_MARKER] === true;

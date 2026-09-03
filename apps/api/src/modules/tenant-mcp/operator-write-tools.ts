@@ -65,6 +65,7 @@ import { tenantWorkspacesService } from '../tenant-workspaces/tenant-workspaces.
 import { organizationRolesService } from '../organization-roles/organization-roles.service.js';
 import { AuthConfigSchema } from '@rekey.dev/shared-types';
 import { devicesService } from '../devices/devices.service.js';
+import { assertEndUserInApplication } from '../../lib/end-users.js';
 import {
   accessibleApplicationIds,
   type OperatorTool,
@@ -199,18 +200,7 @@ async function loadEndUserInApp(
   endUserId: string,
 ): Promise<Application> {
   const app = await loadAppInTenant(ctx, applicationId);
-  const endUser = await prisma.endUser.findUnique({
-    where: { id: endUserId },
-    select: { applicationId: true },
-  });
-  if (!endUser || endUser.applicationId !== app.id) {
-    throw new RekeyError({
-      statusCode: 404,
-      code: 'END_USER_NOT_FOUND',
-      message: `End-user "${endUserId}" not found in this Application.`,
-      fix: 'Use get_end_user to find the id.',
-    });
-  }
+  await assertEndUserInApplication(app.id, endUserId, 'Use get_end_user to find the id.');
   return app;
 }
 

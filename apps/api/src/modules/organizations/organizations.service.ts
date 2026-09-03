@@ -52,6 +52,7 @@ import type {
 import { createHash, randomBytes } from 'node:crypto';
 import { prisma } from '../../lib/prisma.js';
 import { RekeyError } from '../../lib/error.js';
+import { assertMetadataWithinLimit } from '../../lib/metadata-limit.js';
 import { AuthConfigSchema } from '@rekey.dev/shared-types';
 import { organizationRolesService } from '../organization-roles/organization-roles.service.js';
 
@@ -192,6 +193,7 @@ export const organizationsService = {
       });
     }
     try {
+      if (args.metadata !== undefined) assertMetadataWithinLimit(args.metadata);
       return await prisma.$transaction(async (tx) => {
         const org = await tx.organization.create({
           data: {
@@ -290,6 +292,7 @@ export const organizationsService = {
     metadata?: Record<string, unknown>;
   }): Promise<OrganizationDto> {
     const m = await this.requireRole(args, ['OWNER', 'ADMIN']);
+    if (args.metadata !== undefined) assertMetadataWithinLimit(args.metadata);
     const updated = await prisma.organization.update({
       where: { id: m.organizationId },
       data: {
@@ -1002,6 +1005,7 @@ export const organizationsService = {
       await this.adminAssertEndUserInApp(args.applicationId, args.ownerEndUserId);
     }
     try {
+      if (args.metadata !== undefined) assertMetadataWithinLimit(args.metadata);
       const org = await prisma.$transaction(async (tx) => {
         const created = await tx.organization.create({
           data: {
@@ -1040,6 +1044,7 @@ export const organizationsService = {
     metadata?: Record<string, unknown>;
   }): Promise<OrganizationDto> {
     const org = await this.adminLoadOrThrow(args);
+    if (args.metadata !== undefined) assertMetadataWithinLimit(args.metadata);
     const updated = await prisma.organization.update({
       where: { id: org.id },
       data: {

@@ -28,7 +28,8 @@ import type { Application, EndUser } from '@prisma/client';
 import { prisma } from '../../lib/prisma.js';
 import { RekeyError } from '../../lib/error.js';
 import { devicesService } from '../devices/devices.service.js';
-import { hashPassword, needsRehash, verifyPassword } from '../../lib/passwords.js';
+import { hashPassword, needsRehash, verifyPassword, verifyPasswordOrDecoy } from '../../lib/passwords.js';
+import { assertMetadataWithinLimit } from '../../lib/metadata-limit.js';
 import { checkPasswordBreached } from '../../lib/breached-password.js';
 import { env } from '../../config/env.js';
 import {
@@ -179,19 +180,7 @@ function redact(user: EndUser): PublicEndUser {
  * failed on bytes the user could no longer remove. A ceiling one writer
  * enforces is a bug in the other writers, not a ceiling.
  */
-export const METADATA_MAX_BYTES = 16 * 1024;
-
-export function assertMetadataWithinLimit(metadata: Record<string, unknown>): void {
-  const bytes = Buffer.byteLength(JSON.stringify(metadata), 'utf8');
-  if (bytes > METADATA_MAX_BYTES) {
-    throw new RekeyError({
-      statusCode: 400,
-      code: 'METADATA_TOO_LARGE',
-      message: `Metadata would be ${bytes} bytes after merging; the limit is ${METADATA_MAX_BYTES}.`,
-      fix: 'Store large values (files, documents, long text) in your own storage and keep only a reference here.',
-    });
-  }
-}
+export { METADATA_MAX_BYTES, assertMetadataWithinLimit } from '../../lib/metadata-limit.js';
 
 /**
  * GDPR erasure gate (roadmap §10). A tombstoned EndUser (`erasedAt` set) has
@@ -289,25 +278,12 @@ export interface DeviceContext {
 }
 
 /**
- * Resolve the device a new session should be bound to, or null.
- *
- * Three inputs, one outcome: a fingerprint registers/refreshes the device
- * (the limit is enforced here, so a new machine over the cap never gets a
- * token); a bare `deviceId` re-touches a device the session was already bound
- * to (a blocked one still refuses); neither leaves the session unbound —
- * unless the Application requires binding and this is a primary sign-in.
- *
- * Refusals are thrown as the errors the route documents. The device list on
- * DEVICE_LIMIT_REACHED rides in `details` so a client can offer "release one"
- * rather than a dead end.
- */
-/**
  * Refuse a primary sign-in that carries no fingerprint when the Application
  * requires one. Split out of `bindDevice` so the paths that CREATE an account
- * (sign-up, first OAuth login, first magic-link login) can ask before the
- * row exists: a client that forgot `device` used to get the account created,
- * the welcome mail sent and `user.created` emitted, and then a 400 from the
- * session step, so its corrected retry was met with EMAIL_ALREADY_EXISTS.
+ * (sign-up, first OAuth login, first magic-link login) can ask before the row
+ * exists. Asked only afterwards, a client that forgot `device` would have the
+ * account created, the welcome mail sent and `user.created` emitted, and its
+ * corrected retry would meet EMAIL_ALREADY_EXISTS.
  */
 export function assertDeviceBindingSatisfiable(
   application: Application,
@@ -325,6 +301,19 @@ export function assertDeviceBindingSatisfiable(
   }
 }
 
+/**
+ * Resolve the device a new session should be bound to, or null.
+ *
+ * Three inputs, one outcome: a fingerprint registers/refreshes the device
+ * (the limit is enforced here, so a new machine over the cap never gets a
+ * token); a bare `deviceId` re-touches a device the session was already bound
+ * to (a blocked one still refuses); neither leaves the session unbound —
+ * unless the Application requires binding and this is a primary sign-in.
+ *
+ * Refusals are thrown as the errors the route documents. The device list on
+ * DEVICE_LIMIT_REACHED rides in `details` so a client can offer "release one"
+ * rather than a dead end.
+ */
 async function bindDevice(
   application: Application,
   endUser: EndUser,
@@ -842,7 +831,11 @@ export const authService = {
 
     // Single error code — never disclose whether email or password was wrong.
     const valid =
-      endUser !== null && (await verifyPassword(endUser.passwordHash, input.password));
+      // The decoy variant: an unknown address, or one with no password, costs
+      // the same argon2 work as a wrong password, so the response time does
+      // not say which accounts exist. The operator sign-in has always done
+      // this; the end-user one is reachable with a publishable key.
+      (await verifyPasswordOrDecoy(endUser?.passwordHash ?? null, input.password)) && endUser !== null;
     if (valid && endUser !== null && endUser.passwordHash && needsRehash(endUser.passwordHash)) {
       // An imported bcrypt hash just verified: this is the one moment the
       // plaintext is in hand, so upgrade to argon2id now. Best-effort — a

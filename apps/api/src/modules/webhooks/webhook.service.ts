@@ -63,9 +63,7 @@ import { prisma } from '../../lib/prisma.js';
 import { RekeyError } from '../../lib/error.js';
 import { env } from '../../config/env.js';
 import { signWebhook, generateWebhookSecret } from '../../lib/webhook-signing.js';
-import type { LookupAddress, LookupOptions } from 'node:dns';
-import { Agent } from 'undici';
-import { assertSafeUrlResolved } from '../../lib/ssrf-guard.js';
+import { pinnedFetchInit, assertSafeUrlResolved } from '../../lib/ssrf-guard.js';
 import {
   endpointMatches,
   isKnownWebhookEvent,
@@ -89,49 +87,6 @@ const MAX_ATTEMPTS = 5;
 const RETRY_DELAYS_SECONDS = [30, 120, 600, 3600, 14400];
 const REQUEST_TIMEOUT_MS = 10_000;
 
-/**
- * An undici dispatcher whose DNS lookup answers only from a pre-validated set.
- *
- * This is what closes the rebinding window: the guard resolved the host and
- * approved these addresses, and the socket must go to one of *them* rather
- * than to whatever a second DNS query returns a moment later. TLS still
- * validates against the original hostname, because undici keeps the URL's
- * servername — pinning the address is not the same as connecting by IP, which
- * would break certificate verification.
- *
- * Built per delivery rather than cached: the validated set is specific to this
- * attempt, and a pool keyed on the host would outlive it.
- */
-function pinnedDispatcher(allowed: string[]): Agent {
-  return new Agent({
-    connect: {
-      lookup: (
-        _hostname: string,
-        options: LookupOptions,
-        callback: (
-          err: NodeJS.ErrnoException | null,
-          address: string | LookupAddress[],
-          family?: number,
-        ) => void,
-      ): void => {
-        const entries = allowed.map((address) => ({
-          address,
-          family: address.includes(':') ? 6 : 4,
-        }));
-        if (options.all) {
-          callback(null, entries);
-          return;
-        }
-        const first = entries[0];
-        if (!first) {
-          callback(new Error('no validated address to connect to'), '');
-          return;
-        }
-        callback(null, first.address, first.family);
-      },
-    },
-  });
-}
 
 
 // Max stored response-body bytes. We stop READING at this point too (not
@@ -328,13 +283,7 @@ async function postOnce(args: {
     // against their own application. The dispatcher's `lookup` below answers
     // from the validated set instead of asking DNS a second time.
     const allowed = await assertSafeUrlResolved(args.url);
-    // `dispatcher` is not in the DOM RequestInit that TS resolves here — Node's
-    // fetch accepts it and undici reads it. Narrowed at the call site rather
-    // than widening the global type.
-    const pinned =
-      allowed.length > 0
-        ? ({ dispatcher: pinnedDispatcher(allowed) } as unknown as RequestInit)
-        : ({} as RequestInit);
+    const pinned = pinnedFetchInit(allowed);
     const res = await fetch(args.url, {
       method: 'POST',
       headers: {
