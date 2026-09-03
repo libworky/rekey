@@ -323,7 +323,7 @@ describe('discovery projection (P4)', () => {
           // refund button from this, and a button for a provider that cannot
           // refund is one an operator presses after promising a customer their
           // money back.
-          ...(d.capabilities.refunds !== undefined ? ['refunds'] : []),
+          ...(name === 'external' ? [] : ['refunds']),
           'trials',
         ].sort(),
       );

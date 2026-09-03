@@ -68,6 +68,14 @@ export const subscriberService = {
           fix: 'Name the subscriber by email instead; an unknown address is created.',
         });
       }
+      if (found.erasedAt !== null) {
+        throw new RekeyError({
+          statusCode: 410,
+          code: 'END_USER_ERASED',
+          message: `End-user "${input.subscriber.endUserId}" was erased; nothing can be granted to the tombstone.`,
+          fix: 'Remove the customer from your billing system as well, or name a different subscriber.',
+        });
+      }
       return { id: found.id, email: found.email, created: false };
     }
 
