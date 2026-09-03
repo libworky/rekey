@@ -166,6 +166,7 @@ Selected mutating routes accept an `Idempotency-Key` header for safe blind retri
 | `DEVICE_LIMIT_REACHED` | 403 | A new (or released) device would exceed the end-user's `max_devices` entitlement. No token was issued. `details` carries `{ limit, devices: [{ id, label, firstSeenAt, lastSeenAt }] }`, the active devices filling the cap. On refresh, the presented token is NOT spent. | Offer the user the list to release (via a session without `device`, your backend's `POST /api/v1/devices/:id/release`, or an operator), or upgrade the plan. |
 | `DEVICE_BLOCKED` | 403 / 409 | 403: sign-in from a fingerprint an operator blocked. 409: an end-user tried to release a blocked device. | Only an operator can unblock (`POST …/devices/:id/unblock`). |
 | `DEVICE_NOT_FOUND` | 404 | No device with that id belongs to that end-user in this Application; a device from another user or Application looks the same as a typo. | List the user's devices. |
+| `SESSION_DEVICE_RELEASED` | 401 | A refresh or organization switch on a session bound to a device that has since been released. A re-mint never brings a released device back. | Sign the user in again from this device. |
 | `REFRESH_TOKEN_DEVICE_MISMATCH` | 401 | A refresh chain bound to one device was refreshed with a different fingerprint. **Treated as a compromise signal**: every session for the user is revoked. | Sign the user in again from this device. |
 | `REFRESH_TOKEN_REVOKED` | 401 | The token was explicitly revoked — sign-out, sign-out-everywhere, an operator ending the session, or the family being burned by a `REFRESH_TOKEN_REUSED` elsewhere. Distinct from `_REUSED`: this token was never presented twice, it was invalidated by something else. | Send the user through sign-in again. Not on its own a compromise signal. |
 | `REFRESH_TOKEN_EXPIRED` | 401 | Refresh token past its 30-day window. | Send the user through sign-in again. |
@@ -177,7 +178,7 @@ Selected mutating routes accept an `Idempotency-Key` header for safe blind retri
 
 | Code | HTTP | When | How to handle |
 |---|---|---|---|
-| `PASSWORD_HASH_UNSUPPORTED` | 400 | A row's `passwordHash` is not a well-formed argon2id PHC string or a bcrypt hash at cost 14 or below. The whole batch is refused before any write. | Send hashes as the old system stores them, or omit `passwordHash` and let the user reset. |
+| `PASSWORD_HASH_UNSUPPORTED` | 400 | A row's `passwordHash` is not a well-formed argon2id PHC string within the parameter budget (`m` ≤ 262144 KiB, `t` ≤ 10, `p` ≤ 8) or a bcrypt hash at cost 12 or below. The ceilings exist because sign-in honours whatever the stored hash asks for, and an unbounded import would let one tenant make sign-in a memory and CPU sink. The whole batch is refused before any write. | Send hashes as the old system stores them, or omit `passwordHash` and let the user reset. |
 | `IMPORT_DUPLICATE_EMAIL` | 400 | The same address (case-insensitively) appears twice in one batch. | Send each address once. |
 
 ### Auth — email flows (reset, verification, magic link)

@@ -771,7 +771,11 @@ class AuthClient {
    * the response carries `mfaChallengeToken` and you must complete via
    * `mfaVerify(...)`.
    */
-  verifyMagicLink(input: { token: string }): Promise<SignInOutcomeDto> {
+  verifyMagicLink(input: {
+    token: string;
+    /** Bind the session to a device — see docs/devices.md. */
+    device?: { fingerprint: string; label?: string };
+  }): Promise<SignInOutcomeDto> {
     return this.client.send('POST', '/api/v1/auth/magic-link/verify', input);
   }
 
@@ -796,6 +800,8 @@ class AuthClient {
   verifyPasskeyAuthentication(input: {
     response: unknown;
     expectedChallenge: string;
+    /** Bind the session to a device — see docs/devices.md. */
+    device?: { fingerprint: string; label?: string };
   }): Promise<SignInOutcomeDto> {
     return this.client.send('POST', '/api/v1/auth/passkey/authenticate/complete', input);
   }
@@ -1190,11 +1196,18 @@ class AuthClient {
    * `SignInOutcome` — branch on `mfaRequired` before reading `accessToken`.
    * Verify the `state` CSRF value yourself before calling.
    */
-  completeOAuth(provider: string, code: string): Promise<SignInOutcomeDto> {
+  completeOAuth(
+    provider: string,
+    code: string,
+    options?: {
+      /** Bind the session to a device — see docs/devices.md. */
+      device?: { fingerprint: string; label?: string };
+    },
+  ): Promise<SignInOutcomeDto> {
     return this.client.send(
       'POST',
       `/api/v1/auth/oauth/${encodeURIComponent(provider)}/callback`,
-      { code },
+      { code, ...(options?.device && { device: options.device }) },
     );
   }
 
@@ -1641,6 +1654,13 @@ export interface ImportUserInput {
 export interface ImportUsersResult {
   created: Array<{ id: string; email: string }>;
   skipped: Array<{ email: string; reason: string }>;
+  /**
+   * OAuth identities that were NOT linked because the provider account is
+   * already attached to another end-user in this Application. The user was
+   * still created; their sign-in through that provider lands on the OTHER
+   * account until one of the two is fixed.
+   */
+  unlinked: Array<{ email: string; provider: string; providerAccountId: string }>;
 }
 
 class UsageClient {

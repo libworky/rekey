@@ -223,6 +223,33 @@ describe('device-bound sessions', () => {
     expect((withDevice.json().data as Session).deviceId).toBeTruthy();
   });
 
+  it('a released device is not brought back by an organization switch on a still-valid access token', async () => {
+    const userId = await makeEndUser('org@example.com');
+    const s = (await signIn('org@example.com', { fingerprint: 'fp-org-switch-001' })).json().data as Session;
+    const orgId = await app
+      .inject({
+        method: 'POST',
+        url: `/api/v1/tenant/applications/${appId}/organizations`,
+        headers: auth(),
+        payload: { name: 'team', slug: 'team', ownerEndUserId: userId },
+      })
+      .then((r) => (r.json().data as { id: string }).id);
+    await devicesService.release({ applicationId: appId, endUserId: userId, deviceId: s.deviceId!, actor: { type: 'end_user', id: userId } });
+
+    // The access token is still valid for its lifetime; the re-mint it asks
+    // for must not reactivate the device it is bound to.
+    const switched = await app.inject({
+      method: 'POST',
+      url: `/api/v1/users/me/organizations/${orgId}/switch`,
+      headers: { ...keyAuth(), 'x-rekey-user-token': s.accessToken },
+    });
+    expect(switched.statusCode).toBe(401);
+    expect(switched.json().error.code).toBe('SESSION_DEVICE_RELEASED');
+    const device = await prisma.device.findUniqueOrThrow({ where: { id: s.deviceId! } });
+    expect(device.status).toBe('RELEASED');
+    expect(await prisma.refreshToken.count({ where: { endUserId: userId, revokedAt: null } })).toBe(0);
+  });
+
   it('a refresh refused by the device limit does not spend the token', async () => {
     await setDefaultDeviceLimit(1);
     const userId = await makeEndUser('cap@example.com');

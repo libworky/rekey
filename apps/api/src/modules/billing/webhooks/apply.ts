@@ -430,6 +430,24 @@ export async function applySubscriptionGranted(
       },
     },
   });
+  // The sender's id already names a subscription ANOTHER provider created.
+  // Stripe ids are printed on invoices; a sender that reuses one, by accident
+  // or otherwise, must not be able to retire the hosted row. Recorded and
+  // ignored, like the same-plan case below.
+  if (holder && holder.provider !== null && holder.provider !== ev.provider) {
+    ctx.log.error(
+      {
+        subscriptionId: holder.id,
+        currentProvider: holder.provider,
+        provider: ev.provider,
+        providerSubscriptionId: ev.providerSubscriptionId,
+        providerEventId: ev.providerEventId,
+      },
+      'subscription.granted names a subscription id that belongs to another provider — ignored',
+    );
+    await recordRefusedGrant(holder, ev, now);
+    return;
+  }
   if (holder && (holder.planId !== plan.id || holder.endUserId !== subscriber.id)) {
     await retireReplacedSubscription(holder, ev, ctx);
   }
@@ -482,28 +500,7 @@ export async function applySubscriptionGranted(
       },
       'subscription.granted names a subscriber whose live subscription belongs to another provider — not rebound',
     );
-    const previous =
-      typeof existing.metadata === 'object' && existing.metadata !== null && !Array.isArray(existing.metadata)
-        ? (existing.metadata as Record<string, unknown>)
-        : {};
-    const refused = Array.isArray(previous.refusedGrants) ? previous.refusedGrants.slice(-19) : [];
-    await prisma.subscription.update({
-      where: { id: existing.id },
-      data: {
-        metadata: {
-          ...previous,
-          refusedGrants: [
-            ...refused,
-            {
-              provider: ev.provider,
-              providerSubId: ev.providerSubscriptionId,
-              providerEventId: ev.providerEventId,
-              at: now.toISOString(),
-            },
-          ],
-        } as never,
-      },
-    });
+    await recordRefusedGrant(existing, ev, now);
     return;
   }
   const periodAdvanced =
@@ -538,12 +535,18 @@ export async function applySubscriptionGranted(
     if (count === 0 || !recovering) return [];
     return enqueueSubscriptionEvent(tx, 'subscription.activated', existing.id);
   });
+  // Provision on every pass, not only when the period moved. Provisioning is
+  // idempotent per period anchor, so a replay costs a few reads; what it buys
+  // is retry safety. The grant path commits the row and then provisions, and
+  // if provisioning throws, the pipeline answers 5xx and the sender retries
+  // the same event, which now lands here with nothing "new" to do. Without
+  // this the period's entitlements would never be materialised.
+  const row = await prisma.subscription.findUniqueOrThrow({ where: { id: existing.id } });
+  await entitlementsService.provision({ subscription: row, log: ctx.log });
+  // Announce after the entitlements exist, the ordering every other
+  // activation path promises its consumers.
   kickDeliveries(deliveryIds);
   if (recovering) await dunningService.recoverForSubscription(existing.id);
-  if (periodAdvanced || recovering) {
-    const row = await prisma.subscription.findUniqueOrThrow({ where: { id: existing.id } });
-    await entitlementsService.provision({ subscription: row, log: ctx.log });
-  }
   ctx.log.info(
     {
       subscriptionId: existing.id,
@@ -554,6 +557,36 @@ export async function applySubscriptionGranted(
     },
     'subscription.granted — already entitled',
   );
+}
+
+/** Keep the last twenty refused activations on the row for the operator. */
+async function recordRefusedGrant(
+  row: Subscription,
+  ev: SubscriptionGrantedEvent,
+  now: Date,
+): Promise<void> {
+  const previous =
+    typeof row.metadata === 'object' && row.metadata !== null && !Array.isArray(row.metadata)
+      ? (row.metadata as Record<string, unknown>)
+      : {};
+  const refused = Array.isArray(previous.refusedGrants) ? previous.refusedGrants.slice(-19) : [];
+  await prisma.subscription.update({
+    where: { id: row.id },
+    data: {
+      metadata: {
+        ...previous,
+        refusedGrants: [
+          ...refused,
+          {
+            provider: ev.provider,
+            providerSubId: ev.providerSubscriptionId,
+            providerEventId: ev.providerEventId,
+            at: now.toISOString(),
+          },
+        ],
+      } as never,
+    },
+  });
 }
 
 /**
@@ -1080,6 +1113,29 @@ function localSubscriptionWhere(
   return or.length > 0 ? { applicationId, OR: or } : null;
 }
 
+/**
+ * The local subscription an event may act on: the row its ids match, unless
+ * that row was created by a DIFFERENT provider. Provider subscription ids
+ * are not secret (a Stripe id is on every invoice), and the external module
+ * accepts whatever id its sender chooses, so an event verified with one
+ * provider's credentials must not reach a row that belongs to another. A
+ * row with no provider (a legacy or hand-granted one) is fair game, as it
+ * always was; contexts without a provider (tests) keep the historical
+ * behaviour.
+ */
+async function findOwnedSubscription(
+  where: NonNullable<ReturnType<typeof localSubscriptionWhere>>,
+  ctx: ApplyContext,
+): Promise<Subscription | null> {
+  const row = await prisma.subscription.findFirst({ where });
+  if (!row || !ctx.provider || row.provider === null || row.provider === ctx.provider) return row;
+  ctx.log.warn(
+    { subscriptionId: row.id, rowProvider: row.provider, eventProvider: ctx.provider },
+    'billing event matched a subscription created by another provider — ignored',
+  );
+  return null;
+}
+
 export async function applyPaymentSucceeded(
   ev: PaymentSucceededEvent,
   ctx: ApplyContext,
@@ -1092,7 +1148,7 @@ export async function applyPaymentSucceeded(
 
   // Find local subscription if present so the Payment links to it.
   const where = localSubscriptionWhere(ev.applicationId, ev.providerSubscriptionId, ev.checkoutSessionId);
-  const localSub = where ? await prisma.subscription.findFirst({ where }) : null;
+  const localSub = where ? await findOwnedSubscription(where, ctx) : null;
   // `requireLocalSubscription` is deliberately NOT honoured on this path any
   // more, and Razorpay is the only module that sets it.
   //
@@ -1298,7 +1354,7 @@ export async function applyPaymentSucceeded(
  */
 export async function applyPaymentFailed(ev: PaymentFailedEvent, ctx: ApplyContext): Promise<void> {
   const where = localSubscriptionWhere(ev.applicationId, ev.providerSubscriptionId, ev.checkoutSessionId);
-  const localSub = where ? await prisma.subscription.findFirst({ where }) : null;
+  const localSub = where ? await findOwnedSubscription(where, ctx) : null;
   if (!localSub && ev.requireLocalSubscription) {
     ctx.log.warn(
       { providerPaymentId: ev.providerPaymentId, providerSubscriptionId: ev.providerSubscriptionId },
@@ -1488,10 +1544,27 @@ async function applySubscriptionStatusMirror(
   // nothing).
   const existing = await prisma.subscription.findFirst({
     where,
-    select: { id: true, status: true, cancelAt: true },
+    select: { id: true, status: true, cancelAt: true, provider: true },
   });
-  // No status on the event means "timestamps only": nothing transitions,
-  // nothing is announced, dunning is left alone.
+  // Same ownership rule as the payment appliers: another provider's row is
+  // not this event's to mirror.
+  if (existing && ctx.provider && existing.provider !== null && existing.provider !== ctx.provider) {
+    ctx.log.warn(
+      { subscriptionId: existing.id, rowProvider: existing.provider, eventProvider: ctx.provider, type: ev.type },
+      'subscription status event matched a subscription created by another provider — ignored',
+    );
+    return;
+  }
+  // A timestamp-only event (no status) describes a live subscription. On a
+  // row that has already ended, or never started, the date means nothing
+  // and would only read as a scheduled cancellation on a dead row.
+  if (existing && ev.status === undefined && !isEntitlingStatus(existing.status)) {
+    ctx.log.info(
+      { subscriptionId: existing.id, currentStatus: existing.status, providerEventId: ev.providerEventId },
+      'timestamp-only status event on a subscription that is not live — ignored',
+    );
+    return;
+  }
   const transitioned = Boolean(existing && ev.status !== undefined && existing.status !== ev.status);
   // A terminal subscription is not reopened by a later-arriving event. This
   // gates the WRITE, not just the announcement: gating only the announcement is
@@ -1557,7 +1630,7 @@ async function applySubscriptionStatusMirror(
   // CANCELED subscription that nobody was ever told about.
   const deliveryIds = await prisma.$transaction(async (tx) => {
     await tx.subscription.updateMany({
-      where,
+      where: existing ? { id: existing.id } : where,
       data: {
         ...(ev.status !== undefined && { status: ev.status }),
         ...(ev.currentPeriodEnd !== undefined && { currentPeriodEnd: ev.currentPeriodEnd }),

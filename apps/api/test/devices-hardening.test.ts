@@ -1,7 +1,7 @@
 /**
  * Hardening — the last step of the device series:
- *   - the licence routes are throttled per (application, key, fingerprint),
- *     both hashed, rather than per IP;
+ *   - the licence routes are throttled per (application, IP), with no
+ *     per-Application ceiling so a store outage fails open;
  *   - GDPR erasure deletes a person's devices and tombstones the fingerprint
  *     on retained license activations;
  *   - MCP tools over devices for operators (list / release / block / unblock)

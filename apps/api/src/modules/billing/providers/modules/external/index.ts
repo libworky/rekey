@@ -165,7 +165,9 @@ function parseEvent(payload: unknown): { env: Envelope; data: unknown } {
   const parsed = Envelope.safeParse(payload);
   if (!parsed.success) throw payloadInvalid(parsed.error);
   const env = parsed.data;
-  const schema = DATA_SCHEMAS[env.type];
+  // Own keys only: `type` is sender-chosen, and "constructor" or "toString"
+  // would otherwise resolve to Object.prototype and blow up in safeParse.
+  const schema = Object.hasOwn(DATA_SCHEMAS, env.type) ? DATA_SCHEMAS[env.type] : undefined;
   if (!schema) return { env, data: env.data };
   const data = schema.safeParse(env.data ?? {});
   if (!data.success) throw payloadInvalid(data.error, env.type);

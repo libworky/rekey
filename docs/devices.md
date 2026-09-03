@@ -82,7 +82,10 @@ the free tier — so a plan upgrade raises the cap without anyone touching a
 device row, and a downgrade lowers it for the *next* device rather than evicting
 one. An end-user whose plans grant no `max_devices` feature is uncapped, which
 is also what every Application sees until it configures one: adding devices to
-Rekey changed nothing for a deployment that has not asked for a limit.
+Rekey changed nothing for a deployment that has not asked for a limit. A value
+of `0` is honoured literally: no new device is admitted, while devices that
+are already ACTIVE keep signing in. A numeric value declared as a `STRING`
+feature is read as the number it spells.
 
 The check-then-insert runs under a per-`(application, end-user)` advisory lock,
 the same way `licenses/verify` serialises seat allocation, so ten concurrent
@@ -98,7 +101,8 @@ token, so releasing takes one of three routes:
   with the fingerprint.
 - Have your own backend release it: `POST /api/v1/devices/:id/release` with
   the secret key, no user token needed.
-- Let an operator release it from the panel.
+- Let an operator release it: `POST /api/v1/tenant/applications/:id/end-users/:euid/devices/:deviceId/release`,
+  or the `release_device` MCP tool.
 
 With `deviceBinding: required` only the second and third apply, because the
 first needs a session the policy refuses; build the release into your
@@ -148,8 +152,14 @@ stays unbound is left alone.
 the primary sign-in flows refuse without a `device` (`400
 DEVICE_FINGERPRINT_REQUIRED`). Refresh is never gated by it, so flipping the
 switch on a running Application does not sign anyone out; it changes what the
-next sign-in needs. Set it from the panel, `PATCH
-/tenant/applications/:id/auth-config`, or the `update_auth_config` MCP tool.
+next sign-in needs. Set it with `PATCH /tenant/applications/:id/auth-config`
+or the `update_auth_config` MCP tool.
+
+A session stays bound to the device that minted it. A refresh or an
+organization switch on a session whose device has since been released is
+refused (`SESSION_DEVICE_RELEASED`, or `DEVICE_BLOCKED` when an operator
+blocked it) rather than quietly bringing the device back; only a primary
+sign-in re-registers a released device.
 
 ### Errors a client should handle
 
@@ -158,6 +168,7 @@ next sign-in needs. Set it from the panel, `PATCH
 | `DEVICE_LIMIT_REACHED` | 403 | A new (or released) device would exceed `max_devices`. | `{ limit, devices: [{ id, label, firstSeenAt, lastSeenAt }] }` — the active devices to release. |
 | `DEVICE_BLOCKED` | 403 | An operator blocked this fingerprint. | — |
 | `DEVICE_FINGERPRINT_REQUIRED` | 400 | `deviceBinding` is `required` and the body had no `device`. | — |
+| `SESSION_DEVICE_RELEASED` | 401 | A refresh or organization switch on a session whose device was released since. | — |
 | `REFRESH_TOKEN_DEVICE_MISMATCH` | 401 | A bound chain was refreshed from a different fingerprint. All sessions revoked. | — |
 
 ## Managing devices
@@ -203,6 +214,12 @@ opaque fingerprint. Since 2.1.0 it has always been possible to *take* a seat
   (`releasedAt` marks freed seats) and can release one at
   `POST …/licenses/:licenseId/activations/:activationId/release`.
 
+`deactivate` proves possession of the key and nothing else. On a `SEATS`
+licence shared by a team, any holder of the key can release any machine's
+seat, including a colleague's; the fingerprint is client-computed and not a
+secret. If that matters, release seats through your own backend
+(operator activation release) rather than from the client.
+
 A released activation stops counting toward `seatsAllowed`; the next verify
 from the same machine reactivates it in place rather than inserting a second
 row. When the license holder has a Device with the same fingerprint, the
@@ -227,7 +244,8 @@ IP) at 60 requests a minute: a key guesser is bounded to one attempt a second
 per address against each Application, and one Application's launch traffic
 cannot throttle another's. Unlike the credential routes, the licence routes
 fail open when the limiter's store is unreachable, because verify is what
-every client calls at launch. The per-Application auth ceiling applies on top.
+every client calls at launch. The per-Application auth ceiling, which fails
+closed by design, is deliberately not applied to these routes.
 
 ## Webhook events
 

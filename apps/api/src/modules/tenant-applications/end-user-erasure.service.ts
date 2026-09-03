@@ -137,15 +137,36 @@ export async function eraseEndUser(args: {
     // rows they hang off, but the fingerprint and label are tombstoned to a
     // per-row value — the (license, fingerprint) unique index needs each row
     // to stay distinct.
+    // The person's fingerprints, collected before the device rows go: an
+    // activation on an ORG-pooled licence belongs to the org, not to them,
+    // but still names their machine and must be tombstoned too.
+    const fingerprints = (
+      await tx.device.findMany({ where: { applicationId, endUserId }, select: { fingerprint: true } })
+    ).map((d) => d.fingerprint);
     const devices = await tx.device.deleteMany({ where: { applicationId, endUserId } });
     const activations = await tx.licenseActivation.findMany({
-      where: { applicationId, license: { endUserId } },
-      select: { id: true },
+      where: {
+        applicationId,
+        OR: [
+          { license: { endUserId } },
+          ...(fingerprints.length > 0 ? [{ machineFingerprint: { in: fingerprints } }] : []),
+        ],
+      },
+      select: { id: true, releasedAt: true },
     });
+    const now = new Date();
     for (const a of activations) {
+      // Released as well as tombstoned: a seat held by a machine nobody can
+      // name any more is a seat nobody can give back, and the same machine
+      // verifying again would burn a second one.
       await tx.licenseActivation.update({
         where: { id: a.id },
-        data: { machineFingerprint: `erased:${a.id}`, label: null, deviceId: null },
+        data: {
+          machineFingerprint: `erased:${a.id}`,
+          label: null,
+          deviceId: null,
+          ...(a.releasedAt === null && { releasedAt: now }),
+        },
       });
     }
 

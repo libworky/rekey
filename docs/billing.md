@@ -68,6 +68,12 @@ Creating a plan calls `ensurePlanRegistered()` **only when the Application alrea
 | `REGISTERED` | Provider acknowledged it; `metadata.<provider>` holds the price id. | yes |
 | `FAILED` | Provider refused. Forced `active: false`, with the refusal in `registrationError`. | no |
 
+Readiness blockers a plan can report alongside these: `PLAN_NOT_REGISTERED`
+and `PLAN_REGISTRATION_FAILED` (Stripe), `PLAN_TRIAL_UNSUPPORTED` (a trial on
+a provider that cannot run one), `NO_BILLING_PROVIDER`, and
+`PROVIDER_INBOUND_ONLY` (the only enabled provider is the external billing
+system, which hosts no checkout — see [external-billing.md](external-billing.md)).
+
 A plan awaiting registration is inserted `active: false` and only promoted once the provider answers. The provider call is a network call, so it cannot sit inside a database transaction — the ordering is what makes it safe, not a transaction. Before this, a refused registration left the plan committed **and active**: it stayed on the pricing page, indistinguishable from a working plan, and every buyer who clicked it got a 500 out of checkout.
 
 Repairing one does not need a new slug. `PATCH` accepts `name`/`metadata` always, and `amount`/`currency`/`interval` while the plan is unregistered (there is no immutable provider price to contradict yet — a registered plan answers `PLAN_PRICE_IMMUTABLE`). `POST .../plans/:slug/register` then retries registration and puts the plan back on sale. Activating a plan with no provider price is refused outright with `PLAN_NOT_REGISTERED_WITH_PROVIDER`.
