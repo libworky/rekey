@@ -10,8 +10,12 @@
  * merge, not on the request body, because a stream of small patches is the
  * way one would grow it past the limit otherwise.
  *
- * Applies to EVERY writer, on every model that carries a metadata column. It
- * first shipped on the end-user self-service PATCH alone, which meant a
+ * Applies to every writer that accepts caller-supplied metadata: end-users
+ * (sign-up, self-service PATCH, import), organizations, plans, coupons,
+ * licences, usage records and credit drawdowns. Provider-written metadata on
+ * subscriptions and payments is not covered, because its size is the
+ * provider's choice rather than a caller's. It first shipped on the end-user
+ * self-service PATCH alone, which meant a
  * 200 KB blob posted at sign-up was stored and then permanently bricked that
  * user's own PATCH route: the cap is measured post-merge, so every later
  * self-service write failed on bytes the user could no longer remove. A

@@ -508,10 +508,15 @@ describe('error envelope invariant (static)', () => {
      * here for it to miss.
      */
     const SCHEMA_ONLY = new Set(['lib/openapi.ts']);
+    // Posix separators, so the exclusion set and the reported offenders read
+    // the same on Windows, where `path.relative` answers `lib\openapi.ts` and
+    // the exclusion silently stopped applying.
+    const relative = (file: string): string =>
+      path.relative(srcDir, file).split(path.sep).join('/');
 
     const offenders: string[] = [];
     for (const file of await walk(srcDir)) {
-      if (SCHEMA_ONLY.has(path.relative(srcDir, file))) continue;
+      if (SCHEMA_ONLY.has(relative(file))) continue;
       const text = await readFile(file, 'utf8');
       const lines = text.split('\n');
       lines.forEach((line, i) => {
@@ -521,7 +526,7 @@ describe('error envelope invariant (static)', () => {
         // (the dependency-outage branch) without reaching the next statement.
         const window = lines.slice(i, i + 14).join('\n');
         if (!/requestId/.test(window)) {
-          offenders.push(`${path.relative(srcDir, file)}:${i + 1}`);
+          offenders.push(`${relative(file)}:${i + 1}`);
         }
       });
     }

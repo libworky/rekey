@@ -119,7 +119,8 @@ export async function operatorTokenRoutes(app: FastifyInstance): Promise<void> {
             403:
               "TENANT_MEMBERSHIP_REVOKED — the PAT's operator no longer has a membership in " +
               'its bound workspace; or OPERATOR_SCOPE_INSUFFICIENT — the PAT does not carry ' +
-              'the `read` scope.',
+              'the `read` scope; or TENANT_ROLE_INSUFFICIENT — the operator who minted the ' +
+              'token has since been demoted below admin.',
           }),
         },
       },

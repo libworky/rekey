@@ -78,9 +78,8 @@ import {
   tenantPasskeysPublicRoutes,
 } from './modules/tenant-passkeys/index.js';
 import { tenantOAuthPublicRoutes } from './modules/tenant-oauth/index.js';
-import { licensesPublicRoutes } from './modules/licenses/index.js';
+import { licensesPublicRoutes, tenantLicenseActivationRoutes } from './modules/licenses/index.js';
 import { devicesServerRoutes, devicesUserRoutes, tenantDevicesRoutes } from './modules/devices/index.js';
-import { tenantLicenseActivationRoutes } from './modules/licenses/index.js';
 import { portalConfigRoutes } from './modules/portal/index.js';
 import { usagePublicRoutes } from './modules/usage/index.js';
 import { creditsPublicRoutes } from './modules/credits/index.js';
