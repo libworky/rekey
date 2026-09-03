@@ -1783,12 +1783,12 @@ export const WEBHOOK_EVENTS = [
   {
     name: 'device.registered',
     description:
-      'A device was registered for an end-user — a new fingerprint at sign-in or licence verification, or a previously released device coming back (`data.reactivated`). A sign-in from an already-active device emits nothing. Payload: `data.device`.',
+      'A device was registered for an end-user — a new fingerprint at sign-in or refresh, or a previously released device coming back (`data.reactivated`). A sign-in from an already-active device emits nothing; licence verification registers nothing. Payload: `data.device`.',
   },
   {
     name: 'device.released',
     description:
-      'A device gave its slot back — the end-user or an operator released it — and every session minted on it was revoked (`data.sessionsRevoked`). Payload: `data.device`, `data.releasedBy` (`end_user` | `operator`).',
+      'A device gave its slot back — the end-user, an operator, or the application server released it — and every session minted on it was revoked (`data.sessionsRevoked`). Payload: `data.device`, `data.releasedBy` (`end_user` | `operator` | `server`).',
   },
   {
     name: 'device.blocked',

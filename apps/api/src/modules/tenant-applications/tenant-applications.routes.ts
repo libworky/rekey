@@ -4595,6 +4595,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
         subscriptions,
         payments,
         licenses,
+        devices,
         creditBalances,
         creditLedger,
         usageRecords,
@@ -4674,7 +4675,9 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
           orderBy: { createdAt: 'desc' },
           take: PAYMENTS_CAP,
         }),
-        // License metadata — keyPrefix only, never keyHash.
+        // License metadata — keyPrefix only, never keyHash. Activations ride
+        // along: a machine fingerprint the person supplied is personal data
+        // (erasure tombstones it), so a subject-access response must list it.
         prisma.license.findMany({
           where: { applicationId: params.id, endUserId: endUser.id },
           select: {
@@ -4688,8 +4691,38 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
             revokedAt: true,
             createdAt: true,
             plan: { select: { slug: true, name: true } },
+            activations: {
+              select: {
+                id: true,
+                machineFingerprint: true,
+                label: true,
+                deviceId: true,
+                firstSeenAt: true,
+                lastSeenAt: true,
+                releasedAt: true,
+              },
+              orderBy: { firstSeenAt: 'desc' },
+            },
           },
           orderBy: { createdAt: 'desc' },
+        }),
+        // Devices: the machines they signed in from, fingerprints included,
+        // for the same reason.
+        prisma.device.findMany({
+          where: { applicationId: params.id, endUserId: endUser.id },
+          select: {
+            id: true,
+            fingerprint: true,
+            label: true,
+            status: true,
+            firstSeenAt: true,
+            lastSeenAt: true,
+            lastSeenIp: true,
+            releasedAt: true,
+            blockedAt: true,
+            createdAt: true,
+          },
+          orderBy: { firstSeenAt: 'desc' },
         }),
         prisma.creditBalance.findMany({
           where: { applicationId: params.id, endUserId: endUser.id },
@@ -4794,8 +4827,22 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
           createdAt: s.createdAt.toISOString(),
         })),
         payments: payments.map((p) => ({ ...p, createdAt: p.createdAt.toISOString() })),
+        devices: devices.map((d) => ({
+          ...d,
+          firstSeenAt: d.firstSeenAt.toISOString(),
+          lastSeenAt: d.lastSeenAt.toISOString(),
+          releasedAt: d.releasedAt?.toISOString() ?? null,
+          blockedAt: d.blockedAt?.toISOString() ?? null,
+          createdAt: d.createdAt.toISOString(),
+        })),
         licenses: licenses.map((l) => ({
           ...l,
+          activations: l.activations.map((a) => ({
+            ...a,
+            firstSeenAt: a.firstSeenAt.toISOString(),
+            lastSeenAt: a.lastSeenAt.toISOString(),
+            releasedAt: a.releasedAt?.toISOString() ?? null,
+          })),
           expiresAt: l.expiresAt?.toISOString() ?? null,
           revokedAt: l.revokedAt?.toISOString() ?? null,
           createdAt: l.createdAt.toISOString(),

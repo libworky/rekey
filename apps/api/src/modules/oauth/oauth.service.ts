@@ -18,6 +18,7 @@ import { prisma } from '../../lib/prisma.js';
 import { RekeyError } from '../../lib/error.js';
 import { AuthConfigSchema } from '@rekey.dev/shared-types';
 import { assertSignupAllowed, type AuthKind } from '../../lib/signup-policy.js';
+import { assertDeviceBindingSatisfiable } from '../auth/auth.service.js';
 import { deliverVerificationEmail } from '../auth/auth.service.js';
 import { assertEndUserQuota } from '../../lib/tenant-limits.js';
 import { encryptJson, decryptJson } from '../../lib/secrets.js';
@@ -236,6 +237,8 @@ export const oauthService = {
       AuthConfigSchema.parse(args.application.authConfig),
       args.authKind,
     );
+    // Before the row exists, for the same reason sign-up asks first.
+    assertDeviceBindingSatisfiable(args.application, args.device);
     if (!identity.email) {
       throw new RekeyError({
         statusCode: 400,

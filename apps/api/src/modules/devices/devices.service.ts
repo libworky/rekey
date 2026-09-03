@@ -8,11 +8,14 @@
  * two accounts is two devices; cross-account reuse is a signal for the
  * security-events trail, not a constraint.
  *
- * `touch` is THE write path for the ACTIVE count. Sign-in, refresh and licence
- * verification all go through it, and it is the only place the device limit
- * is enforced, for the same reason `licenses.verify` keeps its seat check in
- * one transaction: a limit checked in three places is a limit that is wrong
- * in at least one of them. The check-then-insert runs under a per-(application,
+ * `touch` is THE write path for the ACTIVE count. Sign-in and refresh go
+ * through it, and it is the only place the device limit is enforced, for the
+ * same reason `licenses.verify` keeps its seat check in one transaction: a
+ * limit checked in two places is a limit that is wrong in at least one of
+ * them. Licence verification does NOT touch: it links an activation to a
+ * device that already exists for the holder and otherwise leaves devices
+ * alone, so `max_devices` bounds session devices and licence machines
+ * independently (see licenses.service.ts). The check-then-insert runs under a per-(application,
  * end-user) advisory lock so two concurrent sign-ins from two new machines
  * cannot both pass the count.
  *
@@ -48,11 +51,8 @@ export interface TouchDeviceInput {
   label?: string | null | undefined;
   /** Inbound IP at the time of the touch, for `lastSeenIp`. */
   ip?: string | null | undefined;
-  /**
-   * Which path is touching the device, for the security-events trail. A
-   * licence verify and a sign-in are different facts about the same machine.
-   */
-  via?: 'sign_in' | 'refresh' | 'license_verify';
+  /** Which path is touching the device, for the security-events trail. */
+  via?: 'sign_in' | 'refresh';
 }
 
 export interface DeviceSummary {
@@ -311,7 +311,13 @@ export const devicesService = {
     applicationId: string;
     endUserId: string;
     deviceId: string;
-    actor: { type: 'end_user' | 'operator'; id: string | null };
+    /**
+     * Who asked. `server` is the customer's own backend on a secret key
+     * (`id` is the API key id); it is recorded as an operator-side action
+     * because the end-user did not do it, and a support tool releasing a
+     * device must not read as the user releasing it.
+     */
+    actor: { type: 'end_user' | 'operator' | 'server'; id: string | null };
   }): Promise<{ device: Device; sessionsRevoked: number }> {
     const current = await this.get(args.applicationId, args.endUserId, args.deviceId);
     if (current.status === 'BLOCKED') {
@@ -347,11 +353,17 @@ export const devicesService = {
       },
     });
     void recordSecurityEvent({
-      type: args.actor.type === 'operator' ? 'end_user.device_released' : 'user.device_released',
-      actorType: args.actor.type,
+      type: args.actor.type === 'end_user' ? 'user.device_released' : 'end_user.device_released',
+      actorType: args.actor.type === 'server' ? 'system' : args.actor.type,
       actorId: args.actor.id,
       applicationId: args.applicationId,
-      metadata: { deviceId: result.device.id, endUserId: args.endUserId, sessionsRevoked: result.sessionsRevoked },
+      metadata: {
+        deviceId: result.device.id,
+        endUserId: args.endUserId,
+        sessionsRevoked: result.sessionsRevoked,
+        releasedBy: args.actor.type,
+        ...(args.actor.type === 'server' && { apiKeyId: args.actor.id }),
+      },
     });
     return result;
   },

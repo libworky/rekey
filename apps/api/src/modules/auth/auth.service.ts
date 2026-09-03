@@ -301,6 +301,30 @@ export interface DeviceContext {
  * DEVICE_LIMIT_REACHED rides in `details` so a client can offer "release one"
  * rather than a dead end.
  */
+/**
+ * Refuse a primary sign-in that carries no fingerprint when the Application
+ * requires one. Split out of `bindDevice` so the paths that CREATE an account
+ * (sign-up, first OAuth login, first magic-link login) can ask before the
+ * row exists: a client that forgot `device` used to get the account created,
+ * the welcome mail sent and `user.created` emitted, and then a 400 from the
+ * session step, so its corrected retry was met with EMAIL_ALREADY_EXISTS.
+ */
+export function assertDeviceBindingSatisfiable(
+  application: Application,
+  device: DeviceContext | undefined,
+): void {
+  if (device?.fingerprint || device?.deviceId) return;
+  const { deviceBinding } = AuthConfigSchema.parse(application.authConfig);
+  if (deviceBinding === 'required' && device?.primary !== false) {
+    throw new RekeyError({
+      statusCode: 400,
+      code: 'DEVICE_FINGERPRINT_REQUIRED',
+      message: 'This Application requires a device binding on sign-in.',
+      fix: 'Send `device: { fingerprint, label? }` in the request body — see docs/devices.md.',
+    });
+  }
+}
+
 async function bindDevice(
   application: Application,
   endUser: EndUser,
@@ -319,15 +343,9 @@ async function bindDevice(
     }
   }
   if (!fingerprint) {
-    const { deviceBinding } = AuthConfigSchema.parse(application.authConfig);
-    if (deviceBinding === 'required' && device?.primary !== false) {
-      throw new RekeyError({
-        statusCode: 400,
-        code: 'DEVICE_FINGERPRINT_REQUIRED',
-        message: 'This Application requires a device binding on sign-in.',
-        fix: 'Send `device: { fingerprint, label? }` in the request body — see docs/devices.md.',
-      });
-    }
+    // A bare deviceId whose row is gone is an unbound re-mint, never a
+    // primary sign-in, so the gate is asked without the id.
+    assertDeviceBindingSatisfiable(application, device ? { ...device, deviceId: null } : undefined);
     return null;
   }
 
@@ -352,7 +370,10 @@ async function bindDevice(
       statusCode: 403,
       code: 'DEVICE_LIMIT_REACHED',
       message: `This account is already signed in on ${outcome.limit} device${outcome.limit === 1 ? '' : 's'}, the most its plan allows.`,
-      fix: 'Release one of the devices listed in `details.devices` (DELETE /api/v1/users/me/devices/:id) or upgrade the plan.',
+      fix:
+        'Release one of the devices listed in `details.devices`: sign in without `device` (when binding is optional) ' +
+        'and call DELETE /api/v1/users/me/devices/:id, have your backend call POST /api/v1/devices/:id/release, ' +
+        'or upgrade the plan. See docs/devices.md.',
       details: {
         limit: outcome.limit,
         devices: outcome.devices.map((d) => ({
@@ -641,6 +662,7 @@ export const authService = {
 
     const config = AuthConfigSchema.parse(input.application.authConfig);
     assertSignupAllowed(config, input.authKind);
+    assertDeviceBindingSatisfiable(input.application, input.device);
     if (input.password.length < config.passwordMinLength) {
       throw new RekeyError({
         statusCode: 400,
@@ -1022,6 +1044,54 @@ export const authService = {
       });
     }
 
+    // Everything that can refuse runs BEFORE the rotation. `rotateRefreshToken`
+    // spends the presented token: once it has run, a refusal below would leave
+    // the client holding a token that is already replaced, and its retry would
+    // read as a replay and burn the whole family. A device over the cap, a
+    // blocked device and an unverified address are ordinary refusals, not
+    // compromise signals, and must cost the client nothing but this request.
+    const endUser = await prisma.endUser.findUniqueOrThrow({ where: { id: outcome.token.endUserId } });
+    // GDPR erasure: a refresh token issued before erasure must not mint a fresh
+    // access token. (Erasure also revokes all refresh tokens, but a token
+    // rotated in a concurrent request could still reach here — belt and braces.)
+    assertEndUserNotErased(endUser);
+    // Email-verification gate, re-checked rather than trusted from issue time.
+    // A refresh chain lasts 30 days: without this, an operator who switches
+    // `requireEmailVerification` on is switching it on for future sign-ins
+    // only, and every unconfirmed account that already holds a refresh token
+    // keeps renewing for a month. Re-checking bounds that to one access-token
+    // lifetime.
+    ensureEmailVerified(application, endUser);
+    // Device binding across the rotation.
+    //
+    // A chain bound at sign-in stays bound: the presented row carries
+    // `deviceId` and the rotation copies it. If the caller ALSO sent a
+    // fingerprint it must be the same machine — a refresh token replayed from
+    // a different device is the stolen-token case, and it is treated like a
+    // reuse: the whole family is revoked. A chain that was never bound may be
+    // bound now (a client upgraded to send fingerprints mid-session); one that
+    // stays unbound is left alone — `deviceBinding: required` gates primary
+    // sign-in only, so flipping it never signs existing users out.
+    let deviceId = outcome.token.deviceId;
+    if (deviceId && device?.fingerprint) {
+      const bound = await prisma.device.findUnique({ where: { id: deviceId } });
+      if (bound && bound.fingerprint !== device.fingerprint) {
+        await revokeAllForEndUser(endUser.id);
+        throw new RekeyError({
+          statusCode: 401,
+          code: 'REFRESH_TOKEN_DEVICE_MISMATCH',
+          message:
+            'This session is bound to a different device. All sessions for this user have been revoked as a precaution.',
+          fix: 'Sign the user in again from this device.',
+        });
+      }
+    }
+    const rebound = await bindDevice(application, endUser, {
+      ...device,
+      deviceId,
+      primary: false,
+    });
+
     let replacement;
     try {
       replacement = await rotateRefreshToken(outcome.token);
@@ -1044,18 +1114,6 @@ export const authService = {
       }
       throw e;
     }
-    const endUser = await prisma.endUser.findUniqueOrThrow({ where: { id: outcome.token.endUserId } });
-    // GDPR erasure: a refresh token issued before erasure must not mint a fresh
-    // access token. (Erasure also revokes all refresh tokens, but a token
-    // rotated in a concurrent request could still reach here — belt and braces.)
-    assertEndUserNotErased(endUser);
-    // Email-verification gate, re-checked rather than trusted from issue time.
-    // A refresh chain lasts 30 days: without this, an operator who switches
-    // `requireEmailVerification` on is switching it on for future sign-ins
-    // only, and every unconfirmed account that already holds a refresh token
-    // keeps renewing for a month. Re-checking bounds that to one access-token
-    // lifetime.
-    ensureEmailVerified(application, endUser);
     // Preserve the session's active org across refresh, but self-heal: if the
     // user left the org since the last token, drop the `oid` (and clear it on
     // the rotated refresh row) so a stale active org can't linger.
@@ -1073,35 +1131,6 @@ export const authService = {
         });
       }
     }
-    // Device binding across the rotation.
-    //
-    // A chain bound at sign-in stays bound: the rotated row already carries
-    // `deviceId`. If the caller ALSO sent a fingerprint it must be the same
-    // machine — a refresh token replayed from a different device is the
-    // stolen-token case, and it is treated like a reuse: the whole family is
-    // revoked. A chain that was never bound may be bound now (a client
-    // upgraded to send fingerprints mid-session); one that stays unbound is
-    // left alone — `deviceBinding: required` gates primary sign-in only, so
-    // flipping it never signs existing users out.
-    let deviceId = replacement.record.deviceId;
-    if (deviceId && device?.fingerprint) {
-      const bound = await prisma.device.findUnique({ where: { id: deviceId } });
-      if (bound && bound.fingerprint !== device.fingerprint) {
-        await revokeAllForEndUser(endUser.id);
-        throw new RekeyError({
-          statusCode: 401,
-          code: 'REFRESH_TOKEN_DEVICE_MISMATCH',
-          message:
-            'This session is bound to a different device. All sessions for this user have been revoked as a precaution.',
-          fix: 'Sign the user in again from this device.',
-        });
-      }
-    }
-    const rebound = await bindDevice(application, endUser, {
-      ...device,
-      deviceId,
-      primary: false,
-    });
     if (rebound !== deviceId) {
       // Unbound chain that just identified itself: persist the binding so the
       // next rotation carries it without the client repeating the fingerprint.
@@ -1683,6 +1712,7 @@ export const authService = {
         AuthConfigSchema.parse(input.application.authConfig),
         input.authKind,
       );
+      assertDeviceBindingSatisfiable(input.application, input.device);
       // Workspace ceiling, checked inside the same transaction as the create.
       // Throwing here rolls the token consume back too, so a link rejected for
       // quota stays usable and works once the workspace has room again.
