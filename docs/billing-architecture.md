@@ -53,6 +53,8 @@ An entitlement is a row saying "this subject may have this thing". Resolution un
 
 This is not a workaround. It is the boundary working: entitlement is ours, so we can grant it without asking anyone.
 
+The external billing provider is the same idea driven by events instead of by an operator: a billing system of the operator's own posts what it sold, and the `subscription.granted` applier goes through `grantSubscription` with the sender's subscription id bound onto the row, so the status mirror and the payment appliers then treat it exactly like a Stripe subscription. The one thing it adds is creating the end-user when the sale names an address Rekey has not met, because the alternative is losing the sale to the order two unrelated systems happen to run in. See [external-billing.md](external-billing.md).
+
 ## Decisions, and what they cost
 
 ### Coupons apply once, and the model cannot express anything else
@@ -170,7 +172,7 @@ Do not add a kind whose meaning depends on the provider. If it cannot be explain
 
 ### Adding a provider
 
-Implement the module contract and declare capabilities honestly. Absent means cannot, and that is always safe. A provider that cannot do something makes checkouts refuse, which is visible; a provider that claims something it cannot do charges somebody the wrong amount, which is not.
+Implement the module contract and declare capabilities honestly. Absent means cannot, and that is always safe. `checkout` is the exception: it is required, so a module states whether buyers can be sent to it at all, and an inbound-only module (`false`) is skipped by the router and the public provider list while its webhooks work like everyone else's. A provider that cannot do something makes checkouts refuse, which is visible; a provider that claims something it cannot do charges somebody the wrong amount, which is not.
 
 ### Postpaid usage billing, when we do it
 

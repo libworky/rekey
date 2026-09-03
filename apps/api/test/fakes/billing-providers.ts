@@ -20,6 +20,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import type { Plan } from '@prisma/client';
 import { discountUnsupported } from '../../src/modules/billing/providers/discount.js';
+import { ExternalBillingProvider } from '../../src/modules/billing/providers/external.js';
 import type {
   BillingProvider,
   CancelSubscriptionInput,
@@ -169,5 +170,8 @@ export const fakeRazorpay = new FakeRazorpayProvider();
 export function fakeProviderFor(name: string): BillingProvider {
   if (name === 'paypal') return fakePaypal;
   if (name === 'razorpay') return fakeRazorpay;
+  // Not faked: the real one dials nobody, and what a test wants from it is
+  // exactly its refusals.
+  if (name === 'external') return new ExternalBillingProvider();
   return fakeStripe;
 }

@@ -21,6 +21,7 @@ import {
 import { stripeModule } from '../src/modules/billing/providers/modules/stripe/index.js';
 import { razorpayModule } from '../src/modules/billing/providers/modules/razorpay/index.js';
 import { paypalModule } from '../src/modules/billing/providers/modules/paypal/index.js';
+import { externalModule } from '../src/modules/billing/providers/modules/external/index.js';
 
 const modulesDir = fileURLToPath(
   new URL('../src/modules/billing/providers/modules/', import.meta.url),
@@ -38,15 +39,37 @@ describe('billing provider-module registry', () => {
     }
   });
 
-  it('registers all three built-in providers (P2)', () => {
-    expect([...registryNames].sort()).toEqual(['paypal', 'razorpay', 'stripe']);
+  it('registers the three hosted providers (P2) and the inbound-only external one', () => {
+    expect([...registryNames].sort()).toEqual(['external', 'paypal', 'razorpay', 'stripe']);
   });
 
   it('exposes a zod enum derived from the registry', () => {
     expect(providerNameSchema.safeParse('stripe').success).toBe(true);
     expect(providerNameSchema.safeParse('razorpay').success).toBe(true);
     expect(providerNameSchema.safeParse('paypal').success).toBe(true);
+    expect(providerNameSchema.safeParse('external').success).toBe(true);
     expect(providerNameSchema.safeParse('visa').success).toBe(false);
+  });
+
+  it('every module states whether it hosts a checkout; only external does not', () => {
+    for (const name of registryNames) {
+      expect(typeof getModule(name)!.capabilities.checkout, `${name}.capabilities.checkout`).toBe(
+        'boolean',
+      );
+    }
+    expect(registryNames.filter((n) => getModule(n)!.capabilities.checkout === false)).toEqual([
+      'external',
+    ]);
+  });
+
+  it('the external module blocks checkout for every plan and cannot auto-register a webhook', () => {
+    // Nothing plan-specific goes into the decision; the module cannot host a
+    // checkout for anything, so the readiness view reports it on every plan.
+    const blocker = externalModule.planCheckoutBlocker!({ slug: 'any' } as never);
+    expect(blocker?.code).toBe('PROVIDER_INBOUND_ONLY');
+    expect(externalModule.capabilities.autoWebhookRegister).toBe(false);
+    expect(externalModule.capabilities.onlineVerify).toBe(false);
+    expect(externalModule.detectMode).toBeUndefined();
   });
 
   it('every module declares at most one webhookRole field', () => {
@@ -88,6 +111,20 @@ describe('billing provider-module registry', () => {
     expect(razorpayModule.credentialSchema.find((f) => f.key === 'keyId')?.pattern?.prefix).toBe(
       'rzp_',
     );
+  });
+
+  it('external credentialSchema is the single signing secret, with a length floor', () => {
+    // ExternalCredentials in credentials.service.ts is { webhookSecret }.
+    expect(externalModule.credentialSchema.map((f) => f.key)).toEqual(['webhookSecret']);
+    const field = externalModule.credentialSchema[0]!;
+    expect(field.secret).toBe(true);
+    expect(field.webhookRole).toBe('secret');
+    expect(field.optional).toBeUndefined();
+    // A short HMAC key is guessable; the floor is enforced by the shared
+    // credential rules, not by the panel.
+    const rules = credentialRulesSchema(externalModule);
+    expect(rules.safeParse({ webhookSecret: 'short' }).success).toBe(false);
+    expect(rules.safeParse({ webhookSecret: 'x'.repeat(32) }).success).toBe(true);
   });
 
   it('paypal credentialSchema matches the stored credential JSON keys exactly', () => {
@@ -148,6 +185,7 @@ describe('credentialSchema-driven validation (P3)', () => {
     stripe: { apiKey: 'sk_test_abc123', webhookSecret: 'whsec_abc123' },
     razorpay: { keyId: 'rzp_test_abc123', keySecret: 'secret_abc', webhookSecret: 'wh_secret' },
     paypal: { clientId: 'client_abc123', clientSecret: 'secret_abc123', webhookId: 'wh_id_123' },
+    external: { webhookSecret: 'a-signing-secret-of-at-least-32-characters' },
   };
 
   it('credentialRulesSchema accepts each provider\'s known-good creds', () => {
@@ -270,20 +308,25 @@ describe('discovery projection (P4)', () => {
       expect(d.name).toBe(name);
       expect(d.label.length).toBeGreaterThan(0);
       expect(d.docsUrl).toMatch(/^https:\/\//);
-      expect(Object.keys(d.capabilities).sort()).toEqual([
-        'autoWebhookRegister',
-        'captureStep',
-        'discounts',
-        'oneTime',
-        'onlineVerify',
-        'periodRotationEvents',
-        // Reaches clients deliberately: the panel decides whether to offer a
-        // refund button from this, and a button for a provider that cannot
-        // refund is one an operator presses after promising a customer their
-        // money back.
-        'refunds',
-        'trials',
-      ]);
+      expect(Object.keys(d.capabilities).sort()).toEqual(
+        [
+          'autoWebhookRegister',
+          'captureStep',
+          // The panel hides routing fields and the checkout copy for a module
+          // that cannot host one.
+          'checkout',
+          'discounts',
+          'oneTime',
+          'onlineVerify',
+          'periodRotationEvents',
+          // Reaches clients deliberately: the panel decides whether to offer a
+          // refund button from this, and a button for a provider that cannot
+          // refund is one an operator presses after promising a customer their
+          // money back.
+          ...(d.capabilities.refunds !== undefined ? ['refunds'] : []),
+          'trials',
+        ].sort(),
+      );
     }
   });
 

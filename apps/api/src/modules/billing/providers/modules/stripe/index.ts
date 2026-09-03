@@ -348,6 +348,7 @@ export const stripeModule: ProviderModule = {
     priority: 100,
   },
   capabilities: {
+    checkout: true,
     oneTime: true,
     captureStep: false,
     autoWebhookRegister: true,
