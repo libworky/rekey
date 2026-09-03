@@ -7,8 +7,10 @@
  * against the appliers, and fixture-replay CI (see "Why not npm plugins
  * yet" in the spec).
  *
- * All three built-in providers are registered (P2); their legacy webhook
- * URLs are permanent aliases into the shared pipeline. The hand-written
+ * The three hosted providers are registered (P2); their legacy webhook URLs
+ * are permanent aliases into the shared pipeline. The fourth module,
+ * `external`, is inbound only (`capabilities.checkout: false`) and has no
+ * legacy URL. The hand-written
  * `z.enum(['stripe','paypal','razorpay'])` sites elsewhere are replaced by
  * `providerNameSchema` in P3/P4.
  */
@@ -18,11 +20,14 @@ import type { CredentialField, ProviderModule } from './module-types.js';
 import { stripeModule } from './modules/stripe/index.js';
 import { razorpayModule } from './modules/razorpay/index.js';
 import { paypalModule } from './modules/paypal/index.js';
+import { externalModule } from './modules/external/index.js';
 
 const modules = new Map<string, ProviderModule>([
   [stripeModule.name, stripeModule],
   [razorpayModule.name, razorpayModule],
   [paypalModule.name, paypalModule],
+  // Inbound only: an operator's own billing system posting what it sold.
+  [externalModule.name, externalModule],
 ]);
 
 /** Registered provider names, in registration order. */

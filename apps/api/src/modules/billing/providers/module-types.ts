@@ -296,11 +296,49 @@ export interface SubscriptionPeriodAdvancedEvent extends DomainEventBase {
 }
 
 /**
+ * A subscription sold somewhere Rekey did not run the checkout: the
+ * activate-or-create event.
+ *
+ * Every other event here names a row Rekey already holds, matched by a
+ * checkout session it issued or a provider subscription id it stored. A
+ * billing system Rekey never called has neither, so its activation has to
+ * carry what a checkout would have established: who bought (by end-user id,
+ * or by email, which the applier creates when unknown), which plan, and the
+ * sender's own subscription id so later status events find the row.
+ *
+ * Applied through `subscriptionGrantsService` with the provider bound onto
+ * the row, so the status mirror and the payment appliers work on it exactly
+ * as they do on a Stripe subscription. Posting it again is safe: a replay
+ * changes nothing, a later `currentPeriodEnd` is a renewal, a PAST_DUE row
+ * recovers, and a different plan under the same subscription id is a plan
+ * change (the old row is cancelled).
+ */
+export interface SubscriptionGrantedEvent extends DomainEventBase {
+  type: 'subscription.granted';
+  /** Registry name of the emitting module, stamped as `Subscription.provider`. */
+  provider: string;
+  /** The sender's subscription id, stamped as `providerSubId`. */
+  providerSubscriptionId: string;
+  planSlug: string;
+  subscriber: { endUserId: string } | { email: string; emailVerified?: boolean };
+  /** Beneficiary org, for Applications that bill per organization. */
+  organizationId?: string;
+  /**
+   * `undefined` = open-ended (a grant with no term), `null` = explicitly
+   * open-ended, a Date = the term. A Date in the past is stale news and the
+   * applier ignores the event.
+   */
+  currentPeriodEnd?: Date | null;
+  trialEndsAt?: Date | null;
+}
+
+/**
  * The normalized inbound event set. Modules translate provider payloads
  * into these; core (`webhooks/apply.ts`) owns what happens next. Status
  * maps and provider payload shapes die inside modules.
  */
 export type DomainBillingEvent =
+  | SubscriptionGrantedEvent
   | CheckoutCompletedEvent
   | CheckoutApprovedEvent
   | PaymentSucceededEvent
@@ -353,6 +391,21 @@ export interface ProviderModule {
     priority: number;
   };
   capabilities: {
+    /**
+     * Whether buyers can be sent to this provider to pay.
+     *
+     * Every hosted processor says true. An inbound-only module says false:
+     * it fronts a billing system Rekey never calls, which reports what it
+     * sold by posting events. The geo router skips such a module, the
+     * public provider list omits it, and `getProviderForApplication` hands
+     * back a provider whose outbound calls refuse with a named error.
+     *
+     * Required rather than optional-and-fail-closed like `trials`: the
+     * three built-in modules predate the field and all host a checkout,
+     * and a required boolean makes a new module state the fact rather
+     * than inherit a default in either direction.
+     */
+    checkout: boolean;
     /** Supports one-time checkouts. */
     oneTime: boolean;
     /** Needs an explicit capture step (PayPal Orders v2). */

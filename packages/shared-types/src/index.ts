@@ -1186,6 +1186,13 @@ export type CheckoutResultDto = z.infer<typeof CheckoutResultDtoSchema>;
  * adapt (e.g. no auto-webhook button for Razorpay) without name checks.
  */
 export const BillingProviderCapabilitiesSchema = z.object({
+  /**
+   * Whether buyers can be sent to this provider to pay. Optional because a
+   * server may predate the field; absent means it can (the three hosted
+   * providers always could). `false` marks an inbound-only provider, one
+   * that only receives events from the operator's own billing system.
+   */
+  checkout: z.boolean().optional(),
   oneTime: z.boolean(),
   captureStep: z.boolean(),
   autoWebhookRegister: z.boolean(),

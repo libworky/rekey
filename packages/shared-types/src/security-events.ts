@@ -123,6 +123,12 @@ export const SECURITY_EVENT_LABEL = {
   'user.session_handoff_granted': 'End-user session handed off by the application server',
 
   // ── Operator actions ON an end-user ──
+  // An account that exists because a billing system reported a sale for an
+  // address Rekey did not know. Nobody signed up: the row was created so the
+  // subscription had somewhere to land, and the person claims it at their
+  // first sign-in. In the trail so "where did this user come from" has an
+  // answer. The actor is the system; `metadata.provider` names the module.
+  'end_user.created_by_billing_webhook': 'End-user created by a billing webhook',
   'end_user.erased': 'End-user erased (GDPR)',
   'end_user.delete_blocked': 'End-user deletion blocked',
   'end_user.deleted': 'End-user deleted',
