@@ -196,6 +196,21 @@ Retry semantics: a repeat with the same key (timeout retry, queue redelivery, do
 | Method | Description |
 | --- | --- |
 | `verify({ key, machineFingerprint, label? })` | Verify a license key + record an activation. Always 200 — branch on `result.ok`. |
+| `deactivate({ key, machineFingerprint })` | Give a machine's seat back. Same deterministic body as `verify`; idempotent. |
+
+### `rekey.devices` (secret key)
+| Method | Description |
+| --- | --- |
+| `list(endUserId, { status? })` | The machines an end-user has signed in from. |
+| `release(deviceId, endUserId)` | Give the slot back and revoke that device's sessions. |
+
+### `rekey.users` (secret key)
+| Method | Description |
+| --- | --- |
+| `getByEmail(email)` / `get(id)` | Exact-match lookup, scoped to the Application. |
+| `import({ users })` | Bring users over from another auth system with their argon2id or bcrypt hashes and OAuth identities. Reports `created`, `skipped` and `unlinked`. |
+
+`rekey.billing.getEntitlementsFor(endUserId)` answers "what may this user use" for a backend holding no user token. See `docs/devices.md`.
 
 ### `rekey.mcp` (bring-your-own MCP server)
 | Method | Description |

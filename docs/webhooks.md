@@ -155,7 +155,7 @@ implement, not something you receive.
 
 ## Event catalog
 
-Twenty-three events. The registry lives in
+Twenty-four events. The registry lives in
 `apps/api/src/modules/webhooks/events.ts`, and `@rekey.dev/node` re-exports it
 as `WEBHOOK_EVENTS` (`{ name, description }` pairs), `KNOWN_WEBHOOK_EVENTS`
 (names only) and `isKnownWebhookEvent` — use those to build an event picker
@@ -165,7 +165,7 @@ rather than hardcoding this table.
 
 | Event | When |
 |---|---|
-| `user.created` | An end-user account was created — password sign-up or first OAuth sign-in. |
+| `user.created` | An end-user account was created — password sign-up, first OAuth or magic-link sign-in, an import (`data.via: "import"`), or a billing system reporting a sale for an address Rekey had not met (`data.via: "billing:<provider>"`). |
 | `user.updated` | An end-user's profile changed (email, role, metadata). |
 | `user.deleted` | An end-user account was deleted. |
 | `user.erased` | An end-user was erased for GDPR: PII and auth material hard-deleted, financial rows retained anonymized, and they can never authenticate again. **Propagate this to your own copies of their PII.** `data.user` carries `id` + `erasedAt`. See [data-erasure.md](data-erasure.md). |

@@ -352,8 +352,9 @@ export default async function BillingPage({
           <p className="font-medium">Plans are sold through your external billing system.</p>
           <p className="mt-1 text-xs text-[var(--color-muted-fg)]">
             Rekey checkout is off for {unbuyablePlans.length === 1 ? 'the one live plan' : `all ${unbuyablePlans.length} live plans`}:
-            subscriptions are activated by the events that system posts. Connect Stripe, PayPal or
-            Razorpay as well if you also want self-serve checkout here.
+            subscriptions are activated by the events that system posts. Connect{' '}
+            {checkoutProviders.map((d) => d.label).join(', ')} as well if you also want self-serve
+            checkout here.
           </p>
         </div>
       )}
