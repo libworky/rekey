@@ -587,6 +587,104 @@ describe('External billing provider webhook', () => {
     expect((await subscriptionOf('sub_cancel_me')).status).toBe('ACTIVE');
   });
 
+  it('a scheduled cancellation leaves a PAST_DUE row past due; the date, not an invented status, is mirrored', async () => {
+    await proPlan();
+    await post(activated('sub_sched', 'pro', { email: 'sched@example.com' }, { currentPeriodEnd: daysFromNow(30).toISOString() }));
+    await post(event('subscription.past_due', { subscription: { id: 'sub_sched' } }));
+    expect((await subscriptionOf('sub_sched')).status).toBe('PAST_DUE');
+
+    const later = daysFromNow(10);
+    const res = await post(
+      event('subscription.canceled', { subscription: { id: 'sub_sched', effectiveAt: later.toISOString() } }),
+    );
+    expect(res.json()).toMatchObject({ processed: true });
+    const sub = await subscriptionOf('sub_sched');
+    expect(sub.status).toBe('PAST_DUE');
+    expect(sub.cancelAt?.toISOString()).toBe(later.toISOString());
+    await settle();
+    // No reactivation was announced: the only activation is the first one.
+    expect(await waitForDeliveries(endpointId, 'subscription.activated', 2, 200)).toHaveLength(1);
+  });
+
+  it('never rebinds a live subscription that a hosted provider created', async () => {
+    await proPlan();
+    const r = await app.inject({
+      method: 'POST',
+      url: `/api/v1/tenant/applications/${appId}/end-users`,
+      headers: auth(),
+      payload: { email: 'stripe-user@example.com', password: 'pw-one-two-three' },
+    });
+    const euId = (r.json().data as { id: string }).id;
+    const plan = await prisma.plan.findUniqueOrThrow({ where: { applicationId_slug: { applicationId: appId, slug: 'pro' } } });
+    const stripeRow = await prisma.subscription.create({
+      data: {
+        applicationId: appId,
+        endUserId: euId,
+        planId: plan.id,
+        status: 'ACTIVE',
+        provider: 'stripe',
+        providerSubId: 'sub_stripe_live',
+        currentPeriodEnd: daysFromNow(20),
+      },
+    });
+
+    const res = await post(activated('sub_ext_clash', 'pro', { endUserId: euId }, { currentPeriodEnd: daysFromNow(40).toISOString() }));
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toMatchObject({ processed: true });
+    const after = await prisma.subscription.findUniqueOrThrow({ where: { id: stripeRow.id } });
+    expect(after.provider).toBe('stripe');
+    expect(after.providerSubId).toBe('sub_stripe_live');
+    expect(after.currentPeriodEnd?.toISOString()).toBe(stripeRow.currentPeriodEnd?.toISOString());
+    const refused = (after.metadata as { refusedGrants?: Array<{ providerSubId: string }> }).refusedGrants;
+    expect(refused?.map((g) => g.providerSubId)).toEqual(['sub_ext_clash']);
+    expect(await prisma.subscription.count({ where: { applicationId: appId } })).toBe(1);
+  });
+
+  it('a period end only ever moves forward, and null never clears a term', async () => {
+    await proPlan();
+    const far = daysFromNow(60);
+    await post(activated('sub_fwd', 'pro', { email: 'fwd@example.com' }, { currentPeriodEnd: far.toISOString() }));
+    await post(activated('sub_fwd', 'pro', { email: 'fwd@example.com' }, { currentPeriodEnd: daysFromNow(30).toISOString() }));
+    expect((await subscriptionOf('sub_fwd')).currentPeriodEnd?.toISOString()).toBe(far.toISOString());
+    await post(activated('sub_fwd', 'pro', { email: 'fwd@example.com' }, { currentPeriodEnd: null }));
+    expect((await subscriptionOf('sub_fwd')).currentPeriodEnd?.toISOString()).toBe(far.toISOString());
+  });
+
+  it('an Application that bills per organization refuses an activation naming none, before anything is written', async () => {
+    await proPlan();
+    const cfg = await app.inject({
+      method: 'PATCH',
+      url: `/api/v1/tenant/applications/${appId}/billing-config`,
+      headers: auth(),
+      payload: { billingSubject: 'org' },
+    });
+    expect(cfg.statusCode).toBe(200);
+    const res = await post(activated('sub_org', 'pro', { email: 'org-buyer@example.com' }));
+    expect(res.statusCode).toBe(500);
+    const receipt = await prisma.webhookEvent.findFirstOrThrow({ where: { applicationId: appId, eventType: 'subscription.activated' } });
+    expect(receipt.processingError).toContain('organization');
+    // Nothing was created for an event that could never have activated.
+    expect(await prisma.endUser.count({ where: { applicationId: appId } })).toBe(0);
+    expect(await prisma.subscription.count({ where: { applicationId: appId } })).toBe(0);
+  });
+
+  it('an erased subscriber is refused', async () => {
+    await proPlan();
+    const r = await app.inject({
+      method: 'POST',
+      url: `/api/v1/tenant/applications/${appId}/end-users`,
+      headers: auth(),
+      payload: { email: 'gone@example.com', password: 'pw-one-two-three' },
+    });
+    const euId = (r.json().data as { id: string }).id;
+    await prisma.endUser.update({ where: { id: euId }, data: { erasedAt: new Date() } });
+    const res = await post(activated('sub_gone', 'pro', { endUserId: euId }));
+    expect(res.statusCode).toBe(500);
+    const receipt = await prisma.webhookEvent.findFirstOrThrow({ where: { applicationId: appId } });
+    expect(receipt.processingError).toContain('erased');
+    expect(await prisma.subscription.count({ where: { applicationId: appId } })).toBe(0);
+  });
+
   it('the signing secret has a length floor and the credential is never echoed', async () => {
     const short = await app.inject({
       method: 'PUT',

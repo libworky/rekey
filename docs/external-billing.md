@@ -185,10 +185,13 @@ What happens:
 { "subscription": { "id": "sub_9f1c", "effectiveAt": "2026-10-03T10:15:00Z" } }
 ```
 
-With `effectiveAt` in the future the subscription stays `ACTIVE` with the date
-scheduled, keeps entitling until then, and is cancelled locally when the date
-arrives. Without it, or with a past date, it is cancelled now and
-`subscription.canceled` is emitted. A cancellation for an id Rekey does not
+With `effectiveAt` in the future the subscription keeps its current status
+(`ACTIVE` keeps entitling, `PAST_DUE` stays in dunning) with the date
+scheduled, and is cancelled locally when the date arrives. Without it, or with
+a past date, it is cancelled now and `subscription.canceled` is emitted. Once
+a future date is scheduled, an immediate cancellation posted before that date
+does not shorten it: the buyer was promised the rest of the period and keeps
+it, exactly as with a hosted provider. A cancellation for an id Rekey does not
 hold is logged and ignored.
 
 ### `subscription.past_due`
@@ -253,6 +256,21 @@ Stripe sale produces. Each subscription reports `provider: "external"`.
 - **Rate limits.** The endpoint shares the API's per-IP limit. A nightly
   reconcile that re-posts every active subscription is fine at a few requests
   per second; spread larger volumes.
+- **A lapsed period does not end the subscription.** Rekey treats a
+  subscription with a provider id as one whose provider will say when it ends,
+  so `currentPeriodEnd` passing is not an expiry: entitlement continues until
+  you post `subscription.canceled` (or a scheduled one comes due). Post the
+  cancellation when the money stops.
+- **A live hosted subscription is never rebound.** If the subscriber already
+  holds a live subscription to the same plan created by Stripe, PayPal or
+  Razorpay, your activation is recorded on that row (`metadata.refusedGrants`)
+  and otherwise ignored, because taking the hosted id away would orphan that
+  provider's events while it keeps charging. Cancel it there first.
+- **Applier failures retry.** A body that fails validation is a `400` and is
+  stored nowhere. An event that validates but cannot be applied (unknown plan
+  slug, unknown `endUserId`, an erased subscriber, a missing organization) is
+  stored with the error, answered `500`, and your retry re-attempts it; fix
+  the cause and let the retry succeed, or stop retrying that event.
 - **Erasure.** When an operator erases an end-user, Rekey does not call your
   system. Remove the customer there as well.
 - **Quota.** Creating a subscriber counts against the workspace's end-user

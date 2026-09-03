@@ -40,8 +40,9 @@
 
 import type { FastifyBaseLogger } from 'fastify';
 import type { Subscription } from '@prisma/client';
-import { isEntitlingStatus, ENTITLING_SUBSCRIPTION_STATUSES } from '@rekey.dev/shared-types';
+import { isEntitlingStatus, ENTITLING_SUBSCRIPTION_STATUSES, BillingConfigSchema } from '@rekey.dev/shared-types';
 import { prisma } from '../../../lib/prisma.js';
+import { RekeyError } from '../../../lib/error.js';
 import { entitlementsService } from '../entitlements.service.js';
 import { dunningService } from '../dunning.service.js';
 import {
@@ -387,6 +388,32 @@ export async function applySubscriptionGranted(
     where: { id: ev.applicationId },
   });
   const plan = await plansService.getBySlug(application.id, ev.planSlug);
+  // The organization preconditions `grantSubscription` enforces, checked here
+  // BEFORE anything is written: an event that would fail them must not first
+  // create the subscriber or retire the row its subscription id was bound to.
+  const billingConfig = BillingConfigSchema.parse(application.billingConfig);
+  if (billingConfig.billingSubject === 'org' && ev.organizationId === undefined) {
+    throw new RekeyError({
+      statusCode: 400,
+      code: 'BILLING_ORGANIZATION_REQUIRED',
+      message: 'This Application bills per organization, but the event names no organization.',
+      fix: 'Send `subscriber.organizationId` on subscription.activated for this Application.',
+    });
+  }
+  if (ev.organizationId !== undefined) {
+    const org = await prisma.organization.findFirst({
+      where: { id: ev.organizationId, applicationId: application.id },
+      select: { id: true },
+    });
+    if (!org) {
+      throw new RekeyError({
+        statusCode: 404,
+        code: 'ORGANIZATION_NOT_FOUND',
+        message: `Organization "${ev.organizationId}" not found in this application.`,
+        fix: 'Send an organization id that belongs to this Application.',
+      });
+    }
+  }
   const subscriber = await subscriberService.resolveOrCreate({
     application,
     subscriber: ev.subscriber,
@@ -436,6 +463,49 @@ export async function applySubscriptionGranted(
   }
 
   // Already entitled: renewal, recovery, rebind, or replay.
+  //
+  // Unless the live subscription belongs to a HOSTED provider. A row with a
+  // Stripe id and a Stripe provider is still being charged by Stripe; taking
+  // its id away would orphan every later Stripe event and hand the buyer a
+  // subscription they can no longer cancel from Rekey while Stripe keeps
+  // billing. The event is recorded on the row and otherwise ignored; the
+  // operator resolves which system owns this customer.
+  if (existing.provider !== null && existing.provider !== ev.provider && existing.providerSubId !== null) {
+    ctx.log.error(
+      {
+        subscriptionId: existing.id,
+        currentProvider: existing.provider,
+        currentProviderSubId: existing.providerSubId,
+        provider: ev.provider,
+        providerSubscriptionId: ev.providerSubscriptionId,
+        providerEventId: ev.providerEventId,
+      },
+      'subscription.granted names a subscriber whose live subscription belongs to another provider — not rebound',
+    );
+    const previous =
+      typeof existing.metadata === 'object' && existing.metadata !== null && !Array.isArray(existing.metadata)
+        ? (existing.metadata as Record<string, unknown>)
+        : {};
+    const refused = Array.isArray(previous.refusedGrants) ? previous.refusedGrants.slice(-19) : [];
+    await prisma.subscription.update({
+      where: { id: existing.id },
+      data: {
+        metadata: {
+          ...previous,
+          refusedGrants: [
+            ...refused,
+            {
+              provider: ev.provider,
+              providerSubId: ev.providerSubscriptionId,
+              providerEventId: ev.providerEventId,
+              at: now.toISOString(),
+            },
+          ],
+        } as never,
+      },
+    });
+    return;
+  }
   const periodAdvanced =
     ev.currentPeriodEnd instanceof Date &&
     (existing.currentPeriodEnd === null || ev.currentPeriodEnd > existing.currentPeriodEnd);
@@ -457,7 +527,10 @@ export async function applySubscriptionGranted(
         ...(recovering && { status: 'ACTIVE' as const }),
         provider: ev.provider,
         providerSubId: ev.providerSubscriptionId,
-        ...(ev.currentPeriodEnd !== undefined && { currentPeriodEnd: ev.currentPeriodEnd }),
+        // Only ever forward. An older-but-future period end is a delayed
+        // delivery, not a shortening, and an explicit null on a live termed
+        // row is not a request to make it open-ended.
+        ...(periodAdvanced && { currentPeriodEnd: ev.currentPeriodEnd }),
         ...(ev.trialEndsAt !== undefined && { trialEndsAt: ev.trialEndsAt }),
         ...(clearsCancellation && clearedOnReactivation),
       },
@@ -1417,13 +1490,15 @@ async function applySubscriptionStatusMirror(
     where,
     select: { id: true, status: true, cancelAt: true },
   });
-  const transitioned = Boolean(existing && existing.status !== ev.status);
+  // No status on the event means "timestamps only": nothing transitions,
+  // nothing is announced, dunning is left alone.
+  const transitioned = Boolean(existing && ev.status !== undefined && existing.status !== ev.status);
   // A terminal subscription is not reopened by a later-arriving event. This
   // gates the WRITE, not just the announcement: gating only the announcement is
   // how a stale `ACTIVE` re-delivery used to resurrect a CANCELED subscription,
   // entitlements and all, while the outbox stayed silent about it. See
   // transitionAllowed.
-  if (existing && !transitionAllowed(existing.status, ev.status)) {
+  if (existing && ev.status !== undefined && !transitionAllowed(existing.status, ev.status)) {
     ctx.log.warn(
       {
         subscriptionId: existing.id,
@@ -1484,7 +1559,7 @@ async function applySubscriptionStatusMirror(
     await tx.subscription.updateMany({
       where,
       data: {
-        status: ev.status,
+        ...(ev.status !== undefined && { status: ev.status }),
         ...(ev.currentPeriodEnd !== undefined && { currentPeriodEnd: ev.currentPeriodEnd }),
         ...(ev.trialEndsAt !== undefined && { trialEndsAt: ev.trialEndsAt }),
         ...(ev.cancelAt !== undefined && { cancelAt: ev.cancelAt }),
