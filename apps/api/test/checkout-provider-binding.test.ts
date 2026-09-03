@@ -641,11 +641,16 @@ describe('a subscription binds its buyer to one payment provider', () => {
     const { basic, pro } = await twoPlans();
     const user = await signUp();
     const stale = await seedSub({ endUserId: user.id, planSlug: basic, status: 'PENDING' });
-    // `updatedAt` is maintained by Prisma, so age it in SQL rather than asking
-    // for a value the client will overwrite.
-    await prisma.$executeRaw`UPDATE subscriptions SET updated_at = ${new Date(
-      Date.now() - CHECKOUT_SESSION_LIFETIME_MS - 60_000,
-    )} WHERE id = ${stale.id}`;
+    // Aged through the model, not raw SQL. An explicit `updatedAt` overrides
+    // `@updatedAt`, and it is the only way to write the column the way the
+    // binding query reads it: `$executeRaw` hands Postgres an offset-aware
+    // value that a `TIMESTAMP(3)` column casts through the SESSION time zone,
+    // so anywhere but UTC the row lands one offset in the future and never
+    // looks stale. Green in CI, red on every developer east of Greenwich.
+    await prisma.subscription.update({
+      where: { id: stale.id },
+      data: { updatedAt: new Date(Date.now() - CHECKOUT_SESSION_LIFETIME_MS - 60_000) },
+    });
 
     const res = await checkout(user.token, pro, 'stripe');
 

@@ -292,7 +292,7 @@ apps/
         refresh-tokens.ts / tenant-refresh-tokens.ts
         password-reset.ts / tenant-password-reset.ts
         email-verification.ts
-        passwords.ts         — argon2id hash + verify
+        passwords.ts         — argon2id hash + verify, bcrypt verify-and-rehash
         keys.ts              — API key generation + SHA-256
         license-keys.ts
         mfa.ts               — TOTP + backup codes
@@ -321,12 +321,13 @@ apps/
         tenant-applications/ — tenant-scoped Application + plan + coupon + api-key CRUD
         tenant-workspaces/   — workspace members + invitations
         billing/             — plans + checkout + provider selection
-          providers/         — stripe, paypal, razorpay
+          providers/         — stripe, paypal, razorpay, external (inbound only)
           webhooks/          — inbound provider webhook handlers
+        devices/             — device registry, session binding, release / block
         plans/ coupons/ licenses/ usage/  — billing-tier surfaces
         email/               — template registry, render, transport, routes
         webhooks/            — outbound webhook endpoint CRUD + delivery + retry
-      routes/                — top-level glue (health, me, users-me)
+      routes/                — top-level glue (health, me, users-me, users, users-import)
     test/                    — vitest suites
   panel/                     — Next.js operator panel (App Router, server actions, Tailwind)
   portal/                    — hosted multi-app customer billing portal

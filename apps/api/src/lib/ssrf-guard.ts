@@ -18,7 +18,9 @@
  */
 
 import { lookup } from 'node:dns/promises';
+import type { LookupAddress, LookupOptions } from 'node:dns';
 import { isIP } from 'node:net';
+import { Agent } from 'undici';
 import { env } from '../config/env.js';
 import { RekeyError } from './error.js';
 
@@ -268,6 +270,64 @@ export async function assertSafeUrlResolved(
     }
   }
   return results.map((r) => r.address);
+}
+
+/**
+ * Fetch options that pin the connection to a pre-validated address set.
+ *
+ * `assertSafeUrlResolved` resolves the host and approves its addresses; the
+ * socket must then go to one of THEM, not to whatever a second DNS query
+ * answers a moment later (rebinding: a short-TTL record that flips from a
+ * public address to an internal one between the check and the connect). The
+ * dispatcher's `lookup` answers only from the validated set. TLS still
+ * validates against the original hostname, because undici keeps the URL's
+ * servername; pinning the address is not the same as connecting by IP.
+ *
+ * Built per call rather than cached: the validated set is specific to this
+ * attempt, and a pool keyed on the host would outlive it. Spread the result
+ * into the `fetch` init. An empty set yields no override, which happens only
+ * when the guard was told to allow private targets and so approved the host
+ * without resolving it (`allowPrivate`, or WEBHOOK_ALLOW_PRIVATE_TARGETS).
+ *
+ * The agent is configured to drop its socket as soon as the response is read.
+ * Nothing can destroy it — the helper hands back only the init — and undici
+ * otherwise honours the REMOTE server's keep-alive hint for up to ten minutes,
+ * so a per-call agent that kept its socket would leave one idle connection per
+ * fetch: three per OIDC sign-in, one per webhook delivery. There is no reuse to
+ * lose, because the next call builds a new agent anyway.
+ */
+export function pinnedFetchInit(allowed: readonly string[]): RequestInit {
+  if (allowed.length === 0) return {};
+  const dispatcher = new Agent({
+    connections: 1,
+    keepAliveTimeout: 1,
+    keepAliveMaxTimeout: 1,
+    connect: {
+      lookup: (
+        _hostname: string,
+        options: LookupOptions,
+        callback: (
+          err: NodeJS.ErrnoException | null,
+          address: string | LookupAddress[],
+          family?: number,
+        ) => void,
+      ): void => {
+        const entries = allowed.map((address) => ({
+          address,
+          family: address.includes(':') ? 6 : 4,
+        }));
+        if (options.all) {
+          callback(null, entries);
+          return;
+        }
+        const first = entries[0]!;
+        callback(null, first.address, first.family);
+      },
+    },
+  });
+  // `dispatcher` is not in the DOM RequestInit that TS resolves here; Node's
+  // fetch accepts it and undici reads it.
+  return { dispatcher } as unknown as RequestInit;
 }
 
 /** Back-compat wrapper for callers that do not pin the connection. */

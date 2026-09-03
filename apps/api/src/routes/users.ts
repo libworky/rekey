@@ -3,10 +3,10 @@
  *
  * Secret-key-only end-user lookup, for the customer's own backend.
  *
- * Until now a server holding a secret key had no way to find an end-user it
- * did not already have a token for: `/users/me` needs the user's JWT, and the
- * operator list at `/tenant/applications/:id/end-users?search=` needs a panel
- * session and does a substring search. A licence server answering "which
+ * Without these, a server holding a secret key has no way to find an end-user
+ * it does not already have a token for: `/users/me` needs the user's JWT, and
+ * the operator list at `/tenant/applications/:id/end-users?search=` needs a
+ * panel session and does a substring search. A licence server answering "which
  * account does this email belong to", or a migration script reconciling
  * records, needs an exact, server-to-server answer.
  *
@@ -23,6 +23,7 @@ import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { prisma } from '../lib/prisma.js';
 import { RekeyError } from '../lib/error.js';
+import { assertEndUserInApplication } from '../lib/end-users.js';
 import { authService } from '../modules/auth/auth.service.js';
 import { requireApiKey, requireScope } from '../middleware/api-key-auth.js';
 import { ok, errs, ref } from '../lib/openapi.js';
@@ -99,8 +100,11 @@ export async function usersRoutes(app: FastifyInstance): Promise<void> {
     },
     async (req) => {
       const { id } = z.object({ id: z.string().min(1) }).parse(req.params);
-      const row = await prisma.endUser.findUnique({ where: { id }, select: { applicationId: true } });
-      if (!row || row.applicationId !== req.application!.id) throw notFound(`"${id}"`);
+      await assertEndUserInApplication(
+        req.application!.id,
+        id,
+        'Confirm the id belongs to the Application this secret key represents.',
+      );
       return { success: true, data: await authService.getById(req.application!.id, id) };
     },
   );

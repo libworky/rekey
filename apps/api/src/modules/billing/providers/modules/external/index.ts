@@ -248,7 +248,18 @@ async function verify(
       fix: 'Sign at send time with the current unix time, and keep the sending host clock synchronised.',
     };
   }
-  const expected = createHmac('sha256', creds.webhookSecret ?? '')
+  // The pipeline refuses the request before this when the secret is unset;
+  // an HMAC over an empty key must still never be a way in.
+  if (!creds.webhookSecret) {
+    return {
+      ok: false,
+      statusCode: 503,
+      code: 'BILLING_CREDENTIALS_NOT_CONFIGURED',
+      message: 'This Application has no signing secret for the external billing provider.',
+      fix: 'Save a signing secret on the Billing tab, then resend.',
+    };
+  }
+  const expected = createHmac('sha256', creds.webhookSecret)
     .update(`${sig.t}.${req.rawBody}`)
     .digest();
   const given = Buffer.from(sig.v1, 'hex');

@@ -43,7 +43,7 @@ import { CouponDiscountType, type LicenseKind } from '@prisma/client';
 import { AppEnvironmentSchema, AuthConfigSchema, BillingConfigSchema, BillingProviderSchema, GrantCreditsRequestSchema } from '@rekey.dev/shared-types';
 import { RekeyError } from '../../lib/error.js';
 import { hashPassword } from '../../lib/passwords.js';
-import { assertMetadataWithinLimit } from '../auth/auth.service.js';
+import { assertMetadataWithinLimit } from '../../lib/metadata-limit.js';
 import { assertEndUserQuota } from '../../lib/tenant-limits.js';
 import { entitlementOverridesService } from '../billing/entitlement-overrides.service.js';
 import { kickDeliveries } from '../webhooks/webhook.service.js';
@@ -6330,6 +6330,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
             400:
               'LICENSE_EXPIRES_AT_REQUIRED — a TIMED license is missing `expiresAt`; or ' +
               'LICENSE_SEATS_REQUIRED — a SEATS license is missing a valid `seatsAllowed`; or ' +
+              'METADATA_TOO_LARGE — `metadata` exceeds the 16KB limit; or ' +
               'VALIDATION_ERROR — a field failed schema validation.',
             401: APP_WRITE_ERRORS[401],
             403: APP_WRITE_ERRORS[403],
@@ -6350,6 +6351,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
           metadata: z.record(z.unknown()).optional(),
         })
         .parse(req.body);
+      if (body.metadata !== undefined) assertMetadataWithinLimit(body.metadata);
       // Confirm the EndUser belongs to this Application — otherwise we'd
       // accept arbitrary cross-app linking. (Service trusts the caller;
       // we enforce here.)

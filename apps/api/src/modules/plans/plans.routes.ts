@@ -1,5 +1,6 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
+import { assertMetadataWithinLimit } from '../../lib/metadata-limit.js';
 import { plansService } from './plans.service.js';
 import { applicationsService } from '../applications/applications.service.js';
 import { requireSuperAdmin } from '../../middleware/admin-auth.js';
@@ -127,6 +128,7 @@ export async function plansRoutes(app: FastifyInstance): Promise<void> {
     async (req, reply) => {
       const { id } = Params.parse(req.params);
       const body = CreateBody.parse(req.body);
+      if (body.metadata !== undefined) assertMetadataWithinLimit(body.metadata);
       const plan = await plansService.create({
         applicationId: id,
         slug: body.slug,
@@ -182,6 +184,7 @@ export async function plansRoutes(app: FastifyInstance): Promise<void> {
     async (req) => {
       const { id, slug } = PlanParams.parse(req.params);
       const body = UpdateBody.parse(req.body);
+      if (body.metadata !== undefined) assertMetadataWithinLimit(body.metadata);
       return {
         success: true,
         data: await plansService.update(id, slug, {

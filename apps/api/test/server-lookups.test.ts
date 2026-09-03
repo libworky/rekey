@@ -1,8 +1,8 @@
 /**
- * Secret-key server reads — the fifth step of the device series. A backend
- * that holds a secret key but no user token can now answer "who is this id /
- * email" and "what is this user entitled to". Both refuse the publishable
- * key, both are scoped to the calling Application, and both 404 across it.
+ * Secret-key server reads. A backend that holds a secret key but no user
+ * token can answer "who is this id / email" and "what is this user entitled
+ * to". Both refuse the publishable key, both are scoped to the calling
+ * Application, and both 404 across it.
  */
 
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';

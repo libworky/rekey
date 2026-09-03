@@ -1,6 +1,5 @@
 /**
- * Devices — the model + service behind device binding (the first of the
- * series; sessions, routes and licence integration land on top of it).
+ * Devices: the model and service behind device binding.
  *
  * What is proven here:
  *   - `touch` registers a new device, refreshes a known one without consuming
@@ -22,6 +21,11 @@ import type { FastifyInstance } from 'fastify';
 import { buildApp } from '../src/app.js';
 import { prisma } from '../src/lib/prisma.js';
 import { devicesService } from '../src/modules/devices/devices.service.js';
+import {
+  makeEndUser as makeEndUserFor,
+  setDefaultDeviceLimit as setDefaultDeviceLimitFor,
+  waitForDeliveries,
+} from './device-fixtures.js';
 import { issueRefreshToken } from '../src/lib/refresh-tokens.js';
 
 describe('devices service', () => {
@@ -58,41 +62,7 @@ describe('devices service', () => {
       .then((r) => (r.json().data as { id: string }).id);
   });
 
-  async function makeEndUser(email: string): Promise<string> {
-    return app
-      .inject({
-        method: 'POST',
-        url: `/api/v1/tenant/applications/${appId}/end-users`,
-        headers: auth(),
-        payload: { email, password: 'pw-one-two-three' },
-      })
-      .then((r) => (r.json().data as { id: string }).id);
-  }
 
-  /** A $0 plan carrying `max_devices`, made the Application's default (free tier). */
-  async function setDefaultDeviceLimit(limit: number): Promise<void> {
-    const slug = `free-${limit}`;
-    await app.inject({
-      method: 'POST',
-      url: `/api/v1/tenant/applications/${appId}/plans`,
-      headers: auth(),
-      payload: { slug, name: slug, amount: 0, kind: 'SUBSCRIPTION' },
-    });
-    const put = await app.inject({
-      method: 'PUT',
-      url: `/api/v1/tenant/applications/${appId}/plans/${slug}/entitlements`,
-      headers: auth(),
-      payload: { kind: 'FEATURE', key: 'max_devices', valueType: 'INT', value: String(limit) },
-    });
-    expect(put.statusCode).toBe(200);
-    const application = await prisma.application.findUniqueOrThrow({ where: { id: appId } });
-    await prisma.application.update({
-      where: { id: appId },
-      data: {
-        billingConfig: { ...(application.billingConfig as object), defaultPlanSlug: slug } as never,
-      },
-    });
-  }
 
   /** Subscribe every event on an endpoint so the outbox records what was emitted. */
   async function subscribeAll(): Promise<void> {
@@ -105,14 +75,12 @@ describe('devices service', () => {
     expect(r.statusCode).toBe(201);
   }
 
-  async function emitted(): Promise<string[]> {
-    // The emit is detached; give the enqueue a moment to land.
-    await new Promise((r) => setTimeout(r, 150));
-    const rows = await prisma.webhookDelivery.findMany({
-      where: { applicationId: appId },
-      orderBy: { createdAt: 'asc' },
-      select: { eventType: true },
-    });
+  const makeEndUser = (email: string) => makeEndUserFor(app, token, appId, email);
+  const setDefaultDeviceLimit = (limit: number) => setDefaultDeviceLimitFor(app, token, appId, limit);
+
+  /** Event types delivered so far, once at least `expected` have landed. */
+  async function emitted(expected: number): Promise<string[]> {
+    const rows = await waitForDeliveries({ applicationId: appId }, expected);
     return rows.map((r) => r.eventType);
   }
 
@@ -174,7 +142,7 @@ describe('devices service', () => {
     expect(await prisma.device.count({ where: { endUserId: userId } })).toBe(1);
 
     // registered → (refresh: nothing) → released → registered(reactivated)
-    expect(await emitted()).toEqual(['device.registered', 'device.released', 'device.registered']);
+    expect(await emitted(3)).toEqual(['device.registered', 'device.released', 'device.registered']);
   });
 
   it('is uncapped when no plan grants max_devices', async () => {
@@ -216,7 +184,7 @@ describe('devices service', () => {
     const cAgain = await devicesService.touch({ applicationId: appId, endUserId: userId, fingerprint: 'fp-cccccccc', label: 'C' });
     expect(cAgain.kind).toBe('ok');
 
-    const types = await emitted();
+    const types = await emitted(5);
     expect(types.filter((t) => t === 'device.limit_reached')).toHaveLength(1);
     expect(types.filter((t) => t === 'device.registered')).toHaveLength(3);
   });
@@ -294,7 +262,7 @@ describe('devices service', () => {
     const back = await devicesService.touch({ applicationId: appId, endUserId: userId, fingerprint: 'fp-blockme-01' });
     expect(back.kind).toBe('ok');
 
-    expect(await emitted()).toEqual([
+    expect(await emitted(4)).toEqual([
       'device.registered',
       'device.blocked',
       'device.unblocked',

@@ -1,7 +1,7 @@
 /**
- * Legacy password import — the sixth step of the device series. A migration
- * from another auth system is one batch call; bcrypt hashes verify as-is and
- * are upgraded to argon2id on the first successful sign-in.
+ * Legacy password import. A migration from another auth system is one batch
+ * call; bcrypt hashes verify as-is and are upgraded to argon2id on the first
+ * successful sign-in.
  */
 
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';

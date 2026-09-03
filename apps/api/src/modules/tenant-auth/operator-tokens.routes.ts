@@ -119,7 +119,8 @@ export async function operatorTokenRoutes(app: FastifyInstance): Promise<void> {
             403:
               "TENANT_MEMBERSHIP_REVOKED — the PAT's operator no longer has a membership in " +
               'its bound workspace; or OPERATOR_SCOPE_INSUFFICIENT — the PAT does not carry ' +
-              'the `read` scope.',
+              'the `read` scope; or TENANT_ROLE_INSUFFICIENT — the operator who minted the ' +
+              'token has since been demoted below admin.',
           }),
         },
       },
@@ -128,6 +129,18 @@ export async function operatorTokenRoutes(app: FastifyInstance): Promise<void> {
       // This query used to be unbounded: `applicationsService.list(tenantId)`
       // with no take, so a workspace with thousands of Applications returned
       // all of them in one body. Bounded now, and the caller is told the total.
+      // Same rule the sibling routes apply through `ensureAppInTenant`: a
+      // token minted by an admin who has since been demoted to MEMBER does
+      // not keep listing every Application in the workspace, including the
+      // ones the member holds no grant on.
+      if (req.tenantRole !== undefined && req.tenantRole !== 'OWNER' && req.tenantRole !== 'ADMIN') {
+        throw new RekeyError({
+          statusCode: 403,
+          code: 'TENANT_ROLE_INSUFFICIENT',
+          message: 'This token was minted by a member who no longer has admin rights in this workspace.',
+          fix: 'Have an owner or admin mint a new token, or restore the role.',
+        });
+      }
       const { take, skip } = parsePagination(PaginationQuery.parse(req.query));
       const [items, total] = await Promise.all([
         applicationsService.list(req.tenantId!, { take, skip }),
