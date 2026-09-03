@@ -258,8 +258,14 @@ export function licenseRateLimitKey(req: FastifyRequest): string {
  * at launch, and a Redis blip should not lock every user out of software they
  * have paid for. The auth ceiling still rides along.
  */
-export function licenseRateLimit(maxPerMinute: number): AuthRateLimitConfig {
-  return { ...authRateLimit(maxPerMinute), keyGenerator: licenseRateLimitKey, skipOnError: true };
+export function licenseRateLimit(maxPerMinute: number): Omit<AuthRateLimitConfig, typeof AUTH_CEILING_MARKER> {
+  // The per-Application auth ceiling is deliberately NOT applied: it fails
+  // closed by design (credential guessing must not get a free pass on a store
+  // outage), which would make this route fail closed too, and a licence key
+  // is not a credential a store outage should protect at the cost of every
+  // launch. The (application, IP) bucket is the whole policy here.
+  const { [AUTH_CEILING_MARKER]: _ceiling, ...base } = authRateLimit(maxPerMinute);
+  return { ...base, keyGenerator: licenseRateLimitKey, skipOnError: true };
 }
 
 export function wantsAuthCeiling(rateLimitConfig: unknown): boolean {

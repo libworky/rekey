@@ -139,7 +139,7 @@ export const SECURITY_EVENT_LABEL = {
   'end_user.delete_blocked': 'End-user deletion blocked',
   'end_user.deleted': 'End-user deleted',
   'end_user.data_exported': 'End-user data exported',
-  'end_user.device_released': 'Device released by an operator',
+  'end_user.device_released': 'Device released by an operator or the application server',
   'end_user.device_blocked': 'Device blocked',
   'end_user.device_unblocked': 'Device unblocked',
 

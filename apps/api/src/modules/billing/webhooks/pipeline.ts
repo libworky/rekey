@@ -283,7 +283,13 @@ export async function handleBillingProviderWebhook(
       { provider: module.name, eventId: providerEventId },
       'retrying previously-failed billing webhook',
     );
-    webhookRow = existing;
+    // The retry may carry a different body than the delivery that failed
+    // (a sender that fixed its payload and re-sent under the same id). What
+    // is applied below is THIS body, so the receipt records this body.
+    webhookRow = await prisma.webhookEvent.update({
+      where: { id: existing.id },
+      data: { eventType, payload: req.payload as never },
+    });
   }
 
   // --- Translate + apply -------------------------------------------------

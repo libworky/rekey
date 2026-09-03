@@ -338,6 +338,28 @@ async function bindDevice(
     // simply leaves the new session unbound.
     const bound = await prisma.device.findUnique({ where: { id: device.deviceId } });
     if (bound && bound.endUserId === endUser.id && bound.applicationId === application.id) {
+      // A re-mint rides on a device that is still ACTIVE. Release revokes
+      // the device's refresh chain, but an access token minted before the
+      // release stays valid for up to fifteen minutes, and an org switch on
+      // that token would otherwise walk the released device straight back to
+      // ACTIVE through `touch`, slot and all. Only a primary sign-in may
+      // bring a released device back; a blocked one needs an operator.
+      if (bound.status === 'BLOCKED') {
+        throw new RekeyError({
+          statusCode: 403,
+          code: 'DEVICE_BLOCKED',
+          message: 'The device this session is bound to has been blocked.',
+          fix: "Contact the application's support — only an operator can unblock a device.",
+        });
+      }
+      if (bound.status === 'RELEASED') {
+        throw new RekeyError({
+          statusCode: 401,
+          code: 'SESSION_DEVICE_RELEASED',
+          message: 'The device this session is bound to has been released.',
+          fix: 'Sign the user in again from this device.',
+        });
+      }
       fingerprint = bound.fingerprint;
       via = 'refresh';
     }

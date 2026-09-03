@@ -39,9 +39,6 @@ import { emitDetached } from '../webhooks/webhook.service.js';
 
 export type { Device, DeviceStatus };
 
-/** The fields a device exposes on the wire. Today that is every column. */
-export type PublicDevice = Device;
-
 export interface TouchDeviceInput {
   applicationId: string;
   endUserId: string;
@@ -145,7 +142,10 @@ export const devicesService = {
   async maxDevicesFor(applicationId: string, endUserId: string): Promise<number | null> {
     const { features } = await entitlementsService.resolveForEndUser(applicationId, endUserId);
     const v = features[DEVICE_LIMIT_FEATURE_KEY];
-    return typeof v === 'number' && Number.isFinite(v) ? Math.max(0, Math.floor(v)) : null;
+    // An operator who declared the feature as STRING "3" meant three, not
+    // "no cap"; a value that is not a number at all means no cap.
+    const n = typeof v === 'number' ? v : typeof v === 'string' && v.trim() !== '' ? Number(v) : NaN;
+    return Number.isFinite(n) ? Math.max(0, Math.floor(n)) : null;
   },
 
   /**

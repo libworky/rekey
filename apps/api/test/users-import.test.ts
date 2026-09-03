@@ -139,6 +139,16 @@ describe('user import and bcrypt verify-and-rehash', () => {
     });
     expect(costly.statusCode).toBe(400);
     expect(costly.json().error.code).toBe('PASSWORD_HASH_UNSUPPORTED');
+    // An argon2id hash outside the parameter budget is refused: sign-in would
+    // otherwise honour four gigabytes and sixty-four lanes per attempt.
+    const hungry = await app.inject({
+      method: 'POST',
+      url: '/api/v1/users/import',
+      headers: secret(),
+      payload: { users: [{ email: 'hungry@example.com', passwordHash: '$argon2id$v=19$m=4194304,t=64,p=64$c2FsdHNhbHQ$aGFzaGhhc2hoYXNo' }] },
+    });
+    expect(hungry.statusCode).toBe(400);
+    expect(hungry.json().error.code).toBe('PASSWORD_HASH_UNSUPPORTED');
     // So is an argon2id string that is only a prefix.
     const prefixOnly = await app.inject({
       method: 'POST',

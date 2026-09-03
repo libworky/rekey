@@ -35,6 +35,7 @@ import {
   CHECKOUT_SESSION_LIFETIME_MS,
 } from './checkout-sessions.js';
 import { getProviderForApplication, pickProvider } from './providers/index.js';
+import { getModule } from './providers/registry.js';
 import { billingCredentialsService, type BillingProviderName } from './credentials.service.js';
 import { BillingConfigSchema, cancelEffect, isEntitlingStatus, ENTITLING_SUBSCRIPTION_STATUSES } from '@rekey.dev/shared-types';
 import { enqueueSubscriptionEvent } from './webhooks/billing-events.js';
@@ -128,6 +129,11 @@ function receiptUrlFromMetadata(metadata: unknown): string | null {
  * `updateMany` reports how many rows it actually changed, and only the winner
  * enqueues.
  */
+/** A provider that only receives events and can be asked for nothing. */
+function isInboundOnlyProvider(provider: string | null): boolean {
+  return provider !== null && getModule(provider)?.capabilities.checkout === false;
+}
+
 async function expireIfDue(sub: Subscription): Promise<Subscription> {
   const now = new Date();
 
@@ -192,10 +198,18 @@ async function expireIfDue(sub: Subscription): Promise<Subscription> {
   // agreement is cancelled outright at request time, Stripe's
   // `cancel_at_period_end` bills nothing after the period, and a row with no
   // provider never charges at all.
-  const paidSinceCancellation = await prisma.payment.findFirst({
-    where: { subscriptionId: sub.id, status: 'SUCCEEDED', createdAt: { gt: sub.cancelAt! } },
-    select: { id: true },
-  });
+  //
+  // Not for a subscription an inbound-only provider created. Its payments are
+  // bookkeeping the sender posts on its own schedule, so a charge recorded
+  // after the cancellation date says nothing about whether the subscription
+  // was restarted; a sender that restarts one says so with an activation
+  // carrying a later period end, which clears the schedule explicitly.
+  const paidSinceCancellation = isInboundOnlyProvider(sub.provider)
+    ? null
+    : await prisma.payment.findFirst({
+        where: { subscriptionId: sub.id, status: 'SUCCEEDED', createdAt: { gt: sub.cancelAt! } },
+        select: { id: true },
+      });
   if (paidSinceCancellation) {
     return prisma.subscription.update({
       where: { id: sub.id },
@@ -1396,6 +1410,22 @@ export const billingService = {
     let attempted = 0;
     let failed = 0;
     for (const sub of subs) {
+      // An inbound-only provider cannot be asked to stop; the sender learns
+      // of the deletion from `user.deleted` / `user.erased` and stops on its
+      // side. Locally the row is ended now, so the erased account does not
+      // sit in the active-subscription counts until the sender catches up.
+      if (isInboundOnlyProvider(sub.provider)) {
+        const now = new Date();
+        const deliveryIds = await prisma.$transaction(async (tx) => {
+          const { count } = await tx.subscription.updateMany({
+            where: { id: sub.id, status: { in: ['ACTIVE', 'TRIALING', 'PAST_DUE'] } },
+            data: { status: 'CANCELED', canceledAt: now, cancelAt: now },
+          });
+          return count > 0 ? enqueueSubscriptionEvent(tx, 'subscription.canceled', sub.id) : [];
+        });
+        kickDeliveries(deliveryIds);
+        continue;
+      }
       attempted += 1;
       try {
         const provider = await getProviderForApplication(
