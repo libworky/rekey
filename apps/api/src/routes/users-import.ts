@@ -22,7 +22,7 @@ import { z } from 'zod';
 import { prisma } from '../lib/prisma.js';
 import { RekeyError } from '../lib/error.js';
 import { requireApiKey, requireScope } from '../middleware/api-key-auth.js';
-import { isBcryptHash } from '../lib/passwords.js';
+import { isSupportedPasswordHash, MAX_BCRYPT_COST } from '../lib/passwords.js';
 import { assertEndUserQuota } from '../lib/tenant-limits.js';
 import { assertMetadataWithinLimit } from '../modules/auth/auth.service.js';
 import { applicationRolesService } from '../modules/application-roles/application-roles.service.js';
@@ -30,12 +30,12 @@ import { emitDetached } from '../modules/webhooks/webhook.service.js';
 import { ok, errs } from '../lib/openapi.js';
 
 const MAX_BATCH = 500;
-const ARGON2ID_RE = /^\$argon2id\$/;
 
 const ImportUser = z.object({
   email: z.string().email().max(254),
-  /** argon2id (`$argon2id$…`) or bcrypt (`$2a$`/`$2b$`/`$2y$`). Omit for OAuth-only users. */
+  /** argon2id PHC string, or bcrypt (`$2a$`/`$2b$`/`$2y$`) at cost 14 or below. Omit for OAuth-only users. */
   passwordHash: z.string().min(20).max(512).optional(),
+  /** Defaults to false: an address is verified only when the caller says so. */
   emailVerified: z.boolean().optional(),
   role: z.string().min(1).max(40).optional(),
   metadata: z.record(z.unknown()).optional(),
@@ -113,6 +113,11 @@ export async function usersImportRoutes(app: FastifyInstance): Promise<void> {
               properties: {
                 created: { type: 'array', items: { type: 'object', properties: { id: { type: 'string' }, email: { type: 'string' } }, required: ['id', 'email'] } },
                 skipped: { type: 'array', items: { type: 'object', properties: { email: { type: 'string' }, reason: { type: 'string' } }, required: ['email', 'reason'] } },
+                unlinked: {
+                  type: 'array',
+                  description: 'OAuth identities NOT linked because the provider account already belongs to another end-user here. The user was still created.',
+                  items: { type: 'object', properties: { email: { type: 'string' }, provider: { type: 'string' }, providerAccountId: { type: 'string' } }, required: ['email', 'provider', 'providerAccountId'] },
+                },
               },
               required: ['created', 'skipped'],
             },
@@ -147,12 +152,12 @@ export async function usersImportRoutes(app: FastifyInstance): Promise<void> {
           });
         }
         seen.add(email);
-        if (u.passwordHash !== undefined && !ARGON2ID_RE.test(u.passwordHash) && !isBcryptHash(u.passwordHash)) {
+        if (u.passwordHash !== undefined && !isSupportedPasswordHash(u.passwordHash)) {
           throw new RekeyError({
             statusCode: 400,
             code: 'PASSWORD_HASH_UNSUPPORTED',
-            message: `The password hash for "${email}" is neither argon2id nor bcrypt.`,
-            fix: 'Send hashes as your current system stores them ($argon2id$… or $2a$/$2b$/$2y$…), or omit passwordHash and let the user reset.',
+            message: `The password hash for "${email}" is not a well-formed argon2id hash or a bcrypt hash at cost ${MAX_BCRYPT_COST} or below.`,
+            fix: 'Send hashes as your current system stores them ($argon2id$v=19$m=…,t=…,p=…$salt$hash, or $2a$/$2b$/$2y$ at cost <= ' + MAX_BCRYPT_COST + '), or omit passwordHash and let the user reset.',
           });
         }
         if (u.metadata !== undefined) assertMetadataWithinLimit(u.metadata);
@@ -162,6 +167,11 @@ export async function usersImportRoutes(app: FastifyInstance): Promise<void> {
 
       const created: Array<{ id: string; email: string }> = [];
       const skipped: Array<{ email: string; reason: string }> = [];
+      // Identities that could not be linked because the provider account is
+      // already attached to another end-user in this Application. The row is
+      // still created; the caller must know the Google sign-in will land on
+      // the OTHER account.
+      const unlinked: Array<{ email: string; provider: string; providerAccountId: string }> = [];
       for (const u of users) {
         const email = u.email.toLowerCase();
         const existing = await prisma.endUser.findUnique({
@@ -183,14 +193,19 @@ export async function usersImportRoutes(app: FastifyInstance): Promise<void> {
           }
           throw e;
         }
-        const row = await prisma.$transaction(async (tx) => {
+        let row;
+        try {
+          row = await prisma.$transaction(async (tx) => {
           const endUser = await tx.endUser.create({
             data: {
               applicationId: application.id,
               email,
               passwordHash: u.passwordHash ?? null,
               role: u.role ?? defaultRole,
-              emailVerified: u.emailVerified ?? true,
+              // Unverified unless the caller says otherwise. An Application
+              // that requires verification would otherwise trust every
+              // imported address on the strength of an omitted field.
+              emailVerified: u.emailVerified ?? false,
               ...(u.metadata !== undefined && { metadata: u.metadata as never }),
             },
             select: { id: true, email: true },
@@ -208,7 +223,10 @@ export async function usersImportRoutes(app: FastifyInstance): Promise<void> {
               },
               select: { id: true },
             });
-            if (taken) continue;
+            if (taken) {
+              unlinked.push({ email, provider: ident.provider, providerAccountId: ident.providerAccountId });
+              continue;
+            }
             await tx.oAuthIdentity.create({
               data: {
                 applicationId: application.id,
@@ -220,7 +238,14 @@ export async function usersImportRoutes(app: FastifyInstance): Promise<void> {
             });
           }
           return endUser;
-        });
+          });
+        } catch (e) {
+          // A sign-up for the same address landed between the existence check
+          // and the create: the row exists, which is what "skipped" means.
+          if ((e as { code?: string }).code !== 'P2002') throw e;
+          skipped.push({ email, reason: 'already_exists' });
+          continue;
+        }
         created.push(row);
         emitDetached({
           applicationId: application.id,
@@ -228,7 +253,7 @@ export async function usersImportRoutes(app: FastifyInstance): Promise<void> {
           data: { user: { id: row.id, email: row.email, imported: true } },
         });
       }
-      return { success: true, data: { created, skipped } };
+      return { success: true, data: { created, skipped, unlinked } };
     },
   );
 }

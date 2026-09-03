@@ -63,7 +63,11 @@ export async function usersRoutes(app: FastifyInstance): Promise<void> {
         },
         response: {
           200: ok(ref('EndUser'), 'The matching end-user.'),
-          ...errs({ 400: 'VALIDATION_ERROR — `email` is missing or malformed.', ...USERS_ERRORS }),
+          ...errs({
+            400: 'VALIDATION_ERROR — `email` is missing or malformed.',
+            410: 'END_USER_ERASED — the account was erased (GDPR); only a tombstone remains.',
+            ...USERS_ERRORS,
+          }),
         },
       },
     },
@@ -89,7 +93,7 @@ export async function usersRoutes(app: FastifyInstance): Promise<void> {
         params: { type: 'object', properties: { id: { type: 'string' } }, required: ['id'] },
         response: {
           200: ok(ref('EndUser'), 'The end-user.'),
-          ...errs(USERS_ERRORS),
+          ...errs({ 410: 'END_USER_ERASED — the account was erased (GDPR); only a tombstone remains.', ...USERS_ERRORS }),
         },
       },
     },

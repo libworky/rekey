@@ -12,7 +12,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import type { FastifyInstance, FastifyRequest } from 'fastify';
 import { buildApp } from '../src/app.js';
 import { prisma } from '../src/lib/prisma.js';
-import { licenseRateLimitKey } from '../src/lib/rate-limit.js';
+import { licenseRateLimit, licenseRateLimitKey } from '../src/lib/rate-limit.js';
 import { licensesService } from '../src/modules/licenses/licenses.service.js';
 import { devicesService } from '../src/modules/devices/devices.service.js';
 import { operatorWriteTools } from '../src/modules/tenant-mcp/operator-write-tools.js';
@@ -86,20 +86,19 @@ describe('device hardening', () => {
     return t;
   };
 
-  it('throttles licence verify per (application, key, fingerprint) with both hashed', () => {
-    const req = (body: unknown, application?: string) =>
-      ({ body, application: application ? { id: application } : undefined, ip: '203.0.113.9' }) as unknown as FastifyRequest;
-    const a = licenseRateLimitKey(req({ key: 'rl_lic_secret', machineFingerprint: 'fp-1' }, 'app1'));
-    const b = licenseRateLimitKey(req({ key: 'rl_lic_secret', machineFingerprint: 'fp-2' }, 'app1'));
-    const c = licenseRateLimitKey(req({ key: 'rl_lic_other', machineFingerprint: 'fp-1' }, 'app1'));
-    const d = licenseRateLimitKey(req({ key: 'rl_lic_secret', machineFingerprint: 'fp-1' }, 'app2'));
-    expect(new Set([a, b, c, d]).size).toBe(4);
-    expect(a).toMatch(/^license:app1:[0-9a-f]{32}:[0-9a-f]{32}$/);
+  it('throttles licence verify per (application, IP): a guesser cannot open a fresh bucket per key', () => {
+    const req = (body: unknown, application: string | undefined, ip: string) =>
+      ({ body, application: application ? { id: application } : undefined, ip }) as unknown as FastifyRequest;
+    const a = licenseRateLimitKey(req({ key: 'rl_lic_secret', machineFingerprint: 'fp-1' }, 'app1', '203.0.113.9'));
+    const guess = licenseRateLimitKey(req({ key: 'rl_lic_other', machineFingerprint: 'fp-2' }, 'app1', '203.0.113.9'));
+    const otherApp = licenseRateLimitKey(req({ key: 'rl_lic_secret', machineFingerprint: 'fp-1' }, 'app2', '203.0.113.9'));
+    const otherIp = licenseRateLimitKey(req({ key: 'rl_lic_secret', machineFingerprint: 'fp-1' }, 'app1', '198.51.100.7'));
+    expect(guess).toBe(a);
+    expect(new Set([a, otherApp, otherIp]).size).toBe(3);
+    expect(a).toBe('license:app1:203.0.113.9');
     expect(a).not.toContain('rl_lic_secret');
     expect(a).not.toContain('fp-1');
-    expect(a).not.toContain('203.0.113.9');
-    // Same inputs, same bucket — an office behind one NAT is many buckets, one key many exit nodes is one.
-    expect(licenseRateLimitKey(req({ key: 'rl_lic_secret', machineFingerprint: 'fp-1' }, 'app1'))).toBe(a);
+    expect(licenseRateLimit(60).skipOnError).toBe(true);
   });
 
   it('erasure deletes devices and tombstones activation fingerprints while keeping the rows', async () => {
