@@ -18,6 +18,7 @@ Every error from a Rekey API or SDK has the same shape:
 
 - **`issues`** — on `VALIDATION_ERROR` (400): an array of `{ path, message }` naming each field that failed, capped at 10 entries. This is what tells you *which* key a `.strict()` endpoint refused.
 - **`retryAfterSeconds`** — on the retryable codes listed below.
+- **`details`** — on the few codes whose repair needs data the message cannot carry, such as `DEVICE_LIMIT_REACHED` (the devices to release). Documented per code.
 
 There is also a `docs` field in the envelope type, reserved for a per-code documentation URL. **No error the API emits sets it today**, so do not branch on its presence — this page is the reference it would point at.
 
@@ -161,11 +162,23 @@ Selected mutating routes accept an `Idempotency-Key` header for safe blind retri
 | `IMPERSONATION_ACTION_FORBIDDEN` | 403 | An impersonating operator tried a credential-changing route — password change, MFA setup/disable, passkey enrolment or removal. Those changes outlive the 5-minute token permanently and the user cannot tell who made them, so they are refused for impersonated sessions regardless of who holds the token. Reads, billing, organizations and profile edits are unaffected. | Ask the user to perform the action themselves, or act through the operator panel. |
 | `REFRESH_TOKEN_INVALID` | 401 | Refresh token unknown to the server (or not valid for session refresh). | Send the user through sign-in again. |
 | `REFRESH_TOKEN_REUSED` | 401 | Refresh token already used. **Treat as a compromise signal** — all sessions for the user are revoked as a precaution. | Force re-authentication; investigate where the old token leaked. |
+| `DEVICE_FINGERPRINT_REQUIRED` | 400 | `authConfig.deviceBinding` is `required` and a primary sign-in (password, sign-up, OAuth, magic link, passkey) carried no `device`. Checked before an account is created, so a sign-up refused this way leaves nothing behind. Refresh is never gated. | Send `device: { fingerprint, label? }`. See [devices.md](devices.md). |
+| `DEVICE_LIMIT_REACHED` | 403 | A new (or released) device would exceed the end-user's `max_devices` entitlement. No token was issued. `details` carries `{ limit, devices: [{ id, label, firstSeenAt, lastSeenAt }] }`, the active devices filling the cap. On refresh, the presented token is NOT spent. | Offer the user the list to release (via a session without `device`, your backend's `POST /api/v1/devices/:id/release`, or an operator), or upgrade the plan. |
+| `DEVICE_BLOCKED` | 403 / 409 | 403: sign-in from a fingerprint an operator blocked. 409: an end-user tried to release a blocked device. | Only an operator can unblock (`POST …/devices/:id/unblock`). |
+| `DEVICE_NOT_FOUND` | 404 | No device with that id belongs to that end-user in this Application; a device from another user or Application looks the same as a typo. | List the user's devices. |
+| `REFRESH_TOKEN_DEVICE_MISMATCH` | 401 | A refresh chain bound to one device was refreshed with a different fingerprint. **Treated as a compromise signal**: every session for the user is revoked. | Sign the user in again from this device. |
 | `REFRESH_TOKEN_REVOKED` | 401 | The token was explicitly revoked — sign-out, sign-out-everywhere, an operator ending the session, or the family being burned by a `REFRESH_TOKEN_REUSED` elsewhere. Distinct from `_REUSED`: this token was never presented twice, it was invalidated by something else. | Send the user through sign-in again. Not on its own a compromise signal. |
 | `REFRESH_TOKEN_EXPIRED` | 401 | Refresh token past its 30-day window. | Send the user through sign-in again. |
 | `REFRESH_TOKEN_WRONG_APPLICATION` | 401 | Refresh token belongs to a different Application. | Fix the credential mix-up. |
 
 **`METADATA_TOO_LARGE` (400) and `PAYLOAD_TOO_LARGE` (413) are different errors and want different handling.** The 413 is the HTTP layer refusing a >1 MiB *request*, before any handler runs, on every endpoint; the 400 is one handler refusing a `metadata` object that would push a single `EndUser` row past 16KB. A client switching on "too large" must switch on the code, not the phrase: the 413 says *split this request*, the 400 says *this field will never fit, move the value out of it*. The name is also the one code in this document that breaks the resource-prefix convention above (its peers are `END_USER_*`, `COUPON_*`) — it shipped that way in 2.0.0-rc.1, which is published, so it stays. Nothing about it is deprecated.
+
+### Auth — importing users (`POST /api/v1/users/import`)
+
+| Code | HTTP | When | How to handle |
+|---|---|---|---|
+| `PASSWORD_HASH_UNSUPPORTED` | 400 | A row's `passwordHash` is not a well-formed argon2id PHC string or a bcrypt hash at cost 14 or below. The whole batch is refused before any write. | Send hashes as the old system stores them, or omit `passwordHash` and let the user reset. |
+| `IMPORT_DUPLICATE_EMAIL` | 400 | The same address (case-insensitively) appears twice in one batch. | Send each address once. |
 
 ### Auth — email flows (reset, verification, magic link)
 
@@ -360,6 +373,7 @@ An **unapplied payment** is money that arrived without Rekey being able to attri
 | Code | HTTP | When | How to handle |
 |---|---|---|---|
 | `LICENSE_NOT_FOUND` | 404 | License id unknown (operator routes). | List licenses for the Application. |
+| `LICENSE_ACTIVATION_NOT_FOUND` | 404 | No activation with that id under that license (operator release route). | List the license's activations. |
 | `LICENSE_REVOKED` | 409 | Key rotation attempted on a revoked license. | Issue a new license instead. |
 | `LICENSE_EXPIRES_AT_REQUIRED` | 400 | TIMED license created without `expiresAt`. | Set the expiry. |
 | `LICENSE_SEATS_REQUIRED` | 400 | SEATS license created without a seat count. | Set the seats. |

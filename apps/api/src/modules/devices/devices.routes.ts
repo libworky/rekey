@@ -268,7 +268,7 @@ export async function devicesServerRoutes(app: FastifyInstance): Promise<void> {
         applicationId: req.application!.id,
         endUserId,
         deviceId: id,
-        actor: { type: 'end_user', id: null },
+        actor: { type: 'server', id: req.apiKey?.id ?? null },
       });
       return { success: true, data: result };
     },

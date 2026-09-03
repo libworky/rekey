@@ -128,6 +128,33 @@ describe('user import and bcrypt verify-and-rehash', () => {
     expect(bad.json().error.code).toBe('PASSWORD_HASH_UNSUPPORTED');
     expect(await prisma.endUser.count({ where: { applicationId: appId, email: 'ok@example.com' } })).toBe(0);
 
+    // A bcrypt hash above the cost ceiling is refused whole, like a bad shape.
+    const costly = await app.inject({
+      method: 'POST',
+      url: '/api/v1/users/import',
+      headers: secret(),
+      payload: {
+        users: [{ email: 'costly@example.com', passwordHash: '$2b$31$' + 'a'.repeat(53) }],
+      },
+    });
+    expect(costly.statusCode).toBe(400);
+    expect(costly.json().error.code).toBe('PASSWORD_HASH_UNSUPPORTED');
+    // So is an argon2id string that is only a prefix.
+    const prefixOnly = await app.inject({
+      method: 'POST',
+      url: '/api/v1/users/import',
+      headers: secret(),
+      payload: { users: [{ email: 'prefix@example.com', passwordHash: '$argon2id$not-a-real-hash-at-all' }] },
+    });
+    expect(prefixOnly.statusCode).toBe(400);
+    expect(prefixOnly.json().error.code).toBe('PASSWORD_HASH_UNSUPPORTED');
+
+    // Verified only when the caller says so.
+    const modern = await prisma.endUser.findUniqueOrThrow({
+      where: { applicationId_email: { applicationId: appId, email: 'modern@example.com' } },
+    });
+    expect(modern.emailVerified).toBe(false);
+
     // Duplicate within a batch.
     const dup = await app.inject({
       method: 'POST',

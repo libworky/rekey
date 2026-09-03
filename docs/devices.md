@@ -40,9 +40,9 @@ that it is.
 ## Lifecycle
 
 ```
-                 sign-in / verify
+                 sign-in / refresh
    (none) ──────────────────────────▶ ACTIVE ◀──────────────┐
-                                        │                    │ sign-in / verify
+                                        │                    │ sign-in / refresh
                     release             │                    │ (if under the limit)
                                         ▼                    │
                                      RELEASED ───────────────┘
@@ -90,7 +90,19 @@ first sign-ins from ten new machines register exactly `max_devices` of them.
 
 When a new device is refused, the refusal carries the ACTIVE devices that fill
 the cap — id, label, first and last seen — so your client can show the user
-which machine to release rather than a dead end.
+which machine to release rather than a dead end. The refused sign-in issued no
+token, so releasing takes one of three routes:
+
+- With `deviceBinding: optional`, sign the user in **without** `device`, call
+  `DELETE /api/v1/users/me/devices/:id` with that session, then sign in again
+  with the fingerprint.
+- Have your own backend release it: `POST /api/v1/devices/:id/release` with
+  the secret key, no user token needed.
+- Let an operator release it from the panel.
+
+With `deviceBinding: required` only the second and third apply, because the
+first needs a session the policy refuses; build the release into your
+backend if you require binding.
 
 ## Binding a session to a device
 
@@ -161,9 +173,13 @@ another Application is indistinguishable from a typo.
 | Operator | panel session | `GET …/end-users/:euid/devices` · `POST …/devices/:id/release` · `POST …/devices/:id/block` `{ reason? }` · `POST …/devices/:id/unblock` under `/api/v1/tenant/applications/:id` |
 
 **Release** gives the slot back and revokes every session minted on the
-device, in one transaction — including the caller's own session when it is
-the same device. It is idempotent. A blocked device is not its owner's to
-release.
+device, in one transaction — including the caller's own refresh chain when it
+is the same device; the access token in hand stays valid until it expires
+(up to 15 minutes), because `requireUserSession` reads the `dev` claim and
+does not look the device up per request. It is idempotent. A blocked device is
+not its owner's to release. `data.releasedBy` on the webhook and the
+security-events trail say who asked: `end_user`, `operator`, or `server`
+for the secret-key route.
 
 **Block** and **unblock** are operator decisions and exist on the operator
 surface only. The `reason` never reaches the end-user, who sees
@@ -193,6 +209,12 @@ row. When the license holder has a Device with the same fingerprint, the
 activation's `deviceId` points at it, so the seat list and the device list
 describe the same machines. Emits `license.deactivated`.
 
+Verification **links** but never **registers**: a machine that only ever
+verifies a license key has an activation and no Device, and takes no session
+slot. `max_devices` therefore bounds two pools independently, the machines a
+user signs in from and the machines a license is activated on, each capped at
+the same number.
+
 ## Erasure and throttling
 
 A fingerprint is a machine identifier the person supplied, so GDPR erasure
@@ -200,17 +222,19 @@ deletes their devices outright and tombstones the fingerprint on any license
 activation that is retained for seat accounting — see
 [data-erasure.md](data-erasure.md).
 
-`POST /licenses/verify` and `/deactivate` are throttled per
-(application, license key, fingerprint), both hashed, rather than per IP: an
-office behind one NAT no longer shares a bucket, and a leaked key cannot be
-enumerated faster by rotating exit nodes.
+`POST /licenses/verify` and `/deactivate` are throttled per (application,
+IP) at 60 requests a minute: a key guesser is bounded to one attempt a second
+per address against each Application, and one Application's launch traffic
+cannot throttle another's. Unlike the credential routes, the licence routes
+fail open when the limiter's store is unreachable, because verify is what
+every client calls at launch. The per-Application auth ceiling applies on top.
 
 ## Webhook events
 
 | Event | When |
 |---|---|
-| `device.registered` | A new fingerprint was registered, or a released device came back (`data.reactivated`). A sign-in from an already-active device emits nothing. |
-| `device.released` | The end-user or an operator gave the slot back. `data.sessionsRevoked` says how many sessions ended with it; `data.releasedBy` is `end_user` or `operator`. |
+| `device.registered` | A new fingerprint was registered at sign-in or refresh, or a released device came back (`data.reactivated`). A sign-in from an already-active device emits nothing; licence verification registers nothing. |
+| `device.released` | The end-user, an operator or your backend gave the slot back. `data.sessionsRevoked` says how many sessions ended with it; `data.releasedBy` is `end_user`, `operator` or `server`. |
 | `device.blocked` | An operator blocked the device; its sessions were revoked. |
 | `device.unblocked` | An operator lifted the block. The device is RELEASED. |
 | `device.limit_reached` | A new device was refused. `data.devices` lists the active devices filling the cap. |
@@ -230,7 +254,16 @@ bounds their sessions — and refuses further machines with
 as every deployment was before the entitlement existed. Org-pooled licenses
 have no single end-user to resolve for and follow only `seatsAllowed`.
 
-## What is still to come
+## Related surfaces
 
-Secret-key entitlement and user lookup for backends that hold no user token,
-and MCP tools over these routes.
+Backends that hold no user token can read entitlements by end-user
+(`GET /api/v1/billing/entitlements/for-user?endUserId=`) and look users up
+(`GET /api/v1/users?email=`, `GET /api/v1/users/:id`) with the secret key;
+operators have `list_devices`, `release_device`, `block_device` and
+`unblock_device` over MCP, and end-users `list_my_devices`. Legacy accounts
+come over through `POST /api/v1/users/import` (see [auth.md](auth.md)).
+
+## Not yet
+
+An offline-verifiable activation token with a grace period, for clients that
+must keep working without network for a bounded time.

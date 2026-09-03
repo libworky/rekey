@@ -201,6 +201,47 @@ describe('device-bound sessions', () => {
     expect((r.json().data as Session).deviceId).toBe(s.deviceId);
   });
 
+  it('deviceBinding=required refuses a sign-up without a device before the account exists', async () => {
+    await setDeviceBinding('required');
+    const bare = await app.inject({
+      method: 'POST',
+      url: '/api/v1/auth/sign-up',
+      headers: keyAuth(),
+      payload: { email: 'new@example.com', password: PASSWORD },
+    });
+    expect(bare.statusCode).toBe(400);
+    expect(bare.json().error.code).toBe('DEVICE_FINGERPRINT_REQUIRED');
+    // Nothing was created, so the corrected retry is a sign-up, not a 409.
+    expect(await prisma.endUser.count({ where: { applicationId: appId } })).toBe(0);
+    const withDevice = await app.inject({
+      method: 'POST',
+      url: '/api/v1/auth/sign-up',
+      headers: keyAuth(),
+      payload: { email: 'new@example.com', password: PASSWORD, device: { fingerprint: 'fp-signup-00001' } },
+    });
+    expect(withDevice.statusCode).toBe(201);
+    expect((withDevice.json().data as Session).deviceId).toBeTruthy();
+  });
+
+  it('a refresh refused by the device limit does not spend the token', async () => {
+    await setDefaultDeviceLimit(1);
+    const userId = await makeEndUser('cap@example.com');
+    // An unbound chain, plus one active device filling the cap.
+    const unbound = (await signIn('cap@example.com')).json().data as Session;
+    expect((await signIn('cap@example.com', { fingerprint: 'fp-cap-first-0001' })).statusCode).toBe(200);
+
+    const refused = await refresh(unbound.refreshToken, { fingerprint: 'fp-cap-second-001' });
+    expect(refused.statusCode).toBe(403);
+    expect(refused.json().error.code).toBe('DEVICE_LIMIT_REACHED');
+    // The chain is intact: the same token still refreshes, and nothing was
+    // revoked. Before the reorder, the retry read as a replay and every
+    // session for the user was burned.
+    const retry = await refresh(unbound.refreshToken);
+    expect(retry.statusCode).toBe(200);
+    expect(await prisma.refreshToken.count({ where: { endUserId: userId, revokedAt: null } })).toBe(2);
+    expect(await prisma.device.count({ where: { endUserId: userId } })).toBe(1);
+  });
+
   it('refuses the device over max_devices with the list to release, then admits it after a release', async () => {
     await setDefaultDeviceLimit(1);
     const userId = await makeEndUser('d@example.com');
