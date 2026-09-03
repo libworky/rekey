@@ -486,6 +486,12 @@ export interface ApplicationRow {
     passwordBreachCheckEnabled?: boolean;
     sendVerificationEmailOnSignUp?: boolean;
     requireEmailVerification?: boolean;
+    /**
+     * Whether a sign-in must carry a device fingerprint. `required` refuses
+     * one that does not; `optional` binds the device when a fingerprint is
+     * sent and lets the sign-in through when it is not.
+     */
+    deviceBinding?: 'optional' | 'required';
   };
   billingConfig: {
     /** Master switch. When false the whole billing surface is gated server-side. */
@@ -494,6 +500,14 @@ export interface ApplicationRow {
     dunningEnabled?: boolean;
     /** Default billing subject: individual end-user, or their organization. */
     billingSubject?: 'user' | 'org';
+    /**
+     * Free-tier fallback. Slug of a plan whose FEATURE entitlements and
+     * included usage quota apply to end-users with NO active subscription.
+     * Read-time only: no Subscription row stands behind it, so a user on the
+     * default plan shows an empty subscriptions list while still being
+     * entitled. Unset = no free tier.
+     */
+    defaultPlanSlug?: string;
     provider: string;
     currency: string;
     metadata: Record<string, unknown>;

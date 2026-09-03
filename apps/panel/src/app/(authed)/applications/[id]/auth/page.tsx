@@ -41,6 +41,12 @@ async function saveAuth(applicationId: string, formData: FormData): Promise<void
   const sendVerificationEmailOnSignUp = formData.get('sendVerificationEmailOnSignUp') === 'on';
   const requireEmailVerification = formData.get('requireEmailVerification') === 'on';
   const oidcEnabled = formData.get('oidcEnabled') === 'on';
+  // Same shape as `mfa` and `tokenAlg` above: a closed set, defaulted rather
+  // than trusted, because the value arrives from a form post.
+  const deviceBindingRaw = String(formData.get('deviceBinding') ?? 'optional');
+  const deviceBinding = (deviceBindingRaw === 'required' ? 'required' : 'optional') as
+    | 'optional'
+    | 'required';
   // Only ever HS256 or RS256 — anything else is a crafted form post, and the
   // API would reject it anyway. Falling back to HS256 keeps the default.
   const rawAlg = String(formData.get('tokenAlg') ?? '');
@@ -69,6 +75,7 @@ async function saveAuth(applicationId: string, formData: FormData): Promise<void
         sendVerificationEmailOnSignUp,
         requireEmailVerification,
         oidcEnabled,
+        deviceBinding,
         tokenAlg,
         redirectUrls,
         appUrl,
@@ -498,6 +505,37 @@ export default async function AuthMethodsPage({
                 <option value="off">Off — end-users cannot enable 2FA</option>
                 <option value="optional">Optional — end-users may enable 2FA</option>
                 <option value="required">Required — force enrollment at sign-in</option>
+              </select>
+            </Field>
+
+            {/* This setting exists on the schema, on the PATCH body, in the
+                published OpenAPI and in the operator MCP tool, and had no
+                control here — so device binding could only ever be switched on
+                over the API or by an agent, and a deployment driven from the
+                panel could not use the feature at all. The parity test that
+                keeps those four surfaces in step compares API artifacts only,
+                which is why the omission was silent. */}
+            <Field
+              label="Device binding"
+              hint={
+                <>
+                  Binds each session to the machine it was created on. The client sends an opaque
+                  fingerprint at sign-in; Rekey records a device, enforces the{' '}
+                  <code className="text-xs">max_devices</code> feature entitlement against it, and
+                  puts the device id in the token as the <code className="text-xs">dev</code> claim.{' '}
+                  <strong>Required</strong> refuses a sign-in that carries no fingerprint, so turn
+                  it on only once your clients send one — otherwise every sign-in fails. Devices
+                  are listed and released per end-user under End-users.
+                </>
+              }
+            >
+              <select
+                name="deviceBinding"
+                defaultValue={app.authConfig.deviceBinding ?? 'optional'}
+                className={`${inputCls} w-full sm:w-72`}
+              >
+                <option value="optional">Optional — bind when a fingerprint is sent</option>
+                <option value="required">Required — refuse sign-in without a fingerprint</option>
               </select>
             </Field>
 
