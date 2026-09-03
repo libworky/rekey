@@ -192,8 +192,8 @@ export const organizationsService = {
         fix: 'Use e.g. "acme-prod" or "team-42".',
       });
     }
+    if (args.metadata !== undefined) assertMetadataWithinLimit(args.metadata);
     try {
-      if (args.metadata !== undefined) assertMetadataWithinLimit(args.metadata);
       return await prisma.$transaction(async (tx) => {
         const org = await tx.organization.create({
           data: {
@@ -1004,8 +1004,8 @@ export const organizationsService = {
     if (args.ownerEndUserId) {
       await this.adminAssertEndUserInApp(args.applicationId, args.ownerEndUserId);
     }
+    if (args.metadata !== undefined) assertMetadataWithinLimit(args.metadata);
     try {
-      if (args.metadata !== undefined) assertMetadataWithinLimit(args.metadata);
       const org = await prisma.$transaction(async (tx) => {
         const created = await tx.organization.create({
           data: {
