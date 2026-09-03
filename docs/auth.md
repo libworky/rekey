@@ -290,6 +290,15 @@ login screen's problem.
 session has no active organization, or when membership lapsed since the token
 was minted. A stale `oid` claim degrades to "no org", it never grants access.
 
+## Devices
+
+A native, desktop or CLI client can bind the session it mints to the machine
+it runs on by sending `device: { fingerprint, label }` on any session-minting
+endpoint. The session then carries a `dev` claim, the refresh chain is bound
+to that device, and the number of active devices per end-user can be capped by
+the `max_devices` entitlement on the plan. Browser SDKs never send it and see
+no change. See [devices.md](devices.md).
+
 ## Tokens — access + refresh
 
 Sign-up and sign-in return **two** tokens, used for different jobs:
@@ -367,6 +376,37 @@ Headers: Authorization: Bearer rp_live_…  +  X-Rekey-User-Token: <jwt>
 - **Sliding access tokens via cookie middleware.** We expose the primitives; auto-refresh is the SDK's job (`@rekey.dev/nextjs` does it, `apps/panel` does it by hand).
 
 Replay-chain revocation and sign-out-everywhere both shipped — see the refresh-token bullets above and `POST /auth/sign-out-everywhere`.
+
+## Server-side lookup with a secret key
+
+Your own backend often holds a secret key but not the user's token — a
+licence server, a support tool, a migration script. Two routes answer "who is
+this" without a session, secret key only (the publishable key is refused, so a
+browser can never enumerate accounts through them):
+
+- `GET /api/v1/users?email=` — exact, case-insensitive match in the calling
+  Application. SDK: `rekey.users.getByEmail(email)`.
+- `GET /api/v1/users/:id` — by id, scoped to the Application. SDK:
+  `rekey.users.get(id)`.
+
+Both return the same shape as `GET /users/me`. For what that user is entitled
+to, `GET /api/v1/billing/entitlements/for-user?endUserId=` returns the same
+union as `/billing/entitlements` (SDK: `rekey.billing.getEntitlementsFor(id)`).
+
+## Migrating users from another auth system
+
+`POST /api/v1/users/import` (secret key, `auth:write`; SDK
+`rekey.users.import(users)`) takes up to 500 users per call: email, the
+password hash your current system holds, whether the address was verified, a
+role, metadata, and any OAuth identities already linked so a Google or
+Discord user is not re-prompted.
+
+Hashes are accepted as **argon2id** or **bcrypt** (`$2a$`, `$2b$`, `$2y$`)
+and verified as-is at sign-in. Rekey never creates bcrypt hashes; an imported
+one is upgraded to argon2id on the user's first successful sign-in, the one
+moment the plaintext is in hand. Existing addresses are skipped, never
+updated — an import is not a way to overwrite a live account's password — and
+the whole batch is validated before any row is written.
 
 ## Operator end-user management
 

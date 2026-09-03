@@ -76,6 +76,29 @@ export const accountTools: AccountTool[] = [
     },
   },
   {
+    name: 'list_my_devices',
+    description:
+      "List the signed-in user's devices — the machines they have signed in from — with status " +
+      'and last-seen time. No IPs and no operator notes.',
+    inputSchema: NO_ARGS,
+    handler: async (ctx) => {
+      const rows = await prisma.device.findMany({
+        where: { applicationId: ctx.applicationId, endUserId: ctx.endUserId },
+        select: { id: true, label: true, status: true, firstSeenAt: true, lastSeenAt: true, releasedAt: true },
+        orderBy: { lastSeenAt: 'desc' },
+        take: 100,
+      });
+      return {
+        devices: rows.map((r) => ({
+          ...r,
+          firstSeenAt: r.firstSeenAt.toISOString(),
+          lastSeenAt: r.lastSeenAt.toISOString(),
+          releasedAt: r.releasedAt?.toISOString() ?? null,
+        })),
+      };
+    },
+  },
+  {
     name: 'list_licenses',
     description: "List the signed-in user's licenses (no license keys are returned).",
     inputSchema: NO_ARGS,

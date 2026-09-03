@@ -34,6 +34,13 @@ export interface RekeyErrorPayload {
    * surface it automatically.
    */
   retryAfterSeconds?: number;
+  /**
+   * Structured, code-specific context a client can act on without parsing
+   * `message`. Documented per code (e.g. DEVICE_LIMIT_REACHED carries
+   * `{ limit, devices[] }`); absent everywhere else. Rendered into the envelope
+   * as-is, so never put anything here the caller must not see.
+   */
+  details?: Record<string, unknown>;
 }
 
 /**
@@ -59,6 +66,7 @@ export class RekeyError extends Error {
   public readonly fix: string | undefined;
   public readonly docs: string | undefined;
   public readonly retryAfterSeconds: number | undefined;
+  public readonly details: Record<string, unknown> | undefined;
 
   constructor(args: RekeyErrorPayload & { statusCode?: number; cause?: unknown }) {
     // `cause` keeps the original exception attached without putting any of it
@@ -71,6 +79,7 @@ export class RekeyError extends Error {
     this.fix = args.fix;
     this.docs = args.docs;
     this.retryAfterSeconds = args.retryAfterSeconds;
+    this.details = args.details;
   }
 }
 
@@ -243,6 +252,7 @@ export function rekeyErrorHandler(
         ...(err.fix !== undefined && { fix: err.fix }),
         ...(err.docs !== undefined && { docs: err.docs }),
         ...(err.retryAfterSeconds !== undefined && { retryAfterSeconds: err.retryAfterSeconds }),
+        ...(err.details !== undefined && { details: err.details }),
         requestId,
       },
     });

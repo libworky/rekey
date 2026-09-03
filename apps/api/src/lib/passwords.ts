@@ -18,6 +18,7 @@
 
 import { randomBytes } from 'node:crypto';
 import argon2 from 'argon2';
+import bcrypt from 'bcryptjs';
 
 const TYPE = argon2.argon2id;
 
@@ -33,6 +34,63 @@ export function hashPassword(plain: string): Promise<string> {
 }
 
 /**
+ * A bcrypt hash as produced by every mainstream bcrypt library (`$2a$`,
+ * `$2b$`, `$2y$`). Rekey never CREATES these — `hashPassword` is argon2id
+ * only — but it accepts them at verify time so an application migrating its
+ * users from another auth system can import the hashes it already holds and
+ * let each user keep their password. The first successful sign-in re-hashes
+ * to argon2id (`needsRehash`), so the bcrypt hash lives exactly as long as it
+ * has to.
+ */
+const BCRYPT_RE = /^\$2[aby]\$(\d{2})\$[./A-Za-z0-9]{53}$/;
+
+/**
+ * The most expensive bcrypt an imported hash may carry. Cost is a power of
+ * two, so 14 is 16 384 rounds, already an order of magnitude above what a
+ * migrating system is likely to hold. `bcryptjs` is pure JavaScript, and a
+ * hash at cost 31 would hold a worker for hours per attempt: the import route
+ * is a secret-key surface, so without a ceiling any tenant could turn their
+ * own sign-in into a CPU sink for the deployment.
+ */
+export const MAX_BCRYPT_COST = 14;
+
+/** A full PHC-format argon2id string, the only argon2 shape Rekey accepts. */
+const ARGON2ID_RE = /^\$argon2id\$v=\d+\$m=\d+,t=\d+,p=\d+\$[A-Za-z0-9+/]+\$[A-Za-z0-9+/]+$/;
+
+export function isBcryptHash(hash: string): boolean {
+  return BCRYPT_RE.test(hash);
+}
+
+/** The cost factor of a bcrypt hash, or null when it is not one. */
+export function bcryptCost(hash: string): number | null {
+  const m = BCRYPT_RE.exec(hash);
+  return m ? Number(m[1]) : null;
+}
+
+/**
+ * Whether a hash may be STORED for later verification: a well-formed argon2id
+ * PHC string, or a well-formed bcrypt hash at a cost this deployment is
+ * willing to pay at sign-in. The import route asks this per row so a
+ * malformed hash is refused up front instead of stored as a password that
+ * can never verify.
+ */
+export function isSupportedPasswordHash(hash: string): boolean {
+  if (ARGON2ID_RE.test(hash)) return true;
+  const cost = bcryptCost(hash);
+  return cost !== null && cost <= MAX_BCRYPT_COST;
+}
+
+/**
+ * True when a hash that just verified should be replaced with a fresh
+ * argon2id one. Today that means "it was bcrypt". Callers re-hash with
+ * `hashPassword` and store the result; the plaintext is in hand at exactly
+ * that moment and never again.
+ */
+export function needsRehash(hash: string): boolean {
+  return isBcryptHash(hash);
+}
+
+/**
  * Verify a plaintext password against an encoded hash. Returns `false` for
  * any failure — wrong password, malformed hash, missing hash. Never throws.
  *
@@ -43,6 +101,11 @@ export function hashPassword(plain: string): Promise<string> {
 export async function verifyPassword(hash: string | null, plain: string): Promise<boolean> {
   if (!hash) return false;
   try {
+    if (isBcryptHash(hash)) {
+      // Belt and braces for a row that predates the import ceiling.
+      if ((bcryptCost(hash) ?? Infinity) > MAX_BCRYPT_COST) return false;
+      return await bcrypt.compare(plain, hash);
+    }
     return await argon2.verify(hash, plain);
   } catch {
     return false;

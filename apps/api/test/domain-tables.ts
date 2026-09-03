@@ -27,6 +27,9 @@ export const DOMAIN_TABLES = [
   'usage_meters',
   'license_activations',
   'licenses',
+  // Listed BEFORE refresh_tokens and end_users: sessions and activations point
+  // at devices (SET NULL), and devices point at end_users (CASCADE).
+  'devices',
   'dunning_cases',
   // Listed BEFORE payments: it FKs to payments, and while CASCADE would
   // reach it anyway, an explicit entry keeps the list a readable inventory of

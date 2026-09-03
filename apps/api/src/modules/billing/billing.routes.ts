@@ -1,7 +1,9 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { billingService } from './billing.service.js';
-import { requirePublishableOrSecretKey, requireScope } from '../../middleware/api-key-auth.js';
+import { requireApiKey, requirePublishableOrSecretKey, requireScope } from '../../middleware/api-key-auth.js';
+import { prisma } from '../../lib/prisma.js';
+import { RekeyError } from '../../lib/error.js';
 import { requireUserSession } from '../../middleware/user-session.js';
 import { requireBillingEnabled } from '../../middleware/billing-enabled.js';
 import { billingCredentialsService, type BillingProviderName } from './credentials.service.js';
@@ -228,6 +230,80 @@ export async function billingRoutes(app: FastifyInstance): Promise<void> {
           req.application!.id,
           req.endUser!.id,
           orgView ? { organizationId: orgView } : undefined,
+        ),
+      };
+    },
+  );
+
+  app.get(
+    '/entitlements/for-user',
+    {
+      // Secret key ONLY. The route above resolves the token's own subject; this
+      // one resolves whoever the caller names, which a browser-shipped
+      // publishable key must never be able to do. `requireApiKey` refuses
+      // publishable keys outright.
+      onRequest: [requireApiKey, requireBillingEnabled, requireScope('billing:read')],
+      schema: {
+        tags: ['Public · Billing'],
+        summary: "Resolve a named end-user's entitlements (server-side)",
+        description:
+          'The same union GET /billing/entitlements returns, for the end-user named by ' +
+          '`?endUserId=` instead of by a user token. For your own backend — a licence server, ' +
+          'a support tool, a batch job — which holds a secret key but not the user\'s session. ' +
+          'Pass `?organizationId=` for the org view (the end-user must be a member).',
+        security: [{ apiKey: [] }],
+        querystring: {
+          type: 'object',
+          required: ['endUserId'],
+          properties: {
+            endUserId: { type: 'string', minLength: 1 },
+            organizationId: { type: 'string' },
+          },
+        },
+        response: {
+          200: ok(ResolvedEntitlements, "The named end-user's resolved entitlements."),
+          ...errs({
+            400: 'VALIDATION_ERROR — `endUserId` is missing.',
+            401: 'API_KEY_MISSING / API_KEY_INVALID — the secret key is missing, unknown, revoked, or expired (a publishable key is refused here).',
+            403:
+              "IP_NOT_ALLOWED — caller IP outside the secret key's allowlist; or BILLING_DISABLED; or " +
+              'API_KEY_SCOPE_INSUFFICIENT — the key lacks `billing:read`; or ORGANIZATION_NOT_MEMBER — ' +
+              '`organizationId` was passed but the end-user is not a member of it.',
+            404: 'END_USER_NOT_FOUND — no end-user with that id in this Application.',
+            429: READ_GATE_ERRORS[429],
+          }),
+        },
+      },
+    },
+    async (req) => {
+      const { endUserId, organizationId } = z
+        .object({ endUserId: z.string().min(1), organizationId: z.string().min(1).optional() })
+        .parse(req.query);
+      const endUser = await prisma.endUser.findUnique({
+        where: { id: endUserId },
+        select: { id: true, applicationId: true },
+      });
+      if (!endUser || endUser.applicationId !== req.application!.id) {
+        throw new RekeyError({
+          statusCode: 404,
+          code: 'END_USER_NOT_FOUND',
+          message: `End-user "${endUserId}" not found in this Application.`,
+          fix: 'Confirm the id belongs to the Application this secret key represents.',
+        });
+      }
+      if (organizationId) {
+        await organizationsService.requireMembership({
+          application: req.application!,
+          actorEndUserId: endUser.id,
+          organizationId,
+        });
+      }
+      return {
+        success: true,
+        data: await entitlementsService.resolveForEndUser(
+          req.application!.id,
+          endUser.id,
+          organizationId ? { organizationId } : undefined,
         ),
       };
     },

@@ -42,6 +42,13 @@ declare module 'fastify' {
      */
     activeOrganizationId?: string;
     /**
+     * The device this session is bound to, from the token's `dev` claim, or
+     * undefined for sessions minted without a fingerprint. A claim, not an
+     * authorization: a route that must trust it resolves the `devices` row
+     * and checks `status`, the way `oid` is re-confirmed against membership.
+     */
+    deviceId?: string;
+    /**
      * Present when this session is an OPERATOR impersonating the end-user
      * rather than the end-user themselves. Read by
      * `refuseWhileImpersonating` (middleware/impersonation.ts) to keep an
@@ -144,6 +151,7 @@ export async function requireUserSession(
   const endUser = await authService.getById(request.application.id, claims.sub);
 
   request.endUser = endUser;
+  if (claims.dev) request.deviceId = claims.dev;
 
   // The `oid` claim says which organization was active when the token was
   // minted, which is not the same as which one is active now: removing a member

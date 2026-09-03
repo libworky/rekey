@@ -56,6 +56,8 @@ import {
 } from './modules/billing/webhooks/index.js';
 import { meRoutes } from './routes/me.js';
 import { usersMeRoutes } from './routes/users-me.js';
+import { usersRoutes } from './routes/users.js';
+import { usersImportRoutes } from './routes/users-import.js';
 import {
   tenantAuthRoutes,
   tenantAuthAuthenticatedRoutes,
@@ -76,6 +78,7 @@ import {
 } from './modules/tenant-passkeys/index.js';
 import { tenantOAuthPublicRoutes } from './modules/tenant-oauth/index.js';
 import { licensesPublicRoutes } from './modules/licenses/index.js';
+import { devicesServerRoutes, devicesUserRoutes, tenantDevicesRoutes } from './modules/devices/index.js';
 import { portalConfigRoutes } from './modules/portal/index.js';
 import { usagePublicRoutes } from './modules/usage/index.js';
 import { creditsPublicRoutes } from './modules/credits/index.js';
@@ -553,6 +556,16 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
   await app.register(oauthRoutes, { prefix: '/api/v1/auth/oauth' });
   await app.register(oauthLinkRoutes, { prefix: '/api/v1/auth/oauth' });
   await app.register(usersMeRoutes, { prefix: '/api/v1/users/me' });
+  // The end-user's own devices (docs/devices.md) — same credential tier as
+  // /users/me: publishable key + user JWT.
+  await app.register(devicesUserRoutes, { prefix: '/api/v1/users/me/devices' });
+  // Secret-key surface over any end-user's devices, for the customer's backend.
+  await app.register(devicesServerRoutes, { prefix: '/api/v1/devices' });
+  // Secret-key end-user lookup by id / exact email (routes/users.ts). Mounted
+  // AFTER /users/me so the literal segment wins over the :id parameter.
+  await app.register(usersRoutes, { prefix: '/api/v1/users' });
+  // Bulk import from another auth system (routes/users-import.ts).
+  await app.register(usersImportRoutes, { prefix: '/api/v1/users' });
   // End-user organizations — gated by `authConfig.organizationsEnabled`
   // at the service layer. Routes are mounted regardless; the service
   // refuses on apps that didn't opt in.
@@ -627,6 +640,7 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
   }
   await app.register(tenantEmailRoutes, { prefix: '/api/v1/tenant/applications' });
   await app.register(tenantWebhookRoutes, { prefix: '/api/v1/tenant/applications' });
+  await app.register(tenantDevicesRoutes, { prefix: '/api/v1/tenant/applications' });
   await app.register(tenantMfaRoutes, { prefix: '/api/v1/tenant/auth/mfa' });
   await app.register(securityEventsRoutes, { prefix: '/api/v1/tenant/security-events' });
   await app.register(tenantPasskeysAuthenticatedRoutes, { prefix: '/api/v1/tenant/auth' });

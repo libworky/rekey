@@ -165,6 +165,15 @@ export const AUTH_CONFIG_PATCH_BODY_JSON_SCHEMA = {
         'against GET /.well-known/jwks.json; HS256 (default) requires the API. ' +
         'Switching never breaks outstanding tokens — the API verifies both.',
     },
+    deviceBinding: {
+      type: 'string',
+      enum: ['optional', 'required'],
+      description:
+        'Whether primary sign-in flows must carry a `device` binding. `optional` (default) ' +
+        'records a device when the client sends one; `required` refuses password, OAuth, ' +
+        'magic-link, passkey and MFA sign-in without one (DEVICE_FINGERPRINT_REQUIRED). ' +
+        'Refresh is never gated. See docs/devices.md.',
+    },
   },
 } as const;
 
@@ -214,6 +223,7 @@ export const AUTH_CONFIG_PATCH_BODY = z
     oidcEnabled: z.boolean().optional(),
     dynamicClientRegistration: z.boolean().optional(),
     tokenAlg: z.enum(['HS256', 'RS256']).optional(),
+    deviceBinding: z.enum(['optional', 'required']).optional(),
   })
   .strict();
 
@@ -4585,6 +4595,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
         subscriptions,
         payments,
         licenses,
+        devices,
         creditBalances,
         creditLedger,
         usageRecords,
@@ -4664,7 +4675,9 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
           orderBy: { createdAt: 'desc' },
           take: PAYMENTS_CAP,
         }),
-        // License metadata — keyPrefix only, never keyHash.
+        // License metadata — keyPrefix only, never keyHash. Activations ride
+        // along: a machine fingerprint the person supplied is personal data
+        // (erasure tombstones it), so a subject-access response must list it.
         prisma.license.findMany({
           where: { applicationId: params.id, endUserId: endUser.id },
           select: {
@@ -4678,8 +4691,38 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
             revokedAt: true,
             createdAt: true,
             plan: { select: { slug: true, name: true } },
+            activations: {
+              select: {
+                id: true,
+                machineFingerprint: true,
+                label: true,
+                deviceId: true,
+                firstSeenAt: true,
+                lastSeenAt: true,
+                releasedAt: true,
+              },
+              orderBy: { firstSeenAt: 'desc' },
+            },
           },
           orderBy: { createdAt: 'desc' },
+        }),
+        // Devices: the machines they signed in from, fingerprints included,
+        // for the same reason.
+        prisma.device.findMany({
+          where: { applicationId: params.id, endUserId: endUser.id },
+          select: {
+            id: true,
+            fingerprint: true,
+            label: true,
+            status: true,
+            firstSeenAt: true,
+            lastSeenAt: true,
+            lastSeenIp: true,
+            releasedAt: true,
+            blockedAt: true,
+            createdAt: true,
+          },
+          orderBy: { firstSeenAt: 'desc' },
         }),
         prisma.creditBalance.findMany({
           where: { applicationId: params.id, endUserId: endUser.id },
@@ -4784,8 +4827,22 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
           createdAt: s.createdAt.toISOString(),
         })),
         payments: payments.map((p) => ({ ...p, createdAt: p.createdAt.toISOString() })),
+        devices: devices.map((d) => ({
+          ...d,
+          firstSeenAt: d.firstSeenAt.toISOString(),
+          lastSeenAt: d.lastSeenAt.toISOString(),
+          releasedAt: d.releasedAt?.toISOString() ?? null,
+          blockedAt: d.blockedAt?.toISOString() ?? null,
+          createdAt: d.createdAt.toISOString(),
+        })),
         licenses: licenses.map((l) => ({
           ...l,
+          activations: l.activations.map((a) => ({
+            ...a,
+            firstSeenAt: a.firstSeenAt.toISOString(),
+            lastSeenAt: a.lastSeenAt.toISOString(),
+            releasedAt: a.releasedAt?.toISOString() ?? null,
+          })),
           expiresAt: l.expiresAt?.toISOString() ?? null,
           revokedAt: l.revokedAt?.toISOString() ?? null,
           createdAt: l.createdAt.toISOString(),

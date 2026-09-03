@@ -121,12 +121,21 @@ export const SECURITY_EVENT_LABEL = {
   // key investigable rather than invisible — without it, the handoff would be
   // indistinguishable from an ordinary interactive sign-in.
   'user.session_handoff_granted': 'End-user session handed off by the application server',
+  // Devices. `registered` covers both a brand-new fingerprint and a released
+  // device coming back (metadata.reactivated); `limit_reached` is the refusal,
+  // recorded so "why can't this user sign in from their new PC?" has an answer.
+  'user.device_registered': 'End-user registered a device',
+  'user.device_released': 'End-user released a device',
+  'user.device_limit_reached': 'End-user hit their device limit',
 
   // ── Operator actions ON an end-user ──
   'end_user.erased': 'End-user erased (GDPR)',
   'end_user.delete_blocked': 'End-user deletion blocked',
   'end_user.deleted': 'End-user deleted',
   'end_user.data_exported': 'End-user data exported',
+  'end_user.device_released': 'Device released by an operator',
+  'end_user.device_blocked': 'Device blocked',
+  'end_user.device_unblocked': 'Device unblocked',
 
   // ── Workspace / team ──
   'workspace.member_invited': 'Teammate invited',

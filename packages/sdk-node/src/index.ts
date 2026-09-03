@@ -39,6 +39,11 @@ import type {
   ForgotPasswordRequest,
   ForgotPasswordResultDto,
   LicenseVerifyResultDto,
+  LicenseActivationDto,
+  LicenseDeactivateRequest,
+  LicenseDeactivateResultDto,
+  DeviceDto,
+  DeviceStatusType,
   MfaVerifyRequest,
   OAuthAuthServerMetadata,
   OAuthIntrospectionResponse,
@@ -55,6 +60,7 @@ import type {
   ResetPasswordRequest,
   SignInOutcomeDto,
   SignInRequest,
+  DeviceBindingRequest,
   SignUpRequest,
   SubscriptionDto,
   UsageAggregateDto,
@@ -78,6 +84,7 @@ export type {
   MfaVerifyRequest,
   SignInOutcomeDto,
   SignInRequest,
+  DeviceBindingRequest,
   SignUpRequest,
   RefreshRequest,
   ForgotPasswordRequest,
@@ -117,6 +124,11 @@ export type {
   LicenseDto,
   LicenseStatusType,
   LicenseVerifyResultDto,
+  LicenseActivationDto,
+  LicenseDeactivateRequest,
+  LicenseDeactivateResultDto,
+  DeviceDto,
+  DeviceStatusType,
   UsageRecordDto,
   UsageAggregateDto,
   SubscriptionStatusType,
@@ -258,6 +270,8 @@ export class Rekey {
   public readonly organizations: OrganizationsClient;
   /** License key verification + activation. */
   public readonly licenses: LicensesClient;
+  public readonly devices: DevicesClient;
+  public readonly users: UsersClient;
   /** Usage metering — record events, aggregate windows. */
   public readonly usage: UsageClient;
   /** Prepaid credits — balance reads, idempotent drawdown, ledger. */
@@ -298,6 +312,8 @@ export class Rekey {
     this.billing = new BillingClient(this);
     this.organizations = new OrganizationsClient(this);
     this.licenses = new LicensesClient(this);
+    this.devices = new DevicesClient(this);
+    this.users = new UsersClient(this);
     this.usage = new UsageClient(this);
     this.credits = new CreditsClient(this);
     this.mcp = new McpClient(this);
@@ -909,11 +925,19 @@ class AuthClient {
    *   This is a strong signal the original was leaked; treat as compromise.
    * @throws {RekeyError} `REFRESH_TOKEN_EXPIRED` (401) after the 30-day refresh window.
    */
-  refresh(refreshToken: string): Promise<AuthResultDto> {
+  refresh(
+    refreshToken: string,
+    options: { device?: DeviceBindingRequest } = {},
+  ): Promise<AuthResultDto> {
     // /auth/refresh returns the same shape as /auth/mfa-verify — always a
     // full session (refresh requires a prior MFA-verified session by
-    // definition).
-    return this.client.send('POST', '/api/v1/auth/refresh', { refreshToken });
+    // definition). `device` identifies the machine presenting the token: a
+    // chain bound at sign-in refuses a different fingerprint, and an unbound
+    // one becomes bound (docs/devices.md).
+    return this.client.send('POST', '/api/v1/auth/refresh', {
+      refreshToken,
+      ...(options.device && { device: options.device }),
+    });
   }
 
   /**
@@ -1524,6 +1548,99 @@ class LicensesClient {
   }): Promise<LicenseVerifyResultDto> {
     return this.client.send('POST', '/api/v1/licenses/verify', input);
   }
+
+  /**
+   * Give back the seat this machine holds — call it before a re-image or on
+   * uninstall so the next machine can verify. Same deterministic body as
+   * `verify`; `released: false` means the machine held no seat.
+   *
+   * @example
+   * ```ts
+   * await rekey.licenses.deactivate({ key, machineFingerprint });
+   * ```
+   */
+  deactivate(input: LicenseDeactivateRequest): Promise<LicenseDeactivateResultDto> {
+    return this.client.send('POST', '/api/v1/licenses/deactivate', input);
+  }
+}
+
+/**
+ * Server-side view of end-users' devices (docs/devices.md). Secret key only —
+ * these routes read and mutate OTHER users' devices, which is why they refuse
+ * the publishable key. The end-user's own list lives behind their JWT at
+ * `GET /api/v1/users/me/devices`.
+ */
+class DevicesClient {
+  constructor(private readonly client: Rekey) {}
+
+  /** An end-user's devices, newest activity first. Optional `status` filter. */
+  list(
+    endUserId: string,
+    options: { status?: DeviceStatusType; limit?: number; offset?: number } = {},
+  ): Promise<Paged<DeviceDto>> {
+    const q = new URLSearchParams({ endUserId });
+    if (options.status) q.set('status', options.status);
+    if (options.limit !== undefined) q.set('limit', String(options.limit));
+    if (options.offset !== undefined) q.set('offset', String(options.offset));
+    return this.client.send('GET', `/api/v1/devices?${q.toString()}`);
+  }
+
+  /** Release a device: gives its slot back and revokes every session on it. */
+  release(deviceId: string, endUserId: string): Promise<{ device: DeviceDto; sessionsRevoked: number }> {
+    return this.client.send('POST', `/api/v1/devices/${encodeURIComponent(deviceId)}/release`, { endUserId });
+  }
+}
+
+/**
+ * Server-side end-user lookup (secret key only). `/users/me` answers "who is
+ * this token"; these answer "who is this id / email" for a backend that holds
+ * no token.
+ */
+class UsersClient {
+  constructor(private readonly client: Rekey) {}
+
+  /** Exact, case-insensitive email match in the calling Application. Throws END_USER_NOT_FOUND. */
+  getByEmail(email: string): Promise<EndUserDto> {
+    return this.client.send('GET', `/api/v1/users?email=${encodeURIComponent(email)}`);
+  }
+
+  /** By id, scoped to the calling Application. Throws END_USER_NOT_FOUND. */
+  get(endUserId: string): Promise<EndUserDto> {
+    return this.client.send('GET', `/api/v1/users/${encodeURIComponent(endUserId)}`);
+  }
+
+  /**
+   * Import up to 500 users from another auth system in one call. Password
+   * hashes (argon2id or bcrypt) are stored as given and verified as-is at
+   * sign-in; bcrypt is upgraded to argon2id on first success. Existing
+   * addresses are skipped, never updated.
+   *
+   * @example
+   * ```ts
+   * const { created, skipped } = await rekey.users.import([
+   *   { email: 'a@example.com', passwordHash: '$2b$10$…', emailVerified: true },
+   *   { email: 'b@example.com', oauthIdentities: [{ provider: 'google', providerAccountId: '1234' }] },
+   * ]);
+   * ```
+   */
+  import(users: ImportUserInput[]): Promise<ImportUsersResult> {
+    return this.client.send('POST', '/api/v1/users/import', { users });
+  }
+}
+
+export interface ImportUserInput {
+  email: string;
+  /** `$argon2id$…` or `$2a$`/`$2b$`/`$2y$…`. Omit for OAuth-only users. */
+  passwordHash?: string;
+  emailVerified?: boolean;
+  role?: string;
+  metadata?: Record<string, unknown>;
+  oauthIdentities?: Array<{ provider: string; providerAccountId: string; email?: string }>;
+}
+
+export interface ImportUsersResult {
+  created: Array<{ id: string; email: string }>;
+  skipped: Array<{ email: string; reason: string }>;
 }
 
 class UsageClient {
@@ -2164,6 +2281,23 @@ class BillingClient {
     return this.client.send('GET', `/api/v1/billing/entitlements${qs}`, undefined, {
       'X-Rekey-User-Token': accessToken,
     });
+  }
+
+  /**
+   * The same union as `getEntitlements`, for an end-user you name rather than
+   * one whose token you hold. Secret key only — for a licence server, a
+   * support tool or a batch job.
+   *
+   * @example
+   * ```ts
+   * const { features } = await rekey.billing.getEntitlementsFor(endUserId);
+   * if (features.max_devices !== undefined) capDevices(features.max_devices);
+   * ```
+   */
+  getEntitlementsFor(endUserId: string, opts?: { organizationId?: string }): Promise<EntitlementsDto> {
+    const q = new URLSearchParams({ endUserId });
+    if (opts?.organizationId) q.set('organizationId', opts.organizationId);
+    return this.client.send('GET', `/api/v1/billing/entitlements/for-user?${q.toString()}`);
   }
 
   /**

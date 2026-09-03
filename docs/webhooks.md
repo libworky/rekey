@@ -155,7 +155,7 @@ implement, not something you receive.
 
 ## Event catalog
 
-Seventeen events. The registry lives in
+Twenty-three events. The registry lives in
 `apps/api/src/modules/webhooks/events.ts`, and `@rekey.dev/node` re-exports it
 as `WEBHOOK_EVENTS` (`{ name, description }` pairs), `KNOWN_WEBHOOK_EVENTS`
 (names only) and `isKnownWebhookEvent` — use those to build an event picker
@@ -174,6 +174,21 @@ rather than hardcoding this table.
 | `mfa.disabled` | The end-user disabled MFA. |
 | `password.changed` | Authenticated change or reset-token flow. All their other sessions are revoked. |
 | `email.verified` | The end-user verified their email address. |
+
+### Devices
+
+The machines an end-user signs in from — see [devices.md](devices.md). Every
+payload carries `data.device` (id, endUserId, fingerprint, label, status,
+timestamps) except `device.limit_reached`, which has no row to describe.
+
+| Event | When |
+|---|---|
+| `device.registered` | A new fingerprint was registered for an end-user, or a released device came back (`data.reactivated`). A sign-in from an already-active device emits nothing. |
+| `device.released` | The end-user or an operator gave the slot back; every session minted on the device was revoked (`data.sessionsRevoked`, `data.releasedBy`). |
+| `device.blocked` | An operator blocked the device. Sign-in from that fingerprint is refused until it is unblocked; its sessions were revoked. |
+| `device.unblocked` | An operator lifted the block. The device is RELEASED and takes a slot again on its next sign-in, subject to the limit. |
+| `device.limit_reached` | A new device was refused because the end-user is at `max_devices`. `data.devices` lists the active devices filling the cap, so you can prompt the user to release one. |
+| `license.deactivated` | A machine gave back its license seat — the customer's software called `POST /licenses/deactivate`, or an operator released the activation (`data.releasedBy`). `data.license` carries id, endUserId and kind; `data.machineFingerprint` names the machine. |
 
 ### Billing
 
