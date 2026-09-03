@@ -6,6 +6,10 @@ import { AppEnvironmentSchema, BillingProviderSchema } from '@rekey.dev/shared-t
 import { PaginationQuery, parsePagination, paged, paginationJsonSchema } from '../../lib/pagination.js';
 import { stripApplicationSecrets } from '../../lib/app-access.js';
 import { ok, okPage, errs, ref } from '../../lib/openapi.js';
+import { getModule, registryNames } from '../billing/providers/registry.js';
+
+/** Providers a buyer can be sent to; the create-time hint names one of these. */
+const HOSTED_PROVIDERS = registryNames.filter((n) => getModule(n)!.capabilities.checkout);
 
 /**
  * The 401/403 pair every `/api/v1/admin/*` route shares — `requireSuperAdmin`
@@ -135,7 +139,7 @@ export async function applicationsRoutes(app: FastifyInstance): Promise<void> {
                 'so create a separate Application per environment. Only PRODUCTION counts ' +
                 'against the workspace `maxProductionApps` limit.',
             },
-            billingProvider: { type: 'string', enum: ['stripe', 'paypal', 'razorpay'] },
+            billingProvider: { type: 'string', enum: HOSTED_PROVIDERS },
             enableBilling: {
               type: 'boolean',
               description: 'Provision with the billing surface enabled. Defaults false.',
