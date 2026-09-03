@@ -82,6 +82,22 @@ function lockKey(applicationId: string, endUserId: string): string {
   return `device:${applicationId}:${endUserId}`;
 }
 
+/**
+ * Serialise every status write for one end-user's devices. `touch` holds
+ * this across its count-then-write; `release`, `block` and `unblock` hold it
+ * across their read-then-write so a block cannot land between a touch's read
+ * of RELEASED and its write of ACTIVE (which would have flipped a just-blocked
+ * device back to ACTIVE with `blockedAt` still set), and a release cannot be
+ * lost to a touch that read ACTIVE a moment earlier.
+ */
+async function lockDevices(
+  tx: Prisma.TransactionClient,
+  applicationId: string,
+  endUserId: string,
+): Promise<void> {
+  await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${lockKey(applicationId, endUserId)}, 0))`;
+}
+
 function summary(d: Device): DeviceSummary {
   return {
     id: d.id,
@@ -154,7 +170,7 @@ export const devicesService = {
     const label = input.label === undefined ? undefined : input.label?.slice(0, 120) ?? null;
 
     const outcome = await prisma.$transaction(async (tx) => {
-      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${lockKey(input.applicationId, input.endUserId)}, 0))`;
+      await lockDevices(tx, input.applicationId, input.endUserId);
 
       const existing = await tx.device.findUnique({
         where: {
@@ -319,19 +335,21 @@ export const devicesService = {
      */
     actor: { type: 'end_user' | 'operator' | 'server'; id: string | null };
   }): Promise<{ device: Device; sessionsRevoked: number }> {
-    const current = await this.get(args.applicationId, args.endUserId, args.deviceId);
-    if (current.status === 'BLOCKED') {
-      throw new RekeyError({
-        statusCode: 409,
-        code: 'DEVICE_BLOCKED',
-        message: 'This device is blocked and cannot be released.',
-        fix: 'An operator must unblock it first (POST …/devices/:id/unblock).',
-      });
-    }
-    if (current.status === 'RELEASED') return { device: current, sessionsRevoked: 0 };
-
+    const found = await this.get(args.applicationId, args.endUserId, args.deviceId);
     const now = new Date();
     const result = await prisma.$transaction(async (tx) => {
+      await lockDevices(tx, args.applicationId, args.endUserId);
+      // Re-read under the lock: the status may have moved since the lookup.
+      const current = await tx.device.findUniqueOrThrow({ where: { id: found.id } });
+      if (current.status === 'BLOCKED') {
+        throw new RekeyError({
+          statusCode: 409,
+          code: 'DEVICE_BLOCKED',
+          message: 'This device is blocked and cannot be released.',
+          fix: 'An operator must unblock it first (POST …/devices/:id/unblock).',
+        });
+      }
+      if (current.status === 'RELEASED') return { device: current, sessionsRevoked: 0, changed: false };
       const device = await tx.device.update({
         where: { id: current.id },
         data: { status: 'RELEASED', releasedAt: now },
@@ -340,8 +358,9 @@ export const devicesService = {
         where: { deviceId: current.id, revokedAt: null },
         data: { revokedAt: now },
       });
-      return { device, sessionsRevoked: revoked.count };
+      return { device, sessionsRevoked: revoked.count, changed: true };
     });
+    if (!result.changed) return { device: result.device, sessionsRevoked: 0 };
 
     emitDetached({
       applicationId: args.applicationId,
@@ -379,11 +398,12 @@ export const devicesService = {
     reason?: string | undefined;
     operatorUserId: string | null;
   }): Promise<{ device: Device; sessionsRevoked: number }> {
-    const current = await this.get(args.applicationId, args.endUserId, args.deviceId);
-    if (current.status === 'BLOCKED') return { device: current, sessionsRevoked: 0 };
-
+    const found = await this.get(args.applicationId, args.endUserId, args.deviceId);
     const now = new Date();
     const result = await prisma.$transaction(async (tx) => {
+      await lockDevices(tx, args.applicationId, args.endUserId);
+      const current = await tx.device.findUniqueOrThrow({ where: { id: found.id } });
+      if (current.status === 'BLOCKED') return { device: current, sessionsRevoked: 0, changed: false };
       const device = await tx.device.update({
         where: { id: current.id },
         data: {
@@ -396,8 +416,9 @@ export const devicesService = {
         where: { deviceId: current.id, revokedAt: null },
         data: { revokedAt: now },
       });
-      return { device, sessionsRevoked: revoked.count };
+      return { device, sessionsRevoked: revoked.count, changed: true };
     });
+    if (!result.changed) return { device: result.device, sessionsRevoked: 0 };
 
     emitDetached({
       applicationId: args.applicationId,
@@ -430,13 +451,18 @@ export const devicesService = {
     deviceId: string;
     operatorUserId: string | null;
   }): Promise<Device> {
-    const current = await this.get(args.applicationId, args.endUserId, args.deviceId);
-    if (current.status !== 'BLOCKED') return current;
-
-    const device = await prisma.device.update({
-      where: { id: current.id },
-      data: { status: 'RELEASED', releasedAt: new Date(), blockedAt: null, blockedReason: null },
+    const found = await this.get(args.applicationId, args.endUserId, args.deviceId);
+    const { device, changed } = await prisma.$transaction(async (tx) => {
+      await lockDevices(tx, args.applicationId, args.endUserId);
+      const current = await tx.device.findUniqueOrThrow({ where: { id: found.id } });
+      if (current.status !== 'BLOCKED') return { device: current, changed: false };
+      const updated = await tx.device.update({
+        where: { id: current.id },
+        data: { status: 'RELEASED', releasedAt: new Date(), blockedAt: null, blockedReason: null },
+      });
+      return { device: updated, changed: true };
     });
+    if (!changed) return device;
 
     emitDetached({
       applicationId: args.applicationId,
