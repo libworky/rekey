@@ -87,30 +87,84 @@ export function __resetForTests(): void {
   discoveryCache.clear();
 }
 
+/**
+ * A server clock a minute fast must not reject a token the issuer considers
+ * live. OIDC Core leaves the size of the allowance to the client; a minute is
+ * what the surrounding stack already grants elsewhere.
+ */
+const ID_TOKEN_CLOCK_SKEW_MS = 60_000;
+
+const stripTrailingSlash = (value: string): string => value.replace(/\/+$/, '');
+
+/**
+ * Does an advertised or asserted issuer answer for the one we configured?
+ *
+ * Exact after trailing slashes, with one documented exception: a multi-tenant
+ * Microsoft endpoint (`/common`, `/organizations`) answers discovery with the
+ * literal `{tenantid}` template, because which tenant it is only becomes known
+ * once a token exists. Everything but that segment must still match, so the
+ * template cannot widen the host or the path around it.
+ */
+function issuerAnswersFor(configured: string, advertised: string): boolean {
+  const want = stripTrailingSlash(configured);
+  const got = stripTrailingSlash(advertised);
+  if (want === got) return true;
+  if (!got.includes('{tenantid}')) return false;
+  const pattern = got
+    .split('{tenantid}')
+    .map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+    .join('[^/]+');
+  return new RegExp(`^${pattern}$`).test(want);
+}
+
+/** Refusal for an identity the provider described in a way we cannot trust. */
+function refuseIdentity(what: string): never {
+  throw new RekeyError({
+    statusCode: 502,
+    code: 'OAUTH_ID_TOKEN_INVALID',
+    message: `The identity provider returned an identity that ${what}.`,
+    fix: 'Check the issuer URL and client id configured for this provider; the token must be issued by that issuer for that client.',
+  });
+}
+
 /** The claim checks an ID token must pass before its `sub` names an account. */
 function assertIdTokenClaims(
   claims: Record<string, unknown>,
   expected: { issuer: string; clientId: string },
 ): void {
-  const refuse = (what: string): never => {
-    throw new RekeyError({
-      statusCode: 502,
-      code: 'OAUTH_ID_TOKEN_INVALID',
-      message: `The identity provider returned an ID token that ${what}.`,
-      fix: 'Check the issuer URL and client id configured for this provider; the token must be issued by that issuer for that client.',
-    });
-  };
   const sub = claims['sub'];
-  if (typeof sub !== 'string' || sub.length === 0) refuse('carries no subject');
+  if (typeof sub !== 'string' || sub.length === 0) refuseIdentity('carries no subject');
   const iss = claims['iss'];
-  if (typeof iss !== 'string' || iss.replace(/\/$/, '') !== expected.issuer.replace(/\/$/, '')) {
-    refuse('names a different issuer');
+  // A `{tenantid}` template is resolved by the token's own `tid` before the
+  // comparison, so a multi-tenant configuration still pins the issuer exactly
+  // rather than accepting any tenant that happens to fit the shape.
+  const tid = claims['tid'];
+  const expectedIssuer =
+    typeof tid === 'string' && expected.issuer.includes('{tenantid}')
+      ? expected.issuer.replace('{tenantid}', tid)
+      : expected.issuer;
+  if (typeof iss !== 'string' || !issuerAnswersFor(iss, expectedIssuer)) {
+    refuseIdentity('names a different issuer');
   }
   const aud = claims['aud'];
   const audiences = Array.isArray(aud) ? aud : [aud];
-  if (!audiences.includes(expected.clientId)) refuse('was issued for a different client');
-  const exp = claims['exp'];
-  if (typeof exp !== 'number' || exp * 1000 <= Date.now()) refuse('has expired');
+  if (!audiences.includes(expected.clientId)) {
+    refuseIdentity('was issued for a different client');
+  }
+  // With more than one audience the token is usable at another party, so OIDC
+  // Core §3.1.3.7 requires `azp` to name the client it was actually minted for.
+  // Without this, a token issued to someone else that merely lists us in `aud`
+  // would pass.
+  if (audiences.length > 1 && claims['azp'] !== expected.clientId) {
+    refuseIdentity('was authorized for a different party');
+  }
+  // `exp` is seconds since the epoch. Coerced rather than type-checked because
+  // some issuers serialize it as a JSON string, which is a formatting quirk
+  // rather than a reason to refuse a sign-in.
+  const exp = Number(claims['exp']);
+  if (!Number.isFinite(exp) || exp * 1000 + ID_TOKEN_CLOCK_SKEW_MS <= Date.now()) {
+    refuseIdentity('has expired');
+  }
 }
 
 async function discover(issuerUrl: string): Promise<DiscoveryDoc> {
@@ -134,6 +188,15 @@ async function discover(issuerUrl: string): Promise<DiscoveryDoc> {
     const data = (res.data ?? {}) as Partial<DiscoveryDoc>;
     if (!data.authorization_endpoint || !data.token_endpoint || !data.issuer) {
       throw new Error(`OIDC discovery doc at ${url} missing required fields`);
+    }
+    // OIDC Discovery §4.3: the document must name the issuer it was fetched
+    // from. Without this the later ID token check is self-referential — it
+    // compares the token against a value the same document supplied, so a
+    // document that names someone else validates tokens from someone else.
+    if (!issuerAnswersFor(issuerUrl, data.issuer)) {
+      throw new Error(
+        `OIDC discovery doc at ${url} is issued by "${data.issuer}", not by the configured issuer`,
+      );
     }
     return data as DiscoveryDoc;
   })();
@@ -274,8 +337,13 @@ export class OidcProvider implements OAuthProvider {
         throw new Error(`OIDC userinfo failed: HTTP ${userRes.status}`);
       }
       const data = (userRes.data ?? {}) as Record<string, unknown>;
+      // Same refusal as the ID token path, for the same reason: `String(
+      // undefined ?? '')` is an empty account id, and an empty account id
+      // folds every user of this provider onto one identity.
+      const sub = data['sub'];
+      if (typeof sub !== 'string' || sub.length === 0) refuseIdentity('carries no subject');
       return {
-        providerAccountId: String(data['sub'] ?? ''),
+        providerAccountId: sub,
         ...emailFromClaims(data),
       };
     }

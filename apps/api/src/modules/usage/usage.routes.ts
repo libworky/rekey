@@ -12,6 +12,7 @@ import { prisma } from '../../lib/prisma.js';
 import { RekeyError } from '../../lib/error.js';
 import { env } from '../../config/env.js';
 import { positiveBoundedInt } from '../../lib/bounded-int.js';
+import { assertMetadataWithinLimit } from '../../lib/metadata-limit.js';
 import { ok, errs, ref, type JsonSchema } from '../../lib/openapi.js';
 
 /**
@@ -174,7 +175,8 @@ export async function usagePublicRoutes(app: FastifyInstance): Promise<void> {
               'VALIDATION_ERROR — the body failed schema validation; or ' +
               'IDEMPOTENCY_KEY_INVALID — the Idempotency-Key header is empty or exceeds 200 ' +
               'characters; or USAGE_SUBJECT_AMBIGUOUS — both `endUserId` and `organizationId` ' +
-              'were passed; or USAGE_METER_INACTIVE — the meter exists but does not accept records.',
+              'were passed; or USAGE_METER_INACTIVE — the meter exists but does not accept records; ' +
+              'or METADATA_TOO_LARGE — `metadata` exceeds the 16KB limit.',
             ...WRITE_GATE_ERRORS,
             402: 'USAGE_QUOTA_EXCEEDED — the subject\'s plan-included quota for this meter is exhausted this period.',
             404:
@@ -192,6 +194,10 @@ export async function usagePublicRoutes(app: FastifyInstance): Promise<void> {
     },
     async (req, reply) => {
       const body = RecordBody.parse(req.body);
+      // Usage rows are the highest-volume table in the schema and are never
+      // updated, so an oversized blob here is multiplied by the ingestion rate
+      // rather than held to one row per subject.
+      if (body.metadata) assertMetadataWithinLimit(body.metadata);
       await assertSubjectInApp(req.application!.id, body);
       const record = await usageService.record({
         applicationId: req.application!.id,

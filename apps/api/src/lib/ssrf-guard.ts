@@ -272,7 +272,6 @@ export async function assertSafeUrlResolved(
   return results.map((r) => r.address);
 }
 
-/** Back-compat wrapper for callers that do not pin the connection. */
 /**
  * Fetch options that pin the connection to a pre-validated address set.
  *
@@ -286,13 +285,23 @@ export async function assertSafeUrlResolved(
  *
  * Built per call rather than cached: the validated set is specific to this
  * attempt, and a pool keyed on the host would outlive it. Spread the result
- * into the `fetch` init. An empty set (the guard returned nothing to pin,
- * which only happens when the host is a literal IP it already approved)
- * yields no override.
+ * into the `fetch` init. An empty set yields no override, which happens only
+ * when the guard was told to allow private targets and so approved the host
+ * without resolving it (`allowPrivate`, or WEBHOOK_ALLOW_PRIVATE_TARGETS).
+ *
+ * The agent is configured to drop its socket as soon as the response is read.
+ * Nothing can destroy it — the helper hands back only the init — and undici
+ * otherwise honours the REMOTE server's keep-alive hint for up to ten minutes,
+ * so a per-call agent that kept its socket would leave one idle connection per
+ * fetch: three per OIDC sign-in, one per webhook delivery. There is no reuse to
+ * lose, because the next call builds a new agent anyway.
  */
 export function pinnedFetchInit(allowed: readonly string[]): RequestInit {
   if (allowed.length === 0) return {};
   const dispatcher = new Agent({
+    connections: 1,
+    keepAliveTimeout: 1,
+    keepAliveMaxTimeout: 1,
     connect: {
       lookup: (
         _hostname: string,
@@ -321,6 +330,7 @@ export function pinnedFetchInit(allowed: readonly string[]): RequestInit {
   return { dispatcher } as unknown as RequestInit;
 }
 
+/** Back-compat wrapper for callers that do not pin the connection. */
 export async function assertSafeUrl(
   rawUrl: string,
   options: SafeUrlOptions = {},

@@ -15,6 +15,7 @@ import { RekeyError } from '../../lib/error.js';
 import { requireApiKey, requireScope } from '../../middleware/api-key-auth.js';
 import { requireBillingEnabled } from '../../middleware/billing-enabled.js';
 import { positiveBoundedInt } from '../../lib/bounded-int.js';
+import { assertMetadataWithinLimit } from '../../lib/metadata-limit.js';
 import { ok, okPage, errs, ref, type JsonSchema } from '../../lib/openapi.js';
 import { paged } from '../../lib/pagination.js';
 
@@ -194,7 +195,8 @@ export async function creditsPublicRoutes(app: FastifyInstance): Promise<void> {
           ...errs({
             400:
               'VALIDATION_ERROR — pass exactly one of `endUserId` or `organizationId`; or ' +
-              'IDEMPOTENCY_KEY_INVALID — the Idempotency-Key header is empty or exceeds 200 characters.',
+              'IDEMPOTENCY_KEY_INVALID — the Idempotency-Key header is empty or exceeds 200 ' +
+              'characters; or METADATA_TOO_LARGE — `metadata` exceeds the 16KB limit.',
             ...WRITE_GATE_ERRORS,
             402: 'CREDITS_INSUFFICIENT — the balance is below `amount`.',
             404: SUBJECT_NOT_FOUND,
@@ -209,6 +211,7 @@ export async function creditsPublicRoutes(app: FastifyInstance): Promise<void> {
     async (req) => {
       const applicationId = req.application!.id;
       const body = ConsumeBody.parse(req.body);
+      if (body.metadata) assertMetadataWithinLimit(body.metadata);
       const { subject } = await resolveSubject(applicationId, body);
       const result = await creditsService.consume({
         applicationId,

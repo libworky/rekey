@@ -242,6 +242,9 @@ services:
       # "true" lets outbound webhooks target private/internal addresses. Leave
       # empty on an internet-facing deployment: it is the SSRF guard.
       WEBHOOK_ALLOW_PRIVATE_TARGETS: ${WEBHOOK_ALLOW_PRIVATE_TARGETS:-}
+      # How long a processed inbound billing webhook is remembered, which is
+      # what makes a provider's redelivery idempotent. Empty = 90 days.
+      WEBHOOK_EVENT_RETENTION_DAYS: ${WEBHOOK_EVENT_RETENTION_DAYS:-}
       # Global rate limit, and the higher per-key cap for usage ingestion.
       # Empty = 100 req / 60s, and 1000 for POST /api/v1/usage/record.
       RATE_LIMIT_MAX: ${RATE_LIMIT_MAX:-}
