@@ -1,5 +1,5 @@
 /**
- * Hardening — the last step of the device series:
+ * Device hardening:
  *   - the licence routes are throttled per (application, IP), with no
  *     per-Application ceiling so a store outage fails open;
  *   - GDPR erasure deletes a person's devices and tombstones the fingerprint
@@ -161,7 +161,9 @@ describe('device hardening', () => {
     const other = ctx();
     other.tenantId = 'not-this-tenant';
     other.tenantUserId = 'nobody';
-    await expect(tool('list_devices').handler(other, { applicationId: appId, endUserId: userId })).rejects.toBeTruthy();
+    await expect(
+      tool('list_devices').handler(other, { applicationId: appId, endUserId: userId }),
+    ).rejects.toMatchObject({ statusCode: 404 });
 
     // The write tools are marked as writes.
     for (const name of ['release_device', 'block_device', 'unblock_device']) expect(tool(name).write).toBe(true);

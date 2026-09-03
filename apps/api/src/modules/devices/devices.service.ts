@@ -15,9 +15,9 @@
  * them. Licence verification does NOT touch: it links an activation to a
  * device that already exists for the holder and otherwise leaves devices
  * alone, so `max_devices` bounds session devices and licence machines
- * independently (see licenses.service.ts). The check-then-insert runs under a per-(application,
- * end-user) advisory lock so two concurrent sign-ins from two new machines
- * cannot both pass the count.
+ * independently (see licenses.service.ts). The check-then-insert runs under
+ * a per-(application, end-user) advisory lock so two concurrent sign-ins from
+ * two new machines cannot both pass the count.
  *
  * The limit itself is not stored here. It is the `max_devices` FEATURE
  * entitlement resolved through the plan union (MAX across subscriptions, the
@@ -361,6 +361,7 @@ export const devicesService = {
       return { device, sessionsRevoked: revoked.count, changed: true };
     });
     if (!result.changed) return { device: result.device, sessionsRevoked: 0 };
+    const released = { device: result.device, sessionsRevoked: result.sessionsRevoked };
 
     emitDetached({
       applicationId: args.applicationId,
@@ -384,7 +385,7 @@ export const devicesService = {
         ...(args.actor.type === 'server' && { apiKeyId: args.actor.id }),
       },
     });
-    return result;
+    return released;
   },
 
   /**
@@ -419,6 +420,7 @@ export const devicesService = {
       return { device, sessionsRevoked: revoked.count, changed: true };
     });
     if (!result.changed) return { device: result.device, sessionsRevoked: 0 };
+    const blocked = { device: result.device, sessionsRevoked: result.sessionsRevoked };
 
     emitDetached({
       applicationId: args.applicationId,
@@ -437,7 +439,7 @@ export const devicesService = {
         sessionsRevoked: result.sessionsRevoked,
       },
     });
-    return result;
+    return blocked;
   },
 
   /**

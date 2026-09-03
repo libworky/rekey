@@ -685,7 +685,8 @@ export async function organizationsAuthenticatedRoutes(app: FastifyInstance): Pr
           200: ok(ref('AuthResult'), 'A fresh session pair carrying the active org.'),
           ...errs({
             ...ORG_AUTH_ERRORS,
-            403: `${ORG_AUTH_ERRORS[403]} Or ORGANIZATION_NOT_MEMBER — the caller is not a member of this organization.`,
+            401: `${ORG_AUTH_ERRORS[401]} Or SESSION_DEVICE_RELEASED — the device this session is bound to was released; sign in again.`,
+            403: `${ORG_AUTH_ERRORS[403]} Or ORGANIZATION_NOT_MEMBER — the caller is not a member of this organization; or DEVICE_BLOCKED — an operator blocked the device this session is bound to.`,
           }),
         },
       },

@@ -41,13 +41,15 @@ export async function licensesPublicRoutes(app: FastifyInstance): Promise<void> 
   // requests are pre-authorized by route membership).
   app.addHook('onRequest', requireScope('billing:write'));
 
+  // Per (application, IP) bucket for both licence routes — see
+  // licenseRateLimitKey. 60/min covers an office launching at nine and bounds
+  // a key guesser to one attempt a second per address.
+  const LICENSE_RATE_LIMIT = licenseRateLimit(60);
+
   app.post(
     '/verify',
     {
-      // Per (application, IP) bucket — see licenseRateLimitKey. 60/min covers
-      // an office launching at nine and bounds a key guesser to one attempt a
-      // second per address.
-      config: { rateLimit: licenseRateLimit(60) },
+      config: { rateLimit: LICENSE_RATE_LIMIT },
       schema: {
         tags: ['Public · Licenses'],
         summary: 'Verify a license key + record an activation for this machine',
@@ -100,7 +102,7 @@ export async function licensesPublicRoutes(app: FastifyInstance): Promise<void> 
   app.post(
     '/deactivate',
     {
-      config: { rateLimit: licenseRateLimit(60) },
+      config: { rateLimit: LICENSE_RATE_LIMIT },
       schema: {
         tags: ['Public · Licenses'],
         summary: 'Give back the seat this machine holds on a license',

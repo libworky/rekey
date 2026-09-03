@@ -522,7 +522,8 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
               'was revoked; or REFRESH_TOKEN_EXPIRED — the token has expired; or ' +
               'REFRESH_TOKEN_WRONG_APPLICATION — the token belongs to a different Application; or ' +
               'REFRESH_TOKEN_DEVICE_MISMATCH — the session is bound to a different device than ' +
-              'the one presenting it (every session for this user has been revoked as a precaution).',
+              'the one presenting it (every session for this user has been revoked as a precaution); ' +
+              'or SESSION_DEVICE_RELEASED — the device this session is bound to was released since.',
             403:
               BOOTSTRAP_403 +
               ' Or EMAIL_NOT_VERIFIED — re-checked on every refresh.' +
