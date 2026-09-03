@@ -2382,7 +2382,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
             {
               type: 'object',
               properties: {
-                provider: { type: 'string', enum: ['stripe', 'paypal', 'razorpay'] },
+                provider: { type: 'string', enum: registryNames },
                 configured: { type: 'boolean', enum: [true] },
                 enabled: { type: 'boolean' },
                 mode: { type: 'string', enum: ['test', 'live'] },
@@ -2442,7 +2442,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
               type: 'object',
               properties: {
                 configured: { type: 'boolean', enum: [true] },
-                provider: { type: 'string', enum: ['stripe', 'paypal', 'razorpay'] },
+                provider: { type: 'string', enum: registryNames },
               },
               required: ['configured', 'provider'],
             },
@@ -2534,7 +2534,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
           200: ok(
             {
               type: 'object',
-              properties: { provider: { type: 'string', enum: ['stripe', 'paypal', 'razorpay'] } },
+              properties: { provider: { type: 'string', enum: registryNames } },
               required: ['provider'],
             },
             'Confirmation.',
@@ -2616,7 +2616,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
               type: 'object',
               properties: {
                 configured: { type: 'boolean', enum: [false] },
-                provider: { type: 'string', enum: ['stripe', 'paypal', 'razorpay'] },
+                provider: { type: 'string', enum: registryNames },
               },
               required: ['configured', 'provider'],
             },
@@ -2675,7 +2675,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
             {
               type: 'object',
               properties: {
-                provider: { type: 'string', enum: ['stripe', 'paypal', 'razorpay'] },
+                provider: { type: 'string', enum: registryNames },
                 webhookConfigured: { type: 'boolean' },
                 url: { type: 'string', format: 'uri' },
               },
@@ -2738,7 +2738,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
               type: 'object',
               properties: {
                 id: { type: 'string' },
-                provider: { type: 'string', enum: ['stripe', 'paypal', 'razorpay'] },
+                provider: { type: 'string', enum: registryNames },
                 providerEventId: { type: 'string' },
                 eventType: { type: 'string' },
                 receivedAt: { type: 'string', format: 'date-time' },

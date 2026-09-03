@@ -356,6 +356,15 @@ The signature is the auth — no `Authorization` header on this route. The raw b
 
 See `apps/api/src/modules/billing/webhooks/` for the full module rules.
 
+### (c) Your own billing system posting to Rekey
+
+When the sale happens in a system Rekey never called (your own billing stack,
+an invoicing tool, a marketplace), that system posts signed events to
+`POST /api/v1/webhooks/billing/external/<app-slug>` and Rekey activates,
+renews and cancels the subscription from them, creating the end-user when it
+has not seen them yet. Same pipeline, same appliers, same outbound events as
+(b). See [Bring your own billing](external-billing.md).
+
 ## Caching entitlements
 
 `billing.getEntitlements(accessToken)` resolves feature flags + limits + the live credit balance from active subscriptions. Hitting it on every request adds a network round-trip to every page load, but caching it forever serves stale plans after an upgrade. The recommended middle:

@@ -955,6 +955,12 @@ export interface BillingCredentialRow {
 
 /** What a provider module can do — from the registry, via discovery (P4). */
 export interface BillingProviderCapabilities {
+  /**
+   * false → inbound only: the operator's own billing system posting events.
+   * No checkout, no routing, no dashboard to register a webhook in. Absent
+   * (an older API) means the provider hosts a checkout.
+   */
+  checkout?: boolean;
   oneTime: boolean;
   captureStep: boolean;
   /** false → no webhook-create API (Razorpay): manual dashboard setup only. */

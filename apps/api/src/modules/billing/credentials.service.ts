@@ -19,6 +19,7 @@
  *   stripe   → { apiKey: 'sk_live_…', webhookSecret: 'whsec_…' }
  *   paypal   → { clientId, clientSecret, webhookId }
  *   razorpay → { keyId, keySecret, webhookSecret }
+ *   external → { webhookSecret }
  *
  * Backwards-compat: rows backfilled from the legacy
  * `applications.billing_credentials_ciphertext` column store the *wrapped*
@@ -39,7 +40,7 @@ import { RekeyError } from '../../lib/error.js';
 import { getModule, credentialRulesSchema } from './providers/registry.js';
 import type { ProviderModule } from './providers/module-types.js';
 
-export type BillingProviderName = 'stripe' | 'paypal' | 'razorpay';
+export type BillingProviderName = 'stripe' | 'paypal' | 'razorpay' | 'external';
 
 /**
  * Typed handles on the three built-in credential shapes. The *authoritative*
@@ -66,10 +67,16 @@ export type RazorpayCredentials = {
   webhookSecret: string;
 };
 
+/** The external billing system holds one secret: what it signs events with. */
+export type ExternalCredentials = {
+  webhookSecret: string;
+};
+
 export type CredentialsByProvider = {
   stripe: StripeCredentials;
   paypal: PaypalCredentials;
   razorpay: RazorpayCredentials;
+  external: ExternalCredentials;
 };
 
 export type BillingMode = 'test' | 'live';
@@ -350,6 +357,24 @@ export const billingCredentialsService = {
       }))
       .sort((a, b) => a._s - b._s || a.priority - b.priority)
       .map(({ _s: _, ...rest }) => rest);
+  },
+
+  /**
+   * `listEnabled` restricted to providers a buyer can be sent to.
+   *
+   * An inbound-only module (`capabilities.checkout: false`) is configured and
+   * enabled like any other, and must be for its webhooks to verify, but it
+   * cannot host a checkout. The geo router and the public provider list read
+   * this; the credential surfaces and the bound-provider checks read
+   * `listEnabled`, because "is this provider configured" is a different
+   * question from "can a buyer pay here".
+   */
+  async listCheckoutEnabled(
+    applicationId: string,
+    country?: string,
+  ): Promise<{ provider: BillingProviderName; priority: number; countries: string[]; mode: BillingMode }[]> {
+    const rows = await this.listEnabled(applicationId, country);
+    return rows.filter((r) => getModule(r.provider)?.capabilities.checkout !== false);
   },
 
   /**

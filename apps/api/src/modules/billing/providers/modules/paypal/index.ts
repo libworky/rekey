@@ -487,6 +487,7 @@ export const paypalModule: ProviderModule = {
     priority: 110,
   },
   capabilities: {
+    checkout: true,
     // Subscriptions v1 expresses a trial only as an intro cycle minted onto
     // the plan itself, which is a different feature from a per-checkout trial.
     // Declared false rather than omitted so the discovery contract every
