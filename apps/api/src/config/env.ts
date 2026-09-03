@@ -5,6 +5,12 @@ export const env = createEnv({
   server: {
     NODE_ENV: z.enum(['development', 'production', 'test']).default('development'),
     PORT: z.coerce.number().default(3030),
+    // How long inbound billing-webhook receipts (`webhook_events`, full
+    // payload) are kept. They exist for idempotency and for the operator's
+    // inbound log; neither needs a year of bodies, and a sender that posts
+    // freely (an external billing system) would otherwise grow the table
+    // without bound.
+    WEBHOOK_EVENT_RETENTION_DAYS: z.coerce.number().int().min(1).max(3650).default(90),
     HOST: z.string().default('0.0.0.0'),
 
     // Global rate limit (the `@fastify/rate-limit` plugin). Defaults to

@@ -24,6 +24,7 @@ import { RealStripeProvider } from './stripe-real.js';
 import { RealPaypalProvider } from './paypal.js';
 import { RealRazorpayProvider } from './razorpay.js';
 import { ExternalBillingProvider } from './external.js';
+import { getModule } from './registry.js';
 import {
   billingCredentialsService,
   type BillingProviderName,
@@ -122,6 +123,14 @@ export async function pickProvider(args: {
   if (args.preferred) {
     const match = enabled.find((p) => p.provider === args.preferred);
     if (match) return match.provider;
+    if (getModule(args.preferred)?.capabilities.checkout === false) {
+      throw new RekeyError({
+        statusCode: 400,
+        code: 'BILLING_PROVIDER_INBOUND_ONLY',
+        message: `Provider "${args.preferred}" only receives events from an external billing system; it cannot host a checkout.`,
+        fix: 'Omit `provider` to let the router pick a hosted provider, or sell through the external system.',
+      });
+    }
     throw new RekeyError({
       statusCode: 400,
       code: 'BILLING_PROVIDER_NOT_AVAILABLE',

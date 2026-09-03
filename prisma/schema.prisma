@@ -571,6 +571,7 @@ model Application {
   coupons             Coupon[]
   oauthIdentities     OAuthIdentity[]
   licenses            License[]
+  licenseActivations  LicenseActivation[]
   devices             Device[]
   usageMeters         UsageMeter[]
   billingCredentials  BillingCredentials[]
@@ -1330,8 +1331,9 @@ model LicenseActivation {
   // rather than inserting a second row.
   releasedAt         DateTime? @map("released_at")
 
-  license License @relation(fields: [licenseId], references: [id], onDelete: Cascade)
-  device  Device? @relation(fields: [deviceId], references: [id], onDelete: SetNull)
+  application Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  license     License     @relation(fields: [licenseId], references: [id], onDelete: Cascade)
+  device      Device?     @relation(fields: [deviceId], references: [id], onDelete: SetNull)
 
   @@unique([licenseId, machineFingerprint])
   @@index([licenseId])

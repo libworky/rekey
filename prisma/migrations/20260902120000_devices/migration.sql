@@ -1,5 +1,16 @@
 -- Devices: the machines an end-user signs in from, as a first-class row.
 --
+-- Operational note. This migration runs in one transaction and, on a large
+-- deployment, holds locks for the duration: the backfill rewrites every
+-- `license_activations` row, `SET NOT NULL` rescans it, the new indexes are
+-- built without CONCURRENTLY (impossible inside a transaction), and the FK on
+-- `refresh_tokens` validates with a full scan under a lock that blocks
+-- sign-in, refresh and sign-out until commit. Small tables will not notice.
+-- With millions of refresh tokens, run it in a maintenance window, or split
+-- it by hand: add the columns and the constraints as NOT VALID, backfill in
+-- batches, VALIDATE, then build the indexes with CONCURRENTLY and mark the
+-- migration applied with `prisma migrate resolve --applied`.
+--
 -- Rekey already knew about machines in one place — `license_activations`,
 -- keyed by `machine_fingerprint` under a license. That made a device a fact
 -- about a license rather than about a person: an end-user on a subscription

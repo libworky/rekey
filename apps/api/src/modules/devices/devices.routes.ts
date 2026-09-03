@@ -36,6 +36,7 @@ import {
 import { requireUserSession } from '../../middleware/user-session.js';
 import { requireTenantSession } from '../../middleware/tenant-session.js';
 import { devicesService, type Device } from './devices.service.js';
+import { licensesService } from '../licenses/licenses.service.js';
 
 const DeviceIdParam = z.object({ id: z.string().min(1) });
 const StatusQuery = z.object({
@@ -533,7 +534,6 @@ export async function tenantDevicesRoutes(app: FastifyInstance): Promise<void> {
         .object({ id: z.string().min(1), licenseId: z.string().min(1), activationId: z.string().min(1) })
         .parse(req.params);
       await ensureAppAccess(req, id, 'write');
-      const { licensesService } = await import('../licenses/licenses.service.js');
       const released = await licensesService.releaseActivation({
         applicationId: id,
         licenseId,

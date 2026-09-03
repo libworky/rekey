@@ -266,6 +266,18 @@ Stripe sale produces. Each subscription reports `provider: "external"`.
   Razorpay, your activation is recorded on that row (`metadata.refusedGrants`)
   and otherwise ignored, because taking the hosted id away would orphan that
   provider's events while it keeps charging. Cancel it there first.
+- **One-time plans.** A credit pack or a perpetual licence has no period, so
+  a second purchase of the same plan by the same subscriber looks like a
+  replay unless something moved. Send `currentPeriodEnd` set to the time of
+  each purchase (any value later than the previous one) and Rekey provisions
+  the plan again for that anchor: the credits are granted once per purchase.
+- **Only your rows.** Events from your system act only on subscriptions your
+  system created. An id that happens to match a subscription Stripe, PayPal
+  or Razorpay created is logged and ignored, on activation as well as on
+  cancellation and payments.
+- **Receipts are kept for 90 days** by default (`WEBHOOK_EVENT_RETENTION_DAYS`
+  on the API), which covers every retry window and the inbound log; an
+  `eventId` older than that is accepted as new.
 - **Applier failures retry.** A body that fails validation is a `400` and is
   stored nowhere. An event that validates but cannot be applied (unknown plan
   slug, unknown `endUserId`, an erased subscriber, a missing organization) is

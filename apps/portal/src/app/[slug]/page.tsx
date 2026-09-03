@@ -45,6 +45,8 @@ const CHECKOUT_ERR: Record<string, string> = {
   BILLING_SUBSCRIPTION_SUBJECT_CONFLICT:
     'You already have this plan on another account of yours. It has to be canceled and finish before you can start it here.',
   SUBSCRIPTION_NOT_FOUND: 'We couldn’t find that subscription — it may already be canceled.',
+  SUBSCRIPTION_MANAGED_EXTERNALLY:
+    'This subscription is managed through your billing account, not here. Cancel it there and this page updates shortly after.',
 };
 
 export default async function DashboardPage({
@@ -100,6 +102,9 @@ export default async function DashboardPage({
   ]);
   const currentPlan = subscription ? plans.find((p) => p.id === subscription.planId) : undefined;
   const canceling = Boolean(subscription?.cancelAt);
+  // Sold and billed by the operator's own system (the inbound-only provider):
+  // Rekey cannot stop the money there, so the cancel button would only 409.
+  const managedExternally = subscription?.provider === 'external';
   /** Which of the two cancellations this customer is actually about to get. */
   const cancelText = cancelCopy(subscription ?? { status: 'NONE', currentPeriodEnd: null });
   /**
@@ -172,7 +177,12 @@ export default async function DashboardPage({
                 {canceling ? 'Ends' : 'Renews'} on {new Date(endsOn).toLocaleDateString()}
               </p>
             )}
-            {isEntitlingStatus(subscription.status) && !canceling && canCheckout && (
+            {managedExternally && isEntitlingStatus(subscription.status) && (
+              <p className="text-xs text-[var(--color-muted-fg)]">
+                Managed through your billing account. Changes and cancellations are made there.
+              </p>
+            )}
+            {isEntitlingStatus(subscription.status) && !canceling && canCheckout && !managedExternally && (
               <form action={cancelSubscriptionAction.bind(null, slug, orgId)} className="pt-2">
                 <ConfirmSubmit
                   variant="neutral"

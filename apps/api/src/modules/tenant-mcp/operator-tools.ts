@@ -474,7 +474,7 @@ export const operatorTools: OperatorTool[] = [
   {
     name: 'recent_webhook_events',
     description:
-      "Recent inbound provider webhooks (Stripe / PayPal / Razorpay) received by " +
+      "Recent inbound provider webhooks (Stripe / PayPal / Razorpay / external billing) received by " +
       "the workspace's Applications. Filter optionally by `provider` or set " +
       "`onlyFailed: true` to surface unprocessed / failed-to-process events.",
     inputSchema: {

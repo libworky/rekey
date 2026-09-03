@@ -685,6 +685,88 @@ describe('External billing provider webhook', () => {
     expect(await prisma.subscription.count({ where: { applicationId: appId } })).toBe(0);
   });
 
+  it('acts only on its own rows: a hosted subscription is neither retired, cancelled nor paid by external events', async () => {
+    await proPlan();
+    await makePlan('team');
+    const r = await app.inject({
+      method: 'POST',
+      url: `/api/v1/tenant/applications/${appId}/end-users`,
+      headers: auth(),
+      payload: { email: 'hosted@example.com', password: 'pw-one-two-three' },
+    });
+    const euId = (r.json().data as { id: string }).id;
+    const plan = await prisma.plan.findUniqueOrThrow({ where: { applicationId_slug: { applicationId: appId, slug: 'pro' } } });
+    const stripeRow = await prisma.subscription.create({
+      data: {
+        applicationId: appId,
+        endUserId: euId,
+        planId: plan.id,
+        status: 'ACTIVE',
+        provider: 'stripe',
+        providerSubId: 'sub_stripe_shared',
+        currentPeriodEnd: daysFromNow(20),
+      },
+    });
+
+    // The same id on another plan would be a "plan change" for an external
+    // row; on a Stripe row it is ignored.
+    const retire = await post(activated('sub_stripe_shared', 'team', { endUserId: euId }));
+    expect(retire.json()).toMatchObject({ processed: true });
+    // A cancellation and a payment naming the Stripe id are ignored too.
+    await post(event('subscription.canceled', { subscription: { id: 'sub_stripe_shared' } }));
+    await post(event('payment.succeeded', { payment: { id: 'pay_x', subscriptionId: 'sub_stripe_shared', amount: 100, currency: 'usd' } }));
+
+    const after = await prisma.subscription.findUniqueOrThrow({ where: { id: stripeRow.id } });
+    expect(after.status).toBe('ACTIVE');
+    expect(after.provider).toBe('stripe');
+    expect(after.providerSubId).toBe('sub_stripe_shared');
+    expect((after.metadata as { refusedGrants?: unknown[] }).refusedGrants).toHaveLength(1);
+    expect(await prisma.subscription.count({ where: { applicationId: appId } })).toBe(1);
+    const stray = await prisma.payment.findFirst({ where: { applicationId: appId, providerPaymentId: 'pay_x' } });
+    expect(stray?.subscriptionId ?? null).toBeNull();
+  });
+
+  it('a late payment does not undo a scheduled cancellation', async () => {
+    await proPlan();
+    await post(activated('sub_late', 'pro', { email: 'late@example.com' }, { currentPeriodEnd: daysFromNow(30).toISOString() }));
+    const later = daysFromNow(5);
+    await post(event('subscription.canceled', { subscription: { id: 'sub_late', effectiveAt: later.toISOString() } }));
+    await post(event('payment.succeeded', { payment: { id: 'pay_late', subscriptionId: 'sub_late', amount: 2900, currency: 'usd' } }));
+
+    const application = await prisma.application.findUniqueOrThrow({ where: { id: appId } });
+    const user = await prisma.endUser.findUniqueOrThrow({
+      where: { applicationId_email: { applicationId: appId, email: 'late@example.com' } },
+    });
+    // The lazy expiry seam is where the heuristic used to fire.
+    const current = await billingService.getCurrentSubscription(application, user);
+    expect(current?.cancelAt?.toISOString()).toBe(later.toISOString());
+  });
+
+  it('a timestamp-only event on a subscription that has ended is ignored', async () => {
+    await proPlan();
+    await post(activated('sub_dead', 'pro', { email: 'dead@example.com' }));
+    await post(event('subscription.canceled', { subscription: { id: 'sub_dead' } }));
+    const before = await subscriptionOf('sub_dead');
+    await post(event('subscription.canceled', { subscription: { id: 'sub_dead', effectiveAt: daysFromNow(3).toISOString() } }));
+    const after = await subscriptionOf('sub_dead');
+    expect(after.status).toBe('CANCELED');
+    expect(after.cancelAt?.toISOString()).toBe(before.cancelAt?.toISOString());
+  });
+
+  it('receipts older than the retention window are pruned', async () => {
+    await post(event('ping', {}));
+    await post(event('ping', {}));
+    const rows = await prisma.webhookEvent.findMany({ where: { applicationId: appId } });
+    expect(rows).toHaveLength(2);
+    await prisma.webhookEvent.update({
+      where: { id: rows[0]!.id },
+      data: { receivedAt: new Date(Date.now() - 100 * 24 * 60 * 60 * 1000) },
+    });
+    const { pruneWebhookEvents } = await import('../src/modules/billing/webhooks/retention.js');
+    expect(await pruneWebhookEvents(90)).toBe(1);
+    expect(await prisma.webhookEvent.count({ where: { applicationId: appId } })).toBe(1);
+  });
+
   it('the signing secret has a length floor and the credential is never echoed', async () => {
     const short = await app.inject({
       method: 'PUT',

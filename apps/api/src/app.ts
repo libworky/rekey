@@ -40,6 +40,7 @@ import { idempotencyPreHandler, idempotencyOnSend } from './middleware/idempoten
 import { pruneExpiredChallenges } from './lib/webauthn-challenge.js';
 import { processDueWebhookDeliveries } from './modules/webhooks/webhook.service.js';
 import { processDueDunningCases } from './modules/billing/dunning.service.js';
+import { pruneWebhookEvents } from './modules/billing/webhooks/retention.js';
 import { registerSwagger } from './lib/swagger.js';
 import { tenantsRoutes } from './modules/tenants/index.js';
 import { applicationsRoutes } from './modules/applications/index.js';
@@ -492,6 +493,14 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
           if (deleted > 0) app.log.debug({ deleted }, 'pruned expired idempotency keys');
         })
         .catch((err) => app.log.warn({ err }, 'idempotency-key prune failed'));
+      // Inbound billing-webhook receipts past their retention. Their
+      // idempotency role is long over by then; a provider retries for days,
+      // not months.
+      void pruneWebhookEvents(env.WEBHOOK_EVENT_RETENTION_DAYS)
+        .then((deleted) => {
+          if (deleted > 0) app.log.debug({ deleted }, 'pruned inbound webhook receipts');
+        })
+        .catch((err) => app.log.warn({ err }, 'webhook-event prune failed'));
     }, PRUNE_INTERVAL_MS);
     pruneTimer.unref();
 
