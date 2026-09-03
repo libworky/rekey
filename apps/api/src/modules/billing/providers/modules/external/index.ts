@@ -40,8 +40,8 @@
  *                            sender needs; posting it on every change in the
  *                            external system is correct and idempotent.
  *   subscription.canceled    now, or at `effectiveAt` when that is in the
- *                            future (the row stays ACTIVE with `cancelAt` set
- *                            and expires locally on the date).
+ *                            future (the row keeps its status with `cancelAt`
+ *                            set and is ended locally on the date).
  *   subscription.past_due    a payment failed; dunning opens if enabled.
  *   payment.succeeded/failed/refunded
  *                            bookkeeping for the revenue views. Optional.
@@ -316,16 +316,17 @@ function translate(payload: unknown, ctx: TranslateCtx): DomainBillingEvent[] | 
       const now = new Date();
       const effectiveAt = d.subscription.effectiveAt;
       if (effectiveAt && effectiveAt > now) {
-        // Scheduled: the row stays entitled until the date and is expired
-        // locally by `expireIfDue` when it arrives, the same way a
-        // period-end cancellation the buyer asked for behaves.
+        // Scheduled: the row keeps whatever status it has (ACTIVE stays
+        // entitled, PAST_DUE stays in dunning) until the date, when
+        // `expireIfDue` ends it locally, the same way a period-end
+        // cancellation the buyer asked for behaves. No status is sent: the
+        // event says when access ends, not what the subscription is now.
         return [
           {
             type: 'subscription.canceled',
             providerEventId,
             applicationId,
             providerSubscriptionId: d.subscription.id,
-            status: 'ACTIVE',
             cancelAt: effectiveAt,
             raw,
           },

@@ -259,7 +259,15 @@ export interface SubscriptionStatusEvent extends DomainEventBase {
   providerSubscriptionId: string;
   /** See PaymentEventBase.checkoutSessionId — same OR-matcher, same rules. */
   checkoutSessionId?: string;
-  status: LocalSubscriptionStatus;
+  /**
+   * Absent = leave the status column untouched and mirror only the timestamp
+   * fields. The one use is a cancellation SCHEDULED for a future date by a
+   * sender whose payload does not say what the subscription's status is now:
+   * inventing ACTIVE for it would resurrect a PAST_DUE row, announce a
+   * reactivation and close its dunning case as recovered. Every hosted
+   * module knows the real status and sets it.
+   */
+  status?: LocalSubscriptionStatus;
   currentPeriodEnd?: Date | null;
   /**
    * When the trial ends, for a subscription the provider is running a trial

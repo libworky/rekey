@@ -380,6 +380,12 @@ export const subscriptionGrantsService = {
       // reports the winner's result rather than a 500, because from the
       // caller's side the two are one idempotent request.
       if ((e as { code?: string }).code !== 'P2002') throw e;
+      // Only the (applicationId, endUserId, planId) key is the benign race.
+      // With a provider binding the same code can name
+      // (applicationId, providerSubId): the sender's id is already on another
+      // row, which is a conflict the caller must see, not a win to report.
+      const target = (e as { meta?: { target?: unknown } }).meta?.target;
+      if (Array.isArray(target) && target.some((t) => String(t).includes('provider_sub'))) throw e;
       const won = await prisma.subscription.findUniqueOrThrow({
         where: { applicationId_endUserId_planId: key },
       });

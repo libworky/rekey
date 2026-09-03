@@ -20,6 +20,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { RealStripeProvider } from '../src/modules/billing/providers/stripe-real.js';
 import { RealPaypalProvider } from '../src/modules/billing/providers/paypal.js';
 import { RealRazorpayProvider } from '../src/modules/billing/providers/razorpay.js';
+import { ExternalBillingProvider } from '../src/modules/billing/providers/external.js';
 import { getModule, registryNames } from '../src/modules/billing/providers/registry.js';
 import type { RefundPaymentInput } from '../src/modules/billing/providers/types.js';
 
@@ -46,7 +47,9 @@ describe('capability declaration matches implementation', () => {
         ? new RealStripeProvider({ apiKey: 'sk_test_x', webhookSecret: 'whsec_x' })
         : name === 'paypal'
           ? new RealPaypalProvider({ clientId: 'c', clientSecret: 's', webhookId: 'w' }, 'test')
-          : new RealRazorpayProvider({ keyId: 'rzp_test_x', keySecret: 'k' });
+          : name === 'external'
+            ? new ExternalBillingProvider()
+            : new RealRazorpayProvider({ keyId: 'rzp_test_x', keySecret: 'k' });
     expect(typeof impl.refundPayment === 'function').toBe(Boolean(mod!.capabilities.refunds));
   });
 
