@@ -9,6 +9,7 @@ import {
   requireTenantRole,
 } from '../../middleware/tenant-session.js';
 import { recordSecurityEvent, requestContext } from '../../lib/security-events.js';
+import { env } from '../../config/env.js';
 import { ok, okPage, errs, ref, type JsonSchema } from '../../lib/openapi.js';
 import { PaginationQuery, parsePagination, paged, paginationJsonSchema } from '../../lib/pagination.js';
 
@@ -165,6 +166,37 @@ export async function tenantWorkspacesRoutes(app: FastifyInstance): Promise<void
       },
     },
     async () => ({ success: true, data: { mode: workspaceCreationMode() } }),
+  );
+
+  app.get(
+    '/subscription-grants-mode',
+    {
+      schema: {
+        tags: ['Tenant · Workspace'],
+        security: [{ tenantSession: [] }],
+        summary: 'Whether this deployment lets operators grant subscriptions',
+        description:
+          'UX hint, exactly like `GET /tenant/workspace/creation-mode` above: it lets the panel ' +
+          'hide the "Grant subscription" affordance on a deployment where the grant route would ' +
+          'answer 404. Not a secret and not the enforcement — the grant and cancel routes refuse ' +
+          'with `TENANT_SUBSCRIPTION_GRANTS_DISABLED` regardless of what this reports.\n\n' +
+          'Deployment-level rather than per-Application, which is why it lives here rather than ' +
+          'under one Application: `TENANT_SUBSCRIPTION_GRANTS` is a single switch for the whole ' +
+          'API process.',
+        response: {
+          200: ok(
+            {
+              type: 'object',
+              properties: { mode: { type: 'string', enum: ['enabled', 'disabled'] } },
+              required: ['mode'],
+            },
+            "The deployment's operator-subscription-grant mode.",
+          ),
+          ...errs(TENANT_SESSION_ERRORS),
+        },
+      },
+    },
+    async () => ({ success: true, data: { mode: env.TENANT_SUBSCRIPTION_GRANTS } }),
   );
 
   app.get(

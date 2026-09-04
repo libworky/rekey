@@ -196,6 +196,12 @@ services:
       # open (default) | disabled. Pairs with DEFAULT_TENANT_LIMITS — a ceiling
       # per workspace means little if anyone can mint a fresh one.
       WORKSPACE_CREATION: ${WORKSPACE_CREATION:-}
+      # Whether OWNER/ADMIN may grant a subscription from the panel with no
+      # payment provider behind it: enabled (default) | disabled. Set `disabled`
+      # if this deployment SELLS to the workspaces it hosts, where a granted
+      # subscription can write the granter's own allowance; granting then stays
+      # on the super-admin key.
+      TENANT_SUBSCRIPTION_GRANTS: ${TENANT_SUBSCRIPTION_GRANTS:-}
       # Starting ceilings for every workspace this deployment creates (JSON,
       # TenantLimitsSchema — e.g. {"maxProductionApps":1}). Empty = unlimited.
       DEFAULT_TENANT_LIMITS: ${DEFAULT_TENANT_LIMITS:-}

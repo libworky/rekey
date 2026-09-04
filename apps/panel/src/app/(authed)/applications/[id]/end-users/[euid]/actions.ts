@@ -126,6 +126,87 @@ export async function eraseUser(applicationId: string, euid: string): Promise<vo
 }
 
 // ---------------------------------------------------------------------------
+// Subscriptions
+// ---------------------------------------------------------------------------
+
+/**
+ * Grant a subscription with no payment provider behind it — an invoiced sale, a
+ * comped account, a migration off a previous billing system.
+ *
+ * The note is optional to the API and required here. A comped subscription with
+ * no stated reason is unauditable six months later, and the person who has to
+ * reconstruct it is not the person granting it now.
+ */
+export async function grantSubscription(
+  applicationId: string,
+  euid: string,
+  formData: FormData,
+): Promise<void> {
+  const planSlug = String(formData.get('planSlug') ?? '').trim();
+  const note = String(formData.get('note') ?? '').trim();
+  const periodEnd = String(formData.get('currentPeriodEnd') ?? '').trim();
+  const base = `${tabBase(applicationId, euid)}/subscriptions`;
+
+  if (!planSlug) redirect(`${base}?grantError=PLAN_REQUIRED&grant=1`);
+  if (!note) redirect(`${base}?grantError=NOTE_REQUIRED&grant=1`);
+
+  let activated: boolean;
+  try {
+    const result = await api<{ activated: boolean }>({
+      method: 'POST',
+      path: `${apiBase(applicationId, euid)}/subscriptions`,
+      body: {
+        planSlug,
+        note,
+        // A date input gives YYYY-MM-DD; the API wants an instant. End of that
+        // day UTC, so "ends on the 30th" means the 30th is still covered.
+        ...(periodEnd ? { currentPeriodEnd: `${periodEnd}T23:59:59.000Z` } : {}),
+      },
+    });
+    activated = result.activated;
+  } catch (err) {
+    if (err instanceof PanelApiError) {
+      redirect(`${base}?grantError=${encodeURIComponent(err.code)}&grant=1`);
+    }
+    throw err;
+  }
+  // `activated: false` is the idempotent no-op — the subscriber was already
+  // entitled on this plan. Saying "granted" there would be a lie the operator
+  // acts on, so the two outcomes get different banners.
+  redirect(`${base}?granted=${activated ? '1' : 'already'}`);
+}
+
+export async function cancelSubscription(
+  applicationId: string,
+  euid: string,
+  subId: string,
+  formData: FormData,
+): Promise<void> {
+  const immediate = formData.get('immediate') === 'on';
+  const base = `${tabBase(applicationId, euid)}/subscriptions`;
+  let result: { cancelAt: string | null };
+  try {
+    result = await api<{ cancelAt: string | null }>({
+      method: 'POST',
+      path: `${apiBase(applicationId, euid)}/subscriptions/${encodeURIComponent(subId)}/cancel`,
+      body: { atPeriodEnd: !immediate },
+    });
+  } catch (err) {
+    if (err instanceof PanelApiError) {
+      redirect(`${base}?cancelError=${encodeURIComponent(err.code)}`);
+    }
+    throw err;
+  }
+  // Report what HAPPENED, not what was asked for. `atPeriodEnd: true` is a
+  // request; `cancelEffect` decides, and it schedules nothing for a
+  // subscription with no period left — which is every open-ended grant. A
+  // banner reading "keeps entitling until the end of the period" over an
+  // account that just lost access is worse than no banner.
+  const scheduled = result.cancelAt !== null && new Date(result.cancelAt) > new Date();
+  redirect(`${base}?canceled=${scheduled ? 'period-end' : 'now'}`);
+}
+
+// ---------------------------------------------------------------------------
 // Devices
 // ---------------------------------------------------------------------------
 
