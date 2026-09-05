@@ -50,57 +50,27 @@
  * Routes that stay OWNER/ADMIN-only regardless of grants (extra-sensitive,
  * gated by `requireTenantRole(['OWNER','ADMIN'])` before this helper runs):
  * end-user DSAR export, impersonation, and the inbound request log.
+ *
+ * The decision is implemented ONCE, in `./access-context.ts`, over a plain
+ * context rather than a request — that is what lets the MCP handlers share it
+ * instead of carrying their own copy. This file keeps the request-shaped
+ * adapters every REST route calls.
  */
 
 import type { FastifyRequest } from 'fastify';
-import type { ApplicationGrantRole } from '@prisma/client';
-import { prisma } from './prisma.js';
-import { RekeyError } from './error.js';
+import {
+  accessContextFromRequest,
+  accessScope,
+  applicationAccess,
+  type AppAccess,
+  type AppAccessNeed,
+  type AppAccessScope,
+} from './access-context.js';
 
-export type AppAccessNeed = 'read' | 'write' | 'billing-write';
-
-export interface AppAccess {
-  /**
-   * How the access was satisfied:
-   *  - 'workspace-admin' — caller is OWNER/ADMIN (implicit full access)
-   *  - 'legacy-member'   — grandfathered pre-grants membership (read-only)
-   *  - ApplicationGrantRole   — MEMBER via an explicit grant on this Application
-   */
-  level: 'workspace-admin' | 'legacy-member' | ApplicationGrantRole;
-}
-
-function notFound(applicationId: string): RekeyError {
-  // Don't disclose existence (in another tenant, or behind a missing grant) —
-  // return the same code as "not found" to avoid being an enumeration oracle.
-  return new RekeyError({
-    statusCode: 404,
-    code: 'APPLICATION_NOT_FOUND',
-    message: `Application "${applicationId}" not found in this workspace.`,
-    fix: 'List applications via GET /api/v1/tenant/applications.',
-  });
-}
-
-function legacyWriteDenied(role: string): RekeyError {
-  // Same code/shape requireTenantRole(['OWNER','ADMIN']) used to emit for a
-  // MEMBER hitting these routes — kept for client back-compat.
-  return new RekeyError({
-    statusCode: 403,
-    code: 'TENANT_ROLE_INSUFFICIENT',
-    message: `This action requires one of: OWNER, ADMIN. Your role: ${role}.`,
-    fix: 'Ask a workspace owner or admin to perform this action, to upgrade your role, or to grant you an application role (APP_ADMIN / APP_BILLING).',
-  });
-}
-
-function grantDenied(need: AppAccessNeed, granted: ApplicationGrantRole): RekeyError {
-  return new RekeyError({
-    statusCode: 403,
-    code: 'APP_ACCESS_DENIED',
-    message: `Your application role ${granted} does not allow this action (requires ${
-      need === 'billing-write' ? 'APP_BILLING or APP_ADMIN' : 'APP_ADMIN'
-    }).`,
-    fix: 'Ask a workspace owner or admin to raise your application grant via PUT /api/v1/tenant/workspace/members/:membershipId/grants.',
-  });
-}
+// The decision itself lives in ./access-context.ts, where the MCP path shares
+// it. These two are the request-shaped adapters the 128 REST call sites use;
+// their names, signatures and every observable behaviour are unchanged.
+export type { AppAccess, AppAccessNeed, AppAccessScope };
 
 /**
  * Assert the Application belongs to the active workspace AND the caller may
@@ -111,88 +81,7 @@ export async function ensureAppAccess(
   applicationId: string,
   need: AppAccessNeed,
 ): Promise<AppAccess> {
-  const app = await prisma.application.findUnique({
-    where: { id: applicationId },
-    select: { tenantId: true },
-  });
-  if (!app || app.tenantId !== req.tenantId) throw notFound(applicationId);
-
-  if (req.tenantRole === 'OWNER' || req.tenantRole === 'ADMIN') {
-    return { level: 'workspace-admin' };
-  }
-
-  // MEMBER — consult grants. Every operator auth middleware attaches
-  // tenantMembershipId; the lookup below is a defensive fallback for any
-  // future auth path that only sets tenantUser/tenantId.
-  let membershipId = req.tenantMembershipId;
-  if (!membershipId && req.tenantUser && req.tenantId) {
-    const membership = await prisma.tenantMembership.findUnique({
-      where: {
-        tenantUserId_tenantId: { tenantUserId: req.tenantUser.id, tenantId: req.tenantId },
-      },
-      select: { id: true },
-    });
-    membershipId = membership?.id;
-  }
-  if (!membershipId) {
-    throw new RekeyError({
-      statusCode: 500,
-      code: 'INTERNAL_ERROR',
-      message: 'ensureAppAccess used without requireTenantSession.',
-      fix: 'Register requireTenantSession before the route handler.',
-    });
-  }
-  const [grants, membership] = await Promise.all([
-    prisma.applicationGrant.findMany({
-      where: { tenantMembershipId: membershipId },
-      select: { applicationId: true, role: true },
-    }),
-    prisma.tenantMembership.findUnique({
-      where: { id: membershipId },
-      select: { legacyWorkspaceRead: true },
-    }),
-  ]);
-
-  const grant = grants.find((g) => g.applicationId === applicationId);
-  if (!grant) {
-    // Grandfathered pre-grants membership: workspace-wide read, no writes.
-    // The ONLY path that still reaches the old behaviour, and it is now
-    // predicated on an explicit column rather than on "this member happens to
-    // have no grants" — which is what every new member looks like.
-    //
-    // `grants.length === 0` as well as the flag, deliberately. Setting a grant
-    // clears the flag and the migration clears it for any row that already had
-    // one, so "grandfathered AND granted" is unreachable — but if it ever did
-    // occur, grants must win, exactly as they did before. This condition is
-    // duplicated verbatim in `appAccessScope` below and in
-    // `tenant-mcp/operator-tools.ts`; all three have to agree.
-    if (grants.length === 0 && membership?.legacyWorkspaceRead === true) {
-      if (need === 'read') return { level: 'legacy-member' };
-      throw legacyWriteDenied(req.tenantRole ?? 'MEMBER');
-    }
-    // Default since 2.0.0-rc.3: closed. Same 404 an ungranted Application
-    // already returned for a member who held grants elsewhere, so a denied
-    // Application stays indistinguishable from an absent one.
-    throw notFound(applicationId);
-  }
-
-  if (need === 'read') return { level: grant.role };
-  if (need === 'billing-write') {
-    if (grant.role === 'APP_ADMIN' || grant.role === 'APP_BILLING') return { level: grant.role };
-    throw grantDenied(need, grant.role);
-  }
-  // need === 'write'
-  if (grant.role === 'APP_ADMIN') return { level: grant.role };
-  throw grantDenied(need, grant.role);
-}
-
-export interface AppAccessScope {
-  /** false → caller sees every Application in the workspace (OWNER/ADMIN or grandfathered member). */
-  restricted: boolean;
-  /** Granted application ids (only meaningful when restricted). */
-  applicationIds: string[];
-  /** applicationId → granted role (only meaningful when restricted). */
-  roleByApplicationId: Map<string, ApplicationGrantRole>;
+  return applicationAccess(await accessContextFromRequest(req), applicationId, need);
 }
 
 /**
@@ -200,30 +89,17 @@ export interface AppAccessScope {
  * (which also feeds the panel sidebar + command palette).
  */
 export async function appAccessScope(req: FastifyRequest): Promise<AppAccessScope> {
+  // Mirrors the old inline check: an OWNER/ADMIN, or a request with no
+  // membership id, is unrestricted. The adapter's fallback lookup is not
+  // wanted here — the old code never did one for the scope question.
   if (req.tenantRole === 'OWNER' || req.tenantRole === 'ADMIN' || !req.tenantMembershipId) {
     return { restricted: false, applicationIds: [], roleByApplicationId: new Map() };
   }
-  const [grants, membership] = await Promise.all([
-    prisma.applicationGrant.findMany({
-      where: { tenantMembershipId: req.tenantMembershipId },
-      select: { applicationId: true, role: true },
-    }),
-    prisma.tenantMembership.findUnique({
-      where: { id: req.tenantMembershipId },
-      select: { legacyWorkspaceRead: true },
-    }),
-  ]);
-  // Grandfathered pre-grants membership — workspace-wide read. Zero grants on
-  // its own no longer widens the scope: since 2.0.0-rc.3 it narrows it to
-  // nothing, which is what a new MEMBER invitation is supposed to produce.
-  if (grants.length === 0 && membership?.legacyWorkspaceRead === true) {
-    return { restricted: false, applicationIds: [], roleByApplicationId: new Map() };
-  }
-  return {
-    restricted: true,
-    applicationIds: grants.map((g) => g.applicationId),
-    roleByApplicationId: new Map(grants.map((g) => [g.applicationId, g.role])),
-  };
+  return accessScope({
+    tenantId: req.tenantId!,
+    role: req.tenantRole!,
+    membershipId: req.tenantMembershipId,
+  });
 }
 
 /**

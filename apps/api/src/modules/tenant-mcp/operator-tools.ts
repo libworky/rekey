@@ -46,6 +46,10 @@
 
 import type { TenantRole } from '@prisma/client';
 import { prisma } from '../../lib/prisma.js';
+import {
+  accessContextFromTool,
+  accessibleApplicationIds as sharedAccessibleApplicationIds,
+} from '../../lib/access-context.js';
 import { tenantWorkspacesService } from '../tenant-workspaces/tenant-workspaces.service.js';
 
 export interface OperatorToolContext {
@@ -123,55 +127,18 @@ function clampLimit(raw: unknown, def = 25): number {
 }
 
 /**
- * The Applications this caller may READ, as ids — the MCP equivalent of
- * `appAccessScope` + `ensureAppAccess(…, 'read')` in `lib/app-access.ts`.
+ * The Applications this caller may READ, as ids.
  *
- * The matrix is that file's, reproduced here rather than shared because the
- * REST helper takes a `FastifyRequest` and these handlers have no request:
- *
- *   OWNER / ADMIN     → every Application in the workspace.
- *   MEMBER            → exactly the granted Applications, at any grant role
- *                       (APP_VIEWER included — every grant confers read).
- *                       Zero grants therefore means zero Applications: since
- *                       2.0.0-rc.3 grant-scoped access is the DEFAULT, not a
- *                       mode you opt into with your first grant.
- *   MEMBER, with      → every Application in the workspace (LEGACY read).
- *   legacyWorkspace     Set only by the 2.0.0-rc.3 backfill, for memberships
- *   Read = true         that predate grant-scoped-by-default.
- *
- * If the two ever diverge, this is the copy to fix: REST is the contract.
- *
- * Returns `[]` for a caller with grants that name no Application, which every
- * handler treats as "nothing to show" — the same empty result an operator with
- * no Applications gets, so a denied Application is indistinguishable from an
- * absent one.
+ * This used to be a hand-maintained copy of the matrix in `lib/app-access.ts`,
+ * kept separate because "the REST helper takes a `FastifyRequest` and these
+ * handlers have no request", with a note that if the two ever diverged this
+ * was the copy to fix. They did diverge. The decision now lives in
+ * `lib/access-context.ts` over a plain context, and this is the adapter —
+ * same name, same signature, same `[]`-for-denied behaviour every handler
+ * relies on.
  */
 export async function accessibleApplicationIds(ctx: OperatorToolContext): Promise<string[]> {
-  const all = await prisma.application.findMany({
-    where: { tenantId: ctx.tenantId },
-    select: { id: true },
-    orderBy: { createdAt: 'asc' },
-  });
-  const allIds = all.map((a) => a.id);
-  if (ctx.role === 'OWNER' || ctx.role === 'ADMIN') return allIds;
-  // No membership id means grants cannot be resolved. Fail CLOSED: a MEMBER
-  // whose grants we cannot read must not be handed the workspace.
-  if (!ctx.tenantMembershipId) return [];
-  const [grants, membership] = await Promise.all([
-    prisma.applicationGrant.findMany({
-      where: { tenantMembershipId: ctx.tenantMembershipId },
-      select: { applicationId: true },
-    }),
-    prisma.tenantMembership.findUnique({
-      where: { id: ctx.tenantMembershipId },
-      select: { legacyWorkspaceRead: true },
-    }),
-  ]);
-  // Grandfathered pre-grants membership only. Zero grants alone now means
-  // zero Applications, matching lib/app-access.ts.
-  if (grants.length === 0 && membership?.legacyWorkspaceRead === true) return allIds;
-  const granted = new Set(grants.map((g) => g.applicationId));
-  return allIds.filter((id) => granted.has(id));
+  return sharedAccessibleApplicationIds(accessContextFromTool(ctx));
 }
 
 export const operatorTools: OperatorTool[] = [

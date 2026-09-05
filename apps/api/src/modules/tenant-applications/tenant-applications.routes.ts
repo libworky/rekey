@@ -6175,7 +6175,11 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
       const body = z
         .object({ reason: z.string().max(280).optional() })
         .parse(req.body ?? {});
-      await ensureAppAccess(req, params.id, 'read');
+      // 'write', not 'read': this mints a token that ACTS AS the end-user. It
+      // was classified as a read and saved only by the OWNER/ADMIN preHandler
+      // above — which is why nobody noticed. The preHandler stays; the need is
+      // now honest about what the route does.
+      await ensureAppAccess(req, params.id, 'write');
       const endUser = await prisma.endUser.findUnique({ where: { id: params.euid } });
       if (!endUser || endUser.applicationId !== params.id) {
         throw new RekeyError({
@@ -6283,7 +6287,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
       const params = z
         .object({ id: z.string().min(1), euid: z.string().min(1) })
         .parse(req.params);
-      await ensureAppAccess(req, params.id, 'read');
+      await ensureAppAccess(req, params.id, 'write');
       const endUser = await prisma.endUser.findUnique({ where: { id: params.euid } });
       if (!endUser || endUser.applicationId !== params.id) {
         throw new RekeyError({
