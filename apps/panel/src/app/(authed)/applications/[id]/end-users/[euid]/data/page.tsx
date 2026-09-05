@@ -9,18 +9,15 @@
  *
  * ## Role gating
  *
- * Erase is rendered for the workspace OWNER only.
+ * Erase is rendered for the workspace OWNER only, matching the API floor.
  *
- * The API is currently more permissive than that: both `DELETE
- * …/end-users/:euid` and its `?erasure=true` form are gated on
- * `ensureAppAccess(req, id, 'write')`, which a MEMBER holding an `APP_ADMIN`
- * grant satisfies — so the route comment claiming "OWNER/ADMIN only (same gate
- * as the DSAR export)" and the panel copy claiming "only workspace owners and
- * admins" were both describing a floor that is not enforced. Narrowing the UI
- * cannot fix that, and does not pretend to: the API floor moves to OWNER in
- * its own change. What this does is stop the panel from HANDING the control to
- * roles that should not have it, which is strictly an improvement while the
- * API catches up.
+ * Both `DELETE …/end-users/:euid` forms are OWNER-only there. They did not use
+ * to be: erasure was OWNER/ADMIN, and the plain cascade delete was the
+ * per-application `write` grant alone, which a MEMBER holding `APP_ADMIN`
+ * satisfies. So the path that retains the accounting record was gated harder
+ * than the path that destroys it. The panel never offered the plain delete, and
+ * still does not — a data-subject request wants the erasure, and an operator
+ * who genuinely wants everything gone can say so through the API.
  */
 
 import * as React from 'react';
@@ -33,7 +30,7 @@ import { getEndUserDetail } from '../shared';
 
 const ERASE_ERR: Record<string, string> = {
   END_USER_NOT_FOUND: 'That end-user no longer exists in this Application.',
-  TENANT_ROLE_INSUFFICIENT: 'Your role cannot erase an end-user.',
+  TENANT_ROLE_INSUFFICIENT: 'Only the workspace owner can erase an end-user.',
   APP_ACCESS_DENIED: 'Your grant on this Application does not allow this.',
   PROVIDER_CANCEL_FAILED:
     'The payment provider refused to cancel a live subscription. Erasure does not block on the provider, so retry — if this persists, cancel it in the provider dashboard first.',
