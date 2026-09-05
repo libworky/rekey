@@ -138,9 +138,12 @@ export async function billingAdminRoutes(app: FastifyInstance): Promise<void> {
               type: 'string',
               format: 'date-time',
               description:
-                'End of the granted period. Defaults to one plan interval from now for a ' +
-                'recurring plan, and to null for a one-off purchase (credit pack, perpetual ' +
-                'licence). Must be in the future.',
+                'End of the granted period. Must be in the future. **Omit it and the grant is ' +
+                'open-ended**, for a recurring plan and a one-off purchase alike — nothing ' +
+                'renews a grant and nothing expires it, so a comped account stays comped until ' +
+                'somebody cancels. The consequence at the other end: with no period, ' +
+                '`cancelEffect` has nothing to schedule against, so cancelling that subscription ' +
+                'stops access immediately rather than at period end.',
             },
             note: {
               type: 'string',

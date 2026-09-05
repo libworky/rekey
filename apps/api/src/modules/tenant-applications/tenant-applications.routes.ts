@@ -66,10 +66,56 @@ import { refreshCorsOrigins } from '../../lib/cors-origins.js';
 import { mcpIssuer } from '../mcp/oauth.service.js';
 import { eraseEndUser } from './end-user-erasure.service.js';
 import { billingService } from '../billing/billing.service.js';
+import { subscriptionGrantsService } from '../billing/grant.service.js';
+import { env } from '../../config/env.js';
 import { emitDetached } from '../webhooks/webhook.service.js';
 import { euLoginLockScope, getScopeLockState, LOGIN_POLICY } from '../../lib/brute-force.js';
 import { moneyAmount, positiveBoundedInt } from '../../lib/bounded-int.js';
 import { ok, okPage, okArray, okFlag, errs, ref, type JsonSchema } from '../../lib/openapi.js';
+
+/**
+ * Operator subscription grant. The subscriber is the path's end-user, so
+ * unlike the super-admin route there is no `endUserId`-xor-`email` to settle:
+ * the URL already answered "who".
+ *
+ * `currentPeriodEnd` stays a string here and is converted at the call site —
+ * the service takes a Date, and parsing it in two places is how the two
+ * disagree about time zones.
+ */
+const GrantSubscriptionBody = z.object({
+  planSlug: z.string().min(1).max(40),
+  organizationId: z.string().min(1).max(64).optional(),
+  currentPeriodEnd: z.string().datetime().optional(),
+  note: z.string().max(500).optional(),
+});
+
+/**
+ * Cancel defaults to period end, matching what the end-user's own self-service
+ * path does to the same row. Two operator-visible cancels disagreeing about
+ * the same subscription is a bug this codebase has already had once.
+ */
+const CancelSubscriptionBody = z.object({
+  atPeriodEnd: z.boolean().optional(),
+});
+
+/**
+ * Same shape and the same 201/200 split as the super-admin grant route. The row
+ * reads ACTIVE either way, so the status code and `activated` are the only two
+ * things telling a retrying caller "I did this" from "it was already so", and
+ * two grant routes disagreeing about which code means which would make both
+ * useless.
+ */
+const GRANT_RESULT: JsonSchema = {
+  type: 'object',
+  properties: {
+    subscription: ref('Subscription'),
+    activated: {
+      type: 'boolean',
+      description: 'True when THIS call activated the subscription and emitted `subscription.activated`.',
+    },
+  },
+  required: ['subscription', 'activated'],
+};
 
 /**
  * OpenAPI/Fastify body schema for the auth-config patch.
@@ -4521,6 +4567,310 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
         ...(body.metadata !== undefined && { metadata: body.metadata }),
       });
       return reply.status(201).send({ success: true, data: result });
+    },
+  );
+
+  // ---------- Operator subscription grant + cancel ----------
+  //
+  // Granting a subscription with no payment provider behind it: a sale settled
+  // by invoice or bank transfer, a comped account, an enterprise deal signed on
+  // paper, a migration off a previous billing system. None of those has a
+  // provider event to wait for, and until these routes the only ways to record
+  // one were the super-admin key or SQL against production.
+  //
+  // ## Why this is OWNER/ADMIN and why that is not simply a loosening
+  //
+  // `billing-admin.routes.ts` held granting at the super-admin key and argued
+  // it at length: it is the only billing write that CREATES entitlement on an
+  // assertion rather than following money that demonstrably moved, and on a
+  // deployment where the operator is also the buyer it is a lever aimed at the
+  // deployment's own ceiling. It named `requireTenantRole(['OWNER'])` as the
+  // eventual opening.
+  //
+  // This opens it one notch wider, to ADMIN, on the strength of a control that
+  // argument does not account for: `ensureCanManage` in
+  // tenant-workspaces.service.ts permits an ADMIN to manage MEMBER only. An
+  // ADMIN cannot invite an ADMIN, cannot promote a MEMBER to one, and cannot
+  // touch an OWNER. So the escalation the header worries about — an operator
+  // quietly widening the set of people who may mint entitlement — is already
+  // closed at the membership layer, on both the invite and the role-change
+  // path. The ADMIN population of a workspace is fixed by its OWNERs.
+  //
+  // What that does NOT close is the literal case the header describes: an
+  // operator of the workspace that owns the DEPLOYMENT's own Application
+  // granting themselves a subscription that raises their own limits. Tenant
+  // scoping contains it incidentally, and the header says so, and says the
+  // incidental-ness is the reason it stayed shut. So it is closed on purpose
+  // instead: `TENANT_SUBSCRIPTION_GRANTS=disabled` makes both routes 404 and
+  // keeps granting on the super-admin key, for exactly that deployment shape.
+  //
+  // The service is reused unchanged. That is the point of the header's "it goes
+  // through the same door a real activation does": entitlements are
+  // materialised, `subscription.activated` is enqueued in the same transaction
+  // as the status flip, deliveries are kicked after the commit. Re-implementing
+  // any of it here would produce a subscription that looks active and behaves
+  // like nothing.
+
+  /**
+   * 404 rather than 403 when the deployment has switched these off, matching
+   * the non-disclosure posture of the rest of the tenant surface. The code is
+   * still self-describing: "this deployment does not offer this" is not a
+   * secret, and an operator hunting a missing button deserves to find out why.
+   */
+  function assertTenantGrantsEnabled(): void {
+    if (env.TENANT_SUBSCRIPTION_GRANTS === 'disabled') {
+      throw new RekeyError({
+        statusCode: 404,
+        code: 'TENANT_SUBSCRIPTION_GRANTS_DISABLED',
+        message: 'Operator subscription grants are switched off on this deployment.',
+        fix: 'Grant through POST /api/v1/admin/applications/:id/subscriptions with the super-admin key, or set TENANT_SUBSCRIPTION_GRANTS=enabled on the API.',
+      });
+    }
+  }
+
+  app.post(
+    '/:id/end-users/:euid/subscriptions',
+    {
+      config: { idempotency: true },
+      preHandler: requireTenantRole(['OWNER', 'ADMIN']),
+      schema: {
+        tags: ['Tenant · Billing'],
+        security: [{ tenantSession: [] }],
+        summary: 'Grant an end-user a subscription (no payment provider)',
+        description:
+          'Requires the **OWNER or ADMIN** workspace role AND **billing-write** access to this ' +
+          'Application. No application grant unlocks it on its own.\n\n' +
+          'Activates a subscription against a named plan without a checkout — for a sale settled ' +
+          'somewhere this deployment cannot observe, and for comped accounts. It takes the same ' +
+          "path a provider activation takes: the plan's entitlements are materialised onto the " +
+          'beneficiary and `subscription.activated` is emitted through the same outbox, so ' +
+          'anything already listening for a sale hears this one too.\n\n' +
+          '**Idempotent.** A subscriber already ACTIVE or PAST_DUE on the plan comes back ' +
+          'unchanged with `activated: false`, and `200` rather than `201` — nothing written, ' +
+          'nothing re-provisioned, nothing re-announced, and no second audit entry. It does not ' +
+          'extend a live period; to move a grant to a new term, cancel it and grant again.\n\n' +
+          'The subscription carries no provider, which is what lets it be cancelled locally.\n\n' +
+          'Absent (404) when the deployment sets `TENANT_SUBSCRIPTION_GRANTS=disabled`.',
+        params: {
+          type: 'object',
+          properties: { id: { type: 'string' }, euid: { type: 'string' } },
+          required: ['id', 'euid'],
+        },
+        body: {
+          type: 'object',
+          required: ['planSlug'],
+          properties: {
+            planSlug: {
+              type: 'string',
+              minLength: 1,
+              maxLength: 40,
+              description:
+                'Plan in this Application. Inactive plans are allowed — grandfathering someone onto a withdrawn plan is a deliberate operator act.',
+            },
+            organizationId: {
+              type: 'string',
+              maxLength: 64,
+              description:
+                'Beneficiary organization. Required when the Application bills per organization.',
+            },
+            currentPeriodEnd: {
+              type: 'string',
+              format: 'date-time',
+              description:
+                'When the granted period ends. Must be in the future. **Omit it and the grant is open-ended** — nothing renews a grant and nothing expires it, so a comped account stays comped until somebody cancels. Consequence worth knowing before you rely on it: cancelling an open-ended grant takes effect immediately rather than at period end, because `cancelEffect` has no period to schedule against.',
+            },
+            note: {
+              type: 'string',
+              maxLength: 500,
+              description:
+                'Why this was granted. Kept on the row under `metadata.grant` and in the audit trail — a comped subscription with no stated reason is unauditable six months later.',
+            },
+          },
+        },
+        response: {
+          200: ok(GRANT_RESULT, 'The subscriber was already entitled — nothing changed.'),
+          201: ok(GRANT_RESULT, 'The subscription is now active.'),
+          ...errs({
+            400:
+              'BILLING_ORGANIZATION_REQUIRED — the Application bills per organization and none was ' +
+              'named; or SUBSCRIPTION_PERIOD_END_IN_PAST — `currentPeriodEnd` is not in the future.',
+            ...APP_BILLING_WRITE_ERRORS,
+            403:
+              APP_BILLING_WRITE_ERRORS[403] +
+              ' TENANT_ROLE_INSUFFICIENT also covers a MEMBER holding `APP_BILLING` or `APP_ADMIN`: ' +
+              'this route requires OWNER or ADMIN and no grant unlocks it.',
+            404:
+              'END_USER_NOT_FOUND — no end-user with that id in this Application; or ' +
+              'PLAN_NOT_FOUND — no plan with that slug; or ORGANIZATION_NOT_FOUND — `organizationId` ' +
+              'names no organization in this Application; or TENANT_SUBSCRIPTION_GRANTS_DISABLED — ' +
+              'this deployment does not offer operator grants.',
+            410:
+              'END_USER_ERASED — that end-user is a GDPR tombstone. Nothing can be granted to it, ' +
+              'and an erasure cannot be undone.',
+          }),
+        },
+      },
+    },
+    async (req, reply) => {
+      const params = z.object({ id: z.string().min(1), euid: z.string().min(1) }).parse(req.params);
+      assertTenantGrantsEnabled();
+      await ensureAppAccess(req, params.id, 'billing-write');
+      const body = GrantSubscriptionBody.parse(req.body ?? {});
+
+      const existing = await prisma.endUser.findUnique({ where: { id: params.euid } });
+      if (!existing || existing.applicationId !== params.id) {
+        throw new RekeyError({
+          statusCode: 404,
+          code: 'END_USER_NOT_FOUND',
+          message: `End-user "${params.euid}" not found in this Application.`,
+          fix: 'List end-users to confirm the id.',
+        });
+      }
+
+      const application = await prisma.application.findUniqueOrThrow({
+        where: { id: params.id },
+      });
+      const result = await subscriptionGrantsService.grantSubscription({
+        application,
+        planSlug: body.planSlug,
+        endUserId: params.euid,
+        ...(body.organizationId !== undefined && { organizationId: body.organizationId }),
+        ...(body.currentPeriodEnd !== undefined && {
+          currentPeriodEnd: new Date(body.currentPeriodEnd),
+        }),
+        ...(body.note !== undefined && { note: body.note }),
+      });
+
+      // Only when this call did something. An idempotent no-op that wrote an
+      // audit row would put a fresh "granted" entry in the trail every time
+      // somebody double-clicked, for a sale that happened once.
+      if (result.activated) {
+        void recordSecurityEvent({
+          type: 'app.subscription_granted',
+          actorType: 'operator',
+          actorId: req.tenantUser!.id,
+          tenantId: req.tenantId!,
+          applicationId: params.id,
+          ...requestContext(req),
+          metadata: {
+            endUserId: params.euid,
+            planSlug: body.planSlug,
+            subscriptionId: result.subscription.id,
+            ...(body.note !== undefined && { note: body.note }),
+            via: 'operator',
+          },
+        });
+      }
+      return reply.status(result.activated ? 201 : 200).send({ success: true, data: result });
+    },
+  );
+
+  app.post(
+    '/:id/end-users/:euid/subscriptions/:subId/cancel',
+    {
+      preHandler: requireTenantRole(['OWNER', 'ADMIN']),
+      schema: {
+        tags: ['Tenant · Billing'],
+        security: [{ tenantSession: [] }],
+        summary: "Cancel one of an end-user's subscriptions",
+        description:
+          'Requires the **OWNER or ADMIN** workspace role AND **billing-write** access to this ' +
+          'Application.\n\n' +
+          'Asks for cancellation at period end by default, which is what the end-user\'s own ' +
+          'self-service path does to the same row. Whether that is what HAPPENS is `cancelEffect` ' +
+          "in `@rekey.dev/shared-types`: only an ACTIVE or TRIALING subscription that has a " +
+          '`currentPeriodEnd` can be scheduled, and everything else — including an open-ended ' +
+          'grant, which is what a grant is unless a term was named — stops immediately. Import ' +
+          'that predicate to say which before you ask; the panel does.\n\n' +
+          '`atPeriodEnd: false` ends it immediately regardless. A provider-backed subscription is ' +
+          'cancelled at the provider; a granted one ends locally.\n\n' +
+          'Idempotent: a subscription already CANCELED or EXPIRED comes back unchanged.\n\n' +
+          'This surface previously existed only as an operator MCP tool, so an agent could cancel ' +
+          'a subscription and the panel could not.',
+        params: {
+          type: 'object',
+          properties: { id: { type: 'string' }, euid: { type: 'string' }, subId: { type: 'string' } },
+          required: ['id', 'euid', 'subId'],
+        },
+        body: {
+          type: 'object',
+          properties: {
+            atPeriodEnd: {
+              type: 'boolean',
+              default: true,
+              description: 'False ends it immediately instead of at the end of the paid period.',
+            },
+          },
+        },
+        response: {
+          200: ok(ref('Subscription'), 'The subscription in its post-cancel state.'),
+          ...errs({
+            ...APP_BILLING_WRITE_ERRORS,
+            403:
+              APP_BILLING_WRITE_ERRORS[403] +
+              ' TENANT_ROLE_INSUFFICIENT also covers a MEMBER holding `APP_BILLING` or `APP_ADMIN`: ' +
+              'this route requires OWNER or ADMIN and no grant unlocks it.',
+            404:
+              'SUBSCRIPTION_NOT_FOUND — no subscription with that id belonging to that end-user in ' +
+              'this Application.',
+            409: 'SUBSCRIPTION_MANAGED_EXTERNALLY — an inbound-only provider owns this subscription; cancel it there.',
+          }),
+        },
+      },
+    },
+    async (req) => {
+      const params = z
+        .object({ id: z.string().min(1), euid: z.string().min(1), subId: z.string().min(1) })
+        .parse(req.params);
+      // Deliberately NOT gated by `TENANT_SUBSCRIPTION_GRANTS`. That switch is
+      // about the one write that CREATES entitlement on an assertion; cancel
+      // removes entitlement and fails safe. Gating it here would also have been
+      // incoherent, because the operator MCP `cancel_subscription` tool ignores
+      // the flag — so a `disabled` deployment would be back to an agent being
+      // able to cancel a subscription while the panel could not, which is the
+      // asymmetry these routes exist to remove.
+      await ensureAppAccess(req, params.id, 'billing-write');
+      const body = CancelSubscriptionBody.parse(req.body ?? {});
+
+      // Scope the lookup by application AND end-user in the query itself. Read
+      // by id and check afterwards and this becomes an existence oracle, which
+      // is the exact bug the operator MCP tool's cancel had to fix.
+      const owned = await prisma.subscription.findFirst({
+        where: { id: params.subId, applicationId: params.id, endUserId: params.euid },
+        select: { id: true },
+      });
+      if (!owned) {
+        throw new RekeyError({
+          statusCode: 404,
+          code: 'SUBSCRIPTION_NOT_FOUND',
+          message: `Subscription "${params.subId}" not found for that end-user in this Application.`,
+          fix: "List the end-user's billing to find a subscription id.",
+        });
+      }
+
+      const application = await prisma.application.findUniqueOrThrow({
+        where: { id: params.id },
+      });
+      const atPeriodEnd = body.atPeriodEnd !== false;
+      const updated = await billingService.cancelSubscriptionById(application, params.subId, {
+        atPeriodEnd,
+      });
+
+      void recordSecurityEvent({
+        type: 'app.subscription_canceled',
+        actorType: 'operator',
+        actorId: req.tenantUser!.id,
+        tenantId: req.tenantId!,
+        applicationId: params.id,
+        ...requestContext(req),
+        metadata: {
+          endUserId: params.euid,
+          subscriptionId: params.subId,
+          atPeriodEnd,
+          status: updated.status,
+        },
+      });
+      return { success: true, data: updated };
     },
   );
 

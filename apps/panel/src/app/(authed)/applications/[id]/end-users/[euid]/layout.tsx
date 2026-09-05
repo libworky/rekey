@@ -85,7 +85,7 @@ export default async function EndUserLayout({
       )}
 
       <div className="-mx-6">
-        <nav className="flex items-center gap-1 overflow-x-auto border-b border-[var(--color-border)] px-6">
+        <nav aria-label="End-user sections" className="flex items-center gap-1 overflow-x-auto border-b border-[var(--color-border)] px-6">
           <Tab href={base} exact>
             Overview
           </Tab>

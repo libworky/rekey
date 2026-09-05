@@ -429,6 +429,26 @@ export function getMe(): Promise<MeDto> {
   return apiGet<MeDto>('/api/v1/tenant/auth/me');
 }
 
+/**
+ * Whether this deployment lets operators grant subscriptions with no payment
+ * provider behind them (`TENANT_SUBSCRIPTION_GRANTS`).
+ *
+ * A UX hint, like `creation-mode` and `signup-mode`: it decides whether the
+ * affordance renders, never whether the action is allowed. The routes refuse
+ * with `TENANT_SUBSCRIPTION_GRANTS_DISABLED` on their own. Degrades to
+ * 'disabled' if the endpoint is unreachable — hiding a button on a deployment
+ * that does support grants is recoverable by asking; offering one that 404s
+ * teaches an operator to distrust the page.
+ */
+export function getSubscriptionGrantsMode(): Promise<'enabled' | 'disabled'> {
+  return apiGet<{ mode: 'enabled' | 'disabled' }>(
+    '/api/v1/tenant/workspace/subscription-grants-mode',
+    { interruptOnAccessError: false },
+  )
+    .then((r) => r.mode)
+    .catch(() => 'disabled' as const);
+}
+
 // ---------- DTOs ----------
 
 export interface MeDto {

@@ -58,7 +58,7 @@ export default async function EndUserOverviewPage({
   const lockedUntil = detail.endUser.lockedUntil ? new Date(detail.endUser.lockedUntil) : null;
   const lockedNow = lockedUntil !== null && lockedUntil > new Date();
 
-  const live = billing.subscriptions.find((s) => LIVE_SUBSCRIPTION.has(s.status));
+  const live = billing?.subscriptions.find((s) => LIVE_SUBSCRIPTION.has(s.status));
   /**
    * Free-tier fallback: the plan whose FEATURE entitlements apply to a user
    * with no subscription. Read-time only — no Subscription row stands behind
@@ -70,14 +70,16 @@ export default async function EndUserOverviewPage({
    */
   const defaultPlanSlug = application.billingConfig.defaultPlanSlug ?? null;
 
-  const planValue = live ? live.plan.name : (defaultPlanSlug ?? 'None');
+  const planValue = billing === null ? '—' : live ? live.plan.name : (defaultPlanSlug ?? 'None');
   const planFooter = live
     ? `${formatMoney(live.plan.amount, live.plan.currency)}${
         live.plan.interval ? ` / ${live.plan.interval.toLowerCase()}` : ''
       } · ${live.status.toLowerCase()}`
-    : defaultPlanSlug
-      ? "the application's default plan, no subscription"
-      : 'no subscription and no default plan';
+    : billing === null
+      ? 'billing could not be read'
+      : defaultPlanSlug
+        ? "the application's default plan, no subscription"
+        : 'no subscription and no default plan';
 
   return (
     <div className="space-y-5">
@@ -115,6 +117,13 @@ export default async function EndUserOverviewPage({
           <div>
             <dt className="text-xs text-[var(--color-muted-fg)]">Origin</dt>
             <dd>
+              {/* A hit is a fact. A miss is NOT "signed up": `provenanceFrom`
+                  returns null just as readily because the operator is a MEMBER
+                  and cannot read security events at all, or because the
+                  creation fell outside the scanned window on a busy
+                  application. Asserting "sign-up" there would state the exact
+                  thing this field exists to stop somebody assuming — and would
+                  do it every single time for a MEMBER. */}
               {provenance ? (
                 <span className="inline-flex flex-wrap items-center gap-1.5">
                   <Badge tone="info">billing event</Badge>
@@ -124,7 +133,16 @@ export default async function EndUserOverviewPage({
                   </span>
                 </span>
               ) : (
-                <span className="text-xs text-[var(--color-muted-fg)]">sign-up</span>
+                <span
+                  className="text-xs text-[var(--color-muted-fg)]"
+                  title={
+                    events === null
+                      ? 'Listing security events requires the OWNER or ADMIN workspace role, so this cannot be determined for your role.'
+                      : "No creation event for this end-user in the application's most recent events. That is not evidence they signed up — the record may simply be older than the scanned window."
+                  }
+                >
+                  {events === null ? 'not visible to your role' : 'not in the scanned window'}
+                </span>
               )}
             </dd>
           </div>
@@ -140,23 +158,31 @@ export default async function EndUserOverviewPage({
 
       <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
         <StatTile title="Plan" value={planValue} footer={planFooter} href={`${base}/subscriptions`} />
+        {/* A tile shows "—" rather than "0" when the read failed. Zero is a
+            statement about the account; the request having failed is not. */}
         <StatTile
           title="Devices"
-          value={String(devices.active)}
+          value={devices === null ? '—' : String(devices.active)}
           footer={
-            devices.total === devices.active
-              ? plural(devices.active, 'active device')
-              : `${devices.active} active of ${devices.total} known${
-                  devices.blocked > 0 ? ` · ${devices.blocked} blocked` : ''
-                }`
+            devices === null
+              ? 'device list could not be read'
+              : devices.total === devices.active
+                ? plural(devices.active, 'active device')
+                : `${devices.active} active of ${devices.total} known${
+                    devices.blocked > 0 ? ` · ${devices.blocked} blocked` : ''
+                  }`
           }
           href={`${base}/devices`}
-          tone={devices.blocked > 0 ? 'warn' : undefined}
+          tone={devices !== null && devices.blocked > 0 ? 'warn' : undefined}
         />
         <StatTile
           title="Credits"
-          value={String(credits.balance)}
-          footer={plural(credits.ledger.length, 'recent entry', 'recent entries')}
+          value={credits === null ? '—' : String(credits.balance)}
+          footer={
+            credits === null
+              ? 'credit balance could not be read'
+              : plural(credits.ledger.length, 'recent entry', 'recent entries')
+          }
           href={`${base}/credits`}
         />
         <StatTile

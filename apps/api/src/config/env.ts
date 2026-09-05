@@ -224,6 +224,35 @@ export const env = createEnv({
     // (modules/tenant-auth/operator-signup-policy.ts) reads the live value.
     OPERATOR_SIGNUP_MODE: z.enum(['open', 'invite', 'closed']).default('open'),
 
+    // Whether an operator may grant a subscription from the panel, with no
+    // payment provider behind it — a sale settled by invoice or bank transfer,
+    // a comped account, a migration off a previous billing system.
+    //
+    //   - 'enabled':  OWNER and ADMIN of the owning workspace may grant through
+    //                 the tenant route. The default, because a self-hoster
+    //                 recording a sale their deployment cannot observe is the
+    //                 ordinary case, and the alternative is writing SQL against
+    //                 production.
+    //   - 'disabled': the tenant GRANT route answers 404 — not 403, matching the
+    //                 non-disclosure posture of the rest of the tenant surface.
+    //                 Granting stays available on the super-admin key.
+    //
+    // Scope is granting ONLY. Cancelling is not gated by this: it removes
+    // entitlement and fails safe, and the operator MCP `cancel_subscription`
+    // tool ignores this flag anyway, so gating the REST cancel would only
+    // restore the asymmetry where an agent can cancel and the panel cannot.
+    //
+    // The switch exists for the deployment that SELLS to the workspaces it
+    // hosts. There, a workspace's own allowance is written from the entitlements
+    // on its own subscription, so "an operator may grant a subscription" is one
+    // mis-scoped Application away from "a customer may write their own limits".
+    // Tenant scoping contains that today, because the deployment's own
+    // Application is not in a customer's workspace — but incidentally rather
+    // than by design, and a deployment in that shape should be able to say so
+    // out loud rather than rely on the accident. See billing-admin.routes.ts,
+    // which held granting at the super-admin key for exactly this reason.
+    TENANT_SUBSCRIPTION_GRANTS: z.enum(['enabled', 'disabled']).default('enabled'),
+
     // Ceilings stamped onto every workspace this deployment creates, as a JSON
     // object matching `TenantLimitsSchema` (@rekey.dev/shared-types) — e.g.
     // '{"maxProductionApps":1}'.
