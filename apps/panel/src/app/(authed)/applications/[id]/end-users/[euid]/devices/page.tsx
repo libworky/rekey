@@ -24,6 +24,7 @@
  */
 
 import * as React from 'react';
+import { FilterChips } from '@/components/FilterChips';
 import { formatDateTime } from '@/lib/date';
 import { Card, SectionHeader } from '@/components/Card';
 import { Table, THead, TBody, TR, TH, TD } from '@/components/Table';
@@ -166,26 +167,17 @@ export default async function EndUserDevicesPage({
       )}
       {deviceError && <Banner tone="error">{DEVICE_ERR[deviceError] ?? deviceError}</Banner>}
 
-      <nav aria-label="Filter devices by status" className="flex flex-wrap items-center gap-1">
-        {FILTERS.map((f) => {
-          const active = (statusParam || '') === f.value;
-          const href = f.value ? `${basePath}?status=${f.value}` : basePath;
-          return (
-            <a
-              key={f.value || 'all'}
-              href={href}
-              aria-current={active ? 'page' : undefined}
-              className={`rounded-md px-2.5 py-1 text-xs transition-colors ${
-                active
-                  ? 'bg-[var(--color-surface-muted)] font-medium text-[var(--color-fg)]'
-                  : 'text-[var(--color-muted-fg)] hover:text-[var(--color-fg)]'
-              }`}
-            >
-              {f.label}
-            </a>
-          );
-        })}
-      </nav>
+      {/* Was flat muted-fill pills — the same treatment AppNav's primary row
+          uses — landing directly under two tab strips and the record switcher,
+          so this tab ended in four rows of things that all read as tabs, one of
+          which only changed a query string. Outlined chips say "filter", not
+          "go". */}
+      <FilterChips
+        chips={FILTERS.map((f) => ({ value: f.value || undefined, label: f.label }))}
+        active={statusParam || undefined}
+        hrefFor={(v) => (v ? `${basePath}?status=${v}` : basePath)}
+        label="Filter devices by status"
+      />
 
       {page.items.length === 0 ? (
         <EmptyState

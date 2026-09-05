@@ -13,6 +13,8 @@
  */
 
 import * as React from 'react';
+import { FilterChips } from '@/components/FilterChips';
+import { RecordHeader } from '@/components/RecordHeader';
 import Link from 'next/link';
 import { redirect } from 'next/navigation';
 import { api, apiGet, getApplication, PanelApiError } from '@/lib/api';
@@ -128,7 +130,15 @@ export default async function ImportRunPage({
 
   return (
     <div className="space-y-5">
-      <SectionHeader
+      {/* The "All runs" link in the action slot was a back link wearing a
+          different hat — right-aligned, underlined, and the only way out of a
+          page four levels deep. It is the trail now, where the other three
+          detail pages put theirs. */}
+      <RecordHeader
+        crumbs={[
+          { label: 'Imports', href: `/applications/${id}/imports` },
+          { label: 'Preview' },
+        ]}
         title="Import preview"
         description={
           <>
@@ -137,14 +147,6 @@ export default async function ImportRunPage({
               ? 'Unknown addresses will be created as unlinked end-users.'
               : 'Unknown addresses are skipped.'}
           </>
-        }
-        action={
-          <Link
-            href={`/applications/${id}/imports`}
-            className="text-xs text-[var(--color-muted-fg)] underline underline-offset-2 hover:text-[var(--color-fg)]"
-          >
-            All runs
-          </Link>
         }
       />
 
@@ -165,18 +167,19 @@ export default async function ImportRunPage({
 
       {/* The counts are the summary AND the filter — an operator who wants to
           know what the 382 skipped rows were should not have to scroll. */}
-      <div className="flex flex-wrap gap-2">
-        <CountChip href={base} label="All" value={counts.total ?? 0} active={outcome === undefined} />
-        {ORDER.filter((o) => (counts[o] ?? 0) > 0).map((o) => (
-          <CountChip
-            key={o}
-            href={`${base}?outcome=${o}`}
-            label={OUTCOME[o]!.label}
-            value={counts[o] ?? 0}
-            active={outcome === o}
-          />
-        ))}
-      </div>
+      <FilterChips
+        chips={[
+          { value: undefined, label: 'All', count: counts.total ?? 0 },
+          ...ORDER.filter((o) => (counts[o] ?? 0) > 0).map((o) => ({
+            value: o,
+            label: OUTCOME[o]!.label,
+            count: counts[o] ?? 0,
+          })),
+        ]}
+        active={outcome}
+        hrefFor={(v) => (v ? `${base}?outcome=${v}` : base)}
+        label="Filter preview rows by outcome"
+      />
 
       {run.status === 'ready' && (
         <Card className="space-y-3 border-amber-300 dark:border-amber-800">
@@ -292,28 +295,3 @@ export default async function ImportRunPage({
   );
 }
 
-function CountChip({
-  href,
-  label,
-  value,
-  active,
-}: {
-  href: string;
-  label: string;
-  value: number;
-  active: boolean;
-}): React.JSX.Element {
-  return (
-    <Link
-      href={href}
-      aria-current={active ? 'true' : undefined}
-      className={`rounded-md border px-3 py-1.5 text-xs transition-colors ${
-        active
-          ? 'border-[var(--color-primary)] bg-[var(--color-surface-muted)] text-[var(--color-fg)]'
-          : 'border-[var(--color-border)] text-[var(--color-muted-fg)] hover:text-[var(--color-fg)]'
-      }`}
-    >
-      <span className="font-semibold tabular-nums">{value}</span> {label}
-    </Link>
-  );
-}

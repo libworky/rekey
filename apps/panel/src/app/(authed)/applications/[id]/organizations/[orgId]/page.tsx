@@ -1,5 +1,6 @@
 import * as React from 'react';
 import Link from 'next/link';
+import { RecordHeader } from '@/components/RecordHeader';
 import { notFound, redirect } from 'next/navigation';
 import { cookies } from 'next/headers';
 import { errorQuery, readErrorFlash, api, PanelApiError, type OrganizationDetail, type OrganizationRoleRow, type EndUserRow, type OrgBillingDto } from '@/lib/api';
@@ -260,23 +261,37 @@ export default async function OrganizationDetailPage({
 
   return (
     <div className="space-y-6">
-      <header className="space-y-1.5">
-        <Link
-          href={`/applications/${id}/organizations`}
-          className="inline-flex items-center gap-1 rounded text-xs text-[var(--color-muted-fg)] transition-colors hover:text-[var(--color-fg)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[color-mix(in_srgb,var(--color-primary)_50%,transparent)]"
-        >
-          ← All organizations
-        </Link>
-        <div className="mt-0.5 flex flex-wrap items-baseline gap-x-3 gap-y-1">
-          <h2 className="text-lg font-semibold tracking-tight text-[var(--color-fg)]">{org.name}</h2>
-          <Badge tone="neutral" mono>{org.slug}</Badge>
-          <span className="text-xs text-[var(--color-muted-fg)]">
+      {/* One of four detail pages that each hand-rolled this same header with
+          their own back link. The trail replaces the link — it says where you
+          are as well as how to leave, and the Organizations sub-tab above is
+          already highlighted, so a bare "← All organizations" was navigation
+          to somewhere visible. */}
+      <RecordHeader
+        crumbs={[
+          { label: 'Organizations', href: `/applications/${id}/organizations` },
+          { label: org.name },
+        ]}
+        title={
+          <>
+            <span className="min-w-0 truncate">{org.name}</span>
+            <Badge tone="neutral" mono>
+              {org.slug}
+            </Badge>
+          </>
+        }
+        meta={
+          <>
+            <span className="font-mono">{org.id}</span>
+            <span aria-hidden="true" className="px-1.5 text-[var(--color-faint-fg)]">
+              ·
+            </span>
             created {formatDate(org.createdAt)}
-          </span>
+          </>
+        }
+        action={
           <EditOrgModal applicationId={id} orgId={orgId} name={org.name} metadata={metadataPretty} error={editOrgError} errorDetail={errorDetail} errorFix={errorFix} />
-        </div>
-        <p className="font-mono text-xs text-[var(--color-muted-fg)]">{org.id}</p>
-      </header>
+        }
+      />
 
       {error && !addMemberError && !editOrgError && (
         <Banner tone="error">

@@ -1,5 +1,6 @@
 import * as React from 'react';
 import Link from 'next/link';
+import { Breadcrumb } from '@/components/Breadcrumb';
 import { redirect } from 'next/navigation';
 import { errorQuery, readErrorFlash, api, PanelApiError } from '@/lib/api';
 import { EmailEditorClient } from '@/components/EmailEditorClient';
@@ -140,8 +141,11 @@ export default async function TemplateEditorPage({
     return (
       <div className="rounded-xl border border-[var(--color-border)] bg-[var(--color-surface)] p-5">
         <p className="text-sm">Unknown event: {eventKey}</p>
-        <Link href={`/applications/${id}/email`} className="text-sm text-[var(--color-primary)] hover:underline">
-          ← Back to email
+        <Link
+          href={`/applications/${id}/email/templates`}
+          className="text-sm text-[var(--color-primary)] hover:underline"
+        >
+          ← Back to templates
         </Link>
       </div>
     );
@@ -155,13 +159,17 @@ export default async function TemplateEditorPage({
     <div className="space-y-5">
       <div className="flex items-baseline justify-between gap-2">
         <div>
-          <Link
-            href={`/applications/${id}/email`}
-            className="text-xs text-[var(--color-muted-fg)] hover:text-[var(--color-fg)]"
-          >
-            ← Email
-          </Link>
-          <h2 className="text-lg font-semibold mt-0.5">{heading}</h2>
+          {/* Was "← Email", pointing at the section shell that is already
+              wrapped around this page. The trail names the actual parent —
+              Templates, which is also now the segment highlighted above. */}
+          <Breadcrumb
+            className="mb-1"
+            items={[
+              { label: 'Templates', href: `/applications/${id}/email/templates` },
+              { label: heading },
+            ]}
+          />
+          <h2 className="text-lg font-semibold">{heading}</h2>
           {heading !== eventKey && (
             <p className="font-mono text-[11px] text-[var(--color-muted-fg)]">{eventKey}</p>
           )}

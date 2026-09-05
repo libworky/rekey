@@ -27,12 +27,10 @@
  */
 
 import * as React from 'react';
-import Link from 'next/link';
-import { PageHeader } from '@/components/PageHeader';
 import { Badge } from '@/components/Badge';
 import { Banner } from '@/components/Banner';
 import { CopyLinkButton } from '@/components/CopyLinkButton';
-import { Tab } from '@/components/Tab';
+import { RecordHeader } from '@/components/RecordHeader';
 import { getEndUserDetail } from './shared';
 
 export default async function EndUserLayout({
@@ -49,28 +47,38 @@ export default async function EndUserLayout({
 
   return (
     <div className="space-y-5">
-      <PageHeader
-        level={2}
-        eyebrow={
-          <Link
-            href={`/applications/${id}/end-users`}
-            className="inline-flex items-center gap-1 rounded text-xs text-[var(--color-muted-fg)] transition-colors hover:text-[var(--color-fg)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[color-mix(in_srgb,var(--color-primary)_50%,transparent)]"
-          >
-            ← End-users
-          </Link>
-        }
+      {/* ONE band, where there were three: a `← End-users` back link (redundant
+          — the End-users sub-tab is already visible and highlighted one row
+          above it), a `PageHeader`, and a third full-width underline strip
+          stacked directly beneath AppNav's own. `RecordHeader` and
+          `SegmentedNav` carry the reasoning for changing the third level's
+          idiom rather than just tightening its spacing. */}
+      <RecordHeader
+        crumbs={[
+          { label: 'End-users', href: `/applications/${id}/end-users` },
+          { label: detail.endUser.email },
+        ]}
         title={
-          <span className="inline-flex items-center gap-2 text-lg">
-            {detail.endUser.email}
+          <>
+            <span className="min-w-0 truncate">{detail.endUser.email}</span>
             {isErased && (
               <Badge tone="danger" dot>
                 erased
               </Badge>
             )}
-          </span>
+          </>
         }
-        description={<span className="font-mono text-xs">{detail.endUser.id}</span>}
+        meta={<span className="font-mono">{detail.endUser.id}</span>}
         action={<CopyLinkButton />}
+        segmentsLabel="End-user sections"
+        segments={[
+          { href: base, label: 'Overview', exact: true },
+          { href: `${base}/subscriptions`, label: 'Subscriptions' },
+          { href: `${base}/devices`, label: 'Devices' },
+          { href: `${base}/credits`, label: 'Credits' },
+          { href: `${base}/security`, label: 'Security' },
+          { href: `${base}/data`, label: 'Data & privacy' },
+        ]}
       />
 
       {/* In the LAYOUT for the same reason the application's disabled banner is
@@ -83,19 +91,6 @@ export default async function EndUserLayout({
           longer sign in. Financial records are retained but anonymized.
         </Banner>
       )}
-
-      <div className="-mx-6">
-        <nav aria-label="End-user sections" className="flex items-center gap-1 overflow-x-auto border-b border-[var(--color-border)] px-6">
-          <Tab href={base} exact>
-            Overview
-          </Tab>
-          <Tab href={`${base}/subscriptions`}>Subscriptions</Tab>
-          <Tab href={`${base}/devices`}>Devices</Tab>
-          <Tab href={`${base}/credits`}>Credits</Tab>
-          <Tab href={`${base}/security`}>Security</Tab>
-          <Tab href={`${base}/data`}>Data &amp; privacy</Tab>
-        </nav>
-      </div>
 
       <div>{children}</div>
     </div>
