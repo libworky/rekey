@@ -36,7 +36,7 @@ import { Field } from '@/components/Field';
 import { SubmitButton } from '@/components/SubmitButton';
 import { CopyButton } from '@/components/CopyButton';
 import { Pager, readOffset, readPageSize } from '@/components/Pager';
-import { blockDevice, releaseDevice, unblockDevice } from '../actions';
+import { blockDevice, releaseAllDevices, releaseDevice, unblockDevice } from '../actions';
 import { getEndUserDevices, shortFingerprint, type DeviceRow, type DeviceStatus } from '../shared';
 
 const STATUS_TONE: Record<DeviceStatus, BadgeTone> = {
@@ -72,6 +72,7 @@ function resultMessage(op: string, revoked: number): string | null {
       return `Device blocked — sign-in from this fingerprint is refused until you unblock it. ${sessions}`;
     case 'unblock':
       return 'Device unblocked. It comes back as released: it takes a slot again on its next sign-in, and only if the limit allows.';
+    // 'release-all' has its own banner: it reports three counts, not one.
     default:
       return null;
   }
@@ -105,6 +106,14 @@ export default async function EndUserDevicesPage({
   const page = await getEndUserDevices(id, euid, { status, limit: pageSize, offset });
   const basePath = `/applications/${id}/end-users/${euid}/devices`;
   const banner = done ? resultMessage(done, revoked) : null;
+  const releasedAll =
+    done === 'release-all'
+      ? {
+          released: Number(sp.released) || 0,
+          revoked,
+          blocked: Number(sp.blocked) || 0,
+        }
+      : null;
 
   if (page === null) {
     // "No devices registered" is a statement about the end-user. A failed read
@@ -129,9 +138,32 @@ export default async function EndUserDevicesPage({
         title="Devices"
         count={`(${page.page.total})`}
         description="Every machine this end-user has signed in from, newest activity first. Releasing one frees its slot; blocking one refuses sign-in from that fingerprint."
+        action={
+          page.page.total > 0 ? (
+            <form action={releaseAllDevices.bind(null, id, euid)}>
+              <ConfirmButton
+                variant="subtle"
+                title="Release every active device?"
+                confirm="Frees every active slot and signs them out on those machines, so their next sign-in from any machine is admitted. Blocked devices are deliberately left blocked — unblock those individually."
+                confirmLabel="Release all"
+              >
+                Release all
+              </ConfirmButton>
+            </form>
+          ) : undefined
+        }
       />
 
       {banner && <Banner tone="success">{banner}</Banner>}
+      {releasedAll && (
+        <Banner tone={releasedAll.released === 0 ? 'info' : 'success'}>
+          {releasedAll.released === 0
+            ? 'Nothing to release — this end-user had no active devices.'
+            : `Released ${releasedAll.released} device${releasedAll.released === 1 ? '' : 's'}, ending ${releasedAll.revoked} session${releasedAll.revoked === 1 ? '' : 's'}. Their next sign-in from any machine is admitted.`}
+          {releasedAll.blocked > 0 &&
+            ` ${releasedAll.blocked} blocked device${releasedAll.blocked === 1 ? ' was' : 's were'} left blocked — unblock those individually.`}
+        </Banner>
+      )}
       {deviceError && <Banner tone="error">{DEVICE_ERR[deviceError] ?? deviceError}</Banner>}
 
       <nav aria-label="Filter devices by status" className="flex flex-wrap items-center gap-1">

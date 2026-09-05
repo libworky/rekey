@@ -142,6 +142,19 @@ export const SECURITY_EVENT_LABEL = {
   'end_user.device_released': 'Device released by an operator or the application server',
   'end_user.device_blocked': 'Device blocked',
   'end_user.device_unblocked': 'Device unblocked',
+  'end_user.devices_released_by_operator': 'All devices released by an operator',
+
+  // ── Operator support actions on one end-user ──
+  // An operator acting ON somebody, rather than the person acting for
+  // themselves — hence `end_user.*` with an operator actor and the subject in
+  // `metadata.endUserId`. Two of these put mail in a real person's inbox that
+  // they did not ask for, so both carry an audited reason: at the recipient's
+  // end, support-initiated mail and an attacker who reached the panel look
+  // identical, and the trail is the only thing that tells them apart.
+  'end_user.unlocked_by_operator': 'Sign-in lockout cleared by an operator',
+  'end_user.verification_resent': 'Verification email re-sent by an operator',
+  'end_user.password_reset_sent': 'Password reset email sent by an operator',
+  'end_user.sessions_revoked_by_operator': 'Sessions revoked by an operator',
 
   // ── Workspace / team ──
   'workspace.member_invited': 'Teammate invited',

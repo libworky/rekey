@@ -21,10 +21,13 @@ import { Banner } from '@/components/Banner';
 import { EmptyState } from '@/components/EmptyState';
 import { CopyButton } from '@/components/CopyButton';
 import { SubmitButton } from '@/components/SubmitButton';
-import { impersonate } from '../actions';
+import Link from 'next/link';
+import { ConfirmButton } from '@/components/ConfirmButton';
+import { impersonate, revokeAllSessions, revokeSession, unlockAccount } from '../actions';
 import {
   getEndUserDetail,
   getEndUserEvents,
+  getEndUserSessions,
   AUTH_EVENT_SCAN,
   AUTH_EVENTS_SHOWN,
   IMPERSONATE_COOKIE,
@@ -79,9 +82,10 @@ export default async function EndUserSecurityPage({
   const impError = typeof sp.impError === 'string' ? sp.impError : undefined;
   const impersonated = sp.impersonated === '1';
 
-  const [detail, events] = await Promise.all([
+  const [detail, events, sessions] = await Promise.all([
     getEndUserDetail(id, euid),
     getEndUserEvents(id, euid),
+    getEndUserSessions(id, euid),
   ]);
 
   type Reveal = { accessToken: string; accessTokenExpiresAt: string };
@@ -172,13 +176,109 @@ export default async function EndUserSecurityPage({
             </dd>
           </div>
         </dl>
-        {lockedNow && (
-          <p className="text-[11px] text-[var(--color-muted-fg)]">
-            The lock expires on its own. There is no operator unlock endpoint yet, so the only ways
-            out today are waiting it out or a successful sign-in once it lapses.
-          </p>
-        )}
+        <div className="flex flex-wrap items-center gap-3">
+          <form action={unlockAccount.bind(null, id, euid)}>
+            <SubmitButton
+              className="rounded-md border border-[var(--color-border)] px-3 py-1.5 text-sm text-[var(--color-fg)] hover:bg-[var(--color-surface-muted)]"
+              pendingLabel="Unlocking…"
+            >
+              Clear lockout
+            </SubmitButton>
+          </form>
+          <span className="text-[11px] text-[var(--color-muted-fg)]">
+            {lockedNow
+              ? 'The lock also expires on its own; this just ends it now.'
+              : 'Nothing is locked. Clearing anyway also resets the failure counter, which is harmless.'}
+          </span>
+        </div>
       </Card>
+
+      <section className="space-y-3">
+        <SectionHeader
+          title="Sessions"
+          count={sessions ? `(${sessions.page.total})` : undefined}
+          description="Live refresh tokens, newest first. A session is not a device: releasing a device revokes its sessions, but a session can exist with no device when the Application does not use device binding."
+          action={
+            sessions && sessions.items.length > 0 ? (
+              <form action={revokeAllSessions.bind(null, id, euid)}>
+                <ConfirmButton
+                  variant="subtle"
+                  title="Sign out everywhere?"
+                  confirm="Revokes every live session. Access tokens already issued keep working until they expire — this stops new ones being obtained."
+                  confirmLabel="Sign out everywhere"
+                >
+                  Sign out everywhere
+                </ConfirmButton>
+              </form>
+            ) : undefined
+          }
+        />
+        {sessions === null ? (
+          <Banner tone="error">
+            Sessions could not be read — the request failed, or your access does not cover it. This
+            is <strong>not</strong> an empty session list.
+          </Banner>
+        ) : sessions.items.length === 0 ? (
+          <EmptyState
+            variant="inline"
+            title="No live sessions"
+            description="Nobody is signed in on this account right now, or every session has expired."
+          />
+        ) : (
+          <Table minWidth="min-w-[44rem]">
+            <THead>
+              <TR>
+                <TH>Started</TH>
+                <TH>Expires</TH>
+                <TH>IP</TH>
+                <TH>Device</TH>
+                <TH align="right"> </TH>
+              </TR>
+            </THead>
+            <TBody>
+              {sessions.items.map((s) => (
+                <TR key={s.id} hover>
+                  <TD muted className="whitespace-nowrap text-xs">
+                    <span title={s.userAgent ?? undefined}>{formatDateTime(s.createdAt)}</span>
+                  </TD>
+                  <TD muted className="whitespace-nowrap text-xs">
+                    {formatDateTime(s.expiresAt)}
+                  </TD>
+                  <TD mono muted className="text-xs">
+                    {s.ip ?? '—'}
+                  </TD>
+                  <TD muted className="text-xs">
+                    {s.deviceId ? (
+                      <Link
+                        href={`/applications/${id}/end-users/${euid}/devices`}
+                        className="font-mono underline underline-offset-2"
+                      >
+                        {s.deviceId.slice(0, 10)}…
+                      </Link>
+                    ) : (
+                      <span title="This session was created without a device fingerprint.">
+                        unbound
+                      </span>
+                    )}
+                  </TD>
+                  <TD align="right">
+                    <form action={revokeSession.bind(null, id, euid, s.id)}>
+                      <ConfirmButton
+                        variant="subtle"
+                        title="Revoke this session?"
+                        confirm="Ends this one session. Any access token already issued from it keeps working until it expires."
+                        confirmLabel="Revoke"
+                      >
+                        Revoke
+                      </ConfirmButton>
+                    </form>
+                  </TD>
+                </TR>
+              ))}
+            </TBody>
+          </Table>
+        )}
+      </section>
 
       <section className="space-y-3">
         <SectionHeader

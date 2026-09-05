@@ -126,6 +126,132 @@ export async function eraseUser(applicationId: string, euid: string): Promise<vo
 }
 
 // ---------------------------------------------------------------------------
+// Support actions
+// ---------------------------------------------------------------------------
+
+/**
+ * The support bar. Each is one API call, and each reports what actually
+ * happened rather than that it was attempted — "unlocked" when nothing was
+ * locked, or "sent" when no transport is configured, is the kind of reassurance
+ * that sends an operator back to the customer with the wrong answer.
+ */
+async function supportAction(
+  applicationId: string,
+  euid: string,
+  path: string,
+  body: unknown,
+  tab: string,
+  flag: (data: Record<string, unknown>) => string,
+): Promise<never> {
+  const base = `${tabBase(applicationId, euid)}${tab}`;
+  let data: Record<string, unknown>;
+  try {
+    data = await api<Record<string, unknown>>({
+      method: 'POST',
+      path: `${apiBase(applicationId, euid)}${path}`,
+      body,
+    });
+  } catch (err) {
+    if (err instanceof PanelApiError) {
+      redirect(`${base}?supportError=${encodeURIComponent(err.code)}`);
+    }
+    throw err;
+  }
+  redirect(`${base}?support=${flag(data)}`);
+}
+
+export async function unlockAccount(applicationId: string, euid: string): Promise<void> {
+  await supportAction(applicationId, euid, '/unlock', {}, '/security', (d) =>
+    d.unlocked === true ? 'unlocked' : 'not-locked',
+  );
+}
+
+export async function sendVerification(
+  applicationId: string,
+  euid: string,
+  formData: FormData,
+): Promise<void> {
+  const reason = String(formData.get('reason') ?? '').trim();
+  await supportAction(
+    applicationId,
+    euid,
+    '/send-verification',
+    reason ? { reason } : {},
+    '',
+    (d) => (d.emailSent === true ? 'verification-sent' : 'verification-not-sent'),
+  );
+}
+
+export async function sendPasswordReset(
+  applicationId: string,
+  euid: string,
+  formData: FormData,
+): Promise<void> {
+  const reason = String(formData.get('reason') ?? '').trim();
+  if (!reason) {
+    redirect(`${tabBase(applicationId, euid)}?supportError=REASON_REQUIRED`);
+  }
+  await supportAction(applicationId, euid, '/send-password-reset', { reason }, '', (d) =>
+    d.emailSent === true ? 'reset-sent' : 'reset-not-sent',
+  );
+}
+
+export async function revokeAllSessions(applicationId: string, euid: string): Promise<void> {
+  await supportAction(
+    applicationId,
+    euid,
+    '/sessions/revoke-all',
+    {},
+    '/security',
+    (d) => `signed-out:${typeof d.revoked === 'number' ? d.revoked : 0}`,
+  );
+}
+
+export async function revokeSession(
+  applicationId: string,
+  euid: string,
+  sessionId: string,
+): Promise<void> {
+  const base = `${tabBase(applicationId, euid)}/security`;
+  try {
+    await api({
+      method: 'DELETE',
+      path: `${apiBase(applicationId, euid)}/sessions/${encodeURIComponent(sessionId)}`,
+    });
+  } catch (err) {
+    if (err instanceof PanelApiError) {
+      redirect(`${base}?supportError=${encodeURIComponent(err.code)}`);
+    }
+    throw err;
+  }
+  redirect(`${base}?support=session-revoked`);
+}
+
+/**
+ * "I changed laptop and cannot sign in", as one button. Reports the blocked
+ * devices it deliberately did not touch, because a count that is quietly short
+ * is how an operator concludes the feature is broken.
+ */
+export async function releaseAllDevices(applicationId: string, euid: string): Promise<void> {
+  const base = `${tabBase(applicationId, euid)}/devices`;
+  let data: { released: number; sessionsRevoked: number; skippedBlocked: number };
+  try {
+    data = await api<{ released: number; sessionsRevoked: number; skippedBlocked: number }>({
+      method: 'POST',
+      path: `${apiBase(applicationId, euid)}/devices/release-all`,
+    });
+  } catch (err) {
+    if (err instanceof PanelApiError) {
+      redirect(`${base}?deviceError=${encodeURIComponent(err.code)}`);
+    }
+    throw err;
+  }
+  redirect(
+    `${base}?device=release-all&released=${data.released}&revoked=${data.sessionsRevoked}&blocked=${data.skippedBlocked}`,
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Subscriptions
 // ---------------------------------------------------------------------------
 

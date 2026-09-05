@@ -69,9 +69,54 @@ import { billingService } from '../billing/billing.service.js';
 import { subscriptionGrantsService } from '../billing/grant.service.js';
 import { env } from '../../config/env.js';
 import { emitDetached } from '../webhooks/webhook.service.js';
-import { euLoginLockScope, getScopeLockState, LOGIN_POLICY } from '../../lib/brute-force.js';
+import {
+  clearFailures,
+  euLoginLockScope,
+  getScopeLockState,
+  LOGIN_POLICY,
+} from '../../lib/brute-force.js';
+import {
+  listActiveSessions,
+  revokeAllForEndUser,
+  revokeSessionForEndUser,
+} from '../../lib/refresh-tokens.js';
+import { authService, deliverVerificationEmail } from '../auth/auth.service.js';
+import { authRateLimit } from '../../lib/rate-limit.js';
 import { moneyAmount, positiveBoundedInt } from '../../lib/bounded-int.js';
 import { ok, okPage, okArray, okFlag, errs, ref, type JsonSchema } from '../../lib/openapi.js';
+
+/**
+ * Why an operator did something to somebody. Optional on the verification
+ * re-send, required on the password reset: both put mail in a real inbox that
+ * nobody asked for, and at the recipient's end that is indistinguishable from
+ * an attacker who reached the panel — but a reset mail is the one that actually
+ * hands over an account, so it does not go out unexplained.
+ */
+const SupportReasonBody = z.object({ reason: z.string().min(1).max(280).optional() });
+const SupportReasonRequiredBody = z.object({ reason: z.string().min(1).max(280) });
+
+/**
+ * One live refresh token, as an operator sees it. Same shape the end-user's own
+ * `GET /auth/sessions` returns — one session is one concept, and two surfaces
+ * describing it differently is how an operator and a customer end up comparing
+ * screens that disagree.
+ */
+const END_USER_SESSION: JsonSchema = {
+  type: 'object',
+  properties: {
+    id: { type: 'string' },
+    createdAt: { type: 'string', format: 'date-time' },
+    expiresAt: { type: 'string', format: 'date-time' },
+    userAgent: { type: 'string', nullable: true },
+    ip: { type: 'string', nullable: true },
+    deviceId: {
+      type: 'string',
+      nullable: true,
+      description: 'The device this session is bound to, when the client sent a fingerprint.',
+    },
+  },
+  required: ['id', 'createdAt', 'expiresAt', 'userAgent', 'ip', 'deviceId'],
+};
 
 /**
  * Operator subscription grant. The subscriber is the path's end-user, so
@@ -4567,6 +4612,464 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
         ...(body.metadata !== undefined && { metadata: body.metadata }),
       });
       return reply.status(201).send({ success: true, data: result });
+    },
+  );
+
+  // ---------- Operator support actions on one end-user ----------
+  //
+  // The five things a support agent needs on a ticket and could not do from the
+  // panel: clear a lockout, re-send a verification mail, start a password
+  // reset, see the sessions somebody has open, and end them.
+  //
+  // All are `write` on the Application. None is OWNER/ADMIN-gated: these are
+  // routine support, they are reversible or additive, and holding them at the
+  // workspace-admin floor is what made a support agent file a ticket with a
+  // developer in the first place. The two destructive things on this end-user
+  // (delete, erase) stay OWNER-only, and impersonation stays OWNER/ADMIN.
+  //
+  // The two that send mail carry an audited `reason` and a rate limit. An
+  // unexpected reset mail is indistinguishable, at the recipient's inbox, from
+  // an attacker who reached the panel — so the trail has to say who asked for
+  // it and why, and a compromised operator session must not become a mail
+  // cannon.
+
+  /** Shared 404 for "that end-user is not in this Application". */
+  async function assertEndUser(
+    applicationId: string,
+    euid: string,
+  ): Promise<{ id: string; email: string; erasedAt: Date | null }> {
+    const endUser = await prisma.endUser.findUnique({
+      where: { id: euid },
+      select: { id: true, email: true, applicationId: true, erasedAt: true },
+    });
+    if (!endUser || endUser.applicationId !== applicationId) {
+      throw new RekeyError({
+        statusCode: 404,
+        code: 'END_USER_NOT_FOUND',
+        message: `End-user "${euid}" not found in this Application.`,
+        fix: 'List end-users to confirm the id.',
+      });
+    }
+    return { id: endUser.id, email: endUser.email, erasedAt: endUser.erasedAt };
+  }
+
+  /**
+   * A tombstone has no inbox, no password and no way back in. Every support
+   * action that would mail them or restore access is refused on it rather than
+   * silently doing nothing — `erasedAt` anonymises the address, so a "reset"
+   * would post a live token at a scrubbed string.
+   */
+  function assertNotErased(endUser: { erasedAt: Date | null }): void {
+    if (endUser.erasedAt !== null) {
+      throw new RekeyError({
+        statusCode: 410,
+        code: 'END_USER_ERASED',
+        message: 'That end-user was erased; support actions no longer apply to the tombstone.',
+        fix: 'An erasure cannot be undone. If this person is a customer again, they create a new account.',
+      });
+    }
+  }
+
+  app.post(
+    '/:id/end-users/:euid/unlock',
+    {
+      schema: {
+        tags: ['Tenant · End-users'],
+        security: [{ tenantSession: [] }],
+        summary: "Clear an end-user's sign-in lockout",
+        description:
+          'Requires **write** access to this Application.\n\n' +
+          'Clears the brute-force lock and the failure counter for this end-user in THIS ' +
+          'Application. The lock lives in Redis under `bf:lock:eu:login:<appId>:<email>`, not on ' +
+          'the end-user row, and it is per-Application by design: the same human in two ' +
+          'Applications is two end-users and only the one you name is unlocked.\n\n' +
+          'Idempotent — unlocking an account that is not locked is a no-op and still answers 200.',
+        params: {
+          type: 'object',
+          properties: { id: { type: 'string' }, euid: { type: 'string' } },
+          required: ['id', 'euid'],
+        },
+        response: {
+          200: ok(
+            {
+              type: 'object',
+              properties: {
+                unlocked: {
+                  type: 'boolean',
+                  description: 'True when a lock or a failure counter was actually cleared.',
+                },
+              },
+              required: ['unlocked'],
+            },
+            'Whether anything was cleared.',
+          ),
+          ...errs({
+            ...APP_WRITE_ERRORS,
+            404: 'END_USER_NOT_FOUND — no end-user with that id in this Application.',
+            410: 'END_USER_ERASED — that end-user is a tombstone.',
+          }),
+        },
+      },
+    },
+    async (req) => {
+      const params = z.object({ id: z.string().min(1), euid: z.string().min(1) }).parse(req.params);
+      await ensureAppAccess(req, params.id, 'write');
+      const endUser = await assertEndUser(params.id, params.euid);
+      assertNotErased(endUser);
+
+      const scope = euLoginLockScope(params.id, endUser.email);
+      const before = await getScopeLockState(scope);
+      await clearFailures(scope);
+
+      // `getScopeLockState` returns null ONLY when the store itself failed; a
+      // healthy, unlocked scope returns `{ lockedForSec: null, failuresInWindow: 0 }`.
+      // Treating null as "was locked" would report success on a Redis outage
+      // and claim an unlock on every account that was never locked — exactly
+      // backwards on both counts. `unlocked` means "there was something to
+      // clear", counting a partial failure streak, because clearing that is
+      // also a real effect the operator asked for.
+      const unlocked =
+        before !== null && (before.lockedForSec !== null || before.failuresInWindow > 0);
+      void recordSecurityEvent({
+        type: 'end_user.unlocked_by_operator',
+        actorType: 'operator',
+        actorId: req.tenantUser!.id,
+        tenantId: req.tenantId!,
+        applicationId: params.id,
+        ...requestContext(req),
+        metadata: { endUserId: params.euid, wasLocked: unlocked },
+      });
+      return { success: true, data: { unlocked } };
+    },
+  );
+
+  app.post(
+    '/:id/end-users/:euid/send-verification',
+    {
+      config: { rateLimit: authRateLimit(10) },
+      schema: {
+        tags: ['Tenant · End-users'],
+        security: [{ tenantSession: [] }],
+        summary: "Re-send an end-user's verification email",
+        description:
+          'Requires **write** access to this Application.\n\n' +
+          'Mints a fresh verification token and posts the `email_verification` mail through this ' +
+          "Application's configured transport — the same path sign-up uses, so the link, the " +
+          'lifetime and the delivery bookkeeping are identical.\n\n' +
+          'The raw token is never returned: this is an operator surface, and the point of the call ' +
+          'is that the mail reaches the person. `emailSent: false` means no transport is ' +
+          'configured or the send failed; check Email → Delivery.',
+        params: {
+          type: 'object',
+          properties: { id: { type: 'string' }, euid: { type: 'string' } },
+          required: ['id', 'euid'],
+        },
+        body: {
+          type: 'object',
+          properties: {
+            reason: {
+              type: 'string',
+              maxLength: 280,
+              description: 'Why, for the audit trail. Recommended — this puts mail in a real inbox.',
+            },
+          },
+        },
+        response: {
+          200: ok(
+            {
+              type: 'object',
+              properties: { emailSent: { type: 'boolean' } },
+              required: ['emailSent'],
+            },
+            'Whether the mail reached the transport.',
+          ),
+          ...errs({
+            ...APP_WRITE_ERRORS,
+            404: 'END_USER_NOT_FOUND — no end-user with that id in this Application.',
+            409: 'EMAIL_ALREADY_VERIFIED — nothing to verify.',
+            410: 'END_USER_ERASED — that end-user is a tombstone.',
+            429: 'RATE_LIMITED — too many sends. Honour the `Retry-After` header.',
+          }),
+        },
+      },
+    },
+    async (req) => {
+      const params = z.object({ id: z.string().min(1), euid: z.string().min(1) }).parse(req.params);
+      const body = SupportReasonBody.parse(req.body ?? {});
+      await ensureAppAccess(req, params.id, 'write');
+      const endUser = await assertEndUser(params.id, params.euid);
+      assertNotErased(endUser);
+
+      const full = await prisma.endUser.findUniqueOrThrow({ where: { id: params.euid } });
+      if (full.emailVerified) {
+        throw new RekeyError({
+          statusCode: 409,
+          code: 'EMAIL_ALREADY_VERIFIED',
+          message: 'That address is already verified.',
+          fix: 'Nothing to do.',
+        });
+      }
+      const application = await prisma.application.findUniqueOrThrow({ where: { id: params.id } });
+      const result = await deliverVerificationEmail({
+        application,
+        endUser: { id: full.id, email: full.email },
+        requireResolvableUrl: true,
+      });
+
+      void recordSecurityEvent({
+        type: 'end_user.verification_resent',
+        actorType: 'operator',
+        actorId: req.tenantUser!.id,
+        tenantId: req.tenantId!,
+        applicationId: params.id,
+        ...requestContext(req),
+        metadata: {
+          endUserId: params.euid,
+          emailSent: result.emailSent,
+          ...(body.reason !== undefined && { reason: body.reason }),
+        },
+      });
+      return { success: true, data: { emailSent: result.emailSent } };
+    },
+  );
+
+  app.post(
+    '/:id/end-users/:euid/send-password-reset',
+    {
+      config: { rateLimit: authRateLimit(10) },
+      schema: {
+        tags: ['Tenant · End-users'],
+        security: [{ tenantSession: [] }],
+        summary: "Send an end-user a password-reset email on their behalf",
+        description:
+          'Requires **write** access to this Application.\n\n' +
+          'Takes the same path the end-user\'s own "forgot password" request takes, so the token ' +
+          'lifetime and the link are identical. The raw token is never returned to the operator: ' +
+          'the reset must reach the person, not the person who pressed the button.\n\n' +
+          '**The recipient cannot tell this apart from an attacker who reached your panel.** That ' +
+          'is why `reason` is audited and why this is rate-limited; the mail itself does not yet ' +
+          'say it was support-initiated, which is tracked as an email-template change.\n\n' +
+          'Refused for an account with no password identity — an OAuth-only user has no password ' +
+          'to reset.',
+        params: {
+          type: 'object',
+          properties: { id: { type: 'string' }, euid: { type: 'string' } },
+          required: ['id', 'euid'],
+        },
+        body: {
+          type: 'object',
+          required: ['reason'],
+          properties: {
+            reason: {
+              type: 'string',
+              minLength: 1,
+              maxLength: 280,
+              description: 'Why. Required here, unlike the verification re-send, because an unasked-for reset mail is the one most easily mistaken for an attack.',
+            },
+          },
+        },
+        response: {
+          200: ok(
+            {
+              type: 'object',
+              properties: { emailSent: { type: 'boolean' } },
+              required: ['emailSent'],
+            },
+            'Whether the mail reached the transport.',
+          ),
+          ...errs({
+            ...APP_WRITE_ERRORS,
+            404: 'END_USER_NOT_FOUND — no end-user with that id in this Application.',
+            409: 'END_USER_HAS_NO_PASSWORD — the account signs in with OAuth or a passkey; there is no password to reset.',
+            410: 'END_USER_ERASED — that end-user is a tombstone.',
+            429: 'RATE_LIMITED — too many sends. Honour the `Retry-After` header.',
+          }),
+        },
+      },
+    },
+    async (req) => {
+      const params = z.object({ id: z.string().min(1), euid: z.string().min(1) }).parse(req.params);
+      const body = SupportReasonRequiredBody.parse(req.body ?? {});
+      await ensureAppAccess(req, params.id, 'write');
+      const endUser = await assertEndUser(params.id, params.euid);
+      assertNotErased(endUser);
+
+      const full = await prisma.endUser.findUniqueOrThrow({ where: { id: params.euid } });
+      if (full.passwordHash === null) {
+        throw new RekeyError({
+          statusCode: 409,
+          code: 'END_USER_HAS_NO_PASSWORD',
+          message: 'That end-user has no password set, so there is nothing to reset.',
+          fix: 'They sign in with OAuth, a passkey or a magic link. Sending a reset would strand them on a form they cannot complete.',
+        });
+      }
+      const application = await prisma.application.findUniqueOrThrow({ where: { id: params.id } });
+      // `authKind: 'secret'` — this is an operator surface, not a browser one,
+      // so the constant publishable response (which hides whether anything
+      // happened) would only hide the outcome from the person who needs it.
+      const result = await authService.requestPasswordReset({
+        application,
+        email: full.email,
+        authKind: 'secret',
+      });
+
+      void recordSecurityEvent({
+        type: 'end_user.password_reset_sent',
+        actorType: 'operator',
+        actorId: req.tenantUser!.id,
+        tenantId: req.tenantId!,
+        applicationId: params.id,
+        ...requestContext(req),
+        metadata: { endUserId: params.euid, emailSent: result.emailSent, reason: body.reason },
+      });
+      return { success: true, data: { emailSent: result.emailSent } };
+    },
+  );
+
+  app.get(
+    '/:id/end-users/:euid/sessions',
+    {
+      schema: {
+        tags: ['Tenant · End-users'],
+        security: [{ tenantSession: [] }],
+        summary: "List an end-user's active sessions",
+        description:
+          'Requires **read** access to this Application.\n\n' +
+          'Live refresh tokens, newest first, with the User-Agent and IP captured at issue time ' +
+          'and the device the session is bound to when the client sent a fingerprint. A session is ' +
+          'not a device: releasing a device revokes its sessions, but a session can exist with no ' +
+          'device on an Application that does not use device binding.',
+        params: {
+          type: 'object',
+          properties: { id: { type: 'string' }, euid: { type: 'string' } },
+          required: ['id', 'euid'],
+        },
+        querystring: { type: 'object', properties: { ...paginationJsonSchema } },
+        response: {
+          200: okPage(END_USER_SESSION, "A page of the end-user's live sessions, newest first."),
+          ...errs({
+            400: 'VALIDATION_ERROR — a query parameter is out of range.',
+            ...APP_READ_ERRORS,
+            404: 'END_USER_NOT_FOUND — no end-user with that id in this Application.',
+          }),
+        },
+      },
+    },
+    async (req) => {
+      const params = z.object({ id: z.string().min(1), euid: z.string().min(1) }).parse(req.params);
+      await ensureAppAccess(req, params.id, 'read');
+      await assertEndUser(params.id, params.euid);
+      const { take, skip } = parsePagination(PaginationQuery.parse(req.query));
+      const { items, total } = await listActiveSessions(params.euid, { take, skip });
+      return { success: true, data: paged(items, total, take, skip) };
+    },
+  );
+
+  app.delete(
+    '/:id/end-users/:euid/sessions/:sessionId',
+    {
+      schema: {
+        tags: ['Tenant · End-users'],
+        security: [{ tenantSession: [] }],
+        summary: "Revoke one of an end-user's sessions",
+        description:
+          'Requires **write** access to this Application. Idempotent: a session already revoked, ' +
+          'expired or belonging to somebody else answers `revoked: false` rather than 404, so a ' +
+          'retry is safe and the response is not an existence oracle.',
+        params: {
+          type: 'object',
+          properties: { id: { type: 'string' }, euid: { type: 'string' }, sessionId: { type: 'string' } },
+          required: ['id', 'euid', 'sessionId'],
+        },
+        response: {
+          200: ok(
+            {
+              type: 'object',
+              properties: { revoked: { type: 'boolean' } },
+              required: ['revoked'],
+            },
+            'Whether this call revoked the session.',
+          ),
+          ...errs({
+            ...APP_WRITE_ERRORS,
+            404: 'END_USER_NOT_FOUND — no end-user with that id in this Application.',
+          }),
+        },
+      },
+    },
+    async (req) => {
+      const params = z
+        .object({ id: z.string().min(1), euid: z.string().min(1), sessionId: z.string().min(1) })
+        .parse(req.params);
+      await ensureAppAccess(req, params.id, 'write');
+      await assertEndUser(params.id, params.euid);
+      const revoked = await revokeSessionForEndUser(params.euid, params.sessionId);
+      if (revoked) {
+        void recordSecurityEvent({
+          type: 'end_user.sessions_revoked_by_operator',
+          actorType: 'operator',
+          actorId: req.tenantUser!.id,
+          tenantId: req.tenantId!,
+          applicationId: params.id,
+          ...requestContext(req),
+          metadata: { endUserId: params.euid, sessionId: params.sessionId, count: 1 },
+        });
+      }
+      return { success: true, data: { revoked } };
+    },
+  );
+
+  app.post(
+    '/:id/end-users/:euid/sessions/revoke-all',
+    {
+      schema: {
+        tags: ['Tenant · End-users'],
+        security: [{ tenantSession: [] }],
+        summary: 'Sign an end-user out everywhere',
+        description:
+          'Requires **write** access to this Application. Revokes every live refresh token the ' +
+          'end-user holds. Access tokens already minted stay valid until they expire — this ends ' +
+          'the ability to obtain new ones. To cut access immediately, rotate the Application ' +
+          "token generation instead.\n\nDoes not touch devices: a released device frees a slot, " +
+          'this only ends sessions.',
+        params: {
+          type: 'object',
+          properties: { id: { type: 'string' }, euid: { type: 'string' } },
+          required: ['id', 'euid'],
+        },
+        response: {
+          200: ok(
+            {
+              type: 'object',
+              properties: { revoked: { type: 'integer', description: 'Sessions ended by this call.' } },
+              required: ['revoked'],
+            },
+            'How many sessions were revoked.',
+          ),
+          ...errs({
+            ...APP_WRITE_ERRORS,
+            404: 'END_USER_NOT_FOUND — no end-user with that id in this Application.',
+          }),
+        },
+      },
+    },
+    async (req) => {
+      const params = z.object({ id: z.string().min(1), euid: z.string().min(1) }).parse(req.params);
+      await ensureAppAccess(req, params.id, 'write');
+      await assertEndUser(params.id, params.euid);
+      const revoked = await revokeAllForEndUser(params.euid);
+      if (revoked > 0) {
+        void recordSecurityEvent({
+          type: 'end_user.sessions_revoked_by_operator',
+          actorType: 'operator',
+          actorId: req.tenantUser!.id,
+          tenantId: req.tenantId!,
+          applicationId: params.id,
+          ...requestContext(req),
+          metadata: { endUserId: params.euid, count: revoked, all: true },
+        });
+      }
+      return { success: true, data: { revoked } };
     },
   );
 
