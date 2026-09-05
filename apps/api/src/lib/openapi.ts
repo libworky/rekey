@@ -676,7 +676,7 @@ const HAND_WRITTEN_COMPONENTS: Record<string, JsonSchema> = {
         description: 'Which template fired (e.g. `verify_email`). Null for ad-hoc sends.',
       },
       via: { type: 'string', description: 'The transport that carried it (e.g. `resend`, `smtp`).' },
-      status: { type: 'string', enum: ['sent', 'error', 'no_transport'] },
+      status: { type: 'string', enum: ['sent', 'error', 'no_transport', 'suppressed'] },
       messageId: { type: 'string', nullable: true },
       error: { type: 'string', nullable: true },
       createdAt: { type: 'string', format: 'date-time' },

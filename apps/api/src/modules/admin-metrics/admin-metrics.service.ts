@@ -247,7 +247,14 @@ export const adminMetricsService = {
       sent: emailMap.sent ?? 0,
       error: emailMap.error ?? 0,
       noTransport: emailMap.no_transport ?? 0,
-      total: (emailMap.sent ?? 0) + (emailMap.error ?? 0) + (emailMap.no_transport ?? 0),
+      // The fourth outcome. Left out of the total, a workspace that switches
+      // email off reports a shrinking volume rather than a redirected one.
+      suppressed: emailMap.suppressed ?? 0,
+      total:
+        (emailMap.sent ?? 0) +
+        (emailMap.error ?? 0) +
+        (emailMap.no_transport ?? 0) +
+        (emailMap.suppressed ?? 0),
     };
 
     const subsByStatus = Object.fromEntries(subsGrouped.map((g) => [g.status, g._count._all])) as Record<string, number>;
@@ -1364,15 +1371,18 @@ export const adminMetricsService = {
   },
 
   /**
-   * Email-deliverability rollup from `EmailLog`. Three statuses are written
-   * at the transport boundary (`sent | error | no_transport`), so the
-   * dashboard can surface raw counts + a success ratio across 24h / 7d.
-   * `topErrorApps` lists the worst offenders so the operator knows where to
-   * look first.
+   * Email-deliverability rollup from `EmailLog`. Four statuses are written:
+   * three at the transport boundary (`sent | error | no_transport`) and
+   * `suppressed` at the gate before it, for a send an Application's own
+   * configuration stopped. The dashboard surfaces raw counts + a success ratio
+   * across 24h / 7d. `topErrorApps` lists the worst offenders so the operator
+   * knows where to look first — and deliberately filters on `error` alone, so
+   * an Application that has switched an event off does not appear as a
+   * deliverability problem.
    */
   async emailDeliverability(): Promise<{
-    last24h: { sent: number; error: number; noTransport: number; total: number };
-    last7d: { sent: number; error: number; noTransport: number; total: number };
+    last24h: { sent: number; error: number; noTransport: number; suppressed: number; total: number };
+    last7d: { sent: number; error: number; noTransport: number; suppressed: number; total: number };
     topErrorApps: Array<{ applicationId: string; applicationSlug: string; errors: number }>;
   }> {
     const since24h = new Date(Date.now() - DAY_MS);
@@ -1392,13 +1402,15 @@ export const adminMetricsService = {
       sent: number;
       error: number;
       noTransport: number;
+      suppressed: number;
       total: number;
     } {
       const m = Object.fromEntries(rows.map((r) => [r.status, r._count._all])) as Record<string, number>;
       const sent = m.sent ?? 0;
       const error = m.error ?? 0;
       const noTransport = m.no_transport ?? 0;
-      return { sent, error, noTransport, total: sent + error + noTransport };
+      const suppressed = m.suppressed ?? 0;
+      return { sent, error, noTransport, suppressed, total: sent + error + noTransport + suppressed };
     }
 
     const appIds = errorByApp.map((r) => r.applicationId).filter((id): id is string => !!id);

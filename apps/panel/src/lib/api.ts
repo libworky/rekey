@@ -888,7 +888,7 @@ export interface OrganizationDetail {
   invitations: OrganizationInvitationRow[];
 }
 
-export type EmailLogStatus = 'sent' | 'error' | 'no_transport';
+export type EmailLogStatus = 'sent' | 'error' | 'no_transport' | 'suppressed';
 
 export interface EmailLogRow {
   id: string;

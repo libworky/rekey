@@ -153,6 +153,50 @@ export interface RefundPaymentResult {
  * changes (subscription activated, payment succeeded) flow through the
  * webhook ingress, not this interface.
  */
+/**
+ * One subscription as a provider reports it, normalised.
+ *
+ * Deliberately the smallest set that answers "who is entitled to what, until
+ * when". No card data, no payment instrument, no invoice history, no addresses:
+ * an import reads entitlement, and payments stay where they were taken. A
+ * customer who wants payment rows in Rekey uses the push direction, which
+ * already exists.
+ *
+ * Every field except the four required ones is optional, and unknown fields are
+ * ignored, so the contract can grow without breaking an implementer.
+ */
+export interface ExternalSubscription {
+  /**
+   * The provider's own id. THE idempotency key for the whole feature:
+   * re-importing the same id never creates a second subscription, so a
+   * provider must never reuse one for a different subscription.
+   */
+  externalId: string;
+  /** Anything outside this set is `skip_invalid` rather than a guess. */
+  status: 'active' | 'trialing' | 'past_due' | 'canceled' | 'expired';
+  /** The provider's plan identifier, mapped to a local plan slug by the operator. */
+  planRef: string;
+  customer: {
+    /** The match key. Absent means the row cannot be imported. */
+    email: string;
+    /** Stored on a created user, so a later run survives a renamed address. */
+    externalId?: string | undefined;
+    name?: string | undefined;
+  };
+  /** ISO 8601. Defaults to the import time. */
+  startedAt?: string | undefined;
+  /**
+   * ISO 8601. Absent means open-ended — nothing expires it locally, and
+   * cancelling it later takes effect immediately rather than at period end.
+   */
+  currentPeriodEnd?: string | undefined;
+  cancelAt?: string | null | undefined;
+  /** Defaults to 1. Feeds licence seats where the plan carries a LICENSE entitlement. */
+  quantity?: number | undefined;
+  /** Opaque, stored on the subscription. Subject to the existing metadata ceiling. */
+  metadata?: Record<string, unknown> | undefined;
+}
+
 export interface BillingProvider {
   /** Stable identifier — `"stripe"`, `"paypal"`, `"razorpay"`. */
   readonly name: string;
@@ -206,6 +250,26 @@ export interface BillingProvider {
 
   /** Cancel a subscription. Default = at period end. */
   cancelSubscription(input: CancelSubscriptionInput): Promise<void>;
+
+  /**
+   * Page through the subscriptions this provider already knows about, so an
+   * operator can import a book of business Rekey never sold.
+   *
+   * OPTIONAL, and absent means **cannot** — the same fail-closed posture as
+   * `refundPayment` and `capabilities.discounts`. A provider with no list API
+   * says nothing here, and the panel learns the import is unavailable from the
+   * method being missing rather than from an operator pressing a button and
+   * getting an exception.
+   *
+   * Read-only and side-effect free BY CONTRACT: Rekey calls it repeatedly,
+   * including for dry runs that write nothing.
+   */
+  listSubscriptions?(input: {
+    /** Opaque; echo whatever paginates the source. Absent on the first page. */
+    cursor?: string | undefined;
+    /** Rows per page. Rekey asks for 1..200. */
+    limit: number;
+  }): Promise<{ items: ExternalSubscription[]; nextCursor?: string | undefined }>;
 
   /**
    * Pay a captured charge back to the buyer.

@@ -113,7 +113,11 @@ const WorkspaceEmailLogRow: JsonSchema = {
 const WorkspaceLogQuery = z.object({
   limit: z.coerce.number().int().min(1).max(200).optional(),
   offset: z.coerce.number().int().min(0).max(1_000_000).optional(),
-  status: z.enum(['sent', 'error', 'no_transport']).optional(),
+  // `suppressed` is the fourth outcome, written by the email kill switch
+  // (application off, event off, or the address on the suppression list). It
+  // has to be filterable: the Settings and Templates copy sends an operator
+  // here to find out WHY a mail did not go, and without it the query 400s.
+  status: z.enum(['sent', 'error', 'no_transport', 'suppressed']).optional(),
 });
 
 const InviteBody = z.object({
@@ -837,7 +841,7 @@ export async function tenantWorkspacesRoutes(app: FastifyInstance): Promise<void
           properties: {
             limit: { type: 'integer', minimum: 1, maximum: 200 },
             offset: { type: 'integer', minimum: 0, maximum: 2147483647 },
-            status: { type: 'string', enum: ['sent', 'error', 'no_transport'] },
+            status: { type: 'string', enum: ['sent', 'error', 'no_transport', 'suppressed'] },
           },
         },
         response: {

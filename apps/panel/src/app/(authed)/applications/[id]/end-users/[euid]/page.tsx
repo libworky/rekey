@@ -22,6 +22,7 @@ import { Card, SectionHeader } from '@/components/Card';
 import { Badge } from '@/components/Badge';
 import { EmptyState } from '@/components/EmptyState';
 import { Banner } from '@/components/Banner';
+import { SupportFeedback } from './support-feedback';
 import { Modal } from '@/components/Modal';
 import { Field } from '@/components/Field';
 import { SubmitButton } from '@/components/SubmitButton';
@@ -309,39 +310,6 @@ function StatTile({
   );
 }
 
-/** What each completed support action reports back. */
-const SUPPORT_DONE: Record<string, { tone: 'success' | 'info'; text: string }> = {
-  unlocked: { tone: 'success', text: 'Sign-in lockout cleared. They can try again now.' },
-  'not-locked': {
-    tone: 'info',
-    // Not "unlocked". The operator asked whether the lockout was the problem,
-    // and the honest answer is that it was not — so they keep looking.
-    text: 'Nothing to clear — this account was not locked and had no recent failures. Whatever is stopping them signing in, it is not the lockout.',
-  },
-  'verification-sent': { tone: 'success', text: 'Verification email sent.' },
-  'verification-not-sent': {
-    tone: 'info',
-    text: 'A fresh verification token was minted, but the email could not be sent — this Application has no working transport. Check Email → Delivery.',
-  },
-  'reset-sent': { tone: 'success', text: 'Password-reset email sent, and the reason recorded.' },
-  'reset-not-sent': {
-    tone: 'info',
-    text: 'A reset token was minted, but the email could not be sent — this Application has no working transport. Check Email → Delivery.',
-  },
-  'session-revoked': { tone: 'success', text: 'Session revoked.' },
-};
-
-const SUPPORT_ERR: Record<string, string> = {
-  REASON_REQUIRED: 'Say why you are sending a reset — it goes in the audit trail.',
-  EMAIL_ALREADY_VERIFIED: 'That address is already verified; there is nothing to send.',
-  END_USER_HAS_NO_PASSWORD:
-    'This account has no password — they sign in with OAuth, a passkey or a magic link. A reset would strand them on a form they cannot complete.',
-  END_USER_ERASED: 'This end-user was erased. Support actions no longer apply.',
-  RATE_LIMITED: 'Too many sends in a short window. Wait a moment and try again.',
-  APP_ACCESS_DENIED: 'Your access to this Application is read-only.',
-  TENANT_ROLE_INSUFFICIENT: 'Your role cannot perform support actions on this Application.',
-};
-
 /**
  * The support bar: one row of controls, each one API call.
  *
@@ -372,9 +340,6 @@ function SupportBar({
   // would offer an operator a row of buttons that all answer 410.
   if (erased) return null;
 
-  const result = done ? SUPPORT_DONE[done] : undefined;
-  const signedOut = done?.startsWith('signed-out:') ? Number(done.split(':')[1]) : null;
-
   return (
     <Card className="space-y-3">
       <div>
@@ -385,17 +350,7 @@ function SupportBar({
         </p>
       </div>
 
-      {result && <Banner tone={result.tone}>{result.text}</Banner>}
-      {signedOut !== null && (
-        <Banner tone="success">
-          {signedOut === 0
-            ? 'No sessions were open — nothing to sign out.'
-            : `Signed out of ${signedOut} session${
-                signedOut === 1 ? '' : 's'
-              }. Access tokens already issued stay valid until they expire.`}
-        </Banner>
-      )}
-      {error && <Banner tone="error">{SUPPORT_ERR[error] ?? error}</Banner>}
+      <SupportFeedback done={done} error={error} />
 
       <div className="flex flex-wrap items-center gap-2">
         <form action={unlockAccount.bind(null, applicationId, euid)}>
