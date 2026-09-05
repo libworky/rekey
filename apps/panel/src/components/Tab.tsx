@@ -28,8 +28,14 @@ export function Tab({
   const active = exact
     ? pathname === prefix
     : pathname === prefix || pathname.startsWith(prefix + '/');
-  // Active: red underline, full-fg text. Inactive: muted, hover lifts to fg
-  // and shows a faint border. See design.md §13.
+  // Active: teal (--color-primary) underline, full-fg text. Inactive: muted,
+  // hover lifts to fg and shows a faint border.
+  //
+  // The comment here used to say "red underline" and cite a design.md §13.
+  // The token has been --color-primary (teal) throughout, and design.md does
+  // not exist anywhere in the repo — globals.css cites it too. Two pieces of
+  // load-bearing-looking documentation, both wrong, on the component every
+  // tab strip in the panel is built from.
   const base =
     'px-3 py-2 text-sm whitespace-nowrap border-b-2 -mb-px transition-colors ' +
     'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-[var(--color-primary)] focus-visible:rounded-sm';
@@ -48,8 +54,11 @@ export function Tab({
     }
   }, [active]);
 
+  // `aria-current` was missing entirely, while AppNav and Sidebar both set it.
+  // A screen-reader user got three tab strips of which only two announced
+  // which item was current — and this is the strip the nested sections used.
   return (
-    <Link href={href} ref={ref} className={cls}>
+    <Link href={href} ref={ref} aria-current={active ? 'page' : undefined} className={cls}>
       {children}
     </Link>
   );

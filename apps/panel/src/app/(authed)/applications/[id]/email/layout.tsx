@@ -18,8 +18,7 @@
  */
 
 import * as React from 'react';
-import { PageHeader } from '@/components/PageHeader';
-import { Tab } from '@/components/Tab';
+import { RecordHeader } from '@/components/RecordHeader';
 
 export default async function EmailLayout({
   children,
@@ -33,25 +32,26 @@ export default async function EmailLayout({
 
   return (
     <div className="space-y-5">
-      <PageHeader
-        level={2}
+      {/* Email is the THIRD strip on this route — AppNav already spends two on
+          Developer → Email — so it takes the enclosed idiom rather than a
+          third page-spanning underline row. No breadcrumb: the two strips
+          above already say Developer › Email, and a trail would be the same
+          fact stated a third time. */}
+      <RecordHeader
         title="Email"
         description="Transactional mail this Application sends to its end-users. Workspace mail — operator invitations and the like — is separate and is not affected by anything here."
+        segmentsLabel="Email sections"
+        // `email/[eventKey]` is a child of Templates living at a sibling
+        // path, so without this the strip rendered on the per-event editor
+        // with nothing selected at all.
+        segmentsFallbackHref={`${base}/templates`}
+        segments={[
+          { href: base, label: 'Settings', exact: true },
+          { href: `${base}/templates`, label: 'Templates' },
+          { href: `${base}/logs`, label: 'Delivery' },
+          { href: `${base}/suppressions`, label: 'Suppressions' },
+        ]}
       />
-
-      <div className="-mx-6">
-        <nav
-          aria-label="Email sections"
-          className="flex items-center gap-1 overflow-x-auto border-b border-[var(--color-border)] px-6"
-        >
-          <Tab href={base} exact>
-            Settings
-          </Tab>
-          <Tab href={`${base}/templates`}>Templates</Tab>
-          <Tab href={`${base}/logs`}>Delivery</Tab>
-          <Tab href={`${base}/suppressions`}>Suppressions</Tab>
-        </nav>
-      </div>
 
       <div>{children}</div>
     </div>

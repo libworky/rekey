@@ -1,4 +1,5 @@
 import * as React from 'react';
+import { FilterChips } from '@/components/FilterChips';
 import type { EmailLogWithApp } from '@/lib/api';
 import { formatDateTime } from '@/lib/date';
 import { Table, THead, TBody, TR, TH, TD } from './Table';
@@ -148,25 +149,11 @@ export function EmailLogStatusFilter({
     return `${basePath}${s ? `?${s}` : ''}`;
   };
   return (
-    <div className="flex items-center gap-1.5">
-      {opts.map((o) => {
-        const href = buildHref(o.value);
-        const isActive = active === o.value || (!active && !o.value);
-        return (
-          <a
-            key={o.label}
-            href={href}
-            className={
-              'text-xs px-2.5 py-1 rounded-md border ' +
-              (isActive
-                ? 'border-[var(--color-primary)] text-[var(--color-primary)] bg-[color-mix(in_srgb,var(--color-primary)_5%,transparent)]'
-                : 'border-[var(--color-border)] text-[var(--color-muted-fg)] hover:bg-[var(--color-surface-muted)]')
-            }
-          >
-            {o.label}
-          </a>
-        );
-      })}
-    </div>
+    <FilterChips
+      chips={opts.map((o) => ({ value: o.value, label: o.label }))}
+      active={active}
+      hrefFor={buildHref}
+      label="Filter delivery log by outcome"
+    />
   );
 }
