@@ -69,14 +69,76 @@ export function requestContext(req: FastifyRequest): {
   };
 }
 
+/**
+ * `applicationId` → `tenantId`. An Application never changes workspace, so this
+ * is immutable for the life of the row and safe to memoise for the life of the
+ * process. It exists so the backfill below costs one query per Application
+ * rather than one per event: `recordSecurityEvent` is on the sign-in path.
+ */
+const tenantOfApplication = new Map<string, string>();
+
+/**
+ * Resolve the workspace an event belongs to when the caller named only the
+ * Application.
+ *
+ * ## Why this is not the caller's job
+ *
+ * `securityEventWhere` scopes EVERY tenant-facing read by `tenantId`, so a row
+ * written without one is durable, correct, and invisible: it is in the table
+ * and it is in no operator's log. Six emit sites had this shape — the five
+ * device events (`user.device_registered`, `user.device_limit_reached`,
+ * `user.device_released` / `end_user.device_released`, `end_user.device_blocked`,
+ * `end_user.device_unblocked`) and `user.session_handoff_granted` — against 53
+ * that pass `tenantId` correctly. The entire device audit trail was therefore
+ * unreachable from the panel: blocking someone's device recorded an event that
+ * appeared neither in the workspace Activity log nor on the end-user it
+ * happened to.
+ *
+ * Requiring every caller to remember is what produced the bug, and the six that
+ * forgot are the six furthest from a request context (a service that takes an
+ * `applicationId`, not a `req`). Deriving it here fixes those six and the
+ * seventh nobody has written yet. Callers that pass `tenantId` are untouched.
+ *
+ * Best-effort like everything else in this file: if the lookup fails the event
+ * is still written, exactly as before.
+ */
+async function resolveTenantId(applicationId: string): Promise<string | null> {
+  const cached = tenantOfApplication.get(applicationId);
+  if (cached !== undefined) return cached;
+  const app = await prisma.application
+    .findUnique({ where: { id: applicationId }, select: { tenantId: true } })
+    .catch(() => null);
+  const tenantId = app?.tenantId ?? null;
+  // Only memoise a hit. A miss can mean "not created yet" in a racing test,
+  // and caching null would make that permanent for the process.
+  if (tenantId !== null) tenantOfApplication.set(applicationId, tenantId);
+  return tenantId;
+}
+
+/**
+ * Drop the application→tenant memo between tests.
+ *
+ * Registered in `test/domain-tables.ts` alongside the other module-level
+ * singletons the per-test TRUNCATE cannot reach. A cuid is never reissued, so a
+ * stale entry cannot actually mislead a later test — this is here because
+ * "module state that outlives a truncate" is a category this suite tracks
+ * deliberately, and an unregistered one is the next person's debugging session.
+ */
+export function __resetForTests(): void {
+  tenantOfApplication.clear();
+}
+
 export async function recordSecurityEvent(input: SecurityEventInput): Promise<void> {
   try {
+    const tenantId =
+      input.tenantId ??
+      (input.applicationId ? await resolveTenantId(input.applicationId) : null);
     await prisma.securityEvent.create({
       data: {
         type: input.type,
         actorType: input.actorType,
         actorId: input.actorId ?? null,
-        tenantId: input.tenantId ?? null,
+        tenantId,
         applicationId: input.applicationId ?? null,
         ip: input.ip ?? null,
         userAgent: input.userAgent ?? null,
