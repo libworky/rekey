@@ -144,6 +144,16 @@ const SUPPRESSION_TEXT: Record<SuppressionReason, string> = {
 };
 
 /**
+ * Events that never pass through `dispatch`, so no per-Application switch can
+ * reach them. Rendering a control for these would let an operator turn
+ * something "off" that keeps arriving.
+ */
+const SYSTEM_SCOPED_EVENTS: ReadonlySet<string> = new Set([
+  'workspace_invitation',
+  'billing_unapplied_payment',
+]);
+
+/**
  * Is this send allowed out at all? Cheapest and broadest gate first, so a
  * silenced Application costs one boolean rather than three queries.
  */
@@ -169,6 +179,25 @@ async function suppressionFor(
   if (setting !== null && setting.enabled === false) return 'event_disabled';
   if (suppressed !== null) return 'suppressed_address';
   return null;
+}
+
+/**
+ * Is this address on the Application's suppression list, and why?
+ *
+ * Separate from `suppressionFor` because the test-send route needs exactly
+ * this one gate and deliberately not the other two: it must work while
+ * sending is switched off (that is how an operator proves a new transport
+ * before turning it back on), but it must not mail an address that
+ * hard-bounced or complained.
+ */
+export async function addressSuppression(
+  applicationId: string,
+  to: string,
+): Promise<{ reason: string } | null> {
+  return prisma.emailSuppression.findUnique({
+    where: { applicationId_address: { applicationId, address: to.toLowerCase() } },
+    select: { reason: true },
+  });
 }
 
 /**
@@ -202,7 +231,13 @@ export async function dispatch(input: DispatchInput): Promise<SendOutcome> {
     //
     // Every existing caller already treats `error` as "nothing sent, withhold
     // the token", so this is the safe shape without touching 40 branch sites.
-    return { kind: 'error', message: `Email suppressed: ${SUPPRESSION_TEXT[suppression]}` };
+    return {
+      kind: 'error',
+      message: `Email suppressed: ${SUPPRESSION_TEXT[suppression]}`,
+      // So the auth paths can tell "the operator switched this off" from "the
+      // transport broke" and skip the delivery-failure alarm for the former.
+      suppressed: true,
+    };
   }
 
   const rendered = await renderForEvent(
@@ -439,6 +474,65 @@ export const emailService = {
     return null;
   },
 
+  /**
+   * The SAME coupling, read from the other end.
+   *
+   * `essentialBlocker` refuses to disable an email the live auth config needs.
+   * That is only half a guarantee, because the auth config can move too: turn
+   * `requireEmailVerification` off, disable the `email_verification` email
+   * (now permitted), turn verification back on — three ordinary steps, and
+   * every subsequent sign-up is stranded on a screen waiting for a mail that
+   * will never be sent, with nothing anywhere reporting a problem.
+   *
+   * So the auth-config route asks this before it writes. Returns the blockers
+   * that the PATCHED config would create, or an empty array.
+   */
+  async authConfigBlockers(
+    applicationId: string,
+    next: { methods?: string[] | undefined; requireEmailVerification?: boolean | undefined },
+  ): Promise<Array<{ eventKey: string; message: string }>> {
+    const wanted: Array<[EmailEventKey, boolean, string]> = [
+      [
+        'password_reset',
+        (next.methods ?? []).includes('password'),
+        'Password sign-in needs the password-reset email: it is the only way a user who forgets their password gets back in, and that email is switched off for this Application.',
+      ],
+      [
+        'magic_link_signin',
+        (next.methods ?? []).includes('magic_link'),
+        'Magic-link sign-in IS the magic-link email, and that email is switched off for this Application.',
+      ],
+      [
+        'email_verification',
+        next.requireEmailVerification === true,
+        'Requiring email verification needs the verification email, and that email is switched off for this Application — every new sign-up would be stranded.',
+      ],
+    ];
+    const needed = wanted.filter(([, want]) => want).map(([key]) => key);
+    if (needed.length === 0) return [];
+    const settings = await prisma.emailEventSetting.findMany({
+      where: { applicationId, eventKey: { in: needed }, enabled: false },
+      select: { eventKey: true },
+    });
+    const off = new Set(settings.map((r) => r.eventKey));
+    return wanted
+      .filter(([key, want]) => want && off.has(key))
+      .map(([eventKey, , message]) => ({ eventKey, message }));
+  },
+
+  /**
+   * Events that never pass through `dispatch`.
+   *
+   * `workspace_invitation` (tenant-workspaces.service.ts) and
+   * `billing_unapplied_payment` (unapplied-payments.service.ts) both go out
+   * via `dispatchSystem`, which is deliberately ungated: a workspace
+   * invitation is Rekey talking to a prospective operator, not the
+   * Application talking to its end-users, and an unapplied-payment notice is
+   * Rekey telling the tenant that money arrived it could not match. Neither is
+   * something an Application's own email switch should be able to silence.
+   */
+  addressSuppression,
+
   /** Master switch + every event's state, for the settings screen. */
   async getSendControl(application: Application): Promise<{
     emailsEnabled: boolean;
@@ -448,6 +542,13 @@ export const emailService = {
       enabled: boolean;
       customised: boolean;
       essentialBlocker: { code: string; message: string; fix: string } | null;
+      /**
+       * True where the event is only ever sent by `dispatchSystem`, which has
+       * no per-Application gate. The switch would render, the operator would
+       * turn it off, and the mail would keep going — so the UI marks these
+       * rather than offering a control that does nothing.
+       */
+      systemScoped: boolean;
     }>;
   }> {
     const [settings, customs] = await Promise.all([
@@ -467,6 +568,7 @@ export const emailService = {
         enabled: !disabled.has(key),
         customised: customised.has(key),
         essentialBlocker: await this.essentialBlocker(application, key),
+        systemScoped: SYSTEM_SCOPED_EVENTS.has(key),
       })),
     );
     return { emailsEnabled: application.emailsEnabled, events };
@@ -485,6 +587,21 @@ export const emailService = {
     eventKey: EmailEventKey,
     enabled: boolean,
   ): Promise<void> {
+    // Refuse rather than store a setting nothing reads. These events go out
+    // through `dispatchSystem`, which has no per-Application gate, so a stored
+    // `enabled: false` here would leave an operator certain they had switched
+    // something off while it kept arriving — the worst kind of switch.
+    // Only the DISABLE is refused. Re-enabling has to stay possible, or an
+    // Application carrying a stale `enabled: false` row from before these two
+    // events were recognised as workspace-scoped could never have it cleared.
+    if (!enabled && SYSTEM_SCOPED_EVENTS.has(eventKey)) {
+      throw new RekeyError({
+        statusCode: 409,
+        code: 'EMAIL_EVENT_NOT_APPLICATION_SCOPED',
+        message: `"${eventKey}" is sent by Rekey to your workspace, not by this Application to its end-users, so an Application-level switch does not reach it.`,
+        fix: 'Workspace notifications are not configurable per Application. Nothing to change here.',
+      });
+    }
     if (!enabled) {
       const blocker = await this.essentialBlocker(application, eventKey);
       if (blocker) {
@@ -660,7 +777,7 @@ export const emailService = {
   },
 };
 
-export type EmailLogStatus = 'sent' | 'error' | 'no_transport';
+export type EmailLogStatus = 'sent' | 'error' | 'no_transport' | 'suppressed';
 
 export interface EmailLogRow {
   id: string;

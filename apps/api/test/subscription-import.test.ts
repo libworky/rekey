@@ -343,4 +343,144 @@ describe('subscription import', () => {
     });
     expect(res.statusCode).toBe(404);
   });
+
+  // ---------- what the review found the apply path was dropping ----------
+
+  it('honours the term the provider reported instead of importing it open-ended', async () => {
+    const w = await world();
+    // The whole reason this matters is at the OTHER end of the lifecycle: with
+    // no period, `cancelEffect` has nothing to schedule against, so cancelling
+    // an imported subscription stops access on the spot rather than at period
+    // end — and `docs/external-billing-pull.md` promises the opposite.
+    const periodEnd = new Date(Date.now() + 90 * 24 * 3600 * 1000);
+    const cancelAt = new Date(Date.now() + 60 * 24 * 3600 * 1000);
+    feed.items = [
+      row({
+        email: 'termed@example.com',
+        currentPeriodEnd: periodEnd.toISOString(),
+        cancelAt: cancelAt.toISOString(),
+        startedAt: '2026-01-14T09:00:00.000Z',
+        metadata: { tier: 'enterprise' },
+      }),
+    ];
+    const { runId } = await dryRun(w);
+    const applied = await inject({
+      method: 'POST',
+      url: `${base(w)}/subscription-imports/${runId}/apply`,
+      headers: auth(w),
+      payload: { confirm: w.slug },
+    });
+    expect(applied.statusCode).toBe(200);
+
+    const sub = await prisma.subscription.findFirstOrThrow({
+      where: { applicationId: w.applicationId },
+    });
+    expect(sub.currentPeriodEnd).not.toBeNull();
+    expect(sub.currentPeriodEnd!.toISOString()).toBe(periodEnd.toISOString());
+    expect(sub.cancelAt!.toISOString()).toBe(cancelAt.toISOString());
+    expect(sub.metadata).toMatchObject({
+      import: {
+        providerStartedAt: '2026-01-14T09:00:00.000Z',
+        providerMetadata: { tier: 'enterprise' },
+      },
+    });
+  });
+
+  it('drops a period end that is already in the past rather than importing an expired subscription', async () => {
+    const w = await world();
+    feed.items = [
+      row({ email: 'stale@example.com', currentPeriodEnd: '2020-01-01T00:00:00.000Z' }),
+    ];
+    const { runId } = await dryRun(w);
+    const applied = await inject({
+      method: 'POST',
+      url: `${base(w)}/subscription-imports/${runId}/apply`,
+      headers: auth(w),
+      payload: { confirm: w.slug },
+    });
+    // One bad date must not fail a row that has a perfectly good subscriber:
+    // open-ended is the safe reading of "we could not tell".
+    expect(applied.statusCode).toBe(200);
+    expect(applied.json().data).toMatchObject({ imported: 1, failed: 0 });
+    const sub = await prisma.subscription.findFirstOrThrow({
+      where: { applicationId: w.applicationId },
+    });
+    expect(sub.currentPeriodEnd).toBeNull();
+  });
+
+  it('maps a provider plan ref off the NESTED metadata a plan registration writes', async () => {
+    const w = await world();
+    // `ensurePlanRegistered` writes `metadata.stripe = { priceId }`, and
+    // stripe-real.ts reads it back that way. A fallback that looked for a flat
+    // top-level key matched nothing anybody writes, so only exact slug
+    // equality ever mapped and every other row was `skip_no_plan`.
+    await prisma.plan.updateMany({
+      where: { applicationId: w.applicationId, slug: 'pro' },
+      data: { metadata: { stripe: { priceId: 'price_1QabcdEFGH' } } },
+    });
+    feed.items = [row({ email: 'mapped@example.com', planRef: 'price_1QabcdEFGH' })];
+    const { items } = await dryRun(w);
+    expect(items[0]!.outcome).toBe('create');
+  });
+
+  it('two rows for one address create ONE end-user, not a failed row', async () => {
+    const w = await world();
+    // A customer with two provider subscriptions is ordinary. The preview
+    // resolved both against an end-user that did not exist yet, so both are
+    // `create` — and the second `endUser.create` hits the unique index.
+    feed.items = [
+      row({ email: 'twice@example.com' }),
+      row({ email: 'twice@example.com', planRef: 'pro' }),
+    ];
+    const { runId, items } = await dryRun(w);
+    expect(items.every((i) => i.outcome === 'create')).toBe(true);
+
+    const applied = await inject({
+      method: 'POST',
+      url: `${base(w)}/subscription-imports/${runId}/apply`,
+      headers: auth(w),
+      payload: { confirm: w.slug },
+    });
+    expect(applied.statusCode).toBe(200);
+    expect(applied.json().data.failed).toBe(0);
+    expect(
+      await prisma.endUser.count({
+        where: { applicationId: w.applicationId, email: 'twice@example.com' },
+      }),
+    ).toBe(1);
+    // The second grant is idempotent on (application, end-user, plan), so one
+    // subscription — not two, and not an error.
+    expect(await prisma.subscription.count({ where: { applicationId: w.applicationId } })).toBe(1);
+  });
+
+  it('two operators applying the same preview at once import it once', async () => {
+    const w = await world();
+    feed.items = [
+      row({ email: 'race-a@example.com' }),
+      row({ email: 'race-b@example.com' }),
+    ];
+    const { runId } = await dryRun(w);
+    const apply = () =>
+      inject({
+        method: 'POST',
+        url: `${base(w)}/subscription-imports/${runId}/apply`,
+        headers: auth(w),
+        payload: { confirm: w.slug },
+      });
+    // What this pins is the OUTCOME: one caller wins, nothing is imported
+    // twice, and `subscription.activated` is announced once per row.
+    //
+    // It does not isolate the conditional claim on its own. In-process
+    // `inject` almost always lets the first caller finish its status write
+    // before the second reads, so the sequential `status !== 'ready'` check
+    // catches this ordering by itself — neutering the claim leaves this test
+    // green. The claim exists for the interleaving that check cannot cover
+    // (both callers reading `ready` before either writes), which is real
+    // against a shared database and not reproducible here.
+    const [a, b] = await Promise.all([apply(), apply()]);
+    const codes = [a.statusCode, b.statusCode].sort();
+    expect(codes).toEqual([200, 409]);
+    expect(await prisma.subscription.count({ where: { applicationId: w.applicationId } })).toBe(2);
+  });
+
 });

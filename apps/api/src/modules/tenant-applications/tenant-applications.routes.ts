@@ -1392,6 +1392,10 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
       const { id } = AppParam.parse(req.params);
       await ensureAppAccess(req, id, 'write');
       const body = AUTH_CONFIG_PATCH_BODY.parse(req.body ?? {});
+      // The email coupling is enforced inside `updateAuthConfig` rather than
+      // here: the operator MCP tool calls that service directly, so a check on
+      // this route alone would leave the walk-around it exists to close wide
+      // open through the other door.
       const updated = await applicationsService.updateAuthConfig({
         applicationId: id,
         patch: body,
@@ -5052,7 +5056,10 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
         tenantId: req.tenantId!,
         applicationId: params.id,
         ...requestContext(req),
-        metadata: { endUserId: params.euid, wasLocked: unlocked },
+        // Not `wasLocked`: `unlocked` is also true for a partial failure
+        // streak with no lock in force, and an audit row asserting a lockout
+        // that never happened is worse than one that says nothing.
+        metadata: { endUserId: params.euid, hadLockoutState: unlocked },
       });
       return { success: true, data: { unlocked } };
     },

@@ -115,6 +115,43 @@ const PROBES: Probe[] = [
   // longer appears in the route table this test reads.
   { subResource: 'application-roles', method: 'GET', suffix: '/application-roles' },
   { subResource: 'end-users', method: 'GET', suffix: '/end-users' },
+  // The email-control and subscription-import surfaces. Both read and write
+  // per-Application configuration, and the import one reads a book of business
+  // — exactly the shape that must answer 404 to a stranger rather than
+  // confirming the Application exists.
+  { subResource: 'email-send-control', method: 'GET', suffix: '/email-send-control' },
+  {
+    subResource: 'email-send-control',
+    method: 'PATCH',
+    suffix: '/email-send-control',
+    payload: { emailsEnabled: false },
+  },
+  {
+    subResource: 'email-send-control',
+    method: 'PATCH',
+    suffix: '/email-send-control/welcome',
+    payload: { enabled: false },
+  },
+  { subResource: 'email-stats', method: 'GET', suffix: '/email-stats' },
+  { subResource: 'email-suppressions', method: 'GET', suffix: '/email-suppressions' },
+  {
+    subResource: 'email-suppressions',
+    method: 'POST',
+    suffix: '/email-suppressions',
+    payload: { address: 'stranger@example.com', reason: 'manual' },
+  },
+  {
+    subResource: 'email-suppressions',
+    method: 'DELETE',
+    suffix: '/email-suppressions/stranger@example.com',
+  },
+  { subResource: 'subscription-imports', method: 'GET', suffix: '/subscription-imports' },
+  {
+    subResource: 'subscription-imports',
+    method: 'POST',
+    suffix: '/subscription-imports',
+    payload: { provider: 'external', matchStrategy: 'email' },
+  },
   { subResource: 'licenses', method: 'GET', suffix: '/licenses' },
   { subResource: 'oauth-config', method: 'DELETE', suffix: '/oauth-config/google' },
   { subResource: 'organization-roles', method: 'GET', suffix: '/organization-roles' },

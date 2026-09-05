@@ -113,18 +113,41 @@ describe('billing provider-module registry', () => {
     );
   });
 
-  it('external credentialSchema is the single signing secret, with a length floor', () => {
-    // ExternalCredentials in credentials.service.ts is { webhookSecret }.
-    expect(externalModule.credentialSchema.map((f) => f.key)).toEqual(['webhookSecret']);
+  it('external credentialSchema is one REQUIRED signing secret plus the optional pull pair', () => {
+    // The signing secret is the whole inbound half and stays mandatory. The
+    // two pull fields were added for the subscription import and are OPTIONAL
+    // on purpose: an Application that only ever RECEIVES events needs neither,
+    // and leaving them blank must make the import unavailable rather than make
+    // the credential invalid.
+    expect(externalModule.credentialSchema.map((f) => f.key)).toEqual([
+      'webhookSecret',
+      'subscriptionsUrl',
+      'pullToken',
+    ]);
     const field = externalModule.credentialSchema[0]!;
     expect(field.secret).toBe(true);
     expect(field.webhookRole).toBe('secret');
     expect(field.optional).toBeUndefined();
+
+    const [, url, token] = externalModule.credentialSchema;
+    expect(url!.optional).toBe(true);
+    expect(token!.optional).toBe(true);
+    // The pull token is a bearer credential for somebody else's endpoint, so
+    // it must never be echoed back to the panel; the URL is not a secret and
+    // has to stay readable or an operator cannot see what they configured.
+    expect(token!.secret).toBe(true);
+    expect(url!.secret).toBe(false);
+
     // A short HMAC key is guessable; the floor is enforced by the shared
     // credential rules, not by the panel.
     const rules = credentialRulesSchema(externalModule);
     expect(rules.safeParse({ webhookSecret: 'short' }).success).toBe(false);
     expect(rules.safeParse({ webhookSecret: 'x'.repeat(32) }).success).toBe(true);
+    // And the optional pair really is optional — the secret alone still validates.
+    expect(
+      rules.safeParse({ webhookSecret: 'x'.repeat(32), subscriptionsUrl: 'http://insecure.example' })
+        .success,
+    ).toBe(false);
   });
 
   it('paypal credentialSchema matches the stored credential JSON keys exactly', () => {

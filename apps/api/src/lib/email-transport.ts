@@ -102,7 +102,17 @@ async function withEmailDeadline<T>(work: Promise<T>): Promise<T> {
 export type SendOutcome =
   | { kind: 'sent'; messageId: string | null; via: SentVia }
   | { kind: 'no_transport' }
-  | { kind: 'error'; message: string };
+  /**
+   * Nothing was sent and the caller must withhold whatever token it minted.
+   *
+   * `suppressed` marks the sub-case where the refusal was a CONFIGURATION
+   * CHOICE — the Application's email switch, a disabled event, or an address
+   * on the suppression list — rather than a transport that broke. Callers that
+   * raise a delivery-failure alarm must not raise it for this: an operator who
+   * turns an event off should not then find their own activity feed filling
+   * with `auth.email_delivery_failed` alerts about the thing they just did.
+   */
+  | { kind: 'error'; message: string; suppressed?: true };
 
 export interface SendInput {
   to: string;

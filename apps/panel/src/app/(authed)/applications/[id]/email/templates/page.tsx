@@ -28,6 +28,8 @@ interface EventRow {
   enabled: boolean;
   customised: boolean;
   essentialBlocker: { code: string; message: string; fix: string } | null;
+  /** Sent by Rekey itself, not by this Application — no switch reaches it. */
+  systemScoped?: boolean;
 }
 
 interface SendControl {
@@ -136,9 +138,17 @@ export default async function EmailTemplatesPage({
                     {e.essentialBlocker.message} {e.essentialBlocker.fix}
                   </div>
                 )}
+                {e.systemScoped && (
+                  <div className="mt-1 max-w-lg text-[11px] text-[var(--color-muted-fg)]">
+                    Sent by Rekey to your workspace, not by this Application to its end-users, so
+                    this Application&apos;s email switches do not apply to it.
+                  </div>
+                )}
               </TD>
               <TD>
-                {e.enabled ? (
+                {e.systemScoped ? (
+                  <Badge tone="neutral">workspace</Badge>
+                ) : e.enabled ? (
                   <Badge tone="success" dot>
                     sending
                   </Badge>
@@ -155,7 +165,18 @@ export default async function EmailTemplatesPage({
               </TD>
               <TD align="right">
                 <div className="flex items-center justify-end gap-3">
-                  {e.essentialBlocker && e.enabled ? (
+                  {e.systemScoped ? (
+                    // No switch, because there is nothing for it to switch.
+                    // These go out through `dispatchSystem`, which has no
+                    // per-Application gate — rendering a control here would
+                    // let an operator turn something "off" that keeps arriving.
+                    <span
+                      className="text-xs text-[var(--color-muted-fg)]"
+                      title="Sent by Rekey to your workspace; this Application's email switches do not reach it."
+                    >
+                      not switchable
+                    </span>
+                  ) : e.essentialBlocker && e.enabled ? (
                     // No switch at all rather than one that 409s. The reason is
                     // already spelled out beside the event.
                     <span

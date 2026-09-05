@@ -64,8 +64,14 @@ The signed string is:
 {t}.GET.{path}{query}
 ```
 
-`path` and `query` are exactly as sent, including `?limit=` and `?cursor=`. So
-for the request above, with the signing secret you configured:
+`path` and `query` are exactly as sent, including `?limit=` and `?cursor=`.
+
+**The key is the `Signing secret` you already configured** under Billing →
+Providers → External — the same secret your system uses to sign the events it
+sends Rekey. There is not a second one for this direction. (The *string* being
+signed is different; see the note below. Only the key is shared.)
+
+So for the request above:
 
 ```js
 const signed = `1757000000.GET./rekey/subscriptions?limit=200`;
@@ -114,13 +120,12 @@ from your clock. Compare in constant time.
 | `status` | **yes** | One of `active`, `trialing`, `past_due`, `canceled`, `expired`. Anything else is skipped as invalid rather than guessed at. |
 | `planRef` | **yes** | Your plan identifier. Mapped to a Rekey plan — see §3. |
 | `customer.email` | **yes** | The match key. A row without one cannot be imported. |
-| `customer.externalId` | no | Stored on a created user, so a later run still recognises them if the address changes. |
-| `customer.name` | no | |
-| `startedAt` | no | ISO 8601. Defaults to the import time. |
-| `currentPeriodEnd` | no | ISO 8601. **Omit it and the subscription is open-ended** — nothing expires it locally, and cancelling it later takes effect immediately rather than at period end. |
-| `cancelAt` | no | ISO 8601, or null. |
-| `quantity` | no | Defaults to 1. Feeds licence seat counts where the plan carries a `LICENSE` entitlement. |
-| `metadata` | no | Opaque object, stored on the subscription. Subject to Rekey's existing metadata size ceiling. |
+| `customer.name` | no | Recorded on the subscription's `metadata.import`. An import never renames an end-user who already has an account. |
+| `startedAt` | no | ISO 8601. Recorded on the subscription's `metadata.import.providerStartedAt`. It does not move the local row's `createdAt`, which is when Rekey imported it. |
+| `currentPeriodEnd` | no | ISO 8601. **Omit it and the subscription is open-ended** — nothing expires it locally, and cancelling it later takes effect immediately rather than at period end. A value in the past is treated as absent, because a subscription born already expired entitles nobody. |
+| `cancelAt` | no | ISO 8601, or null. A future value is set on the local row; a past one is ignored. |
+| `quantity` | no | Defaults to 1. Above 1 it is applied as a `LICENSE:` entitlement override, so it only does something where the plan actually carries a `LICENSE` entitlement. Where it does not, the subscription is still imported and the run reports which rows could not take a seat count — Rekey does not invent an entitlement the plan never sold. |
+| `customer.externalId`, `metadata` | no | Opaque, stored under the subscription's `metadata.import`. Subject to Rekey's 16 KB metadata ceiling — a blob over it is dropped and noted there, rather than failing the row. |
 | `nextCursor` | no | Absent or null ends the walk. |
 
 Unknown top-level and per-item fields are ignored, so this contract can grow
@@ -196,7 +201,7 @@ not mistake the account for a broken registration.
 | Code | What happened |
 |---|---|
 | `EXTERNAL_PULL_NOT_CONFIGURED` | No subscriptions URL or token stored. |
-| `EXTERNAL_PULL_URL_REFUSED` | The URL is not a permitted target (SSRF guard). |
+| `SSRF_BLOCKED` / `EXTERNAL_PULL_URL_REFUSED` | The URL is not a permitted target (SSRF guard). |
 | `EXTERNAL_PULL_UNREACHABLE` | No response within 10 seconds, or a connection failure. |
 | `EXTERNAL_PULL_FAILED` | A non-2xx response. A 401 usually means the token or the signature check disagrees. |
 | `EXTERNAL_PULL_MALFORMED` | The body was not a JSON object with an `items` array. |

@@ -24,6 +24,7 @@ import { SubmitButton } from '@/components/SubmitButton';
 import Link from 'next/link';
 import { ConfirmButton } from '@/components/ConfirmButton';
 import { impersonate, revokeAllSessions, revokeSession, unlockAccount } from '../actions';
+import { SupportFeedback } from '../support-feedback';
 import {
   getEndUserDetail,
   getEndUserEvents,
@@ -81,6 +82,13 @@ export default async function EndUserSecurityPage({
   const sp = await searchParams;
   const impError = typeof sp.impError === 'string' ? sp.impError : undefined;
   const impersonated = sp.impersonated === '1';
+  // Three of the six support actions land HERE, not on Overview: clearing a
+  // lockout, revoking one session, and signing every session out. Without
+  // these two lines their outcome — success and refusal alike — was never
+  // rendered anywhere, so a refused action looked exactly like a successful
+  // one.
+  const supportDone = typeof sp.support === 'string' ? sp.support : undefined;
+  const supportError = typeof sp.supportError === 'string' ? sp.supportError : undefined;
 
   const [detail, events, sessions] = await Promise.all([
     getEndUserDetail(id, euid),
@@ -108,6 +116,7 @@ export default async function EndUserSecurityPage({
 
   return (
     <div className="space-y-6">
+      <SupportFeedback done={supportDone} error={supportError} />
       {impersonated && reveal && (
         <div
           aria-live="polite"

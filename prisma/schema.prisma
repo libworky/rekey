@@ -798,7 +798,7 @@ model EmailLog {
   eventKey      String?  @map("event_key")
   /** Transport used: byo_resend | default_resend | byo_smtp | none. */
   via           String
-  /** Outcome: sent | error | no_transport. */
+  /** Outcome: sent | error | no_transport | suppressed. */
   status        String
   /** Provider message id when status=sent (nullable — some providers omit). */
   messageId     String?  @map("message_id")

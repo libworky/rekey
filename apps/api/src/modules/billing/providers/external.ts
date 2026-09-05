@@ -25,7 +25,8 @@
 import { createHmac } from 'node:crypto';
 import type { Plan } from '@prisma/client';
 import { RekeyError } from '../../../lib/error.js';
-import { isWebhookUrlSafe } from '../../../lib/webhook-signing.js';
+import { assertSafeUrlResolved, pinnedFetchInit } from '../../../lib/ssrf-guard.js';
+import { env } from '../../../config/env.js';
 import { EXTERNAL_PROVIDER_NAME } from './modules/external/index.js';
 import type {
   BillingProvider,
@@ -77,9 +78,42 @@ export interface ExternalPullConfig {
   signingSecret: string;
 }
 
-/** Bound the walk: a source that never stops paginating must not hang a run. */
-const MAX_PAGES = 500;
 const PAGE_TIMEOUT_MS = 10_000;
+
+/**
+ * A page of somebody else's JSON.
+ *
+ * Sized against the CONTRACT, not against a typical page: the doc permits 200
+ * rows each carrying up to Rekey's 16 KB metadata ceiling, so a legitimate
+ * page can reach ~3.2 MB. A tighter cap would truncate that mid-object and the
+ * run would die reporting malformed JSON — blaming the sender for obeying the
+ * document. 8 MB leaves room for the envelope and still refuses the unbounded
+ * body a bare `res.json()` would read into memory.
+ */
+const MAX_PAGE_BYTES = 8 * 1024 * 1024;
+
+/**
+ * Read a bounded body with the abort signal still armed.
+ *
+ * Same shape as the webhook path's reader, and for the same two reasons: an
+ * unbounded read lets a third party OOM the process, and doing it before
+ * `clearTimeout` means a server that sends headers promptly and then trickles
+ * the body still hits the timeout instead of hanging the run forever.
+ */
+async function readCapped(res: Response, maxBytes: number): Promise<string> {
+  if (!res.body) return '';
+  const reader = res.body.getReader();
+  const chunks: Buffer[] = [];
+  let total = 0;
+  while (total < maxBytes) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(Buffer.from(value));
+    total += value.byteLength;
+  }
+  void reader.cancel().catch(() => undefined);
+  return Buffer.concat(chunks).toString('utf8').slice(0, maxBytes);
+}
 
 function pullNotConfigured(): RekeyError {
   return new RekeyError({
@@ -114,18 +148,11 @@ export class ExternalBillingProvider implements BillingProvider {
     url.searchParams.set('limit', String(Math.min(Math.max(input.limit, 1), 200)));
     if (input.cursor !== undefined) url.searchParams.set('cursor', input.cursor);
 
-    // Same guard a webhook target gets. An operator who can set this URL could
-    // otherwise point Rekey at its own metadata service.
-    const safety = isWebhookUrlSafe(url.toString());
-    if (!safety.ok) {
-      throw new RekeyError({
-        statusCode: 400,
-        code: 'EXTERNAL_PULL_URL_REFUSED',
-        message: `The subscriptions endpoint was refused: ${safety.reason}`,
-        fix: 'Use a public HTTPS URL. Private and loopback targets are only allowed when WEBHOOK_ALLOW_PRIVATE_TARGETS is set, which is for local development.',
-      });
-    }
-
+    // The SAME hardening the webhook delivery path uses, not merely the
+    // registration-time URL check. `isWebhookUrlSafe` never resolves DNS — its
+    // own module header says so — so on its own it misses a public hostname
+    // with a private A record. An operator who can set this URL is not
+    // necessarily trusted with the deployment's network position.
     const t = Math.floor(Date.now() / 1000);
     const signed = `${t}.GET.${url.pathname}${url.search}`;
     const v1 = createHmac('sha256', this.pull.signingSecret).update(signed).digest('hex');
@@ -133,7 +160,11 @@ export class ExternalBillingProvider implements BillingProvider {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), PAGE_TIMEOUT_MS);
     let res: Response;
+    let bodyText: string;
     try {
+      const allowed = await assertSafeUrlResolved(url.toString(), {
+        allowPrivate: env.WEBHOOK_ALLOW_PRIVATE_TARGETS,
+      });
       res = await fetch(url, {
         method: 'GET',
         headers: {
@@ -142,32 +173,49 @@ export class ExternalBillingProvider implements BillingProvider {
           accept: 'application/json',
           'user-agent': 'Rekey (+subscription-import)',
         },
+        // A validated public URL could otherwise 3xx us onto an internal host,
+        // bypassing the guard above entirely.
+        redirect: 'manual',
         signal: controller.signal,
+        ...pinnedFetchInit(allowed),
       });
+      if (res.status >= 300 && res.status < 400) {
+        throw new RekeyError({
+          statusCode: 400,
+          code: 'EXTERNAL_PULL_URL_REFUSED',
+          message: `The subscriptions endpoint redirected (${res.status}), which is not followed.`,
+          fix: 'Point the configured URL directly at the endpoint. Redirects are refused because a validated public URL could otherwise forward Rekey onto an internal host.',
+        });
+      }
+      if (!res.ok) {
+        throw new RekeyError({
+          statusCode: 502,
+          code: 'EXTERNAL_PULL_FAILED',
+          message: `The subscriptions endpoint answered ${res.status}.`,
+          fix: 'A 401 usually means the pull token or the signature check disagrees. Verify both against docs/external-billing-pull.md.',
+        });
+      }
+      // Inside the try, so the abort signal is still armed: a server that sends
+      // headers and then trickles the body must hit the timeout, not hang.
+      bodyText = await readCapped(res, MAX_PAGE_BYTES);
     } catch (e) {
+      if (e instanceof RekeyError) throw e;
       throw new RekeyError({
         statusCode: 502,
         code: 'EXTERNAL_PULL_UNREACHABLE',
-        message: `Could not reach the subscriptions endpoint: ${(e as Error).message}`,
-        fix: 'Check the URL is reachable from the Rekey deployment and responds within 10 seconds.',
+        message: `Could not read the subscriptions endpoint: ${(e as Error).message}`,
+        fix: 'Check the URL is reachable from the Rekey deployment, is not a private address, and answers within 10 seconds.',
       });
     } finally {
       clearTimeout(timer);
     }
 
-    if (!res.ok) {
-      throw new RekeyError({
-        statusCode: 502,
-        code: 'EXTERNAL_PULL_FAILED',
-        message: `The subscriptions endpoint answered ${res.status}.`,
-        fix: 'A 401 usually means the pull token does not match. Check the token and the signature verification on your side.',
-      });
+    let body: { items?: unknown; nextCursor?: unknown } | null = null;
+    try {
+      body = JSON.parse(bodyText) as { items?: unknown; nextCursor?: unknown };
+    } catch {
+      body = null;
     }
-
-    const body = (await res.json().catch(() => null)) as {
-      items?: unknown;
-      nextCursor?: unknown;
-    } | null;
     if (body === null || !Array.isArray(body.items)) {
       throw new RekeyError({
         statusCode: 502,
