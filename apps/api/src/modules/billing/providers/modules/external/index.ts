@@ -489,6 +489,35 @@ export const externalModule: ProviderModule = {
       },
       webhookRole: 'secret',
     },
+    // The PULL half. Both optional: an Application that only ever receives
+    // events needs neither, and leaving them blank means the subscription
+    // import is unavailable rather than broken.
+    {
+      key: 'subscriptionsUrl',
+      label: 'Subscriptions endpoint (optional)',
+      secret: false,
+      optional: true,
+      placeholder: 'https://billing.example.com/rekey/subscriptions',
+      help:
+        'A GET endpoint your billing system hosts, listing the subscriptions it has sold. Rekey ' +
+        'reads it to import a book of business it never saw — the event feed only covers what ' +
+        'happens after you connect. The exact contract is in docs/external-billing-pull.md.',
+      pattern: {
+        prefix: 'https://',
+        message: 'The subscriptions endpoint must be an https:// URL.',
+      },
+    },
+    {
+      key: 'pullToken',
+      label: 'Pull token (optional)',
+      secret: true,
+      optional: true,
+      placeholder: 'a bearer token your endpoint accepts',
+      help:
+        'Sent as `Authorization: Bearer` when Rekey reads the subscriptions endpoint. Rekey also ' +
+        'signs each read with the signing secret above, so you can tell the caller is Rekey and ' +
+        'not somebody who found the URL.',
+    },
   ],
   webhook: {
     resolveApplication,

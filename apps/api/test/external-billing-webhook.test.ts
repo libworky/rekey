@@ -568,12 +568,21 @@ describe('External billing provider webhook', () => {
       configured: boolean;
       capabilities: { checkout?: boolean };
       status: { webhookConfigured: boolean } | null;
-      credentialFields: Array<{ key: string; secret: boolean }>;
+      credentialFields: Array<{ key: string; secret: boolean; optional?: boolean }>;
     }>).find((p) => p.name === 'external')!;
     expect(external.capabilities.checkout).toBe(false);
     expect(external.configured).toBe(true);
     expect(external.status?.webhookConfigured).toBe(true);
-    expect(external.credentialFields).toEqual([expect.objectContaining({ key: 'webhookSecret', secret: true })]);
+    // The signing secret is the only REQUIRED credential: it is what makes an
+    // inbound event verifiable, and the module is useless without it. The two
+    // pull fields are optional additions for the subscription import — an
+    // Application that only ever receives events needs neither, and leaving
+    // them blank makes the import unavailable rather than broken.
+    expect(external.credentialFields.filter((f) => f.optional !== true).map((f) => f.key)).toEqual([
+      'webhookSecret',
+    ]);
+    expect(external.credentialFields.find((f) => f.key === 'webhookSecret')?.secret).toBe(true);
+    expect(external.credentialFields.find((f) => f.key === 'pullToken')?.secret).toBe(true);
 
     // The money lives elsewhere, so a cancel through Rekey is refused with
     // the repair, and the row is untouched.

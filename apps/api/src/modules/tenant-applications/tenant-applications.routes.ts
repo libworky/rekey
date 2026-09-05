@@ -67,6 +67,7 @@ import { mcpIssuer } from '../mcp/oauth.service.js';
 import { eraseEndUser } from './end-user-erasure.service.js';
 import { billingService } from '../billing/billing.service.js';
 import { subscriptionGrantsService } from '../billing/grant.service.js';
+import { subscriptionImportService } from '../billing/import.service.js';
 import { env } from '../../config/env.js';
 import { emitDetached } from '../webhooks/webhook.service.js';
 import {
@@ -84,6 +85,72 @@ import { authService, deliverVerificationEmail } from '../auth/auth.service.js';
 import { authRateLimit } from '../../lib/rate-limit.js';
 import { moneyAmount, positiveBoundedInt } from '../../lib/bounded-int.js';
 import { ok, okPage, okArray, okFlag, errs, ref, type JsonSchema } from '../../lib/openapi.js';
+
+const ImportRunBody = z.object({
+  provider: z.string().min(1).max(40),
+  matchStrategy: z.enum(['email', 'email_or_create']).default('email'),
+});
+
+/** One import run, as the routes return it. */
+const IMPORT_RUN: JsonSchema = {
+  type: 'object',
+  properties: {
+    id: { type: 'string' },
+    applicationId: { type: 'string' },
+    provider: { type: 'string' },
+    mode: { type: 'string', enum: ['dry_run', 'applied'] },
+    status: {
+      type: 'string',
+      enum: ['queued', 'running', 'ready', 'applying', 'applied', 'failed'],
+    },
+    matchStrategy: { type: 'string', enum: ['email', 'email_or_create'] },
+    startedBy: { type: 'string' },
+    counts: { type: 'object', additionalProperties: true },
+    error: { type: 'string', nullable: true },
+    createdAt: { type: 'string', format: 'date-time' },
+    completedAt: { type: 'string', format: 'date-time', nullable: true },
+  },
+  required: ['id', 'applicationId', 'provider', 'mode', 'status', 'matchStrategy', 'createdAt'],
+};
+
+const IMPORT_ITEM: JsonSchema = {
+  type: 'object',
+  properties: {
+    id: { type: 'string' },
+    externalId: { type: 'string' },
+    email: { type: 'string', nullable: true },
+    planRef: { type: 'string', nullable: true },
+    outcome: {
+      type: 'string',
+      enum: ['match', 'create', 'skip_no_plan', 'skip_active', 'skip_invalid', 'error'],
+    },
+    endUserId: { type: 'string', nullable: true },
+    planSlug: { type: 'string', nullable: true },
+    subscriptionId: { type: 'string', nullable: true },
+    detail: {
+      type: 'object',
+      additionalProperties: true,
+      description: 'Why this row was decided the way it was — the refusal, and what to do about it.',
+    },
+  },
+  required: ['id', 'externalId', 'outcome', 'detail'],
+};
+
+const IMPORT_RUN_WITH_ITEMS: JsonSchema = {
+  type: 'object',
+  properties: {
+    run: IMPORT_RUN,
+    items: {
+      type: 'object',
+      properties: {
+        items: { type: 'array', items: IMPORT_ITEM },
+        page: { type: 'object', additionalProperties: true },
+      },
+      required: ['items', 'page'],
+    },
+  },
+  required: ['run', 'items'],
+};
 
 /**
  * Why an operator did something to somebody. Optional on the verification
@@ -4612,6 +4679,254 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
         ...(body.metadata !== undefined && { metadata: body.metadata }),
       });
       return reply.status(201).send({ success: true, data: result });
+    },
+  );
+
+  // ---------- Subscription import ----------
+  //
+  // Two steps, deliberately. An import is the most dangerous shape a button can
+  // have — a bulk write against somebody else's data, matching strangers to
+  // local accounts by email — so the first call only ever PREVIEWS, and a second
+  // explicit call applies what the operator has read.
+
+  app.post(
+    '/:id/subscription-imports',
+    {
+      preHandler: requireTenantRole(['OWNER', 'ADMIN']),
+      schema: {
+        tags: ['Tenant · Billing'],
+        security: [{ tenantSession: [] }],
+        summary: 'Preview importing subscriptions from a billing provider',
+        description:
+          'Requires the **OWNER or ADMIN** workspace role AND **billing-write** access.\n\n' +
+          '**Writes no subscriptions.** Reads the provider, decides what would happen to every row, ' +
+          'and records that as a run you can read back. Apply it with ' +
+          '`POST …/subscription-imports/:runId/apply` once you have looked.\n\n' +
+          'Outcomes per row: `match` (an existing end-user), `create` (a new unlinked one, only ' +
+          'under `email_or_create`), `skip_no_plan` (the provider plan maps to no local plan), ' +
+          '`skip_active` (already entitled in Rekey — an import never overwrites), `skip_invalid` ' +
+          '(no email, unusable status, or an erased user).\n\n' +
+          'Only providers exposing a list API can be imported from; the rest answer 400 ' +
+          '`PROVIDER_CANNOT_LIST_SUBSCRIPTIONS`.',
+        body: {
+          type: 'object',
+          required: ['provider'],
+          properties: {
+            provider: { type: 'string', description: 'Provider module name, e.g. `external`.' },
+            matchStrategy: {
+              type: 'string',
+              enum: ['email', 'email_or_create'],
+              default: 'email',
+              description:
+                '`email` imports only for people Rekey already knows. `email_or_create` also ' +
+                'creates unlinked end-users — no password, unverified — for buyers it has never seen.',
+            },
+          },
+        },
+        response: {
+          201: ok(
+            {
+              type: 'object',
+              properties: { runId: { type: 'string' } },
+              required: ['runId'],
+            },
+            'The run to read back.',
+          ),
+          ...errs({
+            400:
+              'PROVIDER_CANNOT_LIST_SUBSCRIPTIONS — this provider has no list API; or ' +
+              'EXTERNAL_PULL_NOT_CONFIGURED — no subscriptions endpoint is configured; or ' +
+              'EXTERNAL_PULL_URL_REFUSED — the endpoint is not a permitted target.',
+            ...APP_BILLING_WRITE_ERRORS,
+            502: 'EXTERNAL_PULL_UNREACHABLE / EXTERNAL_PULL_FAILED / EXTERNAL_PULL_MALFORMED — the provider endpoint did not answer usefully.',
+          }),
+        },
+      },
+    },
+    async (req, reply) => {
+      const params = z.object({ id: z.string().min(1) }).parse(req.params);
+      await ensureAppAccess(req, params.id, 'billing-write');
+      const body = ImportRunBody.parse(req.body ?? {});
+      const application = await prisma.application.findUniqueOrThrow({ where: { id: params.id } });
+      const result = await subscriptionImportService.dryRun({
+        application,
+        provider: body.provider as never,
+        matchStrategy: body.matchStrategy,
+        startedBy: req.tenantUser!.id,
+      });
+      return reply.status(201).send({ success: true, data: result });
+    },
+  );
+
+  app.get(
+    '/:id/subscription-imports/:runId',
+    {
+      schema: {
+        tags: ['Tenant · Billing'],
+        security: [{ tenantSession: [] }],
+        summary: 'Read an import run and its rows',
+        description:
+          'Requires **read** access to this Application. The rows are kept after an apply, so ' +
+          '"why does this customer have this subscription" is answerable from the run that made it.',
+        querystring: {
+          type: 'object',
+          properties: {
+            outcome: {
+              type: 'string',
+              enum: ['match', 'create', 'skip_no_plan', 'skip_active', 'skip_invalid', 'error'],
+            },
+            ...paginationJsonSchema,
+          },
+        },
+        response: {
+          200: ok(IMPORT_RUN_WITH_ITEMS, 'The run, its tallies, and a page of its rows.'),
+          ...errs({
+            ...APP_READ_ERRORS,
+            404: 'IMPORT_RUN_NOT_FOUND — no such run on this Application.',
+          }),
+        },
+      },
+    },
+    async (req) => {
+      const params = z
+        .object({ id: z.string().min(1), runId: z.string().min(1) })
+        .parse(req.params);
+      await ensureAppAccess(req, params.id, 'read');
+      const query = z
+        .object({
+          outcome: z
+            .enum(['match', 'create', 'skip_no_plan', 'skip_active', 'skip_invalid', 'error'])
+            .optional(),
+        })
+        .parse(req.query);
+      const run = await prisma.subscriptionImportRun.findFirst({
+        where: { id: params.runId, applicationId: params.id },
+      });
+      if (!run) {
+        throw new RekeyError({
+          statusCode: 404,
+          code: 'IMPORT_RUN_NOT_FOUND',
+          message: `Import run "${params.runId}" not found for this Application.`,
+          fix: 'List recent runs to find one.',
+        });
+      }
+      const { take, skip } = parsePagination(PaginationQuery.parse(req.query));
+      const where = {
+        runId: run.id,
+        ...(query.outcome !== undefined && { outcome: query.outcome }),
+      };
+      const [items, total] = await Promise.all([
+        prisma.subscriptionImportItem.findMany({ where, take, skip, orderBy: { id: 'asc' } }),
+        prisma.subscriptionImportItem.count({ where }),
+      ]);
+      return { success: true, data: { run, items: paged(items, total, take, skip) } };
+    },
+  );
+
+  app.post(
+    '/:id/subscription-imports/:runId/apply',
+    {
+      preHandler: requireTenantRole(['OWNER', 'ADMIN']),
+      schema: {
+        tags: ['Tenant · Billing'],
+        security: [{ tenantSession: [] }],
+        summary: 'Apply a previewed import',
+        description:
+          'Requires the **OWNER or ADMIN** workspace role AND **billing-write** access.\n\n' +
+          'Acts only on the `match` and `create` rows the preview decided — nothing is re-decided ' +
+          'here, so nothing is applied that the operator did not see. Each goes through the same ' +
+          'grant path a hand-recorded sale takes: entitlements are materialised and ' +
+          '`subscription.activated` is announced.\n\n' +
+          'A row that fails is recorded as `error` and the run continues: an import that stops ' +
+          'halfway leaves nobody able to say what landed.\n\n' +
+          'Refused for a run that is not `ready` — including one already applied, so a ' +
+          'double-click cannot import twice.',
+        body: {
+          type: 'object',
+          required: ['confirm'],
+          properties: {
+            confirm: {
+              type: 'string',
+              description:
+                "The Application's slug, typed back. This is a bulk write against real customers.",
+            },
+          },
+        },
+        response: {
+          200: ok(
+            {
+              type: 'object',
+              properties: {
+                imported: { type: 'integer' },
+                failed: { type: 'integer' },
+              },
+              required: ['imported', 'failed'],
+            },
+            'What the apply did.',
+          ),
+          ...errs({
+            400: 'IMPORT_CONFIRM_MISMATCH — `confirm` does not match the Application slug.',
+            ...APP_BILLING_WRITE_ERRORS,
+            404: 'IMPORT_RUN_NOT_FOUND — no such run on this Application.',
+            409: 'IMPORT_RUN_NOT_READY — the run is not in a state that can be applied.',
+          }),
+        },
+      },
+    },
+    async (req) => {
+      const params = z
+        .object({ id: z.string().min(1), runId: z.string().min(1) })
+        .parse(req.params);
+      await ensureAppAccess(req, params.id, 'billing-write');
+      const body = z.object({ confirm: z.string().min(1) }).parse(req.body ?? {});
+      const application = await prisma.application.findUniqueOrThrow({ where: { id: params.id } });
+      if (body.confirm !== application.slug) {
+        throw new RekeyError({
+          statusCode: 400,
+          code: 'IMPORT_CONFIRM_MISMATCH',
+          message: 'The confirmation did not match this Application\'s slug.',
+          fix: `Type "${application.slug}" to confirm. This writes subscriptions for real customers.`,
+        });
+      }
+      const result = await subscriptionImportService.apply({
+        application,
+        runId: params.runId,
+        actorId: req.tenantUser!.id,
+      });
+      return { success: true, data: result };
+    },
+  );
+
+  app.get(
+    '/:id/subscription-imports',
+    {
+      schema: {
+        tags: ['Tenant · Billing'],
+        security: [{ tenantSession: [] }],
+        summary: 'List recent import runs',
+        description: 'Requires **read** access to this Application. Newest first.',
+        querystring: { type: 'object', properties: { ...paginationJsonSchema } },
+        response: {
+          200: okPage(IMPORT_RUN, 'A page of import runs.'),
+          ...errs(APP_READ_ERRORS),
+        },
+      },
+    },
+    async (req) => {
+      const params = z.object({ id: z.string().min(1) }).parse(req.params);
+      await ensureAppAccess(req, params.id, 'read');
+      const { take, skip } = parsePagination(PaginationQuery.parse(req.query));
+      const where = { applicationId: params.id };
+      const [items, total] = await Promise.all([
+        prisma.subscriptionImportRun.findMany({
+          where,
+          take,
+          skip,
+          orderBy: { createdAt: 'desc' },
+        }),
+        prisma.subscriptionImportRun.count({ where }),
+      ]);
+      return { success: true, data: paged(items, total, take, skip) };
     },
   );
 

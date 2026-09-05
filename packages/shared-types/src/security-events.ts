@@ -95,6 +95,9 @@ export const SECURITY_EVENT_LABEL = {
   // CREATES entitlement on somebody's say-so rather than following money the
   // deployment can see, which is exactly why it is in the trail.
   'app.subscription_granted': 'Subscription granted without a payment provider',
+  // A bulk write against somebody else's data. Worth its own entry so the
+  // trail says which run produced a batch of subscriptions.
+  'app.subscriptions_imported': 'Subscriptions imported from a billing provider',
   'app.webhook_endpoint_created': 'Webhook endpoint created',
   'app.webhook_endpoint_updated': 'Webhook endpoint updated',
 
@@ -143,6 +146,7 @@ export const SECURITY_EVENT_LABEL = {
   'end_user.device_blocked': 'Device blocked',
   'end_user.device_unblocked': 'Device unblocked',
   'end_user.devices_released_by_operator': 'All devices released by an operator',
+  'end_user.created_by_import': 'End-user created by a subscription import',
 
   // ── Operator support actions on one end-user ──
   // An operator acting ON somebody, rather than the person acting for

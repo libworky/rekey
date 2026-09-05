@@ -592,6 +592,7 @@ model Application {
   emailLogs           EmailLog[]
   emailEventSettings  EmailEventSetting[]
   emailSuppressions   EmailSuppression[]
+  subscriptionImports SubscriptionImportRun[]
   webhookEndpoints    WebhookEndpoint[]
   organizations       Organization[]
   creditBalances      CreditBalance[]
@@ -696,6 +697,76 @@ model EmailSuppression {
   @@unique([applicationId, address])
   @@index([applicationId, createdAt])
   @@map("email_suppressions")
+}
+
+// ============================================================================
+// Subscription import — reading what a billing system already sold.
+//
+// An import is a RUN, not a call. The operator presses a button and gets a
+// preview: every row the provider returned, what would happen to it, and why —
+// then applies it, or does not. A one-shot "import now" would be an
+// irreversible bulk write against somebody else's data, decided from a button
+// with no way to look first.
+//
+// A run is therefore its own row with its own items, and `mode` records which
+// half it stopped at. `dry_run` never writes a Subscription; `applied` does.
+// ============================================================================
+model SubscriptionImportRun {
+  id            String    @id @default(cuid())
+  applicationId String    @map("application_id")
+  /** Provider module name — the source that was read. */
+  provider      String
+  /** dry_run | applied */
+  mode          String    @default("dry_run")
+  /** queued | running | ready | applying | applied | failed */
+  status        String    @default("queued")
+  /** email | email_or_create */
+  matchStrategy String    @map("match_strategy")
+  /** Operator who started it. */
+  startedBy     String    @map("started_by")
+  /** Tallies by outcome, so a summary needs no scan of the items. */
+  counts        Json      @default("{}")
+  error         String?
+  createdAt     DateTime  @default(now()) @map("created_at")
+  completedAt   DateTime? @map("completed_at")
+
+  application Application             @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  items       SubscriptionImportItem[]
+
+  @@index([applicationId, createdAt])
+  @@map("subscription_import_runs")
+}
+
+// ============================================================================
+// One provider subscription, and what the run decided about it.
+//
+// Kept after an apply, deliberately: "why does this customer have this
+// subscription" is answered by the run that created it, and an import that
+// deletes its own working is an import nobody can audit.
+// ============================================================================
+model SubscriptionImportItem {
+  id             String  @id @default(cuid())
+  runId          String  @map("run_id")
+  /** The provider's own id for the subscription. The idempotency key. */
+  externalId     String  @map("external_id")
+  email          String?
+  /** The provider's plan identifier, before mapping. */
+  planRef        String? @map("plan_ref")
+  /** match | create | skip_no_plan | skip_active | skip_invalid | error */
+  outcome        String
+  /** Set once matched or created. */
+  endUserId      String? @map("end_user_id")
+  /** Local plan the `planRef` mapped to. */
+  planSlug       String? @map("plan_slug")
+  /** Set by an apply. */
+  subscriptionId String? @map("subscription_id")
+  /** Anything worth showing in the preview: the refusal, the raw status, the term. */
+  detail         Json    @default("{}")
+
+  run SubscriptionImportRun @relation(fields: [runId], references: [id], onDelete: Cascade)
+
+  @@index([runId, outcome])
+  @@map("subscription_import_items")
 }
 
 // ============================================================================
