@@ -35,6 +35,7 @@ import { requireUserSession } from '../../middleware/user-session.js';
 import { requireTenantSession } from '../../middleware/tenant-session.js';
 import { devicesService, type Device } from './devices.service.js';
 import { assertEndUserInApplication } from '../../lib/end-users.js';
+import { recordSecurityEvent } from '../../lib/security-events.js';
 
 const DeviceIdParam = z.object({ id: z.string().min(1) });
 const StatusQuery = z.object({
@@ -359,6 +360,93 @@ export async function tenantDevicesRoutes(app: FastifyInstance): Promise<void> {
         actor: { type: 'operator', id: req.tenantUser?.id ?? null },
       });
       return { success: true, data: result };
+    },
+  );
+
+  app.post(
+    '/:id/end-users/:euid/devices/release-all',
+    {
+      schema: {
+        tags: ['Tenant · Devices'],
+        security: [{ tenantSession: [] }],
+        summary: "Release every one of an end-user's active devices",
+        description:
+          'Requires **write** access to this Application. The "I have changed laptop and cannot ' +
+          'sign in" button: frees every ACTIVE slot at once and revokes the sessions minted on ' +
+          'them, so the next sign-in from any machine is admitted.\n\n' +
+          'BLOCKED devices are deliberately left alone — a block is an operator decision about one ' +
+          'machine, and a bulk convenience must not quietly undo it. Unblock those individually. ' +
+          'RELEASED ones are already free and are skipped.\n\n' +
+          'Idempotent: an end-user with nothing active answers `released: 0`.',
+        params: TENANT_PARAMS_SCHEMA,
+        response: {
+          200: ok(
+            {
+              type: 'object',
+              properties: {
+                released: { type: 'integer', description: 'Devices moved from ACTIVE to RELEASED.' },
+                sessionsRevoked: {
+                  type: 'integer',
+                  description: 'Sessions ended across all of them.',
+                },
+                skippedBlocked: {
+                  type: 'integer',
+                  description: 'BLOCKED devices left untouched, so the count is not silently short.',
+                },
+              },
+              required: ['released', 'sessionsRevoked', 'skippedBlocked'],
+            },
+            'What was released, and what was deliberately not.',
+          ),
+          ...errs(TENANT_ERRORS),
+        },
+      },
+    },
+    async (req) => {
+      const { id, euid } = TenantParams.parse(req.params);
+      await ensureAppAccess(req, id, 'write');
+      await assertEndUserInApplication(id, euid);
+
+      const blocked = await devicesService.listForEndUser(id, euid, { status: 'BLOCKED', take: 1 });
+      let released = 0;
+      let sessionsRevoked = 0;
+      // Re-query rather than paging with an offset: every release moves a row
+      // OUT of this filter, so a second page computed against the first
+      // window would skip devices. `release` takes the per-user advisory lock
+      // itself, so these are sequential by construction.
+      for (;;) {
+        const { items } = await devicesService.listForEndUser(id, euid, {
+          status: 'ACTIVE',
+          take: 100,
+        });
+        if (items.length === 0) break;
+        for (const device of items) {
+          const result = await devicesService.release({
+            applicationId: id,
+            endUserId: euid,
+            deviceId: device.id,
+            actor: { type: 'operator', id: req.tenantUser?.id ?? null },
+          });
+          released += 1;
+          sessionsRevoked += result.sessionsRevoked;
+        }
+      }
+
+      // One summary row on top of the per-device `device.released` events the
+      // service already writes. The trail should say "an operator reset this
+      // person's devices" rather than leave somebody to infer it from six rows
+      // that happen to share a timestamp.
+      if (released > 0) {
+        void recordSecurityEvent({
+          type: 'end_user.devices_released_by_operator',
+          actorType: 'operator',
+          actorId: req.tenantUser?.id ?? null,
+          tenantId: req.tenantId ?? null,
+          applicationId: id,
+          metadata: { endUserId: euid, released, sessionsRevoked, skippedBlocked: blocked.total },
+        });
+      }
+      return { success: true, data: { released, sessionsRevoked, skippedBlocked: blocked.total } };
     },
   );
 

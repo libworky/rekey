@@ -21,6 +21,18 @@ import { formatMoney } from '@/lib/format';
 import { Card, SectionHeader } from '@/components/Card';
 import { Badge } from '@/components/Badge';
 import { EmptyState } from '@/components/EmptyState';
+import { Banner } from '@/components/Banner';
+import { Modal } from '@/components/Modal';
+import { Field } from '@/components/Field';
+import { SubmitButton } from '@/components/SubmitButton';
+import { ConfirmButton } from '@/components/ConfirmButton';
+import {
+  releaseAllDevices,
+  revokeAllSessions,
+  sendPasswordReset,
+  sendVerification,
+  unlockAccount,
+} from './actions';
 import {
   getEndUserBilling,
   getEndUserCredits,
@@ -39,10 +51,15 @@ const OVERVIEW_EVENTS_SHOWN = 5;
 
 export default async function EndUserOverviewPage({
   params,
+  searchParams,
 }: {
   params: Promise<{ id: string; euid: string }>;
+  searchParams: Promise<Record<string, string | string[] | undefined>>;
 }): Promise<React.JSX.Element> {
   const { id, euid } = await params;
+  const sp = await searchParams;
+  const done = typeof sp.support === 'string' ? sp.support : undefined;
+  const supportError = typeof sp.supportError === 'string' ? sp.supportError : undefined;
   const [detail, application, billing, credits, devices, events] = await Promise.all([
     getEndUserDetail(id, euid),
     getApplication(id),
@@ -155,6 +172,15 @@ export default async function EndUserOverviewPage({
           </p>
         )}
       </Card>
+
+      <SupportBar
+        applicationId={id}
+        euid={euid}
+        erased={detail.endUser.erasedAt !== null}
+        emailVerified={detail.endUser.emailVerified}
+        done={done}
+        error={supportError}
+      />
 
       <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
         <StatTile title="Plan" value={planValue} footer={planFooter} href={`${base}/subscriptions`} />
@@ -282,3 +308,177 @@ function StatTile({
     </Link>
   );
 }
+
+/** What each completed support action reports back. */
+const SUPPORT_DONE: Record<string, { tone: 'success' | 'info'; text: string }> = {
+  unlocked: { tone: 'success', text: 'Sign-in lockout cleared. They can try again now.' },
+  'not-locked': {
+    tone: 'info',
+    // Not "unlocked". The operator asked whether the lockout was the problem,
+    // and the honest answer is that it was not — so they keep looking.
+    text: 'Nothing to clear — this account was not locked and had no recent failures. Whatever is stopping them signing in, it is not the lockout.',
+  },
+  'verification-sent': { tone: 'success', text: 'Verification email sent.' },
+  'verification-not-sent': {
+    tone: 'info',
+    text: 'A fresh verification token was minted, but the email could not be sent — this Application has no working transport. Check Email → Delivery.',
+  },
+  'reset-sent': { tone: 'success', text: 'Password-reset email sent, and the reason recorded.' },
+  'reset-not-sent': {
+    tone: 'info',
+    text: 'A reset token was minted, but the email could not be sent — this Application has no working transport. Check Email → Delivery.',
+  },
+  'session-revoked': { tone: 'success', text: 'Session revoked.' },
+};
+
+const SUPPORT_ERR: Record<string, string> = {
+  REASON_REQUIRED: 'Say why you are sending a reset — it goes in the audit trail.',
+  EMAIL_ALREADY_VERIFIED: 'That address is already verified; there is nothing to send.',
+  END_USER_HAS_NO_PASSWORD:
+    'This account has no password — they sign in with OAuth, a passkey or a magic link. A reset would strand them on a form they cannot complete.',
+  END_USER_ERASED: 'This end-user was erased. Support actions no longer apply.',
+  RATE_LIMITED: 'Too many sends in a short window. Wait a moment and try again.',
+  APP_ACCESS_DENIED: 'Your access to this Application is read-only.',
+  TENANT_ROLE_INSUFFICIENT: 'Your role cannot perform support actions on this Application.',
+};
+
+/**
+ * The support bar: one row of controls, each one API call.
+ *
+ * This is the part that was missing entirely. Before it, an operator holding
+ * "I cannot sign in" could read a lockout counter and a device list and act on
+ * neither — every actual remedy needed a developer with an API client.
+ *
+ * The two that put mail in somebody's inbox are dialogs rather than bare
+ * buttons, and the reset asks for a reason, because at the recipient's end an
+ * unrequested reset mail and an attacker who reached the panel look the same.
+ */
+function SupportBar({
+  applicationId,
+  euid,
+  erased,
+  emailVerified,
+  done,
+  error,
+}: {
+  applicationId: string;
+  euid: string;
+  erased: boolean;
+  emailVerified: boolean;
+  done?: string | undefined;
+  error?: string | undefined;
+}): React.JSX.Element | null {
+  // Every one of these is refused on a tombstone by the API. Rendering them
+  // would offer an operator a row of buttons that all answer 410.
+  if (erased) return null;
+
+  const result = done ? SUPPORT_DONE[done] : undefined;
+  const signedOut = done?.startsWith('signed-out:') ? Number(done.split(':')[1]) : null;
+
+  return (
+    <Card className="space-y-3">
+      <div>
+        <h3 className="text-sm font-semibold text-[var(--color-fg)]">Support actions</h3>
+        <p className="text-xs text-[var(--color-muted-fg)]">
+          The common remedies, applied to this end-user. Each one is recorded in the activity trail
+          with your operator id.
+        </p>
+      </div>
+
+      {result && <Banner tone={result.tone}>{result.text}</Banner>}
+      {signedOut !== null && (
+        <Banner tone="success">
+          {signedOut === 0
+            ? 'No sessions were open — nothing to sign out.'
+            : `Signed out of ${signedOut} session${
+                signedOut === 1 ? '' : 's'
+              }. Access tokens already issued stay valid until they expire.`}
+        </Banner>
+      )}
+      {error && <Banner tone="error">{SUPPORT_ERR[error] ?? error}</Banner>}
+
+      <div className="flex flex-wrap items-center gap-2">
+        <form action={unlockAccount.bind(null, applicationId, euid)}>
+          <SubmitButton className={supportBtnCls} pendingLabel="Unlocking…">
+            Unlock account
+          </SubmitButton>
+        </form>
+
+        {!emailVerified && (
+          <Modal
+            title="Re-send the verification email"
+            description="Mints a fresh verification token and sends the email again, through this Application's configured transport."
+            trigger="Resend verification"
+            triggerClassName={supportBtnCls}
+          >
+            <form action={sendVerification.bind(null, applicationId, euid)} className="space-y-3">
+              <Field label="Reason" hint="Optional, recorded in the activity trail.">
+                <input
+                  type="text"
+                  name="reason"
+                  maxLength={280}
+                  placeholder="customer says it never arrived"
+                  className={supportInputCls}
+                />
+              </Field>
+              <SubmitButton pendingLabel="Sending…">Send verification email</SubmitButton>
+            </form>
+          </Modal>
+        )}
+
+        <Modal
+          title="Send a password-reset email"
+          description="Starts the same reset the end-user's own forgot-password link starts. The token goes to them, never to you."
+          trigger="Send password reset"
+          triggerClassName={supportBtnCls}
+        >
+          <form action={sendPasswordReset.bind(null, applicationId, euid)} className="space-y-3">
+            <Banner tone="warning">
+              They did not ask for this. At their inbox it is indistinguishable from someone who got
+              into your panel, so the reason below is recorded against your operator id.
+            </Banner>
+            <Field label="Reason" required hint="Recorded in the activity trail.">
+              <input
+                type="text"
+                name="reason"
+                required
+                maxLength={280}
+                placeholder="locked out, identity verified on call"
+                className={supportInputCls}
+              />
+            </Field>
+            <SubmitButton pendingLabel="Sending…">Send reset email</SubmitButton>
+          </form>
+        </Modal>
+
+        <form action={releaseAllDevices.bind(null, applicationId, euid)}>
+          <ConfirmButton
+            variant="subtle"
+            title="Release every device?"
+            confirm="Frees every active device slot and signs them out on those machines, so their next sign-in from any machine is admitted. Blocked devices are left blocked."
+            confirmLabel="Release all devices"
+          >
+            Reset devices
+          </ConfirmButton>
+        </form>
+
+        <form action={revokeAllSessions.bind(null, applicationId, euid)}>
+          <ConfirmButton
+            variant="subtle"
+            title="Sign out everywhere?"
+            confirm="Revokes every live session. Access tokens already issued keep working until they expire — this stops new ones being obtained."
+            confirmLabel="Sign out everywhere"
+          >
+            Sign out everywhere
+          </ConfirmButton>
+        </form>
+      </div>
+    </Card>
+  );
+}
+
+const supportBtnCls =
+  'rounded-md border border-[var(--color-border)] px-3 py-1.5 text-sm text-[var(--color-fg)] hover:bg-[var(--color-surface-muted)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-primary)]';
+
+const supportInputCls =
+  'w-full rounded-md border border-[var(--color-border)] bg-[var(--color-surface)] px-3 py-2 text-sm text-[var(--color-fg)] focus:border-[var(--color-primary)] focus:outline-none focus:ring-2 focus:ring-[color-mix(in_srgb,var(--color-primary)_30%,transparent)]';

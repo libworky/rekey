@@ -203,6 +203,30 @@ export function getEndUserDevices(
   }).catch(() => null);
 }
 
+/** One live refresh token, as the operator sessions route returns it. */
+export interface SessionRow {
+  id: string;
+  createdAt: string;
+  expiresAt: string;
+  userAgent: string | null;
+  ip: string | null;
+  deviceId: string | null;
+}
+
+/**
+ * Live sessions for one end-user. Null on failure, for the same reason the
+ * others are: "no open sessions" is a claim about the account and a failed read
+ * is not.
+ */
+export function getEndUserSessions(
+  applicationId: string,
+  euid: string,
+): Promise<Page<SessionRow> | null> {
+  return apiGet<Page<SessionRow>>(`${base(applicationId, euid)}/sessions?limit=50`, {
+    interruptOnAccessError: false,
+  }).catch(() => null);
+}
+
 /**
  * Just the counts, for the Overview tiles. Asks for one row and reads
  * `page.total`, which is the count matching the filter rather than the count
