@@ -14,6 +14,7 @@
 
 import { prisma } from '../../lib/prisma.js';
 import { RekeyError } from '../../lib/error.js';
+import { emailService } from '../email/email.service.js';
 import { organizationRolesService } from '../organization-roles/organization-roles.service.js';
 import { generatePublicKey } from '../../lib/keys.js';
 import { assertProductionAppQuota } from '../../lib/tenant-limits.js';
@@ -406,6 +407,44 @@ export const applicationsService = {
   }): Promise<Application> {
     const app = await this.get(args.applicationId);
     const current = AuthConfigSchema.parse(app.authConfig);
+
+    // The email coupling, read from the auth-config end.
+    //
+    // `emailService.setEventEnabled` already refuses to switch OFF an email
+    // that the live auth config depends on. On its own that guarantee is
+    // one-directional and walked around in three ordinary steps: turn
+    // `requireEmailVerification` off, disable the now-permitted
+    // `email_verification` email, turn verification back on. Every subsequent
+    // sign-up is then stranded forever on a screen waiting for a mail nothing
+    // will send, and nothing anywhere reports it.
+    //
+    // It lives HERE, not on the REST route, because the operator MCP tool
+    // (`update_auth_config`) calls this service directly — a route-level check
+    // would close one door and leave the other open.
+    //
+    // Only evaluated when the patch actually touches one of the two coupled
+    // fields, and then against the MERGED config. Both halves matter: skipping
+    // it for unrelated patches means an Application that somehow reached the
+    // bad state can still be edited (and repaired) rather than frozen, and
+    // reading the merged config means a patch that sets one half while the
+    // other is already true is still caught.
+    if (args.patch.methods !== undefined || args.patch.requireEmailVerification !== undefined) {
+      const blockers = await emailService.authConfigBlockers(args.applicationId, {
+        methods: args.patch.methods ?? current.methods,
+        requireEmailVerification:
+          args.patch.requireEmailVerification ?? current.requireEmailVerification,
+      });
+      if (blockers.length > 0) {
+        throw new RekeyError({
+          statusCode: 409,
+          code: 'EMAIL_EVENT_REQUIRED_BY_AUTH_CONFIG',
+          message: blockers.map((x) => x.message).join(' '),
+          fix: `Turn ${blockers
+            .map((x) => `"${x.eventKey}"`)
+            .join(' and ')} back on under Email → Templates first, then make this change.`,
+        });
+      }
+    }
     const cleaned: Record<string, unknown> = Object.fromEntries(
       Object.entries(args.patch).filter(([, v]) => v !== undefined),
     );

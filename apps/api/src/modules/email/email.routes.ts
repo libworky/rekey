@@ -90,7 +90,11 @@ const SetCredsBody = z.discriminatedUnion('provider', [
 const LogQuery = z.object({
   limit: z.coerce.number().int().min(1).max(200).optional(),
   offset: z.coerce.number().int().min(0).max(1_000_000).optional(),
-  status: z.enum(['sent', 'error', 'no_transport']).optional(),
+  // `suppressed` is the fourth outcome, written by the email kill switch
+  // (application off, event off, or the address on the suppression list). It
+  // has to be filterable: the Settings and Templates copy sends an operator
+  // here to find out WHY a mail did not go, and without it the query 400s.
+  status: z.enum(['sent', 'error', 'no_transport', 'suppressed']).optional(),
 });
 
 const UpsertTemplateBody = z.object({
@@ -214,8 +218,23 @@ export async function tenantEmailRoutes(app: FastifyInstance): Promise<void> {
                         },
                         required: ['code', 'message', 'fix'],
                       },
+                      systemScoped: {
+                        type: 'boolean',
+                        description:
+                          'True for an event Rekey sends to the WORKSPACE (workspace_invitation, ' +
+                          'billing_unapplied_payment) rather than one this Application sends to its ' +
+                          'end-users. Those go out through an ungated system path, so no switch ' +
+                          'here reaches them and none is offered.',
+                      },
                     },
-                    required: ['key', 'label', 'enabled', 'customised', 'essentialBlocker'],
+                    required: [
+                      'key',
+                      'label',
+                      'enabled',
+                      'customised',
+                      'essentialBlocker',
+                      'systemScoped',
+                    ],
                   },
                 },
               },
@@ -689,7 +708,7 @@ export async function tenantEmailRoutes(app: FastifyInstance): Promise<void> {
           properties: {
             limit: { type: 'integer', minimum: 1, maximum: 200 },
             offset: { type: 'integer', minimum: 0, maximum: 2147483647 },
-            status: { type: 'string', enum: ['sent', 'error', 'no_transport'] },
+            status: { type: 'string', enum: ['sent', 'error', 'no_transport', 'suppressed'] },
           },
         },
         response: {
@@ -993,6 +1012,11 @@ export async function tenantEmailRoutes(app: FastifyInstance): Promise<void> {
             400: 'VALIDATION_ERROR — `to` is missing or not a valid email.',
             ...APP_WRITE_ERRORS,
             404: `${APP_WRITE_ERRORS[404]}; or ${EMAIL_EVENT_UNKNOWN_DESC}`,
+            409:
+              'EMAIL_ADDRESS_SUPPRESSED — that address is on this Application’s suppression ' +
+              'list. A test send deliberately bypasses the master switch and the per-event ' +
+              'switch, but never the suppression list: mailing a hard-bounced or complaining ' +
+              'address again is how a sending domain gets blocked.',
           }),
         },
       },
@@ -1003,6 +1027,25 @@ export async function tenantEmailRoutes(app: FastifyInstance): Promise<void> {
       const body = TestSendBody.parse(req.body);
       const application = await prisma.application.findUniqueOrThrow({ where: { id } });
       const rendered = await emailService.previewWithSamples(id, eventKey);
+      // A test send deliberately IGNORES the Application's master switch and
+      // the per-event switch: an operator configuring transport has to be able
+      // to prove it works before turning sending back on, and that is the
+      // whole purpose of this route.
+      //
+      // It does NOT ignore the SUPPRESSION LIST. That list holds addresses
+      // that hard-bounced or filed a complaint, and mailing a complainant
+      // again is how a sending domain gets blocked — the model's own docblock
+      // says so. "It was only a test" is not a distinction the receiving
+      // mailbox provider makes.
+      const suppressed = await emailService.addressSuppression(id, body.to);
+      if (suppressed !== null) {
+        throw new RekeyError({
+          statusCode: 409,
+          code: 'EMAIL_ADDRESS_SUPPRESSED',
+          message: `${body.to} is on this Application's suppression list (${suppressed.reason}).`,
+          fix: 'Test with a different address. Sending to a hard-bounced or complaining address again is how a sending domain gets blocked — remove it from Email → Suppressions only if you know the bounce is resolved.',
+        });
+      }
       const outcome = await sendEmail(
         application,
         {

@@ -655,13 +655,19 @@ export async function deliverVerificationEmail(args: {
     // Lower stakes than reset/magic-link (this token only flips
     // emailVerified) but the same reasoning: a failed send is not a
     // no-transport deployment, and the token should not land in logs.
-    void recordAuthEmailDeliveryFailure({
-      applicationId: args.application.id,
-      tenantId: args.application.tenantId,
-      eventKey: 'email_verification',
-      endUserId: args.endUser.id,
-      reason: outcome.message,
-    });
+    // Skipped for a SUPPRESSED send: that was the operator's own choice, not
+    // a transport fault, and alarming them about it is noise.
+    if (!outcome.suppressed) {
+      void recordAuthEmailDeliveryFailure({
+        applicationId: args.application.id,
+        tenantId: args.application.tenantId,
+        eventKey: 'email_verification',
+        endUserId: args.endUser.id,
+        reason: outcome.message,
+      });
+    }
+    // OUTSIDE the guard. A suppressed send is still a send that did not
+    // happen, so the token stays withheld — only the alarm is skipped.
     return { emailSent: false, verificationToken: null };
   }
   return { emailSent: false, verificationToken: issued.raw };
@@ -1304,13 +1310,24 @@ export const authService = {
       // reached only by an existing user, so it tells a prober nothing about
       // whether an address has an account. (What does differ on existence is
       // `delivered` — see the caveat on this method's docblock.)
-      void recordAuthEmailDeliveryFailure({
-        applicationId: input.application.id,
-        tenantId: input.application.tenantId,
-        eventKey: 'password_reset',
-        endUserId: endUser.id,
-        reason: outcome.message,
-      });
+      //
+      // The alarm is skipped for a SUPPRESSED send: that was the operator's
+      // own configuration choice, and filling their activity feed with
+      // `auth.email_delivery_failed` about it is noise, not a signal.
+      if (!outcome.suppressed) {
+        void recordAuthEmailDeliveryFailure({
+          applicationId: input.application.id,
+          tenantId: input.application.tenantId,
+          eventKey: 'password_reset',
+          endUserId: endUser.id,
+          reason: outcome.message,
+        });
+      }
+      // The RETURN stays outside that guard, and this is exactly why
+      // suppression returns `error` rather than `no_transport`: falling
+      // through from here would reach the legacy branch that hands the RAW
+      // RESET TOKEN back to the caller. Turning email off must never turn the
+      // API into a token dispenser.
       if (input.authKind === 'publishable') return PUBLISHABLE_SEND_RESPONSE;
       return { delivered: true, emailSent: false, resetToken: null };
     }
@@ -1589,13 +1606,19 @@ export const authService = {
     }
     if (outcome.kind === 'error') {
       // As above, and the stakes are higher: this token IS a session.
-      void recordAuthEmailDeliveryFailure({
-        applicationId: input.application.id,
-        tenantId: input.application.tenantId,
-        eventKey: 'magic_link_signin',
-        endUserId: endUser?.id ?? null,
-        reason: outcome.message,
-      });
+      //
+      // Skipped for a SUPPRESSED send — the operator's own choice, not a fault.
+      if (!outcome.suppressed) {
+        void recordAuthEmailDeliveryFailure({
+          applicationId: input.application.id,
+          tenantId: input.application.tenantId,
+          eventKey: 'magic_link_signin',
+          endUserId: endUser?.id ?? null,
+          reason: outcome.message,
+        });
+      }
+      // The RETURN stays outside that guard. A magic-link token IS a session,
+      // so a suppressed send must withhold it exactly as a failed one does.
       if (input.authKind === 'publishable') return PUBLISHABLE_MAGIC_LINK_RESPONSE;
       return { delivered: true, emailSent: false, magicLinkToken: null };
     }

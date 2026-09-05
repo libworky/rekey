@@ -391,7 +391,13 @@ export async function tenantDevicesRoutes(app: FastifyInstance): Promise<void> {
                 },
                 skippedBlocked: {
                   type: 'integer',
-                  description: 'BLOCKED devices left untouched, so the count is not silently short.',
+                  description:
+                    'BLOCKED devices left untouched, so the count is not silently short. Includes any blocked while the sweep ran.',
+                },
+                capped: {
+                  type: 'boolean',
+                  description:
+                    'Present only when the sweep hit its 50-pass limit, which means devices were still being re-activated as it ran. Run it again.',
                 },
               },
               required: ['released', 'sessionsRevoked', 'skippedBlocked'],
@@ -410,23 +416,57 @@ export async function tenantDevicesRoutes(app: FastifyInstance): Promise<void> {
       const blocked = await devicesService.listForEndUser(id, euid, { status: 'BLOCKED', take: 1 });
       let released = 0;
       let sessionsRevoked = 0;
+      // Seeded from the devices already blocked when the sweep began, and
+      // added to by any that get blocked while it runs.
+      let skippedBlocked = blocked.total;
       // Re-query rather than paging with an offset: every release moves a row
       // OUT of this filter, so a second page computed against the first
       // window would skip devices. `release` takes the per-user advisory lock
       // itself, so these are sequential by construction.
+      // The cap is not there because the loop can spin on its own — every
+      // release moves a row out of the ACTIVE filter, so it terminates. It is
+      // there because `devicesService.touch` puts a RELEASED device back to
+      // ACTIVE, so a client signing in during the sweep adds work: a busy
+      // account could keep this request going far longer than an operator's
+      // patience or a proxy's timeout. 50 passes of 100 is 5000 devices,
+      // which is well past any real end-user.
+      let passes = 0;
+      let capped = false;
       for (;;) {
         const { items } = await devicesService.listForEndUser(id, euid, {
           status: 'ACTIVE',
           take: 100,
         });
+        // Checked AFTER the listing, so a sweep that legitimately drained
+        // everything on its fiftieth pass reports success rather than a
+        // cap it never hit.
         if (items.length === 0) break;
+        if (passes >= 50) {
+          capped = true;
+          break;
+        }
+        passes += 1;
         for (const device of items) {
-          const result = await devicesService.release({
-            applicationId: id,
-            endUserId: euid,
-            deviceId: device.id,
-            actor: { type: 'operator', id: req.tenantUser?.id ?? null },
-          });
+          // A device somebody BLOCKS mid-sweep makes `release` throw 409.
+          // Aborting the request there would discard the count of everything
+          // already released and write no summary event — the operator would
+          // see an error for a reset that half happened. It belongs in the
+          // skipped tally instead, which is what a blocked device is.
+          let result;
+          try {
+            result = await devicesService.release({
+              applicationId: id,
+              endUserId: euid,
+              deviceId: device.id,
+              actor: { type: 'operator', id: req.tenantUser?.id ?? null },
+            });
+          } catch (e) {
+            if ((e as { code?: string }).code === 'DEVICE_BLOCKED') {
+              skippedBlocked += 1;
+              continue;
+            }
+            throw e;
+          }
           released += 1;
           sessionsRevoked += result.sessionsRevoked;
         }
@@ -443,10 +483,10 @@ export async function tenantDevicesRoutes(app: FastifyInstance): Promise<void> {
           actorId: req.tenantUser?.id ?? null,
           tenantId: req.tenantId ?? null,
           applicationId: id,
-          metadata: { endUserId: euid, released, sessionsRevoked, skippedBlocked: blocked.total },
+          metadata: { endUserId: euid, released, sessionsRevoked, skippedBlocked, ...(capped && { capped: true }) },
         });
       }
-      return { success: true, data: { released, sessionsRevoked, skippedBlocked: blocked.total } };
+      return { success: true, data: { released, sessionsRevoked, skippedBlocked, ...(capped && { capped: true }) } };
     },
   );
 

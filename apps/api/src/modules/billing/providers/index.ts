@@ -68,11 +68,27 @@ export async function getProviderForApplication(
       return new RealRazorpayProvider(creds as RazorpayCredentials);
     }
     case 'external': {
-      // Nothing to decrypt: this provider dials nobody. Every outbound call
-      // on it refuses with a named error (see external.ts), which is what a
-      // row stamped `provider: 'external'` should get when a checkout or a
-      // cancellation path reaches for its processor.
-      return new ExternalBillingProvider();
+      // Every outbound call on this provider refuses with a named error (see
+      // external.ts) — what a row stamped `provider: 'external'` should get
+      // when a checkout or cancellation path reaches for its processor.
+      //
+      // The one exception is READING. Credentials are loaded so the
+      // subscription import can pull the book of business the event feed never
+      // saw. Absent or partial credentials are NOT an error here: the provider
+      // is built without a pull config, `listSubscriptions` then refuses with
+      // EXTERNAL_PULL_NOT_CONFIGURED, and every other path behaves exactly as
+      // it did before.
+      const creds = (await billingCredentialsService
+        .loadDecrypted(application.id, 'external')
+        .catch(() => null)) as Record<string, string> | null;
+      const url = creds?.subscriptionsUrl;
+      const token = creds?.pullToken;
+      const secret = creds?.webhookSecret;
+      return new ExternalBillingProvider(
+        url && token && secret
+          ? { subscriptionsUrl: url, token, signingSecret: secret }
+          : undefined,
+      );
     }
   }
 }

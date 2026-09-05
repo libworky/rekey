@@ -91,6 +91,18 @@ describe('email send control', () => {
   }
 
   /** Dispatch straight through the service, so the gate is what is under test. */
+  /** A live SECRET key: the caller the no-transport contract hands tokens to. */
+  async function secretKey(w: World): Promise<string> {
+    const key = await inject({
+      method: 'POST',
+      url: `${base(w)}/api-keys`,
+      headers: auth(w),
+      payload: { name: 'test', mode: 'live' },
+    });
+    expect(key.statusCode).toBe(201);
+    return (key.json().data as { rawKey: string }).rawKey;
+  }
+
   async function send(w: World, to: string) {
     const application = await prisma.application.findUniqueOrThrow({
       where: { id: w.applicationId },
@@ -355,4 +367,179 @@ describe('email send control', () => {
     expect(stats.suppressed).toBe(1);
     expect(stats.error).toBe(0);
   });
+
+  // ---------- what the first review found missing ----------
+
+  it('a suppressed send is FILTERABLE on the delivery log, and carries its reason', async () => {
+    const w = await world();
+    // The copy on Settings and Templates both point an operator here to find
+    // out why a mail did not go. Until the fourth status was accepted by the
+    // query, `?status=suppressed` was a 400 and the reason was never rendered.
+    await inject({
+      method: 'POST',
+      url: `${base(w)}/email-suppressions`,
+      headers: auth(w),
+      payload: { address: `blocked-${w.tag}@example.com`, reason: 'complaint' },
+    });
+    await send(w, `blocked-${w.tag}@example.com`);
+
+    const res = await inject({
+      method: 'GET',
+      url: `${base(w)}/email-logs?status=suppressed`,
+      headers: auth(w),
+    });
+    expect(res.statusCode).toBe(200);
+    const rows = (res.json().data as { items: Array<{ status: string; error: string | null }> })
+      .items;
+    expect(rows.length).toBe(1);
+    expect(rows[0]!.status).toBe('suppressed');
+    // The reason is the entire point of showing the row.
+    expect(rows[0]!.error).toContain('suppression list');
+  });
+
+  it('marks a suppression as such, so the alarm paths can tell it from a broken transport', async () => {
+    const w = await world();
+    await inject({
+      method: 'POST',
+      url: `${base(w)}/email-suppressions`,
+      headers: auth(w),
+      payload: { address: 'flagged@example.com', reason: 'bounce' },
+    });
+
+    // This flag is what lets `auth.service.ts` skip
+    // `recordAuthEmailDeliveryFailure` for a suppression. Without it an
+    // operator who switches an event off, or suppresses one complaining
+    // address, then finds their own activity feed filling with
+    // `auth.email_delivery_failed` alerts about the change they just made.
+    //
+    // Asserted on the OUTCOME rather than by counting security-event rows:
+    // `recordAuthEmailDeliveryFailure` is called with `void`, so a row count
+    // races the write and would pass whether the guard worked or not.
+    const suppressed = await send(w, 'flagged@example.com');
+    expect(suppressed.kind).toBe('error');
+    expect(suppressed.kind === 'error' && suppressed.suppressed).toBe(true);
+
+    // And it is set ONLY for a suppression — a real transport failure must
+    // still raise the alarm, which is the whole point of the distinction.
+    const normal = await send(w, 'fine@example.com');
+    expect(normal.kind).toBe('no_transport');
+    expect((normal as { suppressed?: true }).suppressed).toBeUndefined();
+  });
+
+  it('a suppressed reset STILL withholds the token — the alarm guard must not open that door', async () => {
+    const w = await world();
+    const email = `guard-${w.tag}@example.com`;
+    await makeEndUser(w, email);
+    await inject({
+      method: 'POST',
+      url: `${base(w)}/email-suppressions`,
+      headers: auth(w),
+      payload: { address: email, reason: 'manual' },
+    });
+    const res = await inject({
+      method: 'POST',
+      url: '/api/v1/auth/forgot-password',
+      headers: { authorization: `Bearer ${await secretKey(w)}` },
+      payload: { email },
+    });
+    expect(res.statusCode).toBe(200);
+    // A secret-key caller is exactly the one `no_transport` would hand a live
+    // token to, which makes it the one at risk from the alarm guard.
+    expect(res.json().data.resetToken).toBeNull();
+  });
+
+  it('a test send refuses a suppressed address, but still ignores the master switch', async () => {
+    const w = await world();
+    const email = `test-${w.tag}@example.com`;
+
+    // Master switch off: a test send is how an operator proves transport
+    // before turning sending back on, so it must still be attempted.
+    await inject({
+      method: 'PATCH',
+      url: `${base(w)}/email-send-control`,
+      headers: auth(w),
+      payload: { emailsEnabled: false },
+    });
+    const okRes = await inject({
+      method: 'POST',
+      url: `${base(w)}/email-templates/welcome/test-send`,
+      headers: auth(w),
+      payload: { to: email },
+    });
+    expect(okRes.statusCode).toBe(200);
+
+    // Suppression list: mailing a complainant again is how a sending domain
+    // gets blocked. "It was only a test" is not a distinction the receiving
+    // mailbox provider makes.
+    await inject({
+      method: 'POST',
+      url: `${base(w)}/email-suppressions`,
+      headers: auth(w),
+      payload: { address: email, reason: 'complaint' },
+    });
+    const refused = await inject({
+      method: 'POST',
+      url: `${base(w)}/email-templates/welcome/test-send`,
+      headers: auth(w),
+      payload: { to: email },
+    });
+    expect(refused.statusCode).toBe(409);
+    expect(refused.json().error.code).toBe('EMAIL_ADDRESS_SUPPRESSED');
+  });
+
+  it('the two workspace-scoped events are marked, and their switch is refused', async () => {
+    const w = await world();
+    const res = await inject({
+      method: 'GET',
+      url: `${base(w)}/email-send-control`,
+      headers: auth(w),
+    });
+    const events = (res.json().data as { events: Array<{ key: string; systemScoped: boolean }> })
+      .events;
+    const scoped = events.filter((e) => e.systemScoped).map((e) => e.key).sort();
+    expect(scoped).toEqual(['billing_unapplied_payment', 'workspace_invitation']);
+
+    // A switch that stores a setting nothing reads is the worst kind: the
+    // operator is certain they turned it off and it keeps arriving.
+    const refused = await inject({
+      method: 'PATCH',
+      url: `${base(w)}/email-send-control/workspace_invitation`,
+      headers: auth(w),
+      payload: { enabled: false },
+    });
+    expect(refused.statusCode).toBe(409);
+    expect(refused.json().error.code).toBe('EMAIL_EVENT_NOT_APPLICATION_SCOPED');
+  });
+
+  it('the auth-config route closes the coupling from the other end', async () => {
+    const w = await world();
+    // The three-step walk-around: verification off, verification email off,
+    // verification back on. Without the check on the auth-config route, every
+    // subsequent sign-up is stranded waiting for a mail nothing will send.
+    const off = await inject({
+      method: 'PATCH',
+      url: `${base(w)}/auth-config`,
+      headers: auth(w),
+      payload: { requireEmailVerification: false },
+    });
+    expect(off.statusCode).toBe(200);
+
+    const disabled = await inject({
+      method: 'PATCH',
+      url: `${base(w)}/email-send-control/email_verification`,
+      headers: auth(w),
+      payload: { enabled: false },
+    });
+    expect(disabled.statusCode).toBe(200);
+
+    const backOn = await inject({
+      method: 'PATCH',
+      url: `${base(w)}/auth-config`,
+      headers: auth(w),
+      payload: { requireEmailVerification: true },
+    });
+    expect(backOn.statusCode).toBe(409);
+    expect(backOn.json().error.code).toBe('EMAIL_EVENT_REQUIRED_BY_AUTH_CONFIG');
+  });
+
 });
