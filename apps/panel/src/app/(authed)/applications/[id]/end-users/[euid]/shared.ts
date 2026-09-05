@@ -164,55 +164,63 @@ export function getEndUserDetail(applicationId: string, euid: string): Promise<E
 }
 
 /**
- * Credits and billing degrade instead of interrupting: a MEMBER whose grant
- * does not cover them, or an application with billing off, must still get the
- * profile and the devices. `interruptOnAccessError: false` turns the 403/404
- * into a thrown `PanelApiError` that the caller's `.catch` absorbs.
+ * Credits, billing and devices degrade instead of interrupting: a MEMBER whose
+ * grant does not cover them, or an application with billing off, must still get
+ * the profile. `interruptOnAccessError: false` turns the 403/404 into a thrown
+ * `PanelApiError` that the `.catch` absorbs.
+ *
+ * They resolve to **null on failure, not to an empty value**. The difference is
+ * the whole point: an empty result renders "no subscriptions" or "this
+ * end-user has never signed in with a device fingerprint", which are claims
+ * about the account. A 500, a timeout, or a missing grant is a claim about the
+ * request, and stating the first when the second happened tells an operator
+ * something false about a customer while they are on a ticket about it.
  */
-export function getEndUserCredits(applicationId: string, euid: string): Promise<CreditsDto> {
+export function getEndUserCredits(applicationId: string, euid: string): Promise<CreditsDto | null> {
   return apiGet<CreditsDto>(`${base(applicationId, euid)}/credits`, {
     interruptOnAccessError: false,
-  }).catch(() => ({ balance: 0, ledger: [] }));
+  }).catch(() => null);
 }
 
-export function getEndUserBilling(applicationId: string, euid: string): Promise<BillingDto> {
+export function getEndUserBilling(applicationId: string, euid: string): Promise<BillingDto | null> {
   return apiGet<BillingDto>(`${base(applicationId, euid)}/billing`, {
     interruptOnAccessError: false,
-  }).catch(() => ({ subscriptions: [], payments: [], licenses: [] }));
+  }).catch(() => null);
 }
-
-/** Device page size. The API caps `limit` at 100; a user at their cap has a handful. */
-export const DEVICE_PAGE_SIZE = 50;
 
 export function getEndUserDevices(
   applicationId: string,
   euid: string,
-  opts: { status?: DeviceStatus; limit?: number; offset?: number } = {},
-): Promise<Page<DeviceRow>> {
+  opts: { status?: DeviceStatus; limit: number; offset?: number },
+): Promise<Page<DeviceRow> | null> {
   const q = new URLSearchParams({
-    limit: String(opts.limit ?? DEVICE_PAGE_SIZE),
+    limit: String(opts.limit),
     offset: String(opts.offset ?? 0),
   });
   if (opts.status) q.set('status', opts.status);
   return apiGet<Page<DeviceRow>>(`${base(applicationId, euid)}/devices?${q.toString()}`, {
     interruptOnAccessError: false,
-  }).catch(() => ({ items: [], page: { total: 0, limit: 0, offset: 0, hasMore: false } }));
+  }).catch(() => null);
 }
 
 /**
  * Just the counts, for the Overview tiles. Asks for one row and reads
  * `page.total`, which is the count matching the filter rather than the count
  * returned — so this stays exact for a user with more devices than a page.
+ *
+ * Null if any of the three failed: three tiles disagreeing about whether the
+ * device list is reachable is worse than one tile saying it is not.
  */
 export async function getEndUserDeviceCounts(
   applicationId: string,
   euid: string,
-): Promise<{ active: number; total: number; blocked: number }> {
+): Promise<{ active: number; total: number; blocked: number } | null> {
   const [all, active, blocked] = await Promise.all([
     getEndUserDevices(applicationId, euid, { limit: 1 }),
     getEndUserDevices(applicationId, euid, { status: 'ACTIVE', limit: 1 }),
     getEndUserDevices(applicationId, euid, { status: 'BLOCKED', limit: 1 }),
   ]);
+  if (all === null || active === null || blocked === null) return null;
   return { total: all.page.total, active: active.page.total, blocked: blocked.page.total };
 }
 

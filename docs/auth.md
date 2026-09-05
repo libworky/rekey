@@ -430,7 +430,7 @@ DELETE /api/v1/tenant/applications/:id/end-users/:euid?erasure=true
 → { erased: true, erasedAt, alreadyErased }
 ```
 
-Operator-initiated erasure for GDPR Art. 17 / CCPA delete requests. Unlike a plain `DELETE` (which cascade-removes the user **and** their financial records), erasure **tombstones** the user — hard-deleting PII/auth material while **retaining anonymized financial records** for accounting / legal-retention obligations. A tombstoned user can never authenticate again (every auth path rejects with `END_USER_ERASED`, HTTP 410). OWNER/ADMIN only; recorded as an `end_user.erased` security event and emits a `user.erased` outbound webhook. In the panel: end-user detail page → danger zone → "Erase (GDPR)" (type the email to confirm).
+Operator-initiated erasure for GDPR Art. 17 / CCPA delete requests. Unlike a plain `DELETE` (which cascade-removes the user **and** their financial records), erasure **tombstones** the user — hard-deleting PII/auth material while **retaining anonymized financial records** for accounting / legal-retention obligations. A tombstoned user can never authenticate again (every auth path rejects with `END_USER_ERASED`, HTTP 410), and nothing can be granted to one. Workspace **OWNER only** — as is the plain `DELETE`, which is the more destructive of the two and was the weaker-gated one until 2.2. Recorded as an `end_user.erased` security event and emits a `user.erased` outbound webhook. In the panel: end-user detail page → Data &amp; privacy tab → "Erase (GDPR)" (type the email to confirm).
 
 The full per-model cascade guarantee (delete / anonymize / retain) lives in **[docs/data-erasure.md](data-erasure.md)**.
 

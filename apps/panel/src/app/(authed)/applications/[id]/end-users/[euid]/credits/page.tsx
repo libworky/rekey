@@ -60,6 +60,19 @@ export default async function EndUserCreditsPage({
       {credited && <Banner tone="success">Credits updated.</Banner>}
       {creditError && <Banner tone="error">{CREDIT_ERR[creditError] ?? creditError}</Banner>}
 
+      {/* Not "0 credits". A balance of zero is a fact about the account; a
+          failed read is a fact about the request. The adjust form is withheld
+          too — applying a delta to a balance nobody could read is how an
+          account gets overdrawn by an operator trying to help. */}
+      {credits === null ? (
+        <Banner tone="error">
+          The credit balance could not be read — the request failed, or your grant on this
+          Application does not cover billing. This is <strong>not</strong> a zero balance, so
+          adjustments are withheld until it loads. Reload; if it persists, check the API and your
+          access.
+        </Banner>
+      ) : (
+        <>
       <Card className="space-y-4">
         <div className="flex items-baseline gap-2">
           <span className="text-3xl font-semibold tabular-nums text-[var(--color-fg)]">
@@ -144,6 +157,8 @@ export default async function EndUserCreditsPage({
             ))}
           </TBody>
         </Table>
+      )}
+        </>
       )}
     </div>
   );

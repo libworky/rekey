@@ -333,6 +333,33 @@ describe('operator subscription grants', () => {
     expect(res.json().error.code).toBe('SUBSCRIPTION_NOT_FOUND');
   });
 
+  it('nothing can be granted to a GDPR tombstone', async () => {
+    // The lever and the Erase button are now on the same end-user, one tab
+    // apart. `subscriber.service.ts` has refused this since the external
+    // provider landed; the grant path did not, so an erasure could be followed
+    // by a grant that writes a fresh, un-scrubbed financial row — carrying the
+    // operator's note, typically a name or an invoice reference — for a subject
+    // the workspace has legally committed to scrubbing, and announces
+    // `subscription.activated` for an id that just announced `user.erased`.
+    const w = await world();
+
+    const erase = await inject({
+      method: 'DELETE',
+      url: `/api/v1/tenant/applications/${w.applicationId}/end-users/${w.endUserId}?erasure=true`,
+      headers: { authorization: `Bearer ${w.ownerToken}` },
+    });
+    expect(erase.statusCode).toBe(200);
+
+    const res = await grant(w, w.ownerToken, { note: 'should not be possible' });
+    expect(res.statusCode).toBe(410);
+    expect(res.json().error.code).toBe('END_USER_ERASED');
+
+    // And nothing was written on the way to refusing.
+    expect(
+      await prisma.subscription.count({ where: { applicationId: w.applicationId } }),
+    ).toBe(0);
+  });
+
   it('a MEMBER cannot cancel either', async () => {
     const w = await world();
     const subId = (await grant(w, w.ownerToken)).json().data.subscription.id as string;

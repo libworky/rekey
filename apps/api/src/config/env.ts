@@ -228,14 +228,19 @@ export const env = createEnv({
     // payment provider behind it — a sale settled by invoice or bank transfer,
     // a comped account, a migration off a previous billing system.
     //
-    //   - 'enabled':  OWNER and ADMIN of the owning workspace may grant and
-    //                 cancel, through the tenant routes. The default, because a
-    //                 self-hoster recording a sale their deployment cannot
-    //                 observe is the ordinary case, and the alternative is
-    //                 writing SQL against production.
-    //   - 'disabled': the tenant routes answer 404 — not 403, matching the
+    //   - 'enabled':  OWNER and ADMIN of the owning workspace may grant through
+    //                 the tenant route. The default, because a self-hoster
+    //                 recording a sale their deployment cannot observe is the
+    //                 ordinary case, and the alternative is writing SQL against
+    //                 production.
+    //   - 'disabled': the tenant GRANT route answers 404 — not 403, matching the
     //                 non-disclosure posture of the rest of the tenant surface.
     //                 Granting stays available on the super-admin key.
+    //
+    // Scope is granting ONLY. Cancelling is not gated by this: it removes
+    // entitlement and fails safe, and the operator MCP `cancel_subscription`
+    // tool ignores this flag anyway, so gating the REST cancel would only
+    // restore the asymmetry where an agent can cancel and the panel cannot.
     //
     // The switch exists for the deployment that SELLS to the workspaces it
     // hosts. There, a workspace's own allowance is written from the entitlements

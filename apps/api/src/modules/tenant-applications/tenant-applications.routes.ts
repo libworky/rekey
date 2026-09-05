@@ -4692,13 +4692,21 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
           201: ok(GRANT_RESULT, 'The subscription is now active.'),
           ...errs({
             400:
-              'PLAN_NOT_FOUND — no plan with that slug in this Application; or ' +
-              'BILLING_ORGANIZATION_REQUIRED — the Application bills per organization and none was named; or ' +
-              'VALIDATION_ERROR — `currentPeriodEnd` is not in the future.',
+              'BILLING_ORGANIZATION_REQUIRED — the Application bills per organization and none was ' +
+              'named; or SUBSCRIPTION_PERIOD_END_IN_PAST — `currentPeriodEnd` is not in the future.',
             ...APP_BILLING_WRITE_ERRORS,
+            403:
+              APP_BILLING_WRITE_ERRORS[403] +
+              ' TENANT_ROLE_INSUFFICIENT also covers a MEMBER holding `APP_BILLING` or `APP_ADMIN`: ' +
+              'this route requires OWNER or ADMIN and no grant unlocks it.',
             404:
               'END_USER_NOT_FOUND — no end-user with that id in this Application; or ' +
-              'TENANT_SUBSCRIPTION_GRANTS_DISABLED — this deployment does not offer operator grants.',
+              'PLAN_NOT_FOUND — no plan with that slug; or ORGANIZATION_NOT_FOUND — `organizationId` ' +
+              'names no organization in this Application; or TENANT_SUBSCRIPTION_GRANTS_DISABLED — ' +
+              'this deployment does not offer operator grants.',
+            410:
+              'END_USER_ERASED — that end-user is a GDPR tombstone. Nothing can be granted to it, ' +
+              'and an erasure cannot be undone.',
           }),
         },
       },
@@ -4798,10 +4806,13 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
           200: ok(ref('Subscription'), 'The subscription in its post-cancel state.'),
           ...errs({
             ...APP_BILLING_WRITE_ERRORS,
+            403:
+              APP_BILLING_WRITE_ERRORS[403] +
+              ' TENANT_ROLE_INSUFFICIENT also covers a MEMBER holding `APP_BILLING` or `APP_ADMIN`: ' +
+              'this route requires OWNER or ADMIN and no grant unlocks it.',
             404:
               'SUBSCRIPTION_NOT_FOUND — no subscription with that id belonging to that end-user in ' +
-              'this Application; or TENANT_SUBSCRIPTION_GRANTS_DISABLED — this deployment does not ' +
-              'offer operator subscription writes.',
+              'this Application.',
             409: 'SUBSCRIPTION_MANAGED_EXTERNALLY — an inbound-only provider owns this subscription; cancel it there.',
           }),
         },
@@ -4811,7 +4822,13 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
       const params = z
         .object({ id: z.string().min(1), euid: z.string().min(1), subId: z.string().min(1) })
         .parse(req.params);
-      assertTenantGrantsEnabled();
+      // Deliberately NOT gated by `TENANT_SUBSCRIPTION_GRANTS`. That switch is
+      // about the one write that CREATES entitlement on an assertion; cancel
+      // removes entitlement and fails safe. Gating it here would also have been
+      // incoherent, because the operator MCP `cancel_subscription` tool ignores
+      // the flag — so a `disabled` deployment would be back to an agent being
+      // able to cancel a subscription while the panel could not, which is the
+      // asymmetry these routes exist to remove.
       await ensureAppAccess(req, params.id, 'billing-write');
       const body = CancelSubscriptionBody.parse(req.body ?? {});
 

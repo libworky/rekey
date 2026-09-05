@@ -35,15 +35,9 @@ import { Modal } from '@/components/Modal';
 import { Field } from '@/components/Field';
 import { SubmitButton } from '@/components/SubmitButton';
 import { CopyButton } from '@/components/CopyButton';
-import { Pager } from '@/components/Pager';
+import { Pager, readOffset, readPageSize } from '@/components/Pager';
 import { blockDevice, releaseDevice, unblockDevice } from '../actions';
-import {
-  getEndUserDevices,
-  shortFingerprint,
-  DEVICE_PAGE_SIZE,
-  type DeviceRow,
-  type DeviceStatus,
-} from '../shared';
+import { getEndUserDevices, shortFingerprint, type DeviceRow, type DeviceStatus } from '../shared';
 
 const STATUS_TONE: Record<DeviceStatus, BadgeTone> = {
   ACTIVE: 'success',
@@ -97,8 +91,12 @@ export default async function EndUserDevicesPage({
   const status = (FILTERS.find((f) => f.value === statusParam)?.value || undefined) as
     | DeviceStatus
     | undefined;
-  const pageSize = Number(sp.ps) > 0 ? Math.min(Number(sp.ps), 100) : DEVICE_PAGE_SIZE;
-  const offset = Number(sp.offset) > 0 ? Number(sp.offset) : 0;
+  // `readPageSize` clamps to the sizes the Pager actually offers (10/25/100).
+  // Reading `?ps=` by hand here meant clicking "25" produced a URL the Pager
+  // omits `ps` from, which this then read back as a different default — so the
+  // selector silently disagreed with the page it was on.
+  const pageSize = readPageSize(sp);
+  const offset = readOffset(sp);
 
   const done = typeof sp.device === 'string' ? sp.device : undefined;
   const revoked = Number(sp.revoked) > 0 ? Number(sp.revoked) : 0;
@@ -107,6 +105,23 @@ export default async function EndUserDevicesPage({
   const page = await getEndUserDevices(id, euid, { status, limit: pageSize, offset });
   const basePath = `/applications/${id}/end-users/${euid}/devices`;
   const banner = done ? resultMessage(done, revoked) : null;
+
+  if (page === null) {
+    // "No devices registered" is a statement about the end-user. A failed read
+    // is a statement about the request, and on this tab the wrong one of those
+    // reads as "their machines are all gone", which is exactly the complaint
+    // that brought the operator here.
+    return (
+      <div className="space-y-4">
+        <SectionHeader title="Devices" />
+        <Banner tone="error">
+          The device list could not be read — the request failed, or your access to this Application
+          does not cover it. This is <strong>not</strong> an empty device list. Reload; if it
+          persists, check the API and your access.
+        </Banner>
+      </div>
+    );
+  }
 
   return (
     <div className="space-y-4">
@@ -119,7 +134,7 @@ export default async function EndUserDevicesPage({
       {banner && <Banner tone="success">{banner}</Banner>}
       {deviceError && <Banner tone="error">{DEVICE_ERR[deviceError] ?? deviceError}</Banner>}
 
-      <nav className="flex flex-wrap items-center gap-1">
+      <nav aria-label="Filter devices by status" className="flex flex-wrap items-center gap-1">
         {FILTERS.map((f) => {
           const active = (statusParam || '') === f.value;
           const href = f.value ? `${basePath}?status=${f.value}` : basePath;
@@ -143,11 +158,19 @@ export default async function EndUserDevicesPage({
       {page.items.length === 0 ? (
         <EmptyState
           variant="inline"
-          title={status ? `No ${status.toLowerCase()} devices` : 'No devices registered'}
+          title={
+            offset > 0
+              ? 'Nothing on this page'
+              : status
+                ? `No ${status.toLowerCase()} devices`
+                : 'No devices registered'
+          }
           description={
-            status
-              ? 'Try a different filter.'
-              : 'This end-user has never signed in with a device fingerprint. Devices appear here once the client sends one on sign-in, which it does only when the Application has device binding configured.'
+            offset > 0
+              ? 'Rows may have moved since this link was made. Use Previous to go back.'
+              : status
+                ? 'Try a different filter.'
+                : 'This end-user has never signed in with a device fingerprint. Devices appear here once the client sends one on sign-in, which it does only when the Application has device binding configured.'
           }
         />
       ) : (
@@ -209,17 +232,19 @@ export default async function EndUserDevicesPage({
               ))}
             </TBody>
           </Table>
-
-          <Pager
-            basePath={basePath}
-            offset={offset}
-            pageSize={pageSize}
-            count={page.items.length}
-            hasMore={page.page.hasMore}
-            {...(statusParam ? { extraParams: { status: statusParam } } : {})}
-          />
         </>
       )}
+
+      {/* Outside the branch above: a page that came back empty because rows
+          moved, or because somebody edited the offset, still needs a way back. */}
+      <Pager
+        basePath={basePath}
+        offset={offset}
+        pageSize={pageSize}
+        count={page.items.length}
+        hasMore={page.page.hasMore}
+        {...(statusParam ? { extraParams: { status: statusParam } } : {})}
+      />
 
       <Card className="space-y-1.5">
         <h3 className="text-sm font-semibold text-[var(--color-fg)]">
@@ -270,10 +295,12 @@ function DeviceActions({
         </form>
       )}
 
+      {/* No `modalKey`: nothing redirects with `?blockDevice=<id>`, so the
+          reopen-on-error path would never fire. A refusal surfaces in the
+          page-level banner instead, and declaring the prop would advertise a
+          mechanism that is not wired. */}
       {device.status !== 'BLOCKED' && (
         <Modal
-          modalKey="blockDevice"
-          modalValue={device.id}
           title="Block this device"
           description="Sign-in from this fingerprint is refused until you unblock it, and every session on it is revoked now. The reason is operator-facing only — the end-user never sees it."
           trigger="Block"

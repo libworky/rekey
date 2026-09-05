@@ -5,10 +5,11 @@
  * An OWNER or ADMIN can grant a subscription here, and cancel one. Granting was
  * super-admin-only until the tenant routes existed, because it is the one
  * billing write that CREATES entitlement on an assertion rather than following
- * money that demonstrably moved — so two things gate the affordance: the
+ * money that demonstrably moved — so two things gate that affordance: the
  * operator's role, and `TENANT_SUBSCRIPTION_GRANTS`, which a deployment that
  * sells to the workspaces it hosts sets to `disabled`. Both are checked here
- * for the button and again by the API for the action.
+ * for the button and again by the API for the action. Cancelling is gated by
+ * role only: it removes entitlement and fails safe.
  *
  * Three things this page has to say that the tables cannot:
  *
@@ -69,7 +70,10 @@ const GRANT_ERR: Record<string, string> = {
   APP_ACCESS_DENIED: 'Your grant on this Application does not allow billing writes.',
   TENANT_SUBSCRIPTION_GRANTS_DISABLED:
     'Operator grants are switched off on this deployment (TENANT_SUBSCRIPTION_GRANTS).',
-  VALIDATION_ERROR: 'Check the period end — it has to be in the future.',
+  ORGANIZATION_NOT_FOUND: 'That organization does not belong to this Application.',
+  END_USER_ERASED:
+    'This end-user was erased. Nothing can be granted to a tombstone, and an erasure cannot be undone.',
+  SUBSCRIPTION_PERIOD_END_IN_PAST: 'The period end has to be in the future.',
 };
 
 const CANCEL_ERR: Record<string, string> = {
@@ -77,6 +81,7 @@ const CANCEL_ERR: Record<string, string> = {
   SUBSCRIPTION_MANAGED_EXTERNALLY:
     'This subscription is owned by your own billing system. Cancel it there; Rekey will mirror the event.',
   TENANT_ROLE_INSUFFICIENT: 'Only owners and admins can cancel a subscription.',
+  APP_ACCESS_DENIED: 'Your grant on this Application does not allow billing writes.',
   PROVIDER_CANCEL_FAILED:
     'The payment provider refused the cancellation. Check the provider dashboard and the Activity log.',
 };
@@ -104,8 +109,15 @@ export default async function EndUserSubscriptionsPage({
 
   // Both, not either: hiding the affordance is a usability choice, and the API
   // enforces the same floor on its own.
-  const canGrant =
-    grantsMode === 'enabled' && (me.activeRole === 'OWNER' || me.activeRole === 'ADMIN');
+  //
+  // Cancel is NOT gated by `grantsMode`. That switch is about the write which
+  // creates entitlement; cancelling removes it and fails safe, and the API
+  // leaves the cancel route open when the switch is off. Hiding Cancel here
+  // would leave a `disabled` deployment unable to cancel from the panel while
+  // the operator MCP tool still could.
+  const isOperatorAdmin = me.activeRole === 'OWNER' || me.activeRole === 'ADMIN';
+  const canGrant = grantsMode === 'enabled' && isOperatorAdmin;
+  const canCancel = isOperatorAdmin;
 
   // Only fetched when there is a form to fill. The picker offers active plans;
   // the API accepts withdrawn ones too, but offering the whole historical
@@ -118,6 +130,22 @@ export default async function EndUserSubscriptionsPage({
         .then((p) => p.items.filter((pl) => pl.active))
         .catch(() => [] as PlanRow[])
     : [];
+
+  if (billing === null) {
+    // Every table on this tab is a claim about what the customer has bought.
+    // Rendering three empty ones because the request failed says they have
+    // bought nothing, to an operator holding a ticket about a payment.
+    return (
+      <div className="space-y-4">
+        <SectionHeader title="Subscriptions" />
+        <Banner tone="error">
+          Billing could not be read for this end-user — the request failed, or your grant on this
+          Application does not cover billing. This is <strong>not</strong> an empty billing history.
+          Reload; if it persists, check the API and your access.
+        </Banner>
+      </div>
+    );
+  }
 
   const defaultPlanSlug = application.billingConfig.defaultPlanSlug ?? null;
   const hasExternal = billing.subscriptions.some(
@@ -133,7 +161,14 @@ export default async function EndUserSubscriptionsPage({
           description="Most recent 100, newest first."
           action={
             canGrant ? (
-              <GrantForm applicationId={id} euid={euid} plans={plans} error={grantError} />
+              <GrantForm
+                applicationId={id}
+                euid={euid}
+                plans={plans}
+                error={grantError}
+                keptPlanSlug={typeof sp.planSlug === 'string' ? sp.planSlug : undefined}
+                keptPeriodEnd={typeof sp.periodEnd === 'string' ? sp.periodEnd : undefined}
+              />
             ) : undefined
           }
         />
@@ -160,12 +195,10 @@ export default async function EndUserSubscriptionsPage({
         {canceled === 'now' && (
           <Banner tone="success">Subscription cancelled immediately. Entitlements are gone.</Banner>
         )}
-        {grantError && (
-          <Banner tone="error">{GRANT_ERR[grantError] ?? grantError}</Banner>
-        )}
-        {cancelError && (
-          <Banner tone="error">{CANCEL_ERR[cancelError] ?? cancelError}</Banner>
-        )}
+        {/* `grantError` renders inside the modal, which reopens on it — showing
+            it here as well put the same message twice, one copy behind the
+            backdrop. */}
+        {cancelError && <Banner tone="error">{CANCEL_ERR[cancelError] ?? cancelError}</Banner>}
 
         {hasExternal && (
           <Banner tone="info">
@@ -194,7 +227,7 @@ export default async function EndUserSubscriptionsPage({
                 <TH>Provider</TH>
                 <TH>Renews</TH>
                 <TH>Started</TH>
-                {canGrant && <TH align="right"> </TH>}
+                {canCancel && <TH align="right"> </TH>}
               </TR>
             </THead>
             <TBody>
@@ -234,7 +267,7 @@ export default async function EndUserSubscriptionsPage({
                   <TD muted className="text-xs">
                     {formatDate(s.createdAt)}
                   </TD>
-                  {canGrant && (
+                  {canCancel && (
                     <TD align="right">
                       <CancelAction applicationId={id} euid={euid} subscription={s} />
                     </TD>
@@ -368,11 +401,16 @@ function GrantForm({
   euid,
   plans,
   error,
+  keptPlanSlug,
+  keptPeriodEnd,
 }: {
   applicationId: string;
   euid: string;
   plans: PlanRow[];
   error?: string | undefined;
+  /** Echoed back on a refusal so the form is not lost. The note is not — see `grantSubscription`. */
+  keptPlanSlug?: string | undefined;
+  keptPeriodEnd?: string | undefined;
 }): React.JSX.Element {
   if (plans.length === 0) {
     return (
@@ -397,7 +435,7 @@ function GrantForm({
       <form action={grantSubscription.bind(null, applicationId, euid)} className="space-y-3">
         {error && <Banner tone="error">{GRANT_ERR[error] ?? error}</Banner>}
         <Field label="Plan" required hint="Active plans only. Withdrawn plans can still be granted through the API.">
-          <select name="planSlug" required defaultValue="" className={inputCls}>
+          <select name="planSlug" required defaultValue={keptPlanSlug ?? ""} className={inputCls}>
             <option value="" disabled>
               Pick a plan…
             </option>
@@ -426,7 +464,13 @@ function GrantForm({
           label="Period ends"
           hint="Optional, and open-ended if you leave it blank — a grant does not renew and nothing expires it, so “comp this account” means comped until somebody cancels. Set a date to time-box it. Note that cancelling an open-ended grant takes effect immediately, because there is no paid period left to run out."
         >
-          <input type="date" name="currentPeriodEnd" className={inputCls} />
+          <input
+            type="date"
+            name="currentPeriodEnd"
+            defaultValue={keptPeriodEnd ?? ""}
+            min={new Date().toISOString().slice(0, 10)}
+            className={inputCls}
+          />
         </Field>
         <SubmitButton pendingLabel="Granting…">Grant subscription</SubmitButton>
       </form>

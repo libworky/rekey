@@ -37,7 +37,7 @@ unique per member+application):
 
 | App role | On the granted Application |
 |---|---|
-| `APP_ADMIN` | Full read/write — everything OWNER/ADMIN can do *on that app* (API keys, auth config, end-users, webhooks, email, …) |
+| `APP_ADMIN` | Full read/write on that app (API keys, auth config, end-users, webhooks, email, …) — everything OWNER/ADMIN can do there **except** the extra-sensitive routes listed below |
 | `APP_BILLING` | Billing manager: read everything **except auth config** (redacted in app payloads) · write plans, plan entitlements, coupons, and manual credit grants · cannot mint API keys, touch credentials, or manage users |
 | `APP_VIEWER` | Read-only |
 
@@ -48,7 +48,8 @@ Semantics:
 - Grants are always authoritative: an Application without a grant disappears from `GET /tenant/applications` (which also feeds the panel sidebar and command palette) and returns `404 APPLICATION_NOT_FOUND` on direct access — deliberately the same answer an absent Application gives, so a denied app is not an enumeration oracle. Insufficient grant *level* on a granted app → `403 APP_ACCESS_DENIED`.
 - Removing a member's **last** grant leaves them with nothing, not with workspace-wide read. De-scoping a member never widens their access.
 - Grants survive role changes but are only consulted while the role is `MEMBER` (promote to ADMIN → inert; demote back → re-armed). Setting a grant on an OWNER/ADMIN membership is rejected with `APP_GRANT_MEMBER_ONLY`.
-- Workspace-level surfaces are unaffected: team/workspace/audit-log writes stay OWNER/ADMIN-only, and the extra-sensitive per-app routes (request log, end-user DSAR export, impersonation) remain OWNER/ADMIN-only even for `APP_ADMIN` grant holders.
+- Workspace-level surfaces are unaffected: team/workspace/audit-log writes stay OWNER/ADMIN-only, and the extra-sensitive per-app routes (request log, end-user DSAR export, impersonation, and granting or cancelling a subscription) remain OWNER/ADMIN-only even for `APP_ADMIN` grant holders.
+- Stricter still, **workspace OWNER only**: deleting an end-user and GDPR-erasing one (`DELETE /tenant/applications/:id/end-users/:euid`, both forms). No grant unlocks either, and neither does ADMIN. The plain delete cascades through the financial records; erasure retains them anonymized. See [data-erasure.md](data-erasure.md).
 
 > **Grandfathered memberships.** Fail-closed became the default in 2.0.0-rc.3.
 > Memberships that already existed **and held no grant** at upgrade time were

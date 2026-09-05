@@ -110,7 +110,13 @@ describe('operator subscription grants, switched off', () => {
     expect(res.json().error.fix).toContain('TENANT_SUBSCRIPTION_GRANTS');
   });
 
-  it('the cancel route is absent too', async () => {
+  it('the cancel route stays available — the switch is about granting only', async () => {
+    // Deliberately NOT gated. The switch exists because granting CREATES
+    // entitlement on an assertion; cancelling removes it and fails safe. Gating
+    // it here would also have been incoherent: the operator MCP
+    // `cancel_subscription` tool ignores this flag, so a `disabled` deployment
+    // would be back to an agent being able to cancel while the panel could not,
+    // which is the asymmetry these routes exist to remove.
     const { ownerToken, applicationId, endUserId } = await world();
     const res = await app.inject({
       method: 'POST',
@@ -118,8 +124,10 @@ describe('operator subscription grants, switched off', () => {
       headers: { authorization: `Bearer ${ownerToken}` },
       payload: {},
     });
+    // Reached the handler and got as far as looking the subscription up, rather
+    // than being refused at the door.
     expect(res.statusCode).toBe(404);
-    expect(res.json().error.code).toBe('TENANT_SUBSCRIPTION_GRANTS_DISABLED');
+    expect(res.json().error.code).toBe('SUBSCRIPTION_NOT_FOUND');
   });
 
   it('the refusal happens before anything is written', async () => {

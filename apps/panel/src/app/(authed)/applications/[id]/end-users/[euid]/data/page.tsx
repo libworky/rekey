@@ -32,8 +32,6 @@ const ERASE_ERR: Record<string, string> = {
   END_USER_NOT_FOUND: 'That end-user no longer exists in this Application.',
   TENANT_ROLE_INSUFFICIENT: 'Only the workspace owner can erase an end-user.',
   APP_ACCESS_DENIED: 'Your grant on this Application does not allow this.',
-  PROVIDER_CANCEL_FAILED:
-    'The payment provider refused to cancel a live subscription. Erasure does not block on the provider, so retry — if this persists, cancel it in the provider dashboard first.',
 };
 
 export default async function EndUserDataPage({

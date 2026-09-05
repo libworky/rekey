@@ -307,7 +307,7 @@ export const subscriptionGrantsService = {
         statusCode: 400,
         code: 'SUBSCRIPTION_PERIOD_END_IN_PAST',
         message: 'A granted subscription cannot end in the past.',
-        fix: 'Pass a `currentPeriodEnd` in the future, or omit it to get one plan interval from now.',
+        fix: 'Pass a `currentPeriodEnd` in the future, or omit it for an open-ended grant.',
       });
     }
 
@@ -426,13 +426,13 @@ async function resolveEndUser(
   const endUser = input.endUserId
     ? await prisma.endUser.findFirst({
         where: { id: input.endUserId, applicationId },
-        select: { id: true },
+        select: { id: true, erasedAt: true },
       })
     : await prisma.endUser.findUnique({
         // Stored lowercased at sign-up; an operator typing the address off an
         // invoice will not match the casing.
         where: { applicationId_email: { applicationId, email: (input.email ?? '').toLowerCase() } },
-        select: { id: true },
+        select: { id: true, erasedAt: true },
       });
   if (!endUser) {
     throw new RekeyError({
@@ -444,5 +444,26 @@ async function resolveEndUser(
         'to them. Have them sign up, or find them with GET /api/v1/admin/metrics/end-users?q=.',
     });
   }
-  return endUser;
+  // Nothing can be granted to a tombstone.
+  //
+  // `subscriber.service.ts` has refused this since the external provider
+  // landed; this path did not, and that asymmetry is a live hazard now that an
+  // operator can reach granting from the same end-user page that carries the
+  // Erase button. Erasure's contract is that financial rows are RETAINED and
+  // PII-scrubbed; a grant afterwards writes a fresh, un-scrubbed one — with the
+  // operator's free-text note, typically a name or an invoice reference, on a
+  // subject the workspace has legally committed to scrubbing — and announces
+  // `subscription.activated` for an id that just announced `user.erased`.
+  //
+  // Guarded here rather than at either route so both the operator and the
+  // super-admin surface inherit it.
+  if (endUser.erasedAt !== null) {
+    throw new RekeyError({
+      statusCode: 410,
+      code: 'END_USER_ERASED',
+      message: 'That end-user was erased; nothing can be granted to the tombstone.',
+      fix: 'If this person is a customer again, they must create a new account — an erasure cannot be undone. Remove them from the billing system that produced this grant as well.',
+    });
+  }
+  return { id: endUser.id };
 }

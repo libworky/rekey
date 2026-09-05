@@ -69,76 +69,14 @@ export function requestContext(req: FastifyRequest): {
   };
 }
 
-/**
- * `applicationId` → `tenantId`. An Application never changes workspace, so this
- * is immutable for the life of the row and safe to memoise for the life of the
- * process. It exists so the backfill below costs one query per Application
- * rather than one per event: `recordSecurityEvent` is on the sign-in path.
- */
-const tenantOfApplication = new Map<string, string>();
-
-/**
- * Resolve the workspace an event belongs to when the caller named only the
- * Application.
- *
- * ## Why this is not the caller's job
- *
- * `securityEventWhere` scopes EVERY tenant-facing read by `tenantId`, so a row
- * written without one is durable, correct, and invisible: it is in the table
- * and it is in no operator's log. Six emit sites had this shape — the five
- * device events (`user.device_registered`, `user.device_limit_reached`,
- * `user.device_released` / `end_user.device_released`, `end_user.device_blocked`,
- * `end_user.device_unblocked`) and `user.session_handoff_granted` — against 53
- * that pass `tenantId` correctly. The entire device audit trail was therefore
- * unreachable from the panel: blocking someone's device recorded an event that
- * appeared neither in the workspace Activity log nor on the end-user it
- * happened to.
- *
- * Requiring every caller to remember is what produced the bug, and the six that
- * forgot are the six furthest from a request context (a service that takes an
- * `applicationId`, not a `req`). Deriving it here fixes those six and the
- * seventh nobody has written yet. Callers that pass `tenantId` are untouched.
- *
- * Best-effort like everything else in this file: if the lookup fails the event
- * is still written, exactly as before.
- */
-async function resolveTenantId(applicationId: string): Promise<string | null> {
-  const cached = tenantOfApplication.get(applicationId);
-  if (cached !== undefined) return cached;
-  const app = await prisma.application
-    .findUnique({ where: { id: applicationId }, select: { tenantId: true } })
-    .catch(() => null);
-  const tenantId = app?.tenantId ?? null;
-  // Only memoise a hit. A miss can mean "not created yet" in a racing test,
-  // and caching null would make that permanent for the process.
-  if (tenantId !== null) tenantOfApplication.set(applicationId, tenantId);
-  return tenantId;
-}
-
-/**
- * Drop the application→tenant memo between tests.
- *
- * Registered in `test/domain-tables.ts` alongside the other module-level
- * singletons the per-test TRUNCATE cannot reach. A cuid is never reissued, so a
- * stale entry cannot actually mislead a later test — this is here because
- * "module state that outlives a truncate" is a category this suite tracks
- * deliberately, and an unregistered one is the next person's debugging session.
- */
-export function __resetForTests(): void {
-  tenantOfApplication.clear();
-}
-
 export async function recordSecurityEvent(input: SecurityEventInput): Promise<void> {
   try {
-    const tenantId =
-      input.tenantId ??
-      (input.applicationId ? await resolveTenantId(input.applicationId) : null);
     await prisma.securityEvent.create({
       data: {
         type: input.type,
         actorType: input.actorType,
         actorId: input.actorId ?? null,
-        tenantId,
+        tenantId: input.tenantId ?? null,
         applicationId: input.applicationId ?? null,
         ip: input.ip ?? null,
         userAgent: input.userAgent ?? null,
@@ -172,14 +110,58 @@ export interface SecurityEventQuery {
 }
 
 /**
+ * The Applications a workspace owns, for scoping a read.
+ *
+ * `SecurityEvent` carries `tenantId` and `applicationId` as bare scalars with
+ * no FK relations, deliberately — the same reason `ApiRequestLog` does, so that
+ * writing an audit row can never contend with or block the request it records.
+ * That rules out a join, so the ids are fetched. One small query per read, on a
+ * table an operator lists a page of at a time.
+ */
+async function tenantApplicationIds(tenantId: string): Promise<string[]> {
+  const rows = await prisma.application.findMany({ where: { tenantId }, select: { id: true } });
+  return rows.map((r) => r.id);
+}
+
+/**
  * The filter `listSecurityEvents` and `countSecurityEvents` share.
  *
  * One builder for both: a `total` computed over a different filter than the
  * rows is a pager that walks off the end of the log.
+ *
+ * ## Why an event is scoped two ways
+ *
+ * This used to be `tenantId: query.tenantId` alone, and a row written without a
+ * `tenantId` was therefore durable, correct, and invisible: in the table, and in
+ * no operator's log. Six emit sites had exactly that shape — the five device
+ * events (`user.device_registered`, `user.device_limit_reached`, both
+ * `*.device_released`, `end_user.device_blocked`, `end_user.device_unblocked`)
+ * and `user.session_handoff_granted` — against 53 that pass it. So the whole
+ * device audit trail was written and surfaced nowhere: blocking someone's device
+ * recorded an event that appeared neither in the workspace Activity log nor on
+ * the end-user it happened to.
+ *
+ * The obvious repair is to derive the tenant when the event is WRITTEN. That was
+ * tried and reverted: it puts a read on the audit-write path, which is precisely
+ * what the scalar-only schema exists to avoid, and it measurably reordered
+ * detached webhook emission in `devices.test.ts` (~53% failure) by contending
+ * for a connection with the `emitDetached` beside it.
+ *
+ * An event that names an Application already identifies its workspace — the
+ * fact was never missing, only unjoined. So the scoping is done here, where a
+ * query costs an operator's page load rather than somebody's sign-in, and it
+ * fixes the rows already written: no backfill.
+ *
+ * `application: { tenantId }` is NOT expressible (no relation), hence the id
+ * list. An empty list yields `in: []`, which matches nothing — correct for a
+ * workspace with no Applications.
  */
-function securityEventWhere(query: SecurityEventQuery) {
+async function securityEventWhere(query: SecurityEventQuery) {
+  const ownedApplicationIds = await tenantApplicationIds(query.tenantId);
   return {
-    tenantId: query.tenantId,
+    // Either the row names this workspace, or it names an Application this
+    // workspace owns. Both are the same claim; only one of them was recorded.
+    OR: [{ tenantId: query.tenantId }, { applicationId: { in: ownedApplicationIds } }],
     ...(query.applicationId !== undefined && { applicationId: query.applicationId }),
     ...(query.type !== undefined && { type: query.type }),
     ...(query.actorType !== undefined && { actorType: query.actorType }),
@@ -194,7 +176,7 @@ function securityEventWhere(query: SecurityEventQuery) {
 
 /** Total events matching the same filters `listSecurityEvents` applies. */
 export async function countSecurityEvents(query: SecurityEventQuery): Promise<number> {
-  return prisma.securityEvent.count({ where: securityEventWhere(query) });
+  return prisma.securityEvent.count({ where: await securityEventWhere(query) });
 }
 
 /** List recent security events for a tenant (newest first, capped at `cap` — default 200). */
@@ -212,7 +194,7 @@ export async function listSecurityEvents(query: SecurityEventQuery): Promise<
   }>
 > {
   const rows = await prisma.securityEvent.findMany({
-    where: securityEventWhere(query),
+    where: await securityEventWhere(query),
     // Stable secondary order by id keeps pagination consistent on ties.
     orderBy: [
       query.sort === 'type'
