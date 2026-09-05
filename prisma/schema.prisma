@@ -470,6 +470,17 @@ model Application {
   // with RESEND_DEFAULT_FROM); a BYO transport with no `fromAddress` is an
   // error, not a fallback.
   emailConfig                  Json    @default("{}") @map("email_config")
+  // Master switch for every Application-scoped email: verification, reset,
+  // magic link, welcome, dunning — everything `emailService.dispatch` sends for
+  // this Application. Workspace/system mail goes through `dispatchSystem` and is
+  // deliberately unaffected: an Application-level switch must not be able to
+  // lock operators out of their own workspace.
+  //
+  // A COLUMN, not a key inside `emailConfig`, because `setCredentials` rewrites
+  // that object wholesale — a flag living there would be silently cleared every
+  // time somebody saved transport credentials. `authConfig.appUrl` sits where it
+  // does for exactly the same reason, and says so.
+  emailsEnabled                Boolean @default(true) @map("emails_enabled")
   // Encrypted per-Application transport credentials. AES-256-GCM via
   // lib/secrets.ts. Shape is the `EmailCredentials` union in
   // lib/email-transport.ts: `{ provider: 'resend', apiKey }` or
@@ -579,6 +590,8 @@ model Application {
   organizationRoles   OrganizationRoleDef[]
   emailTemplates      EmailTemplate[]
   emailLogs           EmailLog[]
+  emailEventSettings  EmailEventSetting[]
+  emailSuppressions   EmailSuppression[]
   webhookEndpoints    WebhookEndpoint[]
   organizations       Organization[]
   creditBalances      CreditBalance[]
@@ -625,6 +638,64 @@ model EmailTemplate {
   @@unique([applicationId, eventKey])
   @@index([applicationId])
   @@map("email_templates")
+}
+
+// ============================================================================
+// Per-event send switch.
+//
+// SEPARATE from EmailTemplate on purpose. `EmailTemplate` existing is what
+// "customised" means in the panel, and turning an event OFF must not require
+// customising its body first — nor should deleting a customisation silently
+// re-enable an event somebody switched off.
+//
+// A missing row means enabled: the default is that Rekey sends what it always
+// sent, so an upgrade changes nothing until an operator says otherwise.
+// ============================================================================
+model EmailEventSetting {
+  id            String   @id @default(cuid())
+  applicationId String   @map("application_id")
+  /** An `EmailEventKey` (modules/email/events.ts). */
+  eventKey      String   @map("event_key")
+  enabled       Boolean  @default(true)
+  updatedAt     DateTime @updatedAt @map("updated_at")
+
+  application Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+
+  @@unique([applicationId, eventKey])
+  @@index([applicationId])
+  @@map("email_event_settings")
+}
+
+// ============================================================================
+// Addresses this Application must not email, whatever it is trying to send.
+//
+// The narrowest of the three gates and the only one that is about a PERSON
+// rather than about configuration: a bounce, a spam complaint, an unsubscribe,
+// or an operator who was asked to stop. It outranks everything, including a
+// password reset — an address that hard-bounced cannot receive one anyway, and
+// mailing a complainant again is how a sending domain gets blocked.
+//
+// Rekey never writes these itself yet (no provider bounce webhooks are
+// consumed); `reason` is carried so that when it does, a bounce and a manual
+// entry stay distinguishable.
+// ============================================================================
+model EmailSuppression {
+  id            String   @id @default(cuid())
+  applicationId String   @map("application_id")
+  /** Lowercased, matching how EmailLog stores `toAddress`. */
+  address       String
+  /** bounce | complaint | manual | unsubscribe */
+  reason        String   @default("manual")
+  note          String?
+  /** Operator id for a manual entry; null when Rekey added it itself. */
+  createdBy     String?  @map("created_by")
+  createdAt     DateTime @default(now()) @map("created_at")
+
+  application Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+
+  @@unique([applicationId, address])
+  @@index([applicationId, createdAt])
+  @@map("email_suppressions")
 }
 
 // ============================================================================

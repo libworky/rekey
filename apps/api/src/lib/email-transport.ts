@@ -417,6 +417,46 @@ async function sendDefaultResend(
   }
 }
 
+/**
+ * Persist an EmailLog row for a send that was deliberately NOT attempted.
+ *
+ * Exported so every `email_logs` write still happens in this file — the
+ * invariant the table's own comment states ("Recorded at the transport boundary
+ * so EVERY send is captured regardless of caller"). A suppression never reaches
+ * a transport, so without this it would be the one outcome leaving no trace,
+ * and "the customer never got the email" would have no answer in the single
+ * place an operator looks for send outcomes.
+ *
+ * `status: 'suppressed'` is a fourth value alongside sent / error /
+ * no_transport, and deliberately not `error`: nothing failed.
+ */
+export async function recordSuppressedSend(args: {
+  tenantId: string | null;
+  applicationId: string | null;
+  to: string;
+  subject: string;
+  eventKey: string | null;
+  reason: string;
+}): Promise<void> {
+  try {
+    await prisma.emailLog.create({
+      data: {
+        tenantId: args.tenantId,
+        applicationId: args.applicationId,
+        toAddress: args.to.toLowerCase(),
+        subject: args.subject,
+        eventKey: args.eventKey,
+        via: 'none',
+        status: 'suppressed',
+        messageId: null,
+        error: args.reason,
+      },
+    });
+  } catch {
+    // Same contract as `recordLog`: a log write must never break the caller.
+  }
+}
+
 /** Persist one EmailLog row. Never throws into the send path. */
 async function recordLog(args: {
   tenantId: string | null;

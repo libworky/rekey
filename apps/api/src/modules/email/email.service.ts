@@ -19,10 +19,11 @@
  * `Application` row that authorises the send.
  */
 
-import type { Application, EmailTemplate } from '@prisma/client';
+import type { Application, EmailSuppression, EmailTemplate } from '@prisma/client';
 import { prisma } from '../../lib/prisma.js';
 import { RekeyError } from '../../lib/error.js';
 import {
+  recordSuppressedSend,
   sendEmail,
   sendEmailSystem,
   type SendOutcome,
@@ -131,11 +132,79 @@ export interface DispatchInput {
 }
 
 /**
- * Render + send. Returns the transport outcome verbatim so callers can
- * branch on "delivered" vs "no_transport" to decide whether to expose
- * the raw token in their HTTP response.
+ * Why a send did not happen, when the reason is configuration rather than
+ * failure. Broadest first; that is also the order they are checked in.
+ */
+export type SuppressionReason = 'application_disabled' | 'event_disabled' | 'suppressed_address';
+
+const SUPPRESSION_TEXT: Record<SuppressionReason, string> = {
+  application_disabled: 'All email is switched off for this Application.',
+  event_disabled: 'This email event is switched off for this Application.',
+  suppressed_address: 'This address is on the Application suppression list.',
+};
+
+/**
+ * Is this send allowed out at all? Cheapest and broadest gate first, so a
+ * silenced Application costs one boolean rather than three queries.
+ */
+async function suppressionFor(
+  application: Application,
+  eventKey: EmailEventKey,
+  to: string,
+): Promise<SuppressionReason | null> {
+  if (application.emailsEnabled === false) return 'application_disabled';
+
+  const [setting, suppressed] = await Promise.all([
+    prisma.emailEventSetting.findUnique({
+      where: { applicationId_eventKey: { applicationId: application.id, eventKey } },
+      select: { enabled: true },
+    }),
+    prisma.emailSuppression.findUnique({
+      where: { applicationId_address: { applicationId: application.id, address: to.toLowerCase() } },
+      select: { id: true },
+    }),
+  ]);
+  // A MISSING row means enabled: applying this feature must not silence
+  // anything until an operator says so.
+  if (setting !== null && setting.enabled === false) return 'event_disabled';
+  if (suppressed !== null) return 'suppressed_address';
+  return null;
+}
+
+/**
+ * Render + send, unless something says not to.
+ *
+ * Returns the transport outcome verbatim so callers can branch on "delivered"
+ * vs "no_transport" to decide whether to expose the raw token in their HTTP
+ * response — with the one deliberate exception documented at the gate below.
  */
 export async function dispatch(input: DispatchInput): Promise<SendOutcome> {
+  const suppression = await suppressionFor(input.application, input.eventKey, input.to);
+  if (suppression !== null) {
+    // Logged, so the Delivery view can answer "why did they not get it" — the
+    // whole point of a switch you can see the effect of.
+    await recordSuppressedSend({
+      tenantId: input.application.tenantId,
+      applicationId: input.application.id,
+      to: input.to,
+      subject: `[suppressed] ${input.eventKey}`,
+      eventKey: input.eventKey,
+      reason: SUPPRESSION_TEXT[suppression],
+    });
+    // `error`, NOT `no_transport`, and the distinction is load-bearing.
+    //
+    // `no_transport` is the documented contract that hands the RAW TOKEN back
+    // to the caller, so a self-hoster with no email can deliver it themselves
+    // (see the reset and magic-link paths). Reporting a suppression that way
+    // would quietly turn "we switched email off" into "the API now returns live
+    // password-reset tokens in its responses" — not a trade anybody asked for,
+    // and not one they would notice.
+    //
+    // Every existing caller already treats `error` as "nothing sent, withhold
+    // the token", so this is the safe shape without touching 40 branch sites.
+    return { kind: 'error', message: `Email suppressed: ${SUPPRESSION_TEXT[suppression]}` };
+  }
+
   const rendered = await renderForEvent(
     input.application.id,
     input.eventKey,
@@ -315,6 +384,188 @@ export const emailService = {
         emailConfig: emailConfig as never,
       },
     });
+  },
+
+  // ---- Send control: the master switch, per-event switches, suppressions ----
+
+  /**
+   * Whether an event may be switched off, and what breaks if it is.
+   *
+   * Three of the nine events are load-bearing: turning one off silently removes
+   * the only way a user completes a flow the Application still offers. So they
+   * are coupled to the auth config rather than merely warned about — the switch
+   * is refused while the flow that depends on it is live, and the refusal names
+   * the setting to change first.
+   *
+   * This is the same fail-closed shape the rest of the codebase uses for
+   * "configuration that contradicts itself", and it is preferable to a warning
+   * because the person disabling `password_reset` at 2am is not reading a
+   * warning.
+   */
+  async essentialBlocker(
+    application: Application,
+    eventKey: EmailEventKey,
+  ): Promise<{ code: string; message: string; fix: string } | null> {
+    const auth = (application.authConfig ?? {}) as {
+      methods?: string[];
+      requireEmailVerification?: boolean;
+    };
+    const methods = auth.methods ?? [];
+
+    if (eventKey === 'password_reset' && methods.includes('password')) {
+      return {
+        code: 'EMAIL_EVENT_REQUIRED_BY_AUTH_CONFIG',
+        message:
+          'Password sign-in is enabled, so the password-reset email is the only way a user who forgets their password gets back in.',
+        fix: 'Turn off password sign-in first (Application → Authentication → Methods), or leave this event enabled.',
+      };
+    }
+    if (eventKey === 'magic_link_signin' && methods.includes('magic_link')) {
+      return {
+        code: 'EMAIL_EVENT_REQUIRED_BY_AUTH_CONFIG',
+        message:
+          'Magic-link sign-in is enabled, and the magic-link email IS that sign-in method. Disabling it makes the method unusable while it is still offered.',
+        fix: 'Turn off magic-link sign-in first (Application → Authentication → Methods), or leave this event enabled.',
+      };
+    }
+    if (eventKey === 'email_verification' && auth.requireEmailVerification === true) {
+      return {
+        code: 'EMAIL_EVENT_REQUIRED_BY_AUTH_CONFIG',
+        message:
+          'Email verification is required for sign-in, so this email is the only route into a new account.',
+        fix: 'Turn off "require email verification" first (Application → Authentication), or leave this event enabled.',
+      };
+    }
+    return null;
+  },
+
+  /** Master switch + every event's state, for the settings screen. */
+  async getSendControl(application: Application): Promise<{
+    emailsEnabled: boolean;
+    events: Array<{
+      key: EmailEventKey;
+      label: string;
+      enabled: boolean;
+      customised: boolean;
+      essentialBlocker: { code: string; message: string; fix: string } | null;
+    }>;
+  }> {
+    const [settings, customs] = await Promise.all([
+      prisma.emailEventSetting.findMany({ where: { applicationId: application.id } }),
+      prisma.emailTemplate.findMany({
+        where: { applicationId: application.id },
+        select: { eventKey: true },
+      }),
+    ]);
+    const disabled = new Set(settings.filter((s) => !s.enabled).map((s) => s.eventKey));
+    const customised = new Set(customs.map((c) => c.eventKey));
+
+    const events = await Promise.all(
+      (Object.keys(EMAIL_EVENTS) as EmailEventKey[]).map(async (key) => ({
+        key,
+        label: EMAIL_EVENTS[key].label,
+        enabled: !disabled.has(key),
+        customised: customised.has(key),
+        essentialBlocker: await this.essentialBlocker(application, key),
+      })),
+    );
+    return { emailsEnabled: application.emailsEnabled, events };
+  },
+
+  async setEmailsEnabled(applicationId: string, enabled: boolean): Promise<void> {
+    await prisma.application.update({
+      where: { id: applicationId },
+      data: { emailsEnabled: enabled },
+    });
+  },
+
+  /** Refuses to disable an event the live auth config still depends on. */
+  async setEventEnabled(
+    application: Application,
+    eventKey: EmailEventKey,
+    enabled: boolean,
+  ): Promise<void> {
+    if (!enabled) {
+      const blocker = await this.essentialBlocker(application, eventKey);
+      if (blocker) {
+        throw new RekeyError({ statusCode: 409, ...blocker });
+      }
+    }
+    await prisma.emailEventSetting.upsert({
+      where: { applicationId_eventKey: { applicationId: application.id, eventKey } },
+      create: { applicationId: application.id, eventKey, enabled },
+      update: { enabled },
+    });
+  },
+
+  async listSuppressions(
+    applicationId: string,
+    opts: { take?: number; skip?: number } = {},
+  ): Promise<{ items: EmailSuppression[]; total: number }> {
+    const where = { applicationId };
+    const [items, total] = await Promise.all([
+      prisma.emailSuppression.findMany({
+        where,
+        orderBy: { createdAt: 'desc' },
+        ...(opts.take !== undefined && { take: opts.take }),
+        ...(opts.skip !== undefined && { skip: opts.skip }),
+      }),
+      prisma.emailSuppression.count({ where }),
+    ]);
+    return { items, total };
+  },
+
+  /** Idempotent on (application, address) — re-adding updates the note. */
+  async addSuppression(args: {
+    applicationId: string;
+    address: string;
+    reason: string;
+    note?: string | undefined;
+    createdBy: string | null;
+  }): Promise<EmailSuppression> {
+    const address = args.address.trim().toLowerCase();
+    return prisma.emailSuppression.upsert({
+      where: { applicationId_address: { applicationId: args.applicationId, address } },
+      create: {
+        applicationId: args.applicationId,
+        address,
+        reason: args.reason,
+        ...(args.note !== undefined && { note: args.note }),
+        createdBy: args.createdBy,
+      },
+      update: {
+        reason: args.reason,
+        ...(args.note !== undefined && { note: args.note }),
+      },
+    });
+  },
+
+  /** Idempotent: removing an address that is not suppressed answers false. */
+  async removeSuppression(applicationId: string, address: string): Promise<boolean> {
+    const result = await prisma.emailSuppression.deleteMany({
+      where: { applicationId, address: address.trim().toLowerCase() },
+    });
+    return result.count > 0;
+  },
+
+  /** Send outcomes over a window, for the Email overview. */
+  async sendStats(
+    applicationId: string,
+    sinceHours: number,
+  ): Promise<{ sent: number; error: number; noTransport: number; suppressed: number }> {
+    const since = new Date(Date.now() - sinceHours * 60 * 60 * 1000);
+    const rows = await prisma.emailLog.groupBy({
+      by: ['status'],
+      where: { applicationId, createdAt: { gte: since } },
+      _count: { _all: true },
+    });
+    const by = (s: string): number => rows.find((r) => r.status === s)?._count._all ?? 0;
+    return {
+      sent: by('sent'),
+      error: by('error'),
+      noTransport: by('no_transport'),
+      suppressed: by('suppressed'),
+    };
   },
 
   /** Remove BYO creds — Application falls back to the default Resend pool. */
