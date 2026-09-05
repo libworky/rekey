@@ -50,7 +50,12 @@ import { emailService } from './email.service.js';
 import { describeTransport, sendEmail, type EmailCredentials } from '../../lib/email-transport.js';
 import { isKnownEvent } from './events.js';
 import { ok, okArray, okPage, errs, ref } from '../../lib/openapi.js';
-import { paged } from '../../lib/pagination.js';
+import {
+  paged,
+  paginationJsonSchema,
+  parsePagination,
+  PaginationQuery,
+} from '../../lib/pagination.js';
 
 const AppParam = z.object({ id: z.string().min(1) });
 const EventParam = z.object({ id: z.string().min(1), eventKey: z.string().min(1).max(64) });
@@ -139,8 +144,351 @@ const APP_WRITE_ERRORS = {
 const EMAIL_EVENT_UNKNOWN_DESC =
   'EMAIL_EVENT_UNKNOWN — `eventKey` is not in the event registry (see GET .../email-templates).';
 
+/** One suppressed address, as the routes return it. */
+const EMAIL_SUPPRESSION = {
+  type: 'object',
+  properties: {
+    id: { type: 'string' },
+    applicationId: { type: 'string' },
+    address: { type: 'string', format: 'email' },
+    reason: { type: 'string', enum: ['manual', 'bounce', 'complaint', 'unsubscribe'] },
+    note: { type: 'string', nullable: true },
+    createdBy: { type: 'string', nullable: true, description: 'Operator id, or null when Rekey added it.' },
+    createdAt: { type: 'string', format: 'date-time' },
+  },
+  required: ['id', 'applicationId', 'address', 'reason', 'note', 'createdBy', 'createdAt'],
+} as const;
+
 export async function tenantEmailRoutes(app: FastifyInstance): Promise<void> {
   app.addHook('onRequest', requireTenantSession);
+
+  // ---------- Send control: master switch, per-event, suppressions ----------
+  //
+  // Until these existed `dispatch` had no gate at all: an Application with a
+  // transport configured sent everything it was asked to send, and there was no
+  // way to stop it — not globally, not per event, not for one address. A
+  // product whose own backend already sends transactional mail therefore
+  // delivered two of everything, with no lever.
+
+  app.get(
+    '/:id/email-send-control',
+    {
+      schema: {
+        tags: ['Tenant · Email'],
+        security: [{ tenantSession: [] }],
+        summary: 'Get the master switch and every email event with its state',
+        description:
+          'Requires **read** access to this Application.\n\n' +
+          'Each event reports whether it is enabled, whether its template has been customised, and ' +
+          '— when it cannot currently be switched off — why, as `essentialBlocker`. Three of the ' +
+          'nine are load-bearing: disabling one silently removes the only way a user completes a ' +
+          'flow the Application still offers, so they are refused while that flow is live rather ' +
+          'than merely warned about.',
+        response: {
+          200: ok(
+            {
+              type: 'object',
+              properties: {
+                emailsEnabled: {
+                  type: 'boolean',
+                  description: 'Master switch. False stops every Application-scoped email.',
+                },
+                events: {
+                  type: 'array',
+                  items: {
+                    type: 'object',
+                    properties: {
+                      key: { type: 'string' },
+                      label: { type: 'string' },
+                      enabled: { type: 'boolean' },
+                      customised: { type: 'boolean' },
+                      essentialBlocker: {
+                        type: 'object',
+                        nullable: true,
+                        description:
+                          'Present when this event cannot be disabled right now; null when it can.',
+                        properties: {
+                          code: { type: 'string' },
+                          message: { type: 'string' },
+                          fix: { type: 'string' },
+                        },
+                        required: ['code', 'message', 'fix'],
+                      },
+                    },
+                    required: ['key', 'label', 'enabled', 'customised', 'essentialBlocker'],
+                  },
+                },
+              },
+              required: ['emailsEnabled', 'events'],
+            },
+            'The master switch and the per-event state.',
+          ),
+          ...errs(APP_READ_ERRORS),
+        },
+      },
+    },
+    async (req) => {
+      const { id } = AppParam.parse(req.params);
+      await ensureAppAccess(req, id, 'read');
+      const application = await prisma.application.findUniqueOrThrow({ where: { id } });
+      return { success: true, data: await emailService.getSendControl(application) };
+    },
+  );
+
+  app.patch(
+    '/:id/email-send-control',
+    {
+      schema: {
+        tags: ['Tenant · Email'],
+        security: [{ tenantSession: [] }],
+        summary: 'Turn every email for this Application on or off',
+        description:
+          'Requires **write** access to this Application.\n\n' +
+          '`false` stops every Application-scoped email: verification, reset, magic link, welcome, ' +
+          'dunning — all of it. Each attempted send is still RECORDED, with `status: "suppressed"`, ' +
+          'so the Delivery view can answer "why did they not get it".\n\n' +
+          'Workspace and operator mail (invitations, operator MFA) is deliberately unaffected: an ' +
+          'Application-level switch must not be able to lock operators out of their own workspace.\n\n' +
+          '**This does not hand you the tokens instead.** A suppressed send reports as a failed ' +
+          'send, so a reset or magic-link token is withheld rather than returned to the caller. If ' +
+          'your own backend needs to deliver those, leave email on and remove the transport ' +
+          'credentials — that is the documented no-transport contract.',
+        body: {
+          type: 'object',
+          required: ['emailsEnabled'],
+          properties: { emailsEnabled: { type: 'boolean' } },
+        },
+        response: {
+          200: ok(
+            {
+              type: 'object',
+              properties: { emailsEnabled: { type: 'boolean' } },
+              required: ['emailsEnabled'],
+            },
+            'The new state of the master switch.',
+          ),
+          ...errs(APP_WRITE_ERRORS),
+        },
+      },
+    },
+    async (req) => {
+      const { id } = AppParam.parse(req.params);
+      await ensureAppAccess(req, id, 'write');
+      const body = z.object({ emailsEnabled: z.boolean() }).parse(req.body);
+      await emailService.setEmailsEnabled(id, body.emailsEnabled);
+      return { success: true, data: { emailsEnabled: body.emailsEnabled } };
+    },
+  );
+
+  app.patch(
+    '/:id/email-send-control/:eventKey',
+    {
+      schema: {
+        tags: ['Tenant · Email'],
+        security: [{ tenantSession: [] }],
+        summary: 'Turn one email event on or off',
+        description:
+          'Requires **write** access to this Application.\n\n' +
+          'Independent of whether the template is customised: turning an event off must not require ' +
+          'rewriting its body first, and deleting a customisation must not re-enable something ' +
+          'somebody switched off.\n\n' +
+          'Refused with 409 while the live auth config depends on the event — the password-reset ' +
+          'mail while password sign-in is on, the magic-link mail while magic-link sign-in is on, ' +
+          'the verification mail while verification is required. The refusal names the setting to ' +
+          'change first.',
+        body: {
+          type: 'object',
+          required: ['enabled'],
+          properties: { enabled: { type: 'boolean' } },
+        },
+        response: {
+          200: ok(
+            {
+              type: 'object',
+              properties: { enabled: { type: 'boolean' } },
+              required: ['enabled'],
+            },
+            'The new state of this event.',
+          ),
+          ...errs({
+            ...APP_WRITE_ERRORS,
+            404: `${APP_WRITE_ERRORS[404]}; or ${EMAIL_EVENT_UNKNOWN_DESC}`,
+            409: 'EMAIL_EVENT_REQUIRED_BY_AUTH_CONFIG — a live auth method depends on this email.',
+          }),
+        },
+      },
+    },
+    async (req) => {
+      const { id, eventKey } = EventParam.parse(req.params);
+      await ensureAppAccess(req, id, 'write');
+      if (!isKnownEvent(eventKey)) {
+        throw new RekeyError({
+          statusCode: 404,
+          code: 'EMAIL_EVENT_UNKNOWN',
+          message: `Email event "${eventKey}" is not in the registry.`,
+          fix: 'Use one of the events returned by GET /api/v1/tenant/applications/:id/email-send-control.',
+        });
+      }
+      const body = z.object({ enabled: z.boolean() }).parse(req.body);
+      const application = await prisma.application.findUniqueOrThrow({ where: { id } });
+      await emailService.setEventEnabled(application, eventKey, body.enabled);
+      return { success: true, data: { enabled: body.enabled } };
+    },
+  );
+
+  app.get(
+    '/:id/email-suppressions',
+    {
+      schema: {
+        tags: ['Tenant · Email'],
+        security: [{ tenantSession: [] }],
+        summary: 'List addresses this Application will not email',
+        description:
+          'Requires **read** access to this Application. Newest first. The narrowest of the three ' +
+          'gates, and the only one about a person rather than about configuration.',
+        querystring: { type: 'object', properties: { ...paginationJsonSchema } },
+        response: {
+          200: okPage(EMAIL_SUPPRESSION, 'A page of suppressed addresses.'),
+          ...errs(APP_READ_ERRORS),
+        },
+      },
+    },
+    async (req) => {
+      const { id } = AppParam.parse(req.params);
+      await ensureAppAccess(req, id, 'read');
+      const { take, skip } = parsePagination(PaginationQuery.parse(req.query));
+      const { items, total } = await emailService.listSuppressions(id, { take, skip });
+      return { success: true, data: paged(items, total, take, skip) };
+    },
+  );
+
+  app.post(
+    '/:id/email-suppressions',
+    {
+      schema: {
+        tags: ['Tenant · Email'],
+        security: [{ tenantSession: [] }],
+        summary: 'Stop emailing one address',
+        description:
+          'Requires **write** access to this Application.\n\n' +
+          'Outranks every other gate, including a password reset: an address that hard-bounced ' +
+          'cannot receive one anyway, and mailing a complainant again is how a sending domain gets ' +
+          'blocked.\n\n' +
+          'Idempotent on the address — re-adding updates the reason and note rather than failing.',
+        body: {
+          type: 'object',
+          required: ['address'],
+          properties: {
+            address: { type: 'string', format: 'email', maxLength: 254 },
+            reason: {
+              type: 'string',
+              enum: ['manual', 'bounce', 'complaint', 'unsubscribe'],
+              default: 'manual',
+            },
+            note: { type: 'string', maxLength: 500 },
+          },
+        },
+        response: {
+          201: ok(EMAIL_SUPPRESSION, 'The suppressed address.'),
+          ...errs(APP_WRITE_ERRORS),
+        },
+      },
+    },
+    async (req, reply) => {
+      const { id } = AppParam.parse(req.params);
+      await ensureAppAccess(req, id, 'write');
+      const body = z
+        .object({
+          address: z.string().email().max(254),
+          reason: z.enum(['manual', 'bounce', 'complaint', 'unsubscribe']).default('manual'),
+          note: z.string().max(500).optional(),
+        })
+        .parse(req.body);
+      const row = await emailService.addSuppression({
+        applicationId: id,
+        address: body.address,
+        reason: body.reason,
+        ...(body.note !== undefined && { note: body.note }),
+        createdBy: req.tenantUser?.id ?? null,
+      });
+      return reply.status(201).send({ success: true, data: row });
+    },
+  );
+
+  app.delete(
+    '/:id/email-suppressions/:address',
+    {
+      schema: {
+        tags: ['Tenant · Email'],
+        security: [{ tenantSession: [] }],
+        summary: 'Start emailing an address again',
+        description:
+          'Requires **write** access to this Application. Idempotent: an address that is not ' +
+          'suppressed answers `removed: false` rather than 404.',
+        response: {
+          200: ok(
+            {
+              type: 'object',
+              properties: { removed: { type: 'boolean' } },
+              required: ['removed'],
+            },
+            'Whether this call removed a suppression.',
+          ),
+          ...errs(APP_WRITE_ERRORS),
+        },
+      },
+    },
+    async (req) => {
+      const { id, address } = z
+        .object({ id: z.string().min(1), address: z.string().min(1).max(254) })
+        .parse(req.params);
+      await ensureAppAccess(req, id, 'write');
+      const removed = await emailService.removeSuppression(id, address);
+      return { success: true, data: { removed } };
+    },
+  );
+
+  app.get(
+    '/:id/email-stats',
+    {
+      schema: {
+        tags: ['Tenant · Email'],
+        security: [{ tenantSession: [] }],
+        summary: 'Send outcomes over a recent window',
+        description:
+          'Requires **read** access to this Application. Counted from `email_logs`, so ' +
+          '`suppressed` is visible alongside `sent` — a suppression is an outcome, not an absence.',
+        querystring: {
+          type: 'object',
+          properties: { hours: { type: 'integer', minimum: 1, maximum: 720, default: 24 } },
+        },
+        response: {
+          200: ok(
+            {
+              type: 'object',
+              properties: {
+                sent: { type: 'integer' },
+                error: { type: 'integer' },
+                noTransport: { type: 'integer' },
+                suppressed: { type: 'integer' },
+              },
+              required: ['sent', 'error', 'noTransport', 'suppressed'],
+            },
+            'Counts by outcome over the window.',
+          ),
+          ...errs(APP_READ_ERRORS),
+        },
+      },
+    },
+    async (req) => {
+      const { id } = AppParam.parse(req.params);
+      await ensureAppAccess(req, id, 'read');
+      const { hours } = z
+        .object({ hours: z.coerce.number().int().min(1).max(720).default(24) })
+        .parse(req.query);
+      return { success: true, data: await emailService.sendStats(id, hours) };
+    },
+  );
 
   // ---------- Config + credentials ----------
 
