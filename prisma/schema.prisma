@@ -47,6 +47,12 @@ model Tenant {
   // automation (if any) is what writes plan-derived numbers in here; this
   // codebase only knows "a number, or no number".
   limits       Json?         @map("limits")
+  /// Whether operators may reach this workspace through the operator MCP
+  /// server (/api/v1/tenant/mcp) at all. Off = every MCP credential bound to
+  /// the workspace is refused at auth time and no new consent is granted; the
+  /// deployment-wide OPERATOR_MCP_ENABLED still governs whether the server
+  /// mounts. Default on, so applying this changes nothing.
+  operatorMcpEnabled Boolean @default(true) @map("operator_mcp_enabled")
   createdAt    DateTime      @default(now()) @map("created_at")
   updatedAt    DateTime      @updatedAt @map("updated_at")
 

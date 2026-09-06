@@ -165,6 +165,8 @@ export const SECURITY_EVENT_LABEL = {
   'workspace.invitation_revoked': 'Invitation revoked',
   'workspace.member_role_changed': 'Teammate role changed',
   'workspace.member_removed': 'Teammate removed',
+  // An owner or admin turning agent access for the whole workspace off or on.
+  'workspace.operator_mcp_switched': 'Operator MCP switched',
   'member.app_grant_set': 'Application access granted to member',
   'member.app_grant_removed': 'Application access removed from member',
   // A membership written by deployment automation through the super-admin

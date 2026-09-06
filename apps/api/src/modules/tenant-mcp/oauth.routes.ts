@@ -39,6 +39,7 @@ import {
   operatorProtectedResourceMetadata,
 } from './oauth.service.js';
 import { ok, errs, ref, raw, type JsonSchema } from '../../lib/openapi.js';
+import { assertOperatorMcpEnabled } from './workspace-mcp-switch.js';
 
 // This plugin only mounts when OPERATOR_MCP_ENABLED is on (see app.ts), so
 // there is no per-request feature-toggle 404 here. Most of these are OAuth
@@ -401,7 +402,8 @@ export async function operatorMcpOAuthRoutes(app: FastifyInstance): Promise<void
             403:
               'TENANT_MEMBERSHIP_REVOKED — the session operator is no longer a member of ANY ' +
               'workspace; or TENANT_MEMBERSHIP_REQUIRED — the session operator is not a member ' +
-              'of the specific `tenant_id` they picked at consent.',
+              'of the specific `tenant_id` they picked at consent; or OPERATOR_MCP_DISABLED — ' +
+              'that workspace has switched the operator MCP server off, so no consent is granted.',
             429: 'RATE_LIMITED — too many requests. Honour the `Retry-After` header.',
           }),
         },
@@ -469,6 +471,10 @@ export async function operatorMcpOAuthRoutes(app: FastifyInstance): Promise<void
           fix: 'Pick a workspace you belong to.',
         });
       }
+
+      // Membership is necessary but not sufficient: the workspace itself may
+      // have switched operator MCP off, in which case no consent is granted.
+      await assertOperatorMcpEnabled(data.tenant_id);
 
       const code = await operatorMcpOAuthService.createAuthCode({
         clientId: data.client_id,

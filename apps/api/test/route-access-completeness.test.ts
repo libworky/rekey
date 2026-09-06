@@ -70,6 +70,9 @@ describe('route access declarations', () => {
       /^\/api\/v1\/tenant\/workspace\/members\/:id(\/grants(\/:applicationId)?)?$/,
       /^\/api\/v1\/tenant\/workspace\/invitations(\/:id)?$/,
       /^\/api\/v1\/tenant\/workspace\/limits$/,
+      // PATCH carries a security control (the operator MCP switch); GET and
+      // POST on the same URL are open, not scoped, so the regex is safe.
+      /^\/api\/v1\/tenant\/workspace$/,
     ];
     const violations = app.routeAccess
       .filter((r) => mustBeFloor.some((re) => re.test(r.url)))
