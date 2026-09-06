@@ -30,7 +30,10 @@ import type { Page } from '@/lib/paginate';
 /** One chip rendered next to an event's label. */
 export interface EventDetail {
   label: string;
+  /** Display value, truncated for the cell. */
   value: string;
+  /** The untruncated value, for the title. */
+  full: string;
 }
 
 /**
@@ -47,11 +50,9 @@ const DETAIL_KEYS: ReadonlyArray<{ key: string; label: string }> = [
   { key: 'enabled', label: 'state' },
   { key: 'via', label: 'via' },
   { key: 'role', label: 'role' },
-  { key: 'newRole', label: 'role' },
   { key: 'planSlug', label: 'plan' },
   { key: 'reason', label: 'reason' },
   { key: 'note', label: 'note' },
-  { key: 'email', label: 'email' },
   { key: 'admin', label: 'admin' },
   { key: 'write', label: 'write' },
 ];
@@ -75,8 +76,9 @@ export function eventDetails(metadata: unknown): EventDetail[] {
       else if (v) value = 'yes';
     }
     if (value === null || value === '') continue;
+    const full = value;
     if (value.length > MAX_VALUE_CHARS) value = value.slice(0, MAX_VALUE_CHARS - 1) + '…';
-    out.push({ label, value });
+    out.push({ label, value, full });
     if (out.length === MAX_DETAILS) break;
   }
   return out;

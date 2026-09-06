@@ -17,7 +17,7 @@
 
 import { redirect } from 'next/navigation';
 import { cookies } from 'next/headers';
-import { api, PanelApiError } from '@/lib/api';
+import { api, errorQuery, PanelApiError } from '@/lib/api';
 import { cookieSecure } from '@/lib/cookie-secure';
 import { IMPERSONATE_COOKIE, IMPERSONATE_COOKIE_MAX_AGE } from './shared';
 
@@ -384,27 +384,36 @@ export async function setEntitlementOverrides(
     const key = (keys[i] ?? '').trim();
     const kind = (kinds[i] ?? '').trim().toUpperCase();
     if (!key) continue;
-    if (!OVERRIDE_KINDS.has(kind) || !/^[a-z0-9_.-]+$/i.test(key)) {
-      redirect(`${base}?overrideError=OVERRIDE_KEY_INVALID&sub=${encodeURIComponent(subId)}`);
+    // Same shape the API accepts (`[A-Za-z0-9_.:-]{0,64}` after the kind), so
+    // the panel never refuses a key the route would take. `sub=<id>` is the
+    // Modal reopen flag for this row.
+    if (!OVERRIDE_KINDS.has(kind) || !/^[A-Za-z0-9_.:-]{1,64}$/.test(key)) {
+      redirect(`${base}?error=OVERRIDE_KEY_INVALID&sub=${encodeURIComponent(subId)}`);
     }
     body[`${kind}:${key}`] = parseOverrideValue(values[i] ?? '');
   }
   if (Object.keys(body).length === 0) {
-    redirect(`${base}?overrideError=OVERRIDE_EMPTY&sub=${encodeURIComponent(subId)}`);
+    redirect(`${base}?error=OVERRIDE_EMPTY&sub=${encodeURIComponent(subId)}`);
   }
+  let changed = true;
   try {
-    await api({
+    const r = await api<{ changed?: boolean }>({
       method: 'PATCH',
       path: `/api/v1/tenant/applications/${encodeURIComponent(applicationId)}/subscriptions/${encodeURIComponent(subId)}/entitlement-overrides`,
       body,
     });
+    changed = r.changed !== false;
   } catch (err) {
     if (err instanceof PanelApiError) {
-      redirect(`${base}?overrideError=${encodeURIComponent(err.code)}&sub=${encodeURIComponent(subId)}`);
+      // The API's message and fix travel in the error flash; one code covers
+      // a dozen distinct refusals and the operator needs the specific one.
+      redirect(`${base}?${await errorQuery(err)}&sub=${encodeURIComponent(subId)}`);
     }
     throw err;
   }
-  redirect(`${base}?overrides=${Object.keys(body).length}`);
+  // Report what happened, not what was asked: the route says whether the
+  // resolved entitlements actually moved.
+  redirect(`${base}?overrides=${Object.keys(body).length}&changed=${changed ? 1 : 0}`);
 }
 
 // ---------------------------------------------------------------------------

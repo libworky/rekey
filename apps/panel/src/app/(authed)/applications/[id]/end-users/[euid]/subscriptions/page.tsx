@@ -32,8 +32,10 @@ import {
   getApplication,
   getMe,
   getSubscriptionGrantsMode,
+  readErrorFlash,
   type PlanRow,
 } from '@/lib/api';
+import { ApiErrorText } from '@/components/api-error';
 import { cancelEffect } from '@rekey.dev/shared-types';
 import type { Page } from '@/lib/paginate';
 import { formatDate, formatDateTime } from '@/lib/date';
@@ -76,14 +78,19 @@ const GRANT_ERR: Record<string, string> = {
   SUBSCRIPTION_PERIOD_END_IN_PAST: 'The period end has to be in the future.',
 };
 
+// Codes the overrides route and the panel's own checks can produce. The API's
+// message and fix for a refusal arrive through the error flash and render
+// beside these, since ENTITLEMENT_OVERRIDE_INVALID alone covers a dozen causes.
 const OVERRIDE_ERR: Record<string, string> = {
   OVERRIDE_EMPTY: 'Add at least one entitlement row.',
-  OVERRIDE_KEY_INVALID: 'Pick a kind and give the key as letters, digits, dots, dashes or underscores.',
+  OVERRIDE_KEY_INVALID:
+    'Pick a kind, and give the key as up to 64 letters, digits, dots, colons, dashes or underscores.',
   SUBSCRIPTION_NOT_FOUND: 'That subscription no longer exists for this end-user.',
-  TENANT_ROLE_INSUFFICIENT: 'Only owners and admins can adjust entitlements.',
+  SUBSCRIPTION_NOT_ENTITLING:
+    'This subscription is not entitling anyone right now (cancelled, expired or pending), so there is nothing an override would change.',
   APP_ACCESS_DENIED: 'Your grant on this Application does not allow billing writes.',
   SCOPE_INSUFFICIENT: 'Your scopes on this workspace do not include billing writes.',
-  ENTITLEMENT_KEY_UNKNOWN: 'The plan defines no entitlement with that key. Overrides can change a value the plan already has; adding a brand-new entitlement means editing the plan.',
+  ENTITLEMENT_OVERRIDE_INVALID: 'The API refused an override.',
 };
 
 const CANCEL_ERR: Record<string, string> = {
@@ -110,8 +117,12 @@ export default async function EndUserSubscriptionsPage({
   const grantError = typeof sp.grantError === 'string' ? sp.grantError : undefined;
   const cancelError = typeof sp.cancelError === 'string' ? sp.cancelError : undefined;
   const overridesApplied = typeof sp.overrides === 'string' ? Number(sp.overrides) : null;
-  const overrideError = typeof sp.overrideError === 'string' ? sp.overrideError : undefined;
+  const overridesChanged = sp.changed !== '0';
   const overrideSub = typeof sp.sub === 'string' ? sp.sub : undefined;
+  // The overrides dialog is the only form on this page that redirects with
+  // `?error=`, and `sub` names the row whose dialog reopens (see Modal).
+  const overrideError = overrideSub !== undefined && typeof sp.error === 'string' ? sp.error : undefined;
+  const overrideFlash = await readErrorFlash(overrideError);
 
   const [billing, application, me, grantsMode] = await Promise.all([
     getEndUserBilling(id, euid),
@@ -131,6 +142,12 @@ export default async function EndUserSubscriptionsPage({
   const isOperatorAdmin = me.activeRole === 'OWNER' || me.activeRole === 'ADMIN';
   const canGrant = grantsMode === 'enabled' && isOperatorAdmin;
   const canCancel = isOperatorAdmin;
+  // Overrides are a billing write with no role floor: OWNER/ADMIN, or a MEMBER
+  // holding APP_ADMIN or APP_BILLING on this Application. The panel has no
+  // per-application grant helper, so every member sees the control; a viewer's
+  // attempt is refused by the API with a mapped message. Hiding it from members
+  // would strand the billing role this route exists for.
+  const canAdjust = isOperatorAdmin || me.activeRole === 'MEMBER';
 
   // Only fetched when there is a form to fill. The picker offers active plans;
   // the API accepts withdrawn ones too, but offering the whole historical
@@ -212,11 +229,17 @@ export default async function EndUserSubscriptionsPage({
             it here as well put the same message twice, one copy behind the
             backdrop. */}
         {cancelError && <Banner tone="error">{CANCEL_ERR[cancelError] ?? cancelError}</Banner>}
-        {overridesApplied !== null && !Number.isNaN(overridesApplied) && (
+        {overridesApplied !== null && !Number.isNaN(overridesApplied) && overridesChanged && (
           <Banner tone="success">
             {overridesApplied === 1 ? 'One entitlement' : `${overridesApplied} entitlements`} adjusted for
             this subscription. Feature and usage values apply on the next resolve; a credit allowance
             applies at the next renewal, and an already-issued licence keeps its seat count.
+          </Banner>
+        )}
+        {overridesApplied !== null && !Number.isNaN(overridesApplied) && !overridesChanged && (
+          <Banner tone="info">
+            Nothing changed. The values sent match what this subscription already resolves, or removed
+            overrides that were not set.
           </Banner>
         )}
         {/* `overrideError` renders inside the row's dialog, which reopens on it. */}
@@ -248,7 +271,7 @@ export default async function EndUserSubscriptionsPage({
                 <TH>Provider</TH>
                 <TH>Renews</TH>
                 <TH>Started</TH>
-                {(canCancel || isOperatorAdmin) && <TH align="right"> </TH>}
+                {(canCancel || canAdjust) && <TH align="right"> </TH>}
               </TR>
             </THead>
             <TBody>
@@ -289,15 +312,17 @@ export default async function EndUserSubscriptionsPage({
                   <TD muted className="text-xs">
                     {formatDate(s.createdAt)}
                   </TD>
-                  {(canCancel || isOperatorAdmin) && (
+                  {(canCancel || canAdjust) && (
                     <TD align="right">
                       <div className="flex items-center justify-end gap-2">
-                        {isOperatorAdmin && (
+                        {canAdjust && (
                           <OverridesForm
                             applicationId={id}
                             euid={euid}
                             subscription={s}
                             error={overrideSub === s.id ? overrideError : undefined}
+                            detail={overrideSub === s.id ? overrideFlash.detail : undefined}
+                            fix={overrideSub === s.id ? overrideFlash.fix : undefined}
                           />
                         )}
                         {canCancel && <CancelAction applicationId={id} euid={euid} subscription={s} />}
@@ -539,22 +564,32 @@ function OverridesForm({
   euid,
   subscription,
   error,
+  detail,
+  fix,
 }: {
   applicationId: string;
   euid: string;
   subscription: SubscriptionRow;
   error?: string | undefined;
+  /** The API's own message and fix for `error`, from the error flash. */
+  detail?: string | undefined;
+  fix?: string | undefined;
 }): React.JSX.Element {
   const existing = Object.entries(subscription.entitlementOverrides ?? {});
   return (
     <Modal
-      modalKey={`overrides-${subscription.id}`}
+      modalKey="sub"
+      modalValue={subscription.id}
       title="Adjust entitlements"
       description="Deviate from the plan for this one subscription. Each row names an entitlement the plan already defines and the value this customer gets instead; leave the value empty to remove an override. Feature and usage values apply immediately; a credit allowance applies at the next renewal; an issued licence keeps its seat count."
       trigger="Adjust"
     >
       <form action={setEntitlementOverrides.bind(null, applicationId, euid, subscription.id)} className="space-y-3">
-        {error && <Banner tone="error">{OVERRIDE_ERR[error] ?? error}</Banner>}
+        {error && (
+          <Banner tone="error">
+            <ApiErrorText code={error} detail={detail} fix={fix} map={OVERRIDE_ERR} fallback="The API refused the change." />
+          </Banner>
+        )}
         {existing.length > 0 && (
           <div className="text-xs text-[var(--color-muted-fg)]">
             Currently overridden:{' '}
@@ -579,7 +614,7 @@ function OverridesForm({
           </div>
         ))}
         <p className="text-[11px] text-[var(--color-muted-fg)]">
-          Values: a number, <code className="font-mono">true</code>/<code className="font-mono">false</code>, or text. Rows with no key are ignored.
+          Values: a number, <code className="font-mono">true</code>/<code className="font-mono">false</code>, or text; the literal words true, false and null cannot be stored as text. Keys may contain colons. Rows with no key are ignored.
         </p>
         <SubmitButton pendingLabel="Applying…">Apply overrides</SubmitButton>
       </form>

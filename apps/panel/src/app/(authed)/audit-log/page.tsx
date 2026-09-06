@@ -203,7 +203,7 @@ export default async function AuditLogPage({
                   <div className="flex flex-wrap items-center gap-1.5 font-medium text-[var(--color-fg)]">
                     {humanizeEventType(e.type)}
                     {eventDetails(e.metadata).map((d) => (
-                      <Badge key={d.label} tone="neutral" className="font-normal" title={d.label}>
+                      <Badge key={d.label} tone="neutral" className="font-normal" title={`${d.label}: ${d.full}`}>
                         {d.label === 'via' ? d.value : `${d.label}: ${d.value}`}
                       </Badge>
                     ))}
