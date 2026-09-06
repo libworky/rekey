@@ -147,6 +147,7 @@ export async function tenantWorkspacesRoutes(app: FastifyInstance): Promise<void
   app.get(
     '/creation-mode',
     {
+      config: { access: { open: true } },
       schema: {
         tags: ['Tenant · Workspace'],
         security: [{ tenantSession: [] }],
@@ -175,6 +176,7 @@ export async function tenantWorkspacesRoutes(app: FastifyInstance): Promise<void
   app.get(
     '/subscription-grants-mode',
     {
+      config: { access: { open: true } },
       schema: {
         tags: ['Tenant · Workspace'],
         security: [{ tenantSession: [] }],
@@ -206,6 +208,7 @@ export async function tenantWorkspacesRoutes(app: FastifyInstance): Promise<void
   app.get(
     '/limits',
     {
+      config: { access: { floor: true } },
       preHandler: requireTenantRole(['OWNER', 'ADMIN']),
       schema: {
         tags: ['Tenant · Workspace'],
@@ -301,6 +304,7 @@ export async function tenantWorkspacesRoutes(app: FastifyInstance): Promise<void
   app.get(
     '/',
     {
+      config: { access: { open: true } },
       schema: {
         tags: ['Tenant · Workspace'],
         security: [{ tenantSession: [] }],
@@ -323,6 +327,7 @@ export async function tenantWorkspacesRoutes(app: FastifyInstance): Promise<void
   app.post(
     '/',
     {
+      config: { access: { open: true } },
       schema: {
         tags: ['Tenant · Workspace'],
         security: [{ tenantSession: [] }],
@@ -363,6 +368,7 @@ export async function tenantWorkspacesRoutes(app: FastifyInstance): Promise<void
   app.patch(
     '/',
     {
+      config: { access: { floor: true } },
       preHandler: requireTenantRole(['OWNER', 'ADMIN']),
       schema: {
         tags: ['Tenant · Workspace'],
@@ -400,6 +406,7 @@ export async function tenantWorkspacesRoutes(app: FastifyInstance): Promise<void
   app.get(
     '/members',
     {
+      config: { access: { project: 'workspace-members' } },
       schema: {
         tags: ['Tenant · Workspace'],
         security: [{ tenantSession: [] }],
@@ -427,6 +434,7 @@ export async function tenantWorkspacesRoutes(app: FastifyInstance): Promise<void
   app.delete(
     '/members/:id',
     {
+      config: { access: { floor: true } },
       preHandler: requireTenantRole(['OWNER', 'ADMIN']),
       schema: {
         tags: ['Tenant · Workspace'],
@@ -468,6 +476,7 @@ export async function tenantWorkspacesRoutes(app: FastifyInstance): Promise<void
   app.patch(
     '/members/:id',
     {
+      config: { access: { floor: true } },
       preHandler: requireTenantRole(['OWNER', 'ADMIN']),
       schema: {
         tags: ['Tenant · Workspace'],
@@ -518,6 +527,7 @@ export async function tenantWorkspacesRoutes(app: FastifyInstance): Promise<void
   app.get(
     '/members/:id/grants',
     {
+      config: { access: { floor: true } },
       preHandler: requireTenantRole(['OWNER', 'ADMIN']),
       schema: {
         tags: ['Tenant · Workspace'],
@@ -554,6 +564,7 @@ export async function tenantWorkspacesRoutes(app: FastifyInstance): Promise<void
   app.put(
     '/members/:id/grants',
     {
+      config: { access: { floor: true } },
       preHandler: requireTenantRole(['OWNER', 'ADMIN']),
       schema: {
         tags: ['Tenant · Workspace'],
@@ -617,6 +628,7 @@ export async function tenantWorkspacesRoutes(app: FastifyInstance): Promise<void
   app.delete(
     '/members/:id/grants/:applicationId',
     {
+      config: { access: { floor: true } },
       preHandler: requireTenantRole(['OWNER', 'ADMIN']),
       schema: {
         tags: ['Tenant · Workspace'],
@@ -674,6 +686,7 @@ export async function tenantWorkspacesRoutes(app: FastifyInstance): Promise<void
   app.get(
     '/invitations',
     {
+      config: { access: { floor: true } },
       // OWNER/ADMIN, matching the POST directly below. The two halves of one
       // resource disagreed: creating an invitation was ADMIN-gated while
       // reading the list of them — pending invitee addresses and the workspace
@@ -711,6 +724,7 @@ export async function tenantWorkspacesRoutes(app: FastifyInstance): Promise<void
   app.post(
     '/invitations',
     {
+      config: { access: { floor: true } },
       preHandler: requireTenantRole(['OWNER', 'ADMIN']),
       schema: {
         tags: ['Tenant · Workspace'],
@@ -782,6 +796,7 @@ export async function tenantWorkspacesRoutes(app: FastifyInstance): Promise<void
   app.delete(
     '/invitations/:id',
     {
+      config: { access: { floor: true } },
       preHandler: requireTenantRole(['OWNER', 'ADMIN']),
       schema: {
         tags: ['Tenant · Workspace'],
@@ -820,6 +835,7 @@ export async function tenantWorkspacesRoutes(app: FastifyInstance): Promise<void
   app.get(
     '/email-logs',
     {
+      config: { access: { scope: 'activity:read' } },
       // OWNER/ADMIN, matching GET /api/v1/tenant/security-events. Both are
       // workspace-level operator audit surfaces and they disagreed: the
       // security-events log was ADMIN-only on the stated grounds that it
@@ -944,6 +960,7 @@ export async function tenantInvitationAuthRoutes(app: FastifyInstance): Promise<
   app.post(
     '/accept',
     {
+      config: { access: { open: true } },
       schema: {
         tags: ['Tenant · Workspace'],
         security: [{ tenantSession: [] }],

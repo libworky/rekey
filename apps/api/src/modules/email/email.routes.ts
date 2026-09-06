@@ -177,6 +177,7 @@ export async function tenantEmailRoutes(app: FastifyInstance): Promise<void> {
   app.get(
     '/:id/email-send-control',
     {
+      config: { access: { scope: 'developer:read' } },
       schema: {
         tags: ['Tenant · Email'],
         security: [{ tenantSession: [] }],
@@ -257,6 +258,7 @@ export async function tenantEmailRoutes(app: FastifyInstance): Promise<void> {
   app.patch(
     '/:id/email-send-control',
     {
+      config: { access: { scope: 'developer:write' } },
       schema: {
         tags: ['Tenant · Email'],
         security: [{ tenantSession: [] }],
@@ -302,6 +304,7 @@ export async function tenantEmailRoutes(app: FastifyInstance): Promise<void> {
   app.patch(
     '/:id/email-send-control/:eventKey',
     {
+      config: { access: { scope: 'developer:write' } },
       schema: {
         tags: ['Tenant · Email'],
         security: [{ tenantSession: [] }],
@@ -358,6 +361,7 @@ export async function tenantEmailRoutes(app: FastifyInstance): Promise<void> {
   app.get(
     '/:id/email-suppressions',
     {
+      config: { access: { scope: 'developer:read' } },
       schema: {
         tags: ['Tenant · Email'],
         security: [{ tenantSession: [] }],
@@ -384,6 +388,7 @@ export async function tenantEmailRoutes(app: FastifyInstance): Promise<void> {
   app.post(
     '/:id/email-suppressions',
     {
+      config: { access: { scope: 'developer:write' } },
       schema: {
         tags: ['Tenant · Email'],
         security: [{ tenantSession: [] }],
@@ -437,6 +442,7 @@ export async function tenantEmailRoutes(app: FastifyInstance): Promise<void> {
   app.delete(
     '/:id/email-suppressions/:address',
     {
+      config: { access: { scope: 'developer:write' } },
       schema: {
         tags: ['Tenant · Email'],
         security: [{ tenantSession: [] }],
@@ -470,6 +476,7 @@ export async function tenantEmailRoutes(app: FastifyInstance): Promise<void> {
   app.get(
     '/:id/email-stats',
     {
+      config: { access: { scope: 'developer:read' } },
       schema: {
         tags: ['Tenant · Email'],
         security: [{ tenantSession: [] }],
@@ -514,6 +521,7 @@ export async function tenantEmailRoutes(app: FastifyInstance): Promise<void> {
   app.get(
     '/:id/email-config',
     {
+      config: { access: { scope: 'developer:read' } },
       schema: {
         tags: ['Tenant · Email'],
         security: [{ tenantSession: [] }],
@@ -584,6 +592,7 @@ export async function tenantEmailRoutes(app: FastifyInstance): Promise<void> {
   app.put(
     '/:id/email-credentials',
     {
+      config: { access: { scope: 'developer:write' } },
       schema: {
         tags: ['Tenant · Email'],
         security: [{ tenantSession: [] }],
@@ -662,6 +671,7 @@ export async function tenantEmailRoutes(app: FastifyInstance): Promise<void> {
   app.delete(
     '/:id/email-credentials',
     {
+      config: { access: { scope: 'developer:write' } },
       schema: {
         tags: ['Tenant · Email'],
         security: [{ tenantSession: [] }],
@@ -695,6 +705,7 @@ export async function tenantEmailRoutes(app: FastifyInstance): Promise<void> {
   app.get(
     '/:id/email-logs',
     {
+      config: { access: { scope: 'developer:read' } },
       schema: {
         tags: ['Tenant · Email'],
         security: [{ tenantSession: [] }],
@@ -768,6 +779,7 @@ export async function tenantEmailRoutes(app: FastifyInstance): Promise<void> {
   app.get(
     '/:id/email-templates',
     {
+      config: { access: { scope: 'developer:read' } },
       schema: {
         ...templateReadSchema,
         summary: 'List customisable email events',
@@ -800,6 +812,7 @@ export async function tenantEmailRoutes(app: FastifyInstance): Promise<void> {
   app.get(
     '/:id/email-templates/:eventKey',
     {
+      config: { access: { scope: 'developer:read' } },
       schema: {
         ...templateReadSchema,
         summary: 'Get the template for one event',
@@ -851,6 +864,7 @@ export async function tenantEmailRoutes(app: FastifyInstance): Promise<void> {
   app.put(
     '/:id/email-templates/:eventKey',
     {
+      config: { access: { scope: 'developer:write' } },
       schema: {
         tags: ['Tenant · Email'],
         security: [{ tenantSession: [] }],
@@ -902,6 +916,7 @@ export async function tenantEmailRoutes(app: FastifyInstance): Promise<void> {
   app.delete(
     '/:id/email-templates/:eventKey',
     {
+      config: { access: { scope: 'developer:write' } },
       schema: {
         tags: ['Tenant · Email'],
         security: [{ tenantSession: [] }],
@@ -936,6 +951,7 @@ export async function tenantEmailRoutes(app: FastifyInstance): Promise<void> {
   app.post(
     '/:id/email-templates/:eventKey/preview',
     {
+      config: { access: { scope: 'developer:read' } },
       schema: {
         ...templateReadSchema,
         summary: 'Render a template against sample data (no email is sent)',
@@ -967,6 +983,7 @@ export async function tenantEmailRoutes(app: FastifyInstance): Promise<void> {
   app.post(
     '/:id/email-templates/:eventKey/test-send',
     {
+      config: { access: { scope: 'developer:write' } },
       schema: {
         tags: ['Tenant · Email'],
         security: [{ tenantSession: [] }],

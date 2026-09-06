@@ -304,6 +304,7 @@ export async function tenantDevicesRoutes(app: FastifyInstance): Promise<void> {
   app.get(
     '/:id/end-users/:euid/devices',
     {
+      config: { access: { scope: 'end-users:read' } },
       schema: {
         tags: ['Tenant · Devices'],
         security: [{ tenantSession: [] }],
@@ -333,6 +334,7 @@ export async function tenantDevicesRoutes(app: FastifyInstance): Promise<void> {
   app.post(
     '/:id/end-users/:euid/devices/:deviceId/release',
     {
+      config: { access: { scope: 'end-users:write' } },
       schema: {
         tags: ['Tenant · Devices'],
         security: [{ tenantSession: [] }],
@@ -366,6 +368,7 @@ export async function tenantDevicesRoutes(app: FastifyInstance): Promise<void> {
   app.post(
     '/:id/end-users/:euid/devices/release-all',
     {
+      config: { access: { scope: 'end-users:write' } },
       schema: {
         tags: ['Tenant · Devices'],
         security: [{ tenantSession: [] }],
@@ -493,6 +496,7 @@ export async function tenantDevicesRoutes(app: FastifyInstance): Promise<void> {
   app.post(
     '/:id/end-users/:euid/devices/:deviceId/block',
     {
+      config: { access: { scope: 'end-users:write' } },
       schema: {
         tags: ['Tenant · Devices'],
         security: [{ tenantSession: [] }],
@@ -530,6 +534,7 @@ export async function tenantDevicesRoutes(app: FastifyInstance): Promise<void> {
   app.post(
     '/:id/end-users/:euid/devices/:deviceId/unblock',
     {
+      config: { access: { scope: 'end-users:write' } },
       schema: {
         tags: ['Tenant · Devices'],
         security: [{ tenantSession: [] }],
