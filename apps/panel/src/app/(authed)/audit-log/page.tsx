@@ -9,7 +9,9 @@ import { SubmitButton } from '@/components/SubmitButton';
 import { Table, THead, TBody, TR, TH, TD, readSort, sortToggleHref } from '@/components/Table';
 import { EmptyState } from '@/components/EmptyState';
 import { ActorCell } from '@/components/ActorCell';
+import { Badge } from '@/components/Badge';
 import {
+  eventDetails,
   eventTypeOptions,
   humanizeEventType,
   resolveActorEmails,
@@ -198,7 +200,14 @@ export default async function AuditLogPage({
             {events.map((e) => (
               <TR key={e.id} hover>
                 <TD>
-                  <div className="font-medium text-[var(--color-fg)]">{humanizeEventType(e.type)}</div>
+                  <div className="flex flex-wrap items-center gap-1.5 font-medium text-[var(--color-fg)]">
+                    {humanizeEventType(e.type)}
+                    {eventDetails(e.metadata).map((d) => (
+                      <Badge key={d.label} tone="neutral" className="font-normal" title={d.label}>
+                        {d.label === 'via' ? d.value : `${d.label}: ${d.value}`}
+                      </Badge>
+                    ))}
+                  </div>
                   <div className="font-mono text-xs text-[var(--color-muted-fg)]">{e.type}</div>
                 </TD>
                 <TD>

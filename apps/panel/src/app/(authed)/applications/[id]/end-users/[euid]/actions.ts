@@ -350,6 +350,91 @@ export async function cancelSubscription(
 }
 
 // ---------------------------------------------------------------------------
+// Entitlement overrides
+// ---------------------------------------------------------------------------
+
+/**
+ * Turn one form value into what the overrides route expects. Empty, `null` or
+ * `remove` lifts the override; `true`/`false` are flags; a number is a number;
+ * anything else is a string. The route is sparse: only keys sent are touched.
+ */
+function parseOverrideValue(raw: string): unknown {
+  const v = raw.trim();
+  if (v === '' || v.toLowerCase() === 'null' || v.toLowerCase() === 'remove') return null;
+  if (v === 'true') return true;
+  if (v === 'false') return false;
+  if (/^-?\d+(\.\d+)?$/.test(v)) return Number(v);
+  return v;
+}
+
+const OVERRIDE_KINDS = new Set(['FEATURE', 'CREDIT', 'LICENSE', 'USAGE']);
+
+export async function setEntitlementOverrides(
+  applicationId: string,
+  euid: string,
+  subId: string,
+  formData: FormData,
+): Promise<void> {
+  const base = `${tabBase(applicationId, euid)}/subscriptions`;
+  const kinds = formData.getAll('kind').map(String);
+  const keys = formData.getAll('key').map(String);
+  const values = formData.getAll('value').map(String);
+  const body: Record<string, unknown> = {};
+  for (let i = 0; i < keys.length; i++) {
+    const key = (keys[i] ?? '').trim();
+    const kind = (kinds[i] ?? '').trim().toUpperCase();
+    if (!key) continue;
+    if (!OVERRIDE_KINDS.has(kind) || !/^[a-z0-9_.-]+$/i.test(key)) {
+      redirect(`${base}?overrideError=OVERRIDE_KEY_INVALID&sub=${encodeURIComponent(subId)}`);
+    }
+    body[`${kind}:${key}`] = parseOverrideValue(values[i] ?? '');
+  }
+  if (Object.keys(body).length === 0) {
+    redirect(`${base}?overrideError=OVERRIDE_EMPTY&sub=${encodeURIComponent(subId)}`);
+  }
+  try {
+    await api({
+      method: 'PATCH',
+      path: `/api/v1/tenant/applications/${encodeURIComponent(applicationId)}/subscriptions/${encodeURIComponent(subId)}/entitlement-overrides`,
+      body,
+    });
+  } catch (err) {
+    if (err instanceof PanelApiError) {
+      redirect(`${base}?overrideError=${encodeURIComponent(err.code)}&sub=${encodeURIComponent(subId)}`);
+    }
+    throw err;
+  }
+  redirect(`${base}?overrides=${Object.keys(body).length}`);
+}
+
+// ---------------------------------------------------------------------------
+// Impersonation: end every live session
+// ---------------------------------------------------------------------------
+
+/**
+ * Stamps `endedAt` on every open impersonation of this end-user, whoever
+ * minted it, which invalidates those tokens at once. Idempotent; the count
+ * comes back so the banner can say "nothing was live" honestly.
+ */
+export async function endImpersonations(applicationId: string, euid: string): Promise<void> {
+  const base = `${tabBase(applicationId, euid)}/security`;
+  let ended: number;
+  try {
+    const r = await api<{ ended: number }>({
+      method: 'POST',
+      path: `${apiBase(applicationId, euid)}/impersonate/end`,
+    });
+    ended = r.ended;
+  } catch (err) {
+    if (err instanceof PanelApiError) {
+      redirect(`${base}?supportError=${encodeURIComponent(err.code)}`);
+    }
+    throw err;
+  }
+  redirect(`${base}?support=impersonations-ended:${ended}`);
+}
+
+// ---------------------------------------------------------------------------
 // Devices
 // ---------------------------------------------------------------------------
 

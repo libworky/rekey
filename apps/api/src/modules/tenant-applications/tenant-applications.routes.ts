@@ -4136,6 +4136,15 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
                       cancelAt: { type: 'string', format: 'date-time', nullable: true },
                       canceledAt: { type: 'string', format: 'date-time', nullable: true },
                       beneficiaryOrgId: { type: 'string', nullable: true },
+                      entitlementOverrides: {
+                        type: 'object',
+                        nullable: true,
+                        additionalProperties: true,
+                        description:
+                          'Sparse map of `KIND:key` to the value this subscription gets instead of the ' +
+                          'plan\'s. Null when nothing has been overridden. Edited through ' +
+                          'PATCH /subscriptions/{subId}/entitlement-overrides.',
+                      },
                       createdAt: { type: 'string', format: 'date-time' },
                       plan: {
                         type: 'object',
@@ -4230,6 +4239,10 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
             cancelAt: true,
             canceledAt: true,
             beneficiaryOrgId: true,
+            // What the operator has deviated from the plan for this one
+            // customer. The panel edits it through the overrides route and
+            // needs to show the current state next to the form.
+            entitlementOverrides: true,
             createdAt: true,
             plan: { select: { slug: true, name: true, kind: true, amount: true, currency: true, interval: true } },
           },

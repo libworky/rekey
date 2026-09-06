@@ -46,6 +46,12 @@ export function RequestLogTable({
             <th className="px-4 py-2 font-medium">Status</th>
             <th className="px-4 py-2 font-medium">Duration</th>
             <th className="px-4 py-2 font-medium">IP</th>
+            <th
+              className="px-4 py-2 font-medium"
+              title="The membership scope that admitted the request. Blank when no scope gate ran: owners and admins, role-floor routes, open routes and API-key traffic."
+            >
+              Scope
+            </th>
             <th className="px-4 py-2 font-medium">When</th>
           </tr>
         </thead>
@@ -66,6 +72,9 @@ export function RequestLogTable({
               </td>
               <td className="px-4 py-2 text-xs font-mono text-neutral-600 dark:text-neutral-400">
                 {r.ip ?? '—'}
+              </td>
+              <td className="px-4 py-2 text-xs font-mono text-neutral-600 dark:text-neutral-400 whitespace-nowrap">
+                {r.admittedScope ?? '—'}
               </td>
               <td className="px-4 py-2 text-xs text-neutral-600 dark:text-neutral-400 whitespace-nowrap">
                 {formatDateTime(r.createdAt)}

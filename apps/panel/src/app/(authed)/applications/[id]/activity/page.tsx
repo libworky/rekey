@@ -11,7 +11,7 @@ import { SubmitButton } from '@/components/SubmitButton';
 import { ActorCell } from '@/components/ActorCell';
 import { Pager, readOffset, readPageSize } from '@/components/Pager';
 import type { Page } from '@/lib/paginate';
-import { humanizeEventType, resolveActorEmails } from '@/lib/security-events';
+import { eventDetails, humanizeEventType, resolveActorEmails } from '@/lib/security-events';
 
 /**
  * Per-application Activity log. End-user-scoped events (sign-ups, sign-ins,
@@ -36,14 +36,6 @@ import { humanizeEventType, resolveActorEmails } from '@/lib/security-events';
  * below states that plainly instead of leaving an operator to conclude a user
  * with 7 failed attempts simply did nothing.
  */
-
-function viaLabel(metadata: unknown): string | null {
-  if (metadata && typeof metadata === 'object' && 'via' in metadata) {
-    const via = (metadata as { via?: unknown }).via;
-    if (typeof via === 'string') return via.replace(/_/g, ' ');
-  }
-  return null;
-}
 
 const inputCls =
   'rounded-md border border-[var(--color-border)] bg-[var(--color-surface)] px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-[color-mix(in_srgb,var(--color-primary)_30%,transparent)] focus:border-[var(--color-primary)]';
@@ -198,17 +190,17 @@ export default async function ActivityPage({
           </THead>
           <TBody>
             {events.map((e) => {
-              const via = viaLabel(e.metadata);
+              const details = eventDetails(e.metadata);
               return (
                 <TR key={e.id} hover>
                   <TD>
-                    <div className="flex items-center gap-2 font-medium text-[var(--color-fg)]">
+                    <div className="flex flex-wrap items-center gap-1.5 font-medium text-[var(--color-fg)]">
                       {humanizeEventType(e.type)}
-                      {via && (
-                        <Badge tone="neutral" className="font-normal">
-                          {via}
+                      {details.map((d) => (
+                        <Badge key={d.label} tone="neutral" className="font-normal" title={d.label}>
+                          {d.label === 'via' ? d.value : `${d.label}: ${d.value}`}
                         </Badge>
-                      )}
+                      ))}
                     </div>
                     <div className="font-mono text-xs text-[var(--color-muted-fg)]">{e.type}</div>
                   </TD>

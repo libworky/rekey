@@ -48,7 +48,7 @@ import { Modal } from '@/components/Modal';
 import { Field } from '@/components/Field';
 import { SubmitButton } from '@/components/SubmitButton';
 import { ConfirmButton } from '@/components/ConfirmButton';
-import { cancelSubscription, grantSubscription } from '../actions';
+import { cancelSubscription, grantSubscription, setEntitlementOverrides } from '../actions';
 import { getEndUserBilling, type SubscriptionRow } from '../shared';
 
 /**
@@ -76,6 +76,16 @@ const GRANT_ERR: Record<string, string> = {
   SUBSCRIPTION_PERIOD_END_IN_PAST: 'The period end has to be in the future.',
 };
 
+const OVERRIDE_ERR: Record<string, string> = {
+  OVERRIDE_EMPTY: 'Add at least one entitlement row.',
+  OVERRIDE_KEY_INVALID: 'Pick a kind and give the key as letters, digits, dots, dashes or underscores.',
+  SUBSCRIPTION_NOT_FOUND: 'That subscription no longer exists for this end-user.',
+  TENANT_ROLE_INSUFFICIENT: 'Only owners and admins can adjust entitlements.',
+  APP_ACCESS_DENIED: 'Your grant on this Application does not allow billing writes.',
+  SCOPE_INSUFFICIENT: 'Your scopes on this workspace do not include billing writes.',
+  ENTITLEMENT_KEY_UNKNOWN: 'The plan defines no entitlement with that key. Overrides can change a value the plan already has; adding a brand-new entitlement means editing the plan.',
+};
+
 const CANCEL_ERR: Record<string, string> = {
   SUBSCRIPTION_NOT_FOUND: 'That subscription no longer exists for this end-user.',
   SUBSCRIPTION_MANAGED_EXTERNALLY:
@@ -99,6 +109,9 @@ export default async function EndUserSubscriptionsPage({
   const canceled = typeof sp.canceled === 'string' ? sp.canceled : undefined;
   const grantError = typeof sp.grantError === 'string' ? sp.grantError : undefined;
   const cancelError = typeof sp.cancelError === 'string' ? sp.cancelError : undefined;
+  const overridesApplied = typeof sp.overrides === 'string' ? Number(sp.overrides) : null;
+  const overrideError = typeof sp.overrideError === 'string' ? sp.overrideError : undefined;
+  const overrideSub = typeof sp.sub === 'string' ? sp.sub : undefined;
 
   const [billing, application, me, grantsMode] = await Promise.all([
     getEndUserBilling(id, euid),
@@ -199,6 +212,14 @@ export default async function EndUserSubscriptionsPage({
             it here as well put the same message twice, one copy behind the
             backdrop. */}
         {cancelError && <Banner tone="error">{CANCEL_ERR[cancelError] ?? cancelError}</Banner>}
+        {overridesApplied !== null && !Number.isNaN(overridesApplied) && (
+          <Banner tone="success">
+            {overridesApplied === 1 ? 'One entitlement' : `${overridesApplied} entitlements`} adjusted for
+            this subscription. Feature and usage values apply on the next resolve; a credit allowance
+            applies at the next renewal, and an already-issued licence keeps its seat count.
+          </Banner>
+        )}
+        {/* `overrideError` renders inside the row's dialog, which reopens on it. */}
 
         {hasExternal && (
           <Banner tone="info">
@@ -227,7 +248,7 @@ export default async function EndUserSubscriptionsPage({
                 <TH>Provider</TH>
                 <TH>Renews</TH>
                 <TH>Started</TH>
-                {canCancel && <TH align="right"> </TH>}
+                {(canCancel || isOperatorAdmin) && <TH align="right"> </TH>}
               </TR>
             </THead>
             <TBody>
@@ -247,6 +268,7 @@ export default async function EndUserSubscriptionsPage({
                       {formatMoney(s.plan.amount, s.plan.currency)}
                       {s.plan.interval ? ` / ${s.plan.interval.toLowerCase()}` : ''}
                     </div>
+                    <OverrideChips overrides={s.entitlementOverrides} />
                   </TD>
                   <TD>
                     <StatusPill status={s.status} />
@@ -267,9 +289,19 @@ export default async function EndUserSubscriptionsPage({
                   <TD muted className="text-xs">
                     {formatDate(s.createdAt)}
                   </TD>
-                  {canCancel && (
+                  {(canCancel || isOperatorAdmin) && (
                     <TD align="right">
-                      <CancelAction applicationId={id} euid={euid} subscription={s} />
+                      <div className="flex items-center justify-end gap-2">
+                        {isOperatorAdmin && (
+                          <OverridesForm
+                            applicationId={id}
+                            euid={euid}
+                            subscription={s}
+                            error={overrideSub === s.id ? overrideError : undefined}
+                          />
+                        )}
+                        {canCancel && <CancelAction applicationId={id} euid={euid} subscription={s} />}
+                      </div>
                     </TD>
                   )}
                 </TR>
@@ -473,6 +505,83 @@ function GrantForm({
           />
         </Field>
         <SubmitButton pendingLabel="Granting…">Grant subscription</SubmitButton>
+      </form>
+    </Modal>
+  );
+}
+
+/** Current overrides as compact chips under the plan name. */
+function OverrideChips({ overrides }: { overrides: Record<string, unknown> | null }): React.JSX.Element | null {
+  const entries = Object.entries(overrides ?? {});
+  if (entries.length === 0) return null;
+  return (
+    <div className="mt-1 flex flex-wrap gap-1">
+      {entries.map(([k, v]) => (
+        <Badge key={k} tone="warning" className="font-mono text-[10px] font-normal" title="Overrides the plan for this subscription only">
+          {k} = {typeof v === 'object' ? JSON.stringify(v) : String(v)}
+        </Badge>
+      ))}
+    </div>
+  );
+}
+
+const OVERRIDE_ROWS = 3;
+
+/**
+ * Adjust what one subscription grants without minting a private plan.
+ *
+ * The dialog carries the two facts an operator gets wrong: the map is sparse,
+ * so only the rows sent change; and already-materialised grants are not
+ * retroactive, so a raised credit allowance lands at the next renewal, not now.
+ */
+function OverridesForm({
+  applicationId,
+  euid,
+  subscription,
+  error,
+}: {
+  applicationId: string;
+  euid: string;
+  subscription: SubscriptionRow;
+  error?: string | undefined;
+}): React.JSX.Element {
+  const existing = Object.entries(subscription.entitlementOverrides ?? {});
+  return (
+    <Modal
+      modalKey={`overrides-${subscription.id}`}
+      title="Adjust entitlements"
+      description="Deviate from the plan for this one subscription. Each row names an entitlement the plan already defines and the value this customer gets instead; leave the value empty to remove an override. Feature and usage values apply immediately; a credit allowance applies at the next renewal; an issued licence keeps its seat count."
+      trigger="Adjust"
+    >
+      <form action={setEntitlementOverrides.bind(null, applicationId, euid, subscription.id)} className="space-y-3">
+        {error && <Banner tone="error">{OVERRIDE_ERR[error] ?? error}</Banner>}
+        {existing.length > 0 && (
+          <div className="text-xs text-[var(--color-muted-fg)]">
+            Currently overridden:{' '}
+            {existing.map(([k, v]) => (
+              <code key={k} className="mr-1.5 font-mono">
+                {k}={String(v)}
+              </code>
+            ))}
+          </div>
+        )}
+        {Array.from({ length: OVERRIDE_ROWS }).map((_, i) => (
+          <div key={i} className="grid grid-cols-[7rem_1fr_1fr] gap-2">
+            <select name="kind" defaultValue={i === 0 ? 'FEATURE' : ''} className={inputCls} aria-label="Kind">
+              <option value="">kind…</option>
+              <option value="FEATURE">FEATURE</option>
+              <option value="CREDIT">CREDIT</option>
+              <option value="LICENSE">LICENSE</option>
+              <option value="USAGE">USAGE</option>
+            </select>
+            <input type="text" name="key" placeholder="max_devices" className={inputCls} aria-label="Entitlement key" />
+            <input type="text" name="value" placeholder="value, or empty to remove" className={inputCls} aria-label="Value" />
+          </div>
+        ))}
+        <p className="text-[11px] text-[var(--color-muted-fg)]">
+          Values: a number, <code className="font-mono">true</code>/<code className="font-mono">false</code>, or text. Rows with no key are ignored.
+        </p>
+        <SubmitButton pendingLabel="Applying…">Apply overrides</SubmitButton>
       </form>
     </Modal>
   );
