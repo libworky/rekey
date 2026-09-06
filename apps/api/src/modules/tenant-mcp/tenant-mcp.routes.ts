@@ -48,6 +48,7 @@ import { RekeyError } from '../../lib/error.js';
 import { requestContext } from '../../lib/security-events.js';
 import { resolveOperatorMcpBearer } from './bearer-auth.js';
 import { scopeHasWrite, scopeHasAdmin } from './oauth.service.js';
+import { NO_SCOPES, intersectScopes, mcpTokenScopes } from '../../lib/operator-scopes.js';
 import { handleOperatorMcpMessage, type JsonRpcMessage } from './tenant-mcp-server.js';
 import { errs, type JsonSchema } from '../../lib/openapi.js';
 
@@ -187,6 +188,12 @@ export async function tenantMcpRoutes(app: FastifyInstance): Promise<void> {
           tenantMembershipId: req.tenantMembershipId,
           canWrite,
           canAdmin,
+          // Membership ceiling ∩ token authority. The PAT path already
+          // intersected in bearer-auth; the OAuth path's authority is its
+          // write flag, applied here where that flag is computed.
+          scopes: req.operatorMcpClaims
+            ? intersectScopes(req.tenantScopes ?? NO_SCOPES, mcpTokenScopes(canWrite))
+            : (req.tenantScopes ?? NO_SCOPES),
           ip,
           userAgent,
         },

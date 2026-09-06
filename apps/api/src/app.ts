@@ -445,6 +445,11 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
       tenantId: req.tenantId ?? req.application?.tenantId ?? null,
       operatorUserId: req.tenantUser?.id ?? null,
       ip: req.ip || null,
+      // The scope that admitted this request, when a scope gate ran (a
+      // restricted MEMBER on a scoped route). Null for OWNER/ADMIN, floors
+      // and open routes. This log is a bounded tail; the durable record of
+      // authority is the security event each write and MCP call records.
+      admittedScope: req.accessDecision?.scope ?? null,
     });
     done();
   });

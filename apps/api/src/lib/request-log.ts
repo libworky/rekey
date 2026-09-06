@@ -43,6 +43,8 @@ export interface ApiRequestLogInput {
   tenantId?: string | null;
   operatorUserId?: string | null;
   ip?: string | null;
+  /** The scope that admitted this request, when a scope gate ran. Null otherwise. */
+  admittedScope?: string | null;
 }
 
 interface BufferedRow {
@@ -54,6 +56,7 @@ interface BufferedRow {
   tenantId: string | null;
   operatorUserId: string | null;
   ip: string | null;
+  admittedScope: string | null;
   createdAt: Date;
 }
 
@@ -75,6 +78,7 @@ export function recordApiRequest(input: ApiRequestLogInput): void {
     tenantId: input.tenantId ?? null,
     operatorUserId: input.operatorUserId ?? null,
     ip: input.ip ?? null,
+    admittedScope: input.admittedScope ?? null,
     createdAt: new Date(),
   });
   // Hard cap: if a burst outruns the flush timer, drop the oldest rows rather
@@ -133,6 +137,7 @@ export interface ApiRequestLogRow {
   tenantId: string | null;
   operatorUserId: string | null;
   ip: string | null;
+  admittedScope: string | null;
   createdAt: Date;
 }
 
@@ -182,6 +187,7 @@ export async function listApiRequests(
     tenantId: r.tenantId,
     operatorUserId: r.operatorUserId,
     ip: r.ip,
+    admittedScope: r.admittedScope,
     createdAt: r.createdAt,
   }));
   return { items, total };

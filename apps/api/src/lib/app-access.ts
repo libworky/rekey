@@ -66,7 +66,7 @@ import {
   type AppAccessNeed,
   type AppAccessScope,
 } from './access-context.js';
-import { UNRESTRICTED } from './operator-scopes.js';
+import { NO_SCOPES } from './operator-scopes.js';
 
 // The decision itself lives in ./access-context.ts, where the MCP path shares
 // it. These two are the request-shaped adapters the 128 REST call sites use;
@@ -84,12 +84,22 @@ export async function ensureAppAccess(
 ): Promise<AppAccess> {
   // The scope this route needs is its own declaration (lib/route-access.ts),
   // so the 128 call sites keep their signature and every one is gated.
-  return applicationAccess(
+  const declared = req.routeOptions?.config?.access;
+  const access = await applicationAccess(
     await accessContextFromRequest(req),
     applicationId,
     need,
-    req.routeOptions?.config?.access,
+    declared,
   );
+  // For the request log: the scope that admitted this, if a gate ran. An
+  // OWNER/ADMIN is never gated, so recording the route's scope for them
+  // would claim an authority check that did not happen.
+  req.accessDecision = {
+    scope:
+      access.level !== 'workspace-admin' && declared !== undefined && 'scope' in declared ? declared.scope : null,
+    level: access.level,
+  };
+  return access;
 }
 
 /**
@@ -107,7 +117,7 @@ export async function appAccessScope(req: FastifyRequest): Promise<AppAccessScop
     tenantId: req.tenantId!,
     role: req.tenantRole!,
     membershipId: req.tenantMembershipId,
-    scopes: req.tenantScopes ?? UNRESTRICTED,
+    scopes: req.tenantScopes ?? NO_SCOPES,
   });
 }
 

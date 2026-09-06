@@ -28,6 +28,8 @@
  */
 
 import * as React from 'react';
+import { SEG_SCOPE } from '@/components/AppNav';
+import { hasScope } from '@/lib/operator-scopes';
 import { useRouter, usePathname } from 'next/navigation';
 
 export const OPEN_COMMAND_PALETTE_EVENT = 'rekey:open-command-palette';
@@ -45,6 +47,7 @@ interface PaletteApp {
   name: string;
   slug: string;
   billingEnabled: boolean;
+  scopes: string[] | null;
 }
 
 interface PaletteItem {
@@ -199,6 +202,10 @@ export function CommandPalette(): React.JSX.Element {
         // offer dead links. (When the list hasn't loaded yet we can't know;
         // omit until it has.)
         if (s.billing && !currentApp?.billingEnabled) continue;
+        // Same rule AppNav applies: a section whose reads would all 403 is
+        // not offered. Presentation, not enforcement.
+        const need = SEG_SCOPE[s.seg];
+        if (need && !hasScope(currentApp?.scopes, need)) continue;
         out.push({
           id: `section:${s.seg || 'overview'}`,
           label: s.label,

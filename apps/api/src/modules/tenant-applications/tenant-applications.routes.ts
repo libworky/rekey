@@ -60,8 +60,13 @@ import {
   appAccessScope,
   redactApplicationForBilling,
   stripApplicationSecrets,
+  type AppAccess,
 } from '../../lib/app-access.js';
-import { scopeDenied } from '../../lib/access-context.js';
+import {
+  accessContextFromRequest,
+  effectiveApplicationScopes,
+  scopeDenied,
+} from '../../lib/access-context.js';
 import { recordSecurityEvent, requestContext } from '../../lib/security-events.js';
 import { refreshCorsOrigins } from '../../lib/cors-origins.js';
 import { mcpIssuer } from '../mcp/oauth.service.js';
@@ -704,18 +709,27 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
         // read 3 has been handed an existence oracle, not a page count.
         applicationsService.count(req.tenantId!, scopeIds),
       ]);
+      // Each row carries the caller's access on it, so the sidebar and the
+      // command palette can offer only what will not 403 — the same
+      // `access.scopes` `GET /:id` returns, computed the same way.
+      const ctx = await accessContextFromRequest(req);
+      const levelFor = (appId: string): AppAccess['level'] => {
+        if (!scope.restricted) return req.tenantRole === 'MEMBER' ? 'legacy-member' : 'workspace-admin';
+        return scope.roleByApplicationId.get(appId)!;
+      };
       return {
         success: true,
-        // Secrets stripped for EVERY audience; the billing redaction is the
-        // extra, role-specific layer on top.
+        // Secrets stripped for EVERY audience; sign-in config projected on
+        // the auth-config scope on top.
         data: paged(
-          apps.map((a) =>
-            stripApplicationSecrets(
-              scope.roleByApplicationId.get(a.id) === 'APP_BILLING'
-                ? redactApplicationForBilling(a)
-                : a,
-            ),
-          ),
+          apps.map((a) => {
+            const level = levelFor(a.id);
+            const scopes = effectiveApplicationScopes(ctx, level);
+            const row = { ...a, access: { level, scopes: [...scopes].sort() } };
+            return stripApplicationSecrets(
+              scopes.has('auth-config:read') ? row : redactApplicationForBilling(row),
+            );
+          }),
           total,
           take,
           skip,

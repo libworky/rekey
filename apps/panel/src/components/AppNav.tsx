@@ -55,7 +55,7 @@ interface SubTab {
  * This is presentation, not enforcement (see Sidebar.tsx). The API refuses
  * on its own; this stops the panel showing somebody a door that will slam.
  */
-const SEG_SCOPE: Record<string, Scope | null> = {
+export const SEG_SCOPE: Record<string, Scope | null> = {
   '': null,
   'end-users': 'end-users:read',
   roles: 'organizations:read',

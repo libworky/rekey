@@ -189,7 +189,9 @@ export const tenantWorkspacesService = {
       role: r.role,
       joinedAt: r.createdAt,
       legacyWorkspaceRead: r.legacyWorkspaceRead,
-      scopes: r.scopesRestricted ? r.scopes : null,
+      // Scopes narrow a MEMBER only; mirror /me so a row promoted before
+      // promotion cleared scopes does not show a restriction nothing enforces.
+      scopes: r.role === 'MEMBER' && r.scopesRestricted ? r.scopes : null,
       grants: r.applicationGrants.map((g) => ({
         applicationId: g.application.id,
         applicationName: g.application.name,
@@ -723,9 +725,16 @@ export const tenantWorkspacesService = {
       }
     }
 
+    // Scopes narrow a MEMBER only. Leaving them on a promoted row would be
+    // a stale restriction nothing reads today and something might tomorrow,
+    // and the editor refuses non-members, so it could not be cleared. A
+    // later demotion starts unrestricted; the admin restricts again.
     const updated = await prisma.tenantMembership.update({
       where: { id: target.id },
-      data: { role: args.newRole },
+      data:
+        args.newRole === 'MEMBER'
+          ? { role: args.newRole }
+          : { role: args.newRole, scopesRestricted: false, scopes: [] },
       include: {
         tenantUser: { select: { email: true, name: true } },
         applicationGrants: {
