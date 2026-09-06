@@ -80,8 +80,18 @@ const WorkspaceDetail: JsonSchema = {
  */
 const WorkspaceSummary: JsonSchema = {
   type: 'object',
-  properties: { id: { type: 'string' }, name: { type: 'string' } },
-  required: ['id', 'name'],
+  properties: {
+    id: { type: 'string' },
+    name: { type: 'string' },
+    operatorMcpEnabled: {
+      type: 'boolean',
+      description:
+        'Whether operators may reach this workspace through the operator MCP server. Off refuses ' +
+        'every MCP credential bound to the workspace and grants no new consent; nothing is revoked, ' +
+        'so turning it back on restores the same credentials.',
+    },
+  },
+  required: ['id', 'name', 'operatorMcpEnabled'],
 };
 
 /**
@@ -124,7 +134,16 @@ const InviteBody = z.object({
   email: z.string().email().max(254),
   role: z.enum(['OWNER', 'ADMIN', 'MEMBER']),
 });
-const RenameBody = z.object({ name: z.string().min(2).max(80) });
+// Name and the MCP switch on one route: both are "what this workspace is",
+// and both are OWNER/ADMIN. Either may be omitted; at least one must be present.
+const WorkspacePatchBody = z
+  .object({
+    name: z.string().min(2).max(80).optional(),
+    operatorMcpEnabled: z.boolean().optional(),
+  })
+  .refine((b) => b.name !== undefined || b.operatorMcpEnabled !== undefined, {
+    message: 'Provide name, operatorMcpEnabled, or both.',
+  });
 const CreateBody = z.object({ name: z.string().min(2).max(80) });
 const InvIdParam = z.object({ id: z.string().min(1) });
 const MemberIdParam = z.object({ id: z.string().min(1) });
@@ -390,13 +409,16 @@ export async function tenantWorkspacesRoutes(app: FastifyInstance): Promise<void
       schema: {
         tags: ['Tenant · Workspace'],
         security: [{ tenantSession: [] }],
-        summary: 'Rename the active workspace',
+        summary: 'Update the active workspace',
         description:
-          'Requires the **OWNER or ADMIN** workspace role.',
+          'Requires the **OWNER or ADMIN** workspace role. Rename it, switch the operator MCP ' +
+          'server on or off for it, or both.',
         body: {
           type: 'object',
-          required: ['name'],
-          properties: { name: { type: 'string', minLength: 2, maxLength: 80 } },
+          properties: {
+            name: { type: 'string', minLength: 2, maxLength: 80 },
+            operatorMcpEnabled: { type: 'boolean' },
+          },
         },
         response: {
           200: ok(WorkspaceSummary, 'The renamed workspace.'),
@@ -409,12 +431,13 @@ export async function tenantWorkspacesRoutes(app: FastifyInstance): Promise<void
       },
     },
     async (req) => {
-      const body = RenameBody.parse(req.body);
+      const body = WorkspacePatchBody.parse(req.body);
       return {
         success: true,
-        data: await tenantWorkspacesService.renameWorkspace({
+        data: await tenantWorkspacesService.updateWorkspace({
           tenantId: req.tenantId!,
-          name: body.name,
+          ...(body.name !== undefined && { name: body.name }),
+          ...(body.operatorMcpEnabled !== undefined && { operatorMcpEnabled: body.operatorMcpEnabled }),
         }),
       };
     },

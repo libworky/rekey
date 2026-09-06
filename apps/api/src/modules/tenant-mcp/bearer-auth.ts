@@ -36,6 +36,7 @@ import {
   type OperatorMcpAccessClaims,
 } from '../../lib/operator-mcp-jwt.js';
 import { operatorMcpIssuer } from './oauth.service.js';
+import { assertOperatorMcpEnabled } from './workspace-mcp-switch.js';
 
 declare module 'fastify' {
   interface FastifyRequest {
@@ -112,6 +113,7 @@ async function resolveByPat(request: FastifyRequest, raw: string): Promise<void>
     },
   });
   if (!membership) throw unauthorized();
+  await assertOperatorMcpEnabled(token.tenantId);
 
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
   const { passwordHash, ...publicUser } = user;
@@ -149,6 +151,7 @@ async function resolveByOAuthJwt(request: FastifyRequest, token: string): Promis
     },
   });
   if (!membership) throw unauthorized();
+  await assertOperatorMcpEnabled(claims.tid);
 
   const user = await prisma.tenantUser.findUnique({ where: { id: claims.sub } });
   if (!user) throw unauthorized();

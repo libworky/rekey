@@ -66,6 +66,18 @@ function supportEmail(): string | null {
 // /api/v1/tenant/workspace, by design. This action is the type-to-confirm
 // gate: it records no state, it just routes a deliberate owner to the
 // instructions below (which differ for managed vs self-hosted).
+async function setOperatorMcp(formData: FormData): Promise<void> {
+  'use server';
+  const enabled = formData.get('operatorMcpEnabled') === 'on';
+  try {
+    await api({ method: 'PATCH', path: '/api/v1/tenant/workspace', body: { operatorMcpEnabled: enabled } });
+  } catch (err) {
+    if (err instanceof PanelApiError) redirect(`/workspace?error=${encodeURIComponent(err.code)}`);
+    throw err;
+  }
+  redirect('/workspace?saved=mcp');
+}
+
 async function requestWorkspaceDeletion(): Promise<void> {
   'use server';
   redirect('/workspace?deletionRequested=1');
@@ -127,6 +139,37 @@ export default async function WorkspaceSettingsPage({
       />
 
       {renamed && <SavedBanner params={['renamed']} message="Workspace renamed." />}
+
+      {/* Operator MCP — the per-workspace switch */}
+      <Card className="space-y-3">
+        <div>
+          <h2 className="text-sm font-semibold text-[var(--color-fg)]">Operator MCP</h2>
+          <p className="max-w-2xl text-xs text-[var(--color-muted-fg)]">
+            Whether AI agents may act in this workspace through the operator MCP server. Off refuses
+            every connected agent on its next request and grants no new ones. Nothing is revoked, so
+            turning it back on restores the same connections.
+          </p>
+        </div>
+        <form action={setOperatorMcp} className="flex flex-wrap items-center gap-3">
+          <label className="flex items-center gap-2 text-sm">
+            <input
+              type="checkbox"
+              name="operatorMcpEnabled"
+              defaultChecked={(workspace as { operatorMcpEnabled?: boolean }).operatorMcpEnabled ?? true}
+              disabled={!canEdit}
+            />
+            Allow operator MCP in this workspace
+          </label>
+          {canEdit && (
+            <SubmitButton
+              pendingLabel="Saving…"
+              className="rounded-md border border-[var(--color-border)] px-3 py-1.5 text-sm text-[var(--color-fg)] hover:bg-[var(--color-surface-muted)]"
+            >
+              Save
+            </SubmitButton>
+          )}
+        </form>
+      </Card>
 
       {/* General — rename */}
       <Card className="space-y-4">
