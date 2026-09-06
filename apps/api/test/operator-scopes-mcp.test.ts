@@ -237,6 +237,10 @@ describe('operator scopes over MCP', () => {
     expect((await rpc(w.pat, 'tools/list')).result!.tools!.map((t) => t.name)).toContain('list_plans');
     const ok = await rpc(w.pat, 'tools/call', { name: 'list_plans', arguments: { applicationId: w.appId } });
     expect(ok.result!.isError).toBeUndefined();
+    // No gate checked an admin, so the event records no admitting scope.
+    const evs = await waitForSecurityEvents({ tenantId: w.tenantId, type: 'operator.mcp_tool_called' });
+    const adminCall = evs.find((e) => (e.metadata as { tool: string }).tool === 'list_plans');
+    expect(adminCall?.metadata).toMatchObject({ tool: 'list_plans', scope: null });
 
     // Demoted again: starts unrestricted (the row was cleared), so the admin
     // restricts afresh rather than inheriting a restriction they cannot see.
@@ -261,15 +265,45 @@ describe('operator scopes over MCP', () => {
     expect(ev!.metadata).toMatchObject({ tool: 'list_organization_roles', scope: 'organizations:read' });
   });
 
-  it('per-app counts and the end-user subscription are omitted without their domain', async () => {
+  it('per-app counts are overview data: omitted without overview:read, present with it', async () => {
     const w = await world();
-    await setScopes(w, ['end-users:read']);
-    const apps = called(await rpc(w.pat, 'tools/call', { name: 'list_applications', arguments: {} })) as unknown as {
-      applications: Array<Record<string, unknown>>;
+    const listApps = async () => {
+      const apps = called(await rpc(w.pat, 'tools/call', { name: 'list_applications', arguments: {} })) as unknown as {
+        applications: Array<Record<string, unknown>>;
+      };
+      return apps.applications.find((a) => a.id === w.appId)!;
     };
-    const row = apps.applications.find((a) => a.id === w.appId)!;
-    expect(row).toHaveProperty('endUserCount');
-    expect(row).not.toHaveProperty('activeSubscriptions');
-    expect(row).not.toHaveProperty('apiRequestsLast24h');
+    await setScopes(w, ['end-users:read']);
+    const without = await listApps();
+    expect(without).toHaveProperty('slug');
+    expect(without).not.toHaveProperty('endUserCount');
+    expect(without).not.toHaveProperty('activeSubscriptions');
+    expect(without).not.toHaveProperty('apiRequestsLast24h');
+
+    await setScopes(w, ['overview:read']);
+    const withOverview = await listApps();
+    expect(withOverview).toHaveProperty('endUserCount');
+    expect(withOverview).toHaveProperty('activeSubscriptions');
+    expect(withOverview).toHaveProperty('apiRequestsLast24h');
+  });
+
+  it('a promotion sent together with scopes is refused before either write runs', async () => {
+    const w = await world();
+    await setScopes(w, ['organizations:read']);
+    const r = await inject({
+      method: 'PATCH',
+      url: `/api/v1/tenant/workspace/members/${w.membershipId}`,
+      headers: auth(w.ownerToken),
+      payload: { role: 'ADMIN', scopes: ['billing:read'] },
+    });
+    expect(r.statusCode).toBe(400);
+    // Nothing half-applied: still a MEMBER, still restricted to the old set.
+    const roster = await inject({ method: 'GET', url: '/api/v1/tenant/workspace/members', headers: auth(w.ownerToken) });
+    const row = (roster.json().data as { items: Array<{ membershipId: string; role: string; scopes: string[] | null }> }).items.find(
+      (m) => m.membershipId === w.membershipId,
+    )!;
+    expect(row.role).toBe('MEMBER');
+    expect(row.scopes).toEqual(['organizations:read']);
+    expect((await rpc(w.pat, 'tools/list')).result!.tools!.map((t) => t.name)).not.toContain('list_plans');
   });
 });

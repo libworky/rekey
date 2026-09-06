@@ -9,6 +9,7 @@
 
 import type { TenantRole } from '@prisma/client';
 import { type Scope } from '../../lib/operator-scopes.js';
+import { isWorkspaceAdmin } from '../../lib/access-context.js';
 import { recordSecurityEvent } from '../../lib/security-events.js';
 import { effectiveToolScopes, operatorTools, type OperatorTool, type OperatorToolContext } from './operator-tools.js';
 import { operatorWriteTools } from './operator-write-tools.js';
@@ -200,9 +201,10 @@ export async function handleOperatorMcpMessage(
       }
       const args =
         (msg.params?.arguments as Record<string, unknown> | undefined) ?? {};
-      // Log the call before running it, and log it whether it succeeds or not.
-      // A refused or failed call is exactly what an operator reviewing an
-      // agent's behaviour wants to see.
+      // Log the call before running it, whether or not the handler then
+      // succeeds: a failed call is exactly what an operator reviewing an
+      // agent's behaviour wants to see. A call refused above is not logged;
+      // nothing ran, and the refusal is returned to the client.
       //
       // Arguments are recorded by KEY only. They routinely carry credentials —
       // configure_billing_provider takes a provider secret — and an audit trail
@@ -218,11 +220,12 @@ export async function handleOperatorMcpMessage(
           tool: tool.name,
           write: tool.write === true,
           admin: tool.admin === true,
-          // The scope that admitted the call (null for a workspace-floor
-          // tool). Durable, unlike the request log: a membership's scopes
-          // change, and the audit trail must still say what authority a
-          // past call ran under.
-          scope: TOOL_SCOPES[tool.name] ?? null,
+          // The scope that admitted the call: null for a workspace-floor
+          // tool, and null for OWNER/ADMIN, whom no scope gate checked (the
+          // same rule the request log applies). Durable, unlike the request
+          // log: a membership's scopes change, and the audit trail must
+          // still say what authority a past call ran under.
+          scope: isWorkspaceAdmin(ctx.role) ? null : (TOOL_SCOPES[tool.name] ?? null),
           argKeys: Object.keys(args).sort(),
         },
       });

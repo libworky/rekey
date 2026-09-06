@@ -189,7 +189,9 @@ export const tenantWorkspacesService = {
       role: r.role,
       joinedAt: r.createdAt,
       legacyWorkspaceRead: r.legacyWorkspaceRead,
-      scopes: r.scopesRestricted ? r.scopes : null,
+      // Scopes narrow a MEMBER only; mirror /me so a row promoted before
+      // promotion cleared scopes does not show a restriction nothing enforces.
+      scopes: r.role === 'MEMBER' && r.scopesRestricted ? r.scopes : null,
       grants: r.applicationGrants.map((g) => ({
         applicationId: g.application.id,
         applicationName: g.application.name,

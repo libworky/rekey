@@ -66,7 +66,7 @@ import {
   type AppAccessNeed,
   type AppAccessScope,
 } from './access-context.js';
-import { UNRESTRICTED } from './operator-scopes.js';
+import { NO_SCOPES } from './operator-scopes.js';
 
 // The decision itself lives in ./access-context.ts, where the MCP path shares
 // it. These two are the request-shaped adapters the 128 REST call sites use;
@@ -117,7 +117,7 @@ export async function appAccessScope(req: FastifyRequest): Promise<AppAccessScop
     tenantId: req.tenantId!,
     role: req.tenantRole!,
     membershipId: req.tenantMembershipId,
-    scopes: req.tenantScopes ?? UNRESTRICTED,
+    scopes: req.tenantScopes ?? NO_SCOPES,
   });
 }
 

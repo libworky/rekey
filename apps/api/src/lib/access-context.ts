@@ -52,6 +52,7 @@ import {
   intersectScopes,
   presetScopes,
   type Scope,
+  NO_SCOPES,
 } from './operator-scopes.js';
 import type { RouteAccess } from './route-access.js';
 
@@ -111,11 +112,9 @@ function internal(message: string, fix: string): RekeyError {
  * path that set `tenantUser`/`tenantId` but not the membership id gets one
  * resolved here. No current path needs it; it is preserved, not relied on.
  *
- * `tenantScopes` absent is treated as UNRESTRICTED. All three auth paths set
- * it; a fourth that did not would get today's behaviour rather than a wall,
- * which keeps the promise that this change alters nothing until an admin
- * restricts somebody. The scope tests exercise all three paths, so a path
- * that forgot to set it would fail them, not fail open in production.
+ * `tenantScopes` absent fails closed (see `NO_SCOPES`): a MEMBER with no
+ * scopes, the same default the operator MCP route applies. OWNER/ADMIN are
+ * never gated on scopes, so the default only ever reaches a member.
  */
 export async function accessContextFromRequest(req: FastifyRequest): Promise<AccessContext> {
   if (!req.tenantId || !req.tenantRole) {
@@ -138,7 +137,7 @@ export async function accessContextFromRequest(req: FastifyRequest): Promise<Acc
     tenantId: req.tenantId,
     role: req.tenantRole,
     membershipId,
-    scopes: req.tenantScopes ?? UNRESTRICTED,
+    scopes: req.tenantScopes ?? NO_SCOPES,
   };
 }
 

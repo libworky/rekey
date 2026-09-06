@@ -138,6 +138,13 @@ const MemberPatchBody = z
   })
   .refine((b) => b.role !== undefined || b.scopes !== undefined, {
     message: 'Provide role, scopes, or both.',
+  })
+  // Scopes apply to MEMBER only, and promotion clears them. Refusing the
+  // combination up front keeps the two writes below from half-applying:
+  // the role would flip and the scopes clear before the scope write is
+  // refused.
+  .refine((b) => b.role === undefined || b.role === 'MEMBER' || b.scopes === undefined, {
+    message: 'Scopes apply to MEMBER only. Send the role alone; promotion clears the member\'s scopes.',
   });
 const GrantBody = z.object({
   applicationId: z.string().min(1),

@@ -47,6 +47,12 @@
 import type { TenantRole } from '@prisma/client';
 import { UNRESTRICTED, type Scope } from '../../lib/operator-scopes.js';
 import { isWorkspaceAdmin } from '../../lib/access-context.js';
+import { prisma } from '../../lib/prisma.js';
+import {
+  accessContextFromTool,
+  accessibleApplicationIds as sharedAccessibleApplicationIds,
+} from '../../lib/access-context.js';
+import { tenantWorkspacesService } from '../tenant-workspaces/tenant-workspaces.service.js';
 
 /**
  * The scopes a tool call runs under. OWNER and ADMIN hold every scope
@@ -68,12 +74,6 @@ export function effectiveToolScopes(ctx: Pick<OperatorToolContext, 'role' | 'sco
   if (isWorkspaceAdmin(ctx.role)) return UNRESTRICTED;
   return ctx.scopes ?? UNRESTRICTED;
 }
-import { prisma } from '../../lib/prisma.js';
-import {
-  accessContextFromTool,
-  accessibleApplicationIds as sharedAccessibleApplicationIds,
-} from '../../lib/access-context.js';
-import { tenantWorkspacesService } from '../tenant-workspaces/tenant-workspaces.service.js';
 
 export interface OperatorToolContext {
   tenantUserId: string;
@@ -96,6 +96,11 @@ export interface OperatorToolContext {
    * Set by the route from `req.tenantScopes`. `toolAllowed` consults it for
    * every tool that names a scope; the per-application helpers carry it into
    * the access decision.
+   *
+   * `effectiveToolScopes` ignores this for OWNER/ADMIN: role is the ceiling,
+   * and today a token cannot narrow below all reads (writes are gated by
+   * `canWrite` separately). A narrower token scope added later must be
+   * honoured there explicitly; the gate will not pick it up on its own.
    */
   scopes: ReadonlySet<Scope>;
   /** Inbound request context, threaded through for the security audit log. */
@@ -253,12 +258,14 @@ export const operatorTools: OperatorTool[] = [
         orderBy: { createdAt: 'asc' },
         select: { id: true, slug: true, name: true, createdAt: true },
       });
-      // A workspace floor lists the applications; each count is a domain's
-      // data and is omitted (never zeroed) without that domain's read scope.
-      const held = effectiveToolScopes(ctx);
-      const wantUsers = held.has('end-users:read');
-      const wantSubs = held.has('billing:read');
-      const wantRequests = held.has('activity:read');
+      // A workspace floor lists the applications. The counts are overview
+      // data, the same rule get_workspace_overview applies (counts are the
+      // overview, money is billing): omitted, never zeroed, without
+      // overview:read.
+      const wantCounts = effectiveToolScopes(ctx).has('overview:read');
+      const wantUsers = wantCounts;
+      const wantSubs = wantCounts;
+      const wantRequests = wantCounts;
       const enriched = await Promise.all(
         apps.map(async (a) => {
           const [endUserCount, activeSubs, requests24h] = await Promise.all([
