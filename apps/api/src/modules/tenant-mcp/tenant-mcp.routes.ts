@@ -58,11 +58,15 @@ import { errs, type JsonSchema } from '../../lib/openapi.js';
 // runs before every handler in this file and throws the Rekey-enveloped 401
 // below on any auth failure.
 
-const AUTH_401 = {
+const AUTH_ERRS = {
   401:
     'OPERATOR_MCP_UNAUTHORIZED — no `Authorization: Bearer` header, or the presented PAT / ' +
     'OAuth access token is unknown, revoked, expired, wrong-audience, or belongs to an ' +
     'operator no longer a member of the token\'s workspace.',
+  403:
+    'OPERATOR_MCP_DISABLED — the credential is valid but its workspace has switched the ' +
+    'operator MCP server off. The one case that is not a generic 401: the caller is a ' +
+    'confirmed member, and the fix names who can turn it back on.',
 };
 
 const JsonRpcSuccess: JsonSchema = {
@@ -142,7 +146,7 @@ export async function tenantMcpRoutes(app: FastifyInstance): Promise<void> {
           204: {
             description: 'The request was a JSON-RPC notification (no `id`) — accepted, no reply body.',
           },
-          ...errs(AUTH_401),
+          ...errs(AUTH_ERRS),
         },
       },
     },
@@ -243,7 +247,7 @@ export async function tenantMcpRoutes(app: FastifyInstance): Promise<void> {
             },
             required: ['success', 'error'],
           },
-          ...errs(AUTH_401),
+          ...errs(AUTH_ERRS),
         },
       },
     },

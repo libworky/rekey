@@ -402,7 +402,8 @@ export async function operatorMcpOAuthRoutes(app: FastifyInstance): Promise<void
             403:
               'TENANT_MEMBERSHIP_REVOKED — the session operator is no longer a member of ANY ' +
               'workspace; or TENANT_MEMBERSHIP_REQUIRED — the session operator is not a member ' +
-              'of the specific `tenant_id` they picked at consent.',
+              'of the specific `tenant_id` they picked at consent; or OPERATOR_MCP_DISABLED — ' +
+              'that workspace has switched the operator MCP server off, so no consent is granted.',
             429: 'RATE_LIMITED — too many requests. Honour the `Retry-After` header.',
           }),
         },

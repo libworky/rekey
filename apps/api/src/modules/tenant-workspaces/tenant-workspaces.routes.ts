@@ -69,8 +69,12 @@ const WorkspaceDetail: JsonSchema = {
     id: { type: 'string' },
     name: { type: 'string' },
     createdAt: { type: 'string', format: 'date-time' },
+    operatorMcpEnabled: {
+      type: 'boolean',
+      description: 'Whether the operator MCP server admits credentials for this workspace.',
+    },
   },
-  required: ['id', 'name', 'createdAt'],
+  required: ['id', 'name', 'createdAt', 'operatorMcpEnabled'],
 };
 
 /**
@@ -421,7 +425,7 @@ export async function tenantWorkspacesRoutes(app: FastifyInstance): Promise<void
           },
         },
         response: {
-          200: ok(WorkspaceSummary, 'The renamed workspace.'),
+          200: ok(WorkspaceSummary, 'The updated workspace.'),
           ...errs({
             400: 'WORKSPACE_NAME_INVALID — name is not 2–80 characters after trimming.',
             ...TENANT_SESSION_ERRORS,
@@ -432,14 +436,24 @@ export async function tenantWorkspacesRoutes(app: FastifyInstance): Promise<void
     },
     async (req) => {
       const body = WorkspacePatchBody.parse(req.body);
-      return {
-        success: true,
-        data: await tenantWorkspacesService.updateWorkspace({
+      const data = await tenantWorkspacesService.updateWorkspace({
+        tenantId: req.tenantId!,
+        ...(body.name !== undefined && { name: body.name }),
+        ...(body.operatorMcpEnabled !== undefined && { operatorMcpEnabled: body.operatorMcpEnabled }),
+      });
+      // Turning agent access off or on for a whole workspace is a security
+      // control; the audit log is where an owner looks for who did that.
+      if (body.operatorMcpEnabled !== undefined) {
+        void recordSecurityEvent({
+          type: 'workspace.operator_mcp_switched',
+          actorType: 'operator',
+          actorId: req.tenantUser!.id,
           tenantId: req.tenantId!,
-          ...(body.name !== undefined && { name: body.name }),
-          ...(body.operatorMcpEnabled !== undefined && { operatorMcpEnabled: body.operatorMcpEnabled }),
-        }),
-      };
+          ...requestContext(req),
+          metadata: { enabled: body.operatorMcpEnabled },
+        });
+      }
+      return { success: true, data };
     },
   );
 

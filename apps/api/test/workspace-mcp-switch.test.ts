@@ -14,12 +14,17 @@
  *   - on again restores the SAME credential — refused, never revoked
  *   - only OWNER/ADMIN can flip it; a MEMBER gets the role floor
  *   - the workspace read reports the current state
+ *   - the OAuth path: an issued access token is refused while off; the
+ *     refresh chain keeps rotating and what it mints is refused too; on again
+ *     restores the rotated credential with no re-consent
+ *   - flipping it is a security event
  */
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { FastifyInstance } from 'fastify';
 import { buildApp } from '../src/app.js';
 import { createHash, randomBytes } from 'node:crypto';
+import { waitForSecurityEvents } from './wait-for-security-events.js';
 
 const REDIRECT = 'http://127.0.0.1:9798/callback';
 function pkce(): { verifier: string; challenge: string } {
@@ -159,6 +164,72 @@ describe('workspace operator-MCP switch', () => {
     expect(r.json().error.code).toBe('TENANT_ROLE_INSUFFICIENT');
     // And nothing changed.
     expect((await list(w.pat)).statusCode).toBe(200);
+  });
+
+  it('OAuth: off refuses the access token, refresh keeps rotating, on again restores it', async () => {
+    const w = await world();
+    const reg = await inject({
+      method: 'POST',
+      url: '/api/v1/tenant/mcp/oauth/register',
+      payload: { redirect_uris: [REDIRECT], client_name: 'switch-oauth' },
+    });
+    const clientId = (reg.json() as { client_id: string }).client_id;
+    const { verifier, challenge } = pkce();
+    const grant = await inject({
+      method: 'POST',
+      url: '/api/v1/tenant/mcp/oauth/grant',
+      headers: auth(w.ownerToken),
+      payload: {
+        client_id: clientId,
+        redirect_uri: REDIRECT,
+        code_challenge: challenge,
+        code_challenge_method: 'S256',
+        scope: 'mcp:operator:read',
+        state: 'st',
+        tenant_id: w.tenantId,
+        approve: true,
+      },
+    });
+    expect(grant.statusCode).toBe(200);
+    const code = new URL((grant.json() as { data: { redirect: string } }).data.redirect).searchParams.get('code');
+    const tok = await inject({
+      method: 'POST',
+      url: '/api/v1/tenant/mcp/oauth/token',
+      payload: { grant_type: 'authorization_code', code, code_verifier: verifier, redirect_uri: REDIRECT, client_id: clientId },
+    });
+    expect(tok.statusCode).toBe(200);
+    const first = tok.json() as { access_token: string; refresh_token: string };
+    expect((await list(first.access_token)).statusCode).toBe(200);
+
+    await setSwitch(w.ownerToken, false);
+    const refused = await list(first.access_token);
+    expect(refused.statusCode).toBe(403);
+    expect(refused.json().error.code).toBe('OPERATOR_MCP_DISABLED');
+
+    // The refresh chain is not the switch's business: it rotates, and what
+    // it mints is refused at auth like any other access token for the
+    // workspace. Gating refresh would drop every agent's grant during an
+    // incident and force a re-consent afterwards, which is revoking.
+    const refreshed = await inject({
+      method: 'POST',
+      url: '/api/v1/tenant/mcp/oauth/token',
+      payload: { grant_type: 'refresh_token', refresh_token: first.refresh_token, client_id: clientId },
+    });
+    expect(refreshed.statusCode).toBe(200);
+    const second = refreshed.json() as { access_token: string };
+    expect((await list(second.access_token)).statusCode).toBe(403);
+
+    await setSwitch(w.ownerToken, true);
+    expect((await list(second.access_token)).statusCode).toBe(200);
+  });
+
+  it('flipping the switch is a security event', async () => {
+    const w = await world();
+    await setSwitch(w.ownerToken, false);
+    const [ev] = await waitForSecurityEvents({ tenantId: w.tenantId, type: 'workspace.operator_mcp_switched' });
+    expect(ev).toBeDefined();
+    expect(ev!.actorType).toBe('operator');
+    expect(ev!.metadata).toMatchObject({ enabled: false });
   });
 
   it('rename still works on its own, and the body needs at least one field', async () => {
