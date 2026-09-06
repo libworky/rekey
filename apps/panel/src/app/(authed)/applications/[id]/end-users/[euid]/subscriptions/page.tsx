@@ -78,19 +78,20 @@ const GRANT_ERR: Record<string, string> = {
   SUBSCRIPTION_PERIOD_END_IN_PAST: 'The period end has to be in the future.',
 };
 
-// Codes the overrides route and the panel's own checks can produce. The API's
-// message and fix for a refusal arrive through the error flash and render
-// beside these, since ENTITLEMENT_OVERRIDE_INVALID alone covers a dozen causes.
+// Codes with panel copy: the panel's own checks and the access refusals. An
+// API refusal of the override itself renders the API's message and fix from
+// the error flash instead, since one code covers a dozen distinct causes.
 const OVERRIDE_ERR: Record<string, string> = {
   OVERRIDE_EMPTY: 'Add at least one entitlement row.',
   OVERRIDE_KEY_INVALID:
     'Pick a kind, and give the key as up to 64 letters, digits, dots, colons, dashes or underscores.',
   SUBSCRIPTION_NOT_FOUND: 'That subscription no longer exists for this end-user.',
-  SUBSCRIPTION_NOT_ENTITLING:
-    'This subscription is not entitling anyone right now (cancelled, expired or pending), so there is nothing an override would change.',
   APP_ACCESS_DENIED: 'Your grant on this Application does not allow billing writes.',
   SCOPE_INSUFFICIENT: 'Your scopes on this workspace do not include billing writes.',
-  ENTITLEMENT_OVERRIDE_INVALID: 'The API refused an override.',
+  // ENTITLEMENT_OVERRIDE_INVALID and SUBSCRIPTION_NOT_ENTITLING are deliberately
+  // NOT mapped: ApiErrorText shows the API's own message and fix only for a
+  // code with no panel copy, and for these two the API's words are the ones
+  // that name the actual cause.
 };
 
 const CANCEL_ERR: Record<string, string> = {
