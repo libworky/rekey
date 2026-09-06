@@ -511,11 +511,23 @@ describe('per-application grants (ApplicationGrant)', () => {
     expect(rows).toHaveLength(1);
     expect(rows[0]).toMatchObject({ applicationId: appA, role: 'APP_BILLING' });
 
-    // Members list carries grants (this is how members see their own access).
-    const members = await inject({
+    // The members list carries grants for OWNER/ADMIN callers only. It used to
+    // carry them for every session — which was "how members see their own
+    // access", and also how a member read every colleague's grant matrix. A
+    // member's own access now comes from GET /me (scopes) and GET /:id
+    // (access.scopes); the roster shows them the people, not the permissions.
+    const asMember = await inject({
       method: 'GET',
       url: '/api/v1/tenant/workspace/members',
       headers: auth(memberToken),
+    });
+    const memberView = (asMember.json().data as { items: Array<Record<string, unknown>> }).items;
+    for (const m of memberView) expect(m).not.toHaveProperty('grants');
+
+    const members = await inject({
+      method: 'GET',
+      url: '/api/v1/tenant/workspace/members',
+      headers: auth(ownerToken),
     });
     const memberRows = (
       members.json().data as {

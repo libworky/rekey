@@ -61,6 +61,7 @@ import {
   redactApplicationForBilling,
   stripApplicationSecrets,
 } from '../../lib/app-access.js';
+import { scopeDenied } from '../../lib/access-context.js';
 import { recordSecurityEvent, requestContext } from '../../lib/security-events.js';
 import { refreshCorsOrigins } from '../../lib/cors-origins.js';
 import { mcpIssuer } from '../mcp/oauth.service.js';
@@ -670,6 +671,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.get(
     '/',
     {
+      config: { access: { open: true } },
       schema: {
         tags: ['Tenant · Applications'],
         security: [{ tenantSession: [] }],
@@ -725,6 +727,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.get(
     '/check-slug',
     {
+      config: { access: { open: true } },
       schema: {
         tags: ['Tenant · Applications'],
         security: [{ tenantSession: [] }],
@@ -786,6 +789,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.get(
     '/:id',
     {
+      config: { access: { project: 'application' } },
       schema: {
         tags: ['Tenant · Applications'],
         security: [{ tenantSession: [] }],
@@ -798,7 +802,29 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
           200: ok(
             {
               allOf: [
-                ref('Application'),
+                {
+                  allOf: [
+                    ref('Application'),
+                    {
+                      type: 'object',
+                      properties: {
+                        access: {
+                          type: 'object',
+                          description:
+                            'How the caller reached this Application, and their effective scopes on it. ' +
+                            'The panel renders navigation from `scopes`; a section whose scope is absent ' +
+                            'is not shown rather than shown and refused.',
+                          properties: {
+                            level: { type: 'string' },
+                            scopes: { type: 'array', items: { type: 'string' } },
+                          },
+                          required: ['level', 'scopes'],
+                        },
+                      },
+                      required: ['access'],
+                    },
+                  ],
+                },
                 {
                   type: 'object',
                   properties: {
@@ -827,12 +853,21 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
       // Surface the PUBLIC MCP URL (derived from PUBLIC_WEBHOOK_BASE_URL/API_URL
       // on the API side) so the panel shows the externally-reachable host, not
       // its own in-cluster REKEY_URL (e.g. http://api:3030).
-      const data = { ...application, mcpUrl: mcpIssuer(application.slug) };
-      // Billing managers see money, not sign-in: hide the auth/OAuth config.
+      const data = {
+        ...application,
+        mcpUrl: mcpIssuer(application.slug),
+        // The capabilities the panel renders from. Computed from what the gate
+        // already resolved, so it cannot disagree with what the gate enforces.
+        access: { level: access.level, scopes: [...access.scopes].sort() },
+      };
+      // Sign-in config is projected on the auth-config scope. This is the old
+      // "billing managers see money, not sign-in" rule — APP_BILLING's preset
+      // excludes auth-config — now driven by the scope instead of the literal
+      // role, so a member restricted by scopes gets the same redaction.
       return {
         success: true,
         data: stripApplicationSecrets(
-          access.level === 'APP_BILLING' ? redactApplicationForBilling(data) : data,
+          access.scopes.has('auth-config:read') ? data : redactApplicationForBilling(data),
         ),
       };
     },
@@ -841,6 +876,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.get(
     '/:id/stats',
     {
+      config: { access: { scope: 'overview:read' } },
       schema: {
         tags: ['Tenant · Applications'],
         security: [{ tenantSession: [] }],
@@ -924,6 +960,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.get(
     '/:id/requests',
     {
+      config: { access: { scope: 'activity:read' } },
       preHandler: requireTenantRole(['OWNER', 'ADMIN']),
       schema: {
         tags: ['Tenant · Applications'],
@@ -964,6 +1001,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.post(
     '/',
     {
+      config: { access: { floor: true } },
       preHandler: requireTenantRole(['OWNER', 'ADMIN']),
       schema: {
         tags: ['Tenant · Applications'],
@@ -1043,6 +1081,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.post(
     '/:id/promote',
     {
+      config: { access: { floor: true } },
       preHandler: requireTenantRole(['OWNER']),
       schema: {
         tags: ['Tenant · Applications'],
@@ -1099,6 +1138,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.post(
     '/:id/disable',
     {
+      config: { access: { floor: true } },
       preHandler: requireTenantRole(['OWNER']),
       schema: {
         tags: ['Tenant · Applications'],
@@ -1164,6 +1204,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.delete(
     '/:id/disable',
     {
+      config: { access: { floor: true } },
       preHandler: requireTenantRole(['OWNER']),
       schema: {
         tags: ['Tenant · Applications'],
@@ -1220,6 +1261,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.patch(
     '/:id/subscriptions/:subId/entitlement-overrides',
     {
+      config: { access: { scope: 'billing:write' } },
       schema: {
         tags: ['Tenant · Billing'],
         security: [{ tenantSession: [] }],
@@ -1366,6 +1408,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.patch(
     '/:id/auth-config',
     {
+      config: { access: { scope: 'auth-config:write' } },
       schema: {
         tags: ['Tenant · Applications'],
         security: [{ tenantSession: [] }],
@@ -1419,6 +1462,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.patch(
     '/:id/billing-config',
     {
+      config: { access: { scope: 'billing:write' } },
       schema: {
         tags: ['Tenant · Applications'],
         security: [{ tenantSession: [] }],
@@ -1557,6 +1601,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.get(
     '/:id/api-keys',
     {
+      config: { access: { scope: 'developer:read' } },
       schema: {
         tags: ['Tenant · API Keys'],
         security: [{ tenantSession: [] }],
@@ -1585,7 +1630,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
     {
       // Generic Idempotency-Key header support (scoped to the workspace) — a
       // retried mint would otherwise create a second key whose rawKey nobody saw.
-      config: { idempotency: true },
+      config: { access: { scope: 'developer:write' }, idempotency: true },
       schema: {
         tags: ['Tenant · API Keys'],
         security: [{ tenantSession: [] }],
@@ -1662,6 +1707,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.delete(
     '/:id/api-keys/:keyId',
     {
+      config: { access: { scope: 'developer:write' } },
       schema: {
         tags: ['Tenant · API Keys'],
         security: [{ tenantSession: [] }],
@@ -1705,6 +1751,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.get(
     '/:id/plans',
     {
+      config: { access: { scope: 'billing:read' } },
       schema: {
         tags: ['Tenant · Plans'],
         security: [{ tenantSession: [] }],
@@ -1747,7 +1794,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
     '/:id/plans',
     {
       // Generic Idempotency-Key header support (scoped to the workspace).
-      config: { idempotency: true },
+      config: { access: { scope: 'billing:write' }, idempotency: true },
       schema: {
         tags: ['Tenant · Plans'],
         security: [{ tenantSession: [] }],
@@ -1843,6 +1890,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.patch(
     '/:id/plans/:slug',
     {
+      config: { access: { scope: 'billing:write' } },
       schema: {
         tags: ['Tenant · Plans'],
         security: [{ tenantSession: [] }],
@@ -1940,6 +1988,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.post(
     '/:id/plans/:slug/register',
     {
+      config: { access: { scope: 'billing:write' } },
       schema: {
         tags: ['Tenant · Plans'],
         security: [{ tenantSession: [] }],
@@ -2000,6 +2049,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.get(
     '/:id/plans/:slug/entitlements',
     {
+      config: { access: { scope: 'billing:read' } },
       schema: {
         tags: ['Tenant · Plans'],
         security: [{ tenantSession: [] }],
@@ -2071,6 +2121,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.put(
     '/:id/plans/:slug/entitlements',
     {
+      config: { access: { scope: 'billing:write' } },
       schema: {
         tags: ['Tenant · Plans'],
         security: [{ tenantSession: [] }],
@@ -2167,6 +2218,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.delete(
     '/:id/plans/:slug/entitlements/:entId',
     {
+      config: { access: { scope: 'billing:write' } },
       schema: {
         tags: ['Tenant · Plans'],
         security: [{ tenantSession: [] }],
@@ -2218,6 +2270,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.get(
     '/:id/coupons',
     {
+      config: { access: { scope: 'billing:read' } },
       schema: {
         tags: ['Tenant · Coupons'],
         security: [{ tenantSession: [] }],
@@ -2268,7 +2321,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
     '/:id/coupons',
     {
       // Generic Idempotency-Key header support (scoped to the workspace).
-      config: { idempotency: true },
+      config: { access: { scope: 'billing:write' }, idempotency: true },
       schema: {
         tags: ['Tenant · Coupons'],
         security: [{ tenantSession: [] }],
@@ -2339,6 +2392,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.patch(
     '/:id/coupons/:code',
     {
+      config: { access: { scope: 'billing:write' } },
       schema: {
         tags: ['Tenant · Coupons'],
         security: [{ tenantSession: [] }],
@@ -2404,6 +2458,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.get(
     '/:id/billing/providers',
     {
+      config: { access: { scope: 'billing:read' } },
       schema: {
         tags: ['Tenant · Billing'],
         security: [{ tenantSession: [] }],
@@ -2529,6 +2584,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.get(
     '/:id/billing-credentials',
     {
+      config: { access: { scope: 'billing:read' } },
       schema: {
         tags: ['Tenant · Billing'],
         security: [{ tenantSession: [] }],
@@ -2572,6 +2628,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.put(
     '/:id/billing-credentials/:provider',
     {
+      config: { access: { scope: 'billing:write' } },
       schema: {
         tags: ['Tenant · Billing'],
         security: [{ tenantSession: [] }],
@@ -2668,6 +2725,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.patch(
     '/:id/billing-credentials/:provider',
     {
+      config: { access: { scope: 'billing:write' } },
       schema: {
         tags: ['Tenant · Billing'],
         security: [{ tenantSession: [] }],
@@ -2757,6 +2815,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.delete(
     '/:id/billing-credentials/:provider',
     {
+      config: { access: { scope: 'billing:write' } },
       schema: {
         tags: ['Tenant · Billing'],
         security: [{ tenantSession: [] }],
@@ -2814,6 +2873,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.post(
     '/:id/billing-credentials/:provider/register-webhook',
     {
+      config: { access: { scope: 'billing:write' } },
       schema: {
         tags: ['Tenant · Billing'],
         security: [{ tenantSession: [] }],
@@ -2877,6 +2937,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.get(
     '/:id/billing-credentials/webhook-events',
     {
+      config: { access: { scope: 'billing:read' } },
       schema: {
         tags: ['Tenant · Billing'],
         security: [{ tenantSession: [] }],
@@ -2969,6 +3030,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.get(
     '/:id/billing/stats',
     {
+      config: { access: { scope: 'billing:read' } },
       schema: {
         tags: ['Tenant · Billing'],
         security: [{ tenantSession: [] }],
@@ -2999,6 +3061,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.get(
     '/:id/payments',
     {
+      config: { access: { scope: 'billing:read' } },
       schema: {
         tags: ['Tenant · Billing'],
         security: [{ tenantSession: [] }],
@@ -3161,6 +3224,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.get(
     '/:id/unapplied-payments',
     {
+      config: { access: { scope: 'billing:read' } },
       schema: {
         tags: ['Tenant · Billing'],
         security: [{ tenantSession: [] }],
@@ -3210,6 +3274,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.post(
     '/:id/unapplied-payments/:caseId/refund',
     {
+      config: { access: { scope: 'billing:write' } },
       schema: {
         tags: ['Tenant · Billing'],
         security: [{ tenantSession: [] }],
@@ -3275,6 +3340,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.post(
     '/:id/unapplied-payments/:caseId/extend',
     {
+      config: { access: { scope: 'billing:write' } },
       schema: {
         tags: ['Tenant · Billing'],
         security: [{ tenantSession: [] }],
@@ -3340,6 +3406,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.post(
     '/:id/unapplied-payments/:caseId/dismiss',
     {
+      config: { access: { scope: 'billing:write' } },
       schema: {
         tags: ['Tenant · Billing'],
         security: [{ tenantSession: [] }],
@@ -3394,6 +3461,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.get(
     '/:id/dunning',
     {
+      config: { access: { scope: 'billing:read' } },
       schema: {
         tags: ['Tenant · Billing'],
         security: [{ tenantSession: [] }],
@@ -3519,6 +3587,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.put(
     '/:id/oauth-config/:provider',
     {
+      config: { access: { scope: 'auth-config:write' } },
       schema: {
         tags: ['Tenant · OAuth'],
         security: [{ tenantSession: [] }],
@@ -3601,6 +3670,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.delete(
     '/:id/oauth-config/:provider',
     {
+      config: { access: { scope: 'auth-config:write' } },
       schema: {
         tags: ['Tenant · OAuth'],
         security: [{ tenantSession: [] }],
@@ -3648,6 +3718,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.get(
     '/:id/end-users',
     {
+      config: { access: { scope: 'end-users:read' } },
       schema: {
         tags: ['Tenant · End-users'],
         security: [{ tenantSession: [] }],
@@ -3693,7 +3764,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
     },
     async (req) => {
       const { id } = AppParam.parse(req.params);
-      await ensureAppAccess(req, id, 'read');
+      const access = await ensureAppAccess(req, id, 'read');
       const q = z
         .object({
           search: z.string().max(254).optional(),
@@ -3708,6 +3779,14 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
         })
         .merge(PaginationQuery)
         .parse(req.query);
+      // The rows carry no plan, but this filter is a per-user paying/churned
+      // oracle: ask for ACTIVE, then CANCELED, and you have the book of business
+      // by name. It is a billing question asked of the end-users domain, so it
+      // needs the billing scope. REFUSED rather than ignored: silently dropping
+      // it would return an unfiltered list the caller reads as filtered.
+      if (q.subscriptionStatus !== undefined && !access.scopes.has('billing:read')) {
+        throw scopeDenied('billing:read');
+      }
       const { take, skip } = parsePagination(q, 25);
       const order = q.order ?? 'desc';
       // The endpoint the functional audit caught truncating: 36 rows in the
@@ -3749,7 +3828,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
     '/:id/end-users',
     {
       // Generic Idempotency-Key header support (scoped to the workspace).
-      config: { idempotency: true },
+      config: { access: { scope: 'end-users:write' }, idempotency: true },
       schema: {
         tags: ['Tenant · End-users'],
         security: [{ tenantSession: [] }],
@@ -3868,6 +3947,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.get(
     '/:id/end-users/:euid',
     {
+      config: { access: { scope: 'end-users:read' } },
       schema: {
         tags: ['Tenant · End-users'],
         security: [{ tenantSession: [] }],
@@ -4015,6 +4095,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.get(
     '/:id/end-users/:euid/billing',
     {
+      config: { access: { scope: 'billing:read' } },
       schema: {
         tags: ['Tenant · End-users'],
         security: [{ tenantSession: [] }],
@@ -4197,6 +4278,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.patch(
     '/:id/end-users/:euid',
     {
+      config: { access: { scope: 'end-users:write' } },
       schema: {
         tags: ['Tenant · End-users'],
         security: [{ tenantSession: [] }],
@@ -4313,6 +4395,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.delete(
     '/:id/end-users/:euid',
     {
+      config: { access: { floor: true } },
       schema: {
         tags: ['Tenant · End-users'],
         security: [{ tenantSession: [] }],
@@ -4562,6 +4645,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.get(
     '/:id/end-users/:euid/credits',
     {
+      config: { access: { scope: 'billing:read' } },
       schema: {
         tags: ['Tenant · Credits'],
         security: [{ tenantSession: [] }],
@@ -4618,7 +4702,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
       // Generic Idempotency-Key HEADER support (scoped to the workspace).
       // Distinct from the body-level `idempotencyKey`, which dedupes at the
       // credit-ledger level and keeps working unchanged.
-      config: { idempotency: true },
+      config: { access: { scope: 'billing:write' }, idempotency: true },
       schema: {
         tags: ['Tenant · Credits'],
         security: [{ tenantSession: [] }],
@@ -4696,6 +4780,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.post(
     '/:id/subscription-imports',
     {
+      config: { access: { scope: 'billing:write' } },
       preHandler: requireTenantRole(['OWNER', 'ADMIN']),
       schema: {
         tags: ['Tenant · Billing'],
@@ -4765,6 +4850,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.get(
     '/:id/subscription-imports/:runId',
     {
+      config: { access: { scope: 'billing:read' } },
       schema: {
         tags: ['Tenant · Billing'],
         security: [{ tenantSession: [] }],
@@ -4830,6 +4916,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.post(
     '/:id/subscription-imports/:runId/apply',
     {
+      config: { access: { scope: 'billing:write' } },
       preHandler: requireTenantRole(['OWNER', 'ADMIN']),
       schema: {
         tags: ['Tenant · Billing'],
@@ -4904,6 +4991,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.get(
     '/:id/subscription-imports',
     {
+      config: { access: { scope: 'billing:read' } },
       schema: {
         tags: ['Tenant · Billing'],
         security: [{ tenantSession: [] }],
@@ -4992,6 +5080,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.post(
     '/:id/end-users/:euid/unlock',
     {
+      config: { access: { scope: 'end-users:write' } },
       schema: {
         tags: ['Tenant · End-users'],
         security: [{ tenantSession: [] }],
@@ -5068,7 +5157,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.post(
     '/:id/end-users/:euid/send-verification',
     {
-      config: { rateLimit: authRateLimit(10) },
+      config: { access: { scope: 'end-users:write' }, rateLimit: authRateLimit(10) },
       schema: {
         tags: ['Tenant · End-users'],
         security: [{ tenantSession: [] }],
@@ -5158,7 +5247,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.post(
     '/:id/end-users/:euid/send-password-reset',
     {
-      config: { rateLimit: authRateLimit(10) },
+      config: { access: { scope: 'end-users:write' }, rateLimit: authRateLimit(10) },
       schema: {
         tags: ['Tenant · End-users'],
         security: [{ tenantSession: [] }],
@@ -5251,6 +5340,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.get(
     '/:id/end-users/:euid/sessions',
     {
+      config: { access: { scope: 'end-users:read' } },
       schema: {
         tags: ['Tenant · End-users'],
         security: [{ tenantSession: [] }],
@@ -5290,6 +5380,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.delete(
     '/:id/end-users/:euid/sessions/:sessionId',
     {
+      config: { access: { scope: 'end-users:write' } },
       schema: {
         tags: ['Tenant · End-users'],
         security: [{ tenantSession: [] }],
@@ -5344,6 +5435,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.post(
     '/:id/end-users/:euid/sessions/revoke-all',
     {
+      config: { access: { scope: 'end-users:write' } },
       schema: {
         tags: ['Tenant · End-users'],
         security: [{ tenantSession: [] }],
@@ -5456,7 +5548,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.post(
     '/:id/end-users/:euid/subscriptions',
     {
-      config: { idempotency: true },
+      config: { access: { scope: 'billing:write' }, idempotency: true },
       preHandler: requireTenantRole(['OWNER', 'ADMIN']),
       schema: {
         tags: ['Tenant · Billing'],
@@ -5593,6 +5685,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.post(
     '/:id/end-users/:euid/subscriptions/:subId/cancel',
     {
+      config: { access: { scope: 'billing:write' } },
       preHandler: requireTenantRole(['OWNER', 'ADMIN']),
       schema: {
         tags: ['Tenant · Billing'],
@@ -5714,6 +5807,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.get(
     '/:id/end-users/:euid/export',
     {
+      config: { access: { floor: true } },
       preHandler: requireTenantRole(['OWNER', 'ADMIN']),
       schema: {
         tags: ['Tenant · End-users'],
@@ -6118,6 +6212,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.post(
     '/:id/end-users/:euid/impersonate',
     {
+      config: { access: { floor: true } },
       preHandler: requireTenantRole(['OWNER', 'ADMIN']),
       schema: {
         tags: ['Tenant · End-users'],
@@ -6175,7 +6270,11 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
       const body = z
         .object({ reason: z.string().max(280).optional() })
         .parse(req.body ?? {});
-      await ensureAppAccess(req, params.id, 'read');
+      // 'write', not 'read': this mints a token that ACTS AS the end-user. It
+      // was classified as a read and saved only by the OWNER/ADMIN preHandler
+      // above — which is why nobody noticed. The preHandler stays; the need is
+      // now honest about what the route does.
+      await ensureAppAccess(req, params.id, 'write');
       const endUser = await prisma.endUser.findUnique({ where: { id: params.euid } });
       if (!endUser || endUser.applicationId !== params.id) {
         throw new RekeyError({
@@ -6256,6 +6355,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.post(
     '/:id/end-users/:euid/impersonate/end',
     {
+      config: { access: { floor: true } },
       preHandler: requireTenantRole(['OWNER', 'ADMIN']),
       schema: {
         tags: ['Tenant · End-users'],
@@ -6283,7 +6383,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
       const params = z
         .object({ id: z.string().min(1), euid: z.string().min(1) })
         .parse(req.params);
-      await ensureAppAccess(req, params.id, 'read');
+      await ensureAppAccess(req, params.id, 'write');
       const endUser = await prisma.endUser.findUnique({ where: { id: params.euid } });
       if (!endUser || endUser.applicationId !== params.id) {
         throw new RekeyError({
@@ -6310,6 +6410,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.post(
     '/:id/rotate-sessions',
     {
+      config: { access: { scope: 'auth-config:write' } },
       schema: {
         tags: ['Tenant · Applications'],
         security: [{ tenantSession: [] }],
@@ -6375,6 +6476,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.post(
     '/:id/rotate-public-key',
     {
+      config: { access: { scope: 'auth-config:write' } },
       // Every field is optional, so a caller may POST with no body at all.
       // Fastify validates a missing body against `{type:'object'}` and answers
       // 400 "body must be object" — the same trap documented on tenant-mfa's
@@ -6475,6 +6577,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.patch(
     '/:id/portal',
     {
+      config: { access: { scope: 'auth-config:write' } },
       schema: {
         tags: ['Tenant · Applications'],
         security: [{ tenantSession: [] }],
@@ -6572,6 +6675,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.get(
     '/:id/oauth-clients',
     {
+      config: { access: { scope: 'auth-config:read' } },
       schema: {
         tags: ['Tenant · Applications'],
         security: [{ tenantSession: [] }],
@@ -6642,6 +6746,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.delete(
     '/:id/oauth-clients/:clientId',
     {
+      config: { access: { scope: 'auth-config:write' } },
       schema: {
         tags: ['Tenant · Applications'],
         security: [{ tenantSession: [] }],
@@ -6712,6 +6817,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.get(
     '/:id/access',
     {
+      config: { access: { scope: 'auth-config:read' } },
       schema: {
         tags: ['Tenant · Applications'],
         security: [{ tenantSession: [] }],
@@ -6740,6 +6846,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.put(
     '/:id/access',
     {
+      config: { access: { scope: 'auth-config:write' } },
       schema: {
         tags: ['Tenant · Applications'],
         security: [{ tenantSession: [] }],
@@ -6855,6 +6962,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.get(
     '/:id/application-roles',
     {
+      config: { access: { scope: 'organizations:read' } },
       schema: {
         tags: ['Tenant · End-users'],
         security: [{ tenantSession: [] }],
@@ -6895,6 +7003,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.post(
     '/:id/application-roles',
     {
+      config: { access: { scope: 'organizations:write' } },
       schema: {
         tags: ['Tenant · End-users'],
         security: [{ tenantSession: [] }],
@@ -6955,6 +7064,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.patch(
     '/:id/application-roles/:name',
     {
+      config: { access: { scope: 'organizations:write' } },
       schema: {
         tags: ['Tenant · End-users'],
         security: [{ tenantSession: [] }],
@@ -7014,6 +7124,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.delete(
     '/:id/application-roles/:name',
     {
+      config: { access: { scope: 'organizations:write' } },
       schema: {
         tags: ['Tenant · End-users'],
         security: [{ tenantSession: [] }],
@@ -7070,7 +7181,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
 
   const legacyRoleAlias = { hide: true, tags: ['Tenant · End-users'] } as const;
 
-  app.get('/:id/end-user-roles', { schema: legacyRoleAlias }, async (req) => {
+  app.get('/:id/end-user-roles', { config: { access: { scope: 'organizations:read' } }, schema: legacyRoleAlias }, async (req) => {
     const { id } = AppParam.parse(req.params);
     await ensureAppAccess(req, id, 'read');
     return { success: true, data: await applicationRolesService.list(id) };
@@ -7078,7 +7189,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
 
   app.post(
     '/:id/end-user-roles',
-    { schema: { ...legacyRoleAlias, body: APPLICATION_ROLE_CREATE_BODY } },
+    { config: { access: { scope: 'organizations:write' } }, schema: { ...legacyRoleAlias, body: APPLICATION_ROLE_CREATE_BODY } },
     async (req, reply) => {
     const { id } = AppParam.parse(req.params);
     await ensureAppAccess(req, id, 'write');
@@ -7102,7 +7213,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
 
   app.patch(
     '/:id/end-user-roles/:name',
-    { schema: { ...legacyRoleAlias, body: APPLICATION_ROLE_PATCH_BODY } },
+    { config: { access: { scope: 'organizations:write' } }, schema: { ...legacyRoleAlias, body: APPLICATION_ROLE_PATCH_BODY } },
     async (req) => {
     const params = z.object({ id: z.string().min(1), name: z.string().min(1) }).parse(req.params);
     await ensureAppAccess(req, params.id, 'write');
@@ -7125,7 +7236,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
 
   app.delete(
     '/:id/end-user-roles/:name',
-    { schema: { ...legacyRoleAlias, querystring: APPLICATION_ROLE_DELETE_QUERY } },
+    { config: { access: { scope: 'organizations:write' } }, schema: { ...legacyRoleAlias, querystring: APPLICATION_ROLE_DELETE_QUERY } },
     async (req) => {
     const params = z.object({ id: z.string().min(1), name: z.string().min(1) }).parse(req.params);
     const q = z.object({ reassignTo: z.string().min(1).max(40).optional() }).parse(req.query);
@@ -7157,6 +7268,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.get(
     '/:id/organization-roles',
     {
+      config: { access: { scope: 'organizations:read' } },
       schema: {
         tags: ['Tenant · Organizations'],
         security: [{ tenantSession: [] }],
@@ -7211,6 +7323,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.post(
     '/:id/organization-roles',
     {
+      config: { access: { scope: 'organizations:write' } },
       schema: {
         tags: ['Tenant · Organizations'],
         security: [{ tenantSession: [] }],
@@ -7310,6 +7423,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.patch(
     '/:id/organization-roles/:name',
     {
+      config: { access: { scope: 'organizations:write' } },
       schema: {
         tags: ['Tenant · Organizations'],
         security: [{ tenantSession: [] }],
@@ -7382,6 +7496,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.delete(
     '/:id/organization-roles/:name',
     {
+      config: { access: { scope: 'organizations:write' } },
       schema: {
         tags: ['Tenant · Organizations'],
         security: [{ tenantSession: [] }],
@@ -7454,6 +7569,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.get(
     '/:id/licenses',
     {
+      config: { access: { scope: 'billing:read' } },
       schema: {
         tags: ['Tenant · Licenses'],
         security: [{ tenantSession: [] }],
@@ -7485,7 +7601,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
     {
       // Generic Idempotency-Key header support (scoped to the workspace) — a
       // retried issue would otherwise mint a second license key nobody saw.
-      config: { idempotency: true },
+      config: { access: { scope: 'billing:write' }, idempotency: true },
       schema: {
         tags: ['Tenant · Licenses'],
         security: [{ tenantSession: [] }],
@@ -7599,6 +7715,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.delete(
     '/:id/licenses/:licenseId',
     {
+      config: { access: { scope: 'billing:write' } },
       schema: {
         tags: ['Tenant · Licenses'],
         security: [{ tenantSession: [] }],
@@ -7635,6 +7752,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.get(
     '/:id/usage-meters',
     {
+      config: { access: { scope: 'billing:read' } },
       schema: {
         tags: ['Tenant · Usage'],
         security: [{ tenantSession: [] }],
@@ -7664,6 +7782,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.post(
     '/:id/usage-meters',
     {
+      config: { access: { scope: 'billing:write' } },
       schema: {
         tags: ['Tenant · Usage'],
         security: [{ tenantSession: [] }],
@@ -7712,6 +7831,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.patch(
     '/:id/usage-meters/:slug',
     {
+      config: { access: { scope: 'billing:write' } },
       schema: {
         tags: ['Tenant · Usage'],
         security: [{ tenantSession: [] }],
@@ -7791,6 +7911,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.delete(
     '/:id/usage-meters/:slug',
     {
+      config: { access: { scope: 'billing:write' } },
       schema: {
         tags: ['Tenant · Usage'],
         security: [{ tenantSession: [] }],
@@ -7831,6 +7952,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.get(
     '/:id/organizations',
     {
+      config: { access: { scope: 'organizations:read' } },
       schema: {
         tags: ['Tenant · Organizations'],
         security: [{ tenantSession: [] }],
@@ -7894,6 +8016,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.get(
     '/:id/organizations/:orgId',
     {
+      config: { access: { scope: 'organizations:read' } },
       schema: {
         tags: ['Tenant · Organizations'],
         security: [{ tenantSession: [] }],
@@ -8006,6 +8129,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.delete(
     '/:id/organizations/:orgId',
     {
+      config: { access: { scope: 'organizations:write' } },
       schema: {
         tags: ['Tenant · Organizations'],
         security: [{ tenantSession: [] }],
@@ -8049,6 +8173,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.post(
     '/:id/organizations',
     {
+      config: { access: { scope: 'organizations:write' } },
       schema: {
         tags: ['Tenant · Organizations'],
         security: [{ tenantSession: [] }],
@@ -8127,6 +8252,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.patch(
     '/:id/organizations/:orgId',
     {
+      config: { access: { scope: 'organizations:write' } },
       schema: {
         tags: ['Tenant · Organizations'],
         security: [{ tenantSession: [] }],
@@ -8201,6 +8327,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.post(
     '/:id/organizations/:orgId/members',
     {
+      config: { access: { scope: 'organizations:write' } },
       schema: {
         tags: ['Tenant · Organizations'],
         security: [{ tenantSession: [] }],
@@ -8294,6 +8421,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.patch(
     '/:id/organizations/:orgId/members/:euid',
     {
+      config: { access: { scope: 'organizations:write' } },
       schema: {
         tags: ['Tenant · Organizations'],
         security: [{ tenantSession: [] }],
@@ -8365,6 +8493,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.delete(
     '/:id/organizations/:orgId/members/:euid',
     {
+      config: { access: { scope: 'organizations:write' } },
       schema: {
         tags: ['Tenant · Organizations'],
         security: [{ tenantSession: [] }],
@@ -8414,6 +8543,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.get(
     '/:id/organizations/:orgId/billing',
     {
+      config: { access: { scope: 'billing:read' } },
       schema: {
         tags: ['Tenant · Organizations'],
         security: [{ tenantSession: [] }],
@@ -8558,6 +8688,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.post(
     '/:id/organizations/:orgId/licenses/:licenseId/rotate-key',
     {
+      config: { access: { scope: 'billing:write' } },
       schema: {
         tags: ['Tenant · Organizations'],
         security: [{ tenantSession: [] }],

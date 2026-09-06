@@ -37,6 +37,7 @@ export async function tenantLicenseActivationRoutes(app: FastifyInstance): Promi
   app.get(
     '/:id/licenses/:licenseId/activations',
     {
+      config: { access: { scope: 'billing:read' } },
       schema: {
         tags: ['Tenant · Licenses'],
         security: [{ tenantSession: [] }],
@@ -92,6 +93,7 @@ export async function tenantLicenseActivationRoutes(app: FastifyInstance): Promi
   app.post(
     '/:id/licenses/:licenseId/activations/:activationId/release',
     {
+      config: { access: { scope: 'billing:write' } },
       schema: {
         tags: ['Tenant · Licenses'],
         security: [{ tenantSession: [] }],

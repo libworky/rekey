@@ -1,4 +1,5 @@
 import * as React from 'react';
+import { DOMAIN_LABEL, SCOPE_DOMAINS, levelFor } from '@/lib/operator-scopes';
 import { redirect } from 'next/navigation';
 import { errorQuery, readErrorFlash, api, PanelApiError, type ApplicationRow, type MemberRow, type InvitationRow, getMe } from '@/lib/api';
 import { emptyPage, type Page } from '@/lib/paginate';
@@ -85,6 +86,36 @@ async function setGrant(membershipId: string, formData: FormData): Promise<void>
       method: 'PUT',
       path: `/api/v1/tenant/workspace/members/${encodeURIComponent(membershipId)}/grants`,
       body: { applicationId, role },
+    });
+  } catch (err) {
+    if (err instanceof PanelApiError) redirect(`/team?${await errorQuery(err)}`);
+    throw err;
+  }
+  redirect('/team');
+}
+
+/**
+ * Set or lift a member's scopes. One select per domain (none / read / write)
+ * plus a switch for "unrestricted"; the API validates against its registry
+ * and refuses anything unknown, so the panel's copy of the domain list can
+ * only ever hide a control, never grant a permission.
+ */
+async function setScopes(membershipId: string, formData: FormData): Promise<void> {
+  'use server';
+  const restricted = formData.get('restricted') === 'on';
+  const scopes: string[] = [];
+  if (restricted) {
+    for (const d of SCOPE_DOMAINS) {
+      const level = String(formData.get(`scope:${d}`) ?? 'none');
+      if (level === 'read') scopes.push(`${d}:read`);
+      if (level === 'write') scopes.push(`${d}:write`);
+    }
+  }
+  try {
+    await api({
+      method: 'PATCH',
+      path: `/api/v1/tenant/workspace/members/${encodeURIComponent(membershipId)}`,
+      body: { scopes: restricted ? scopes : null },
     });
   } catch (err) {
     if (err instanceof PanelApiError) redirect(`/team?${await errorQuery(err)}`);
@@ -299,24 +330,24 @@ export default async function TeamPage({
                         one thing an owner must not be told. */}
                     <Badge
                       tone={
-                        m.grants.length > 0
+                        (m.grants ?? []).length > 0
                           ? 'success'
                           : m.legacyWorkspaceRead
                             ? 'warning'
                             : 'neutral'
                       }
                     >
-                      {m.grants.length > 0
-                        ? `${m.grants.length} granted app${m.grants.length === 1 ? '' : 's'}`
+                      {(m.grants ?? []).length > 0
+                        ? `${(m.grants ?? []).length} granted app${(m.grants ?? []).length === 1 ? '' : 's'}`
                         : m.legacyWorkspaceRead
                           ? 'All apps · read-only (legacy)'
                           : 'No access yet'}
                     </Badge>
                   </div>
 
-                  {m.grants.length > 0 && (
+                  {(m.grants ?? []).length > 0 && (
                     <ul className="space-y-1.5">
-                      {m.grants.map((g) => (
+                      {(m.grants ?? []).map((g) => (
                         <li
                           key={g.applicationId}
                           className="flex items-center justify-between gap-3 rounded-md border border-[var(--color-border)] bg-[color-mix(in_srgb,var(--color-surface-muted)_40%,transparent)] px-3 py-1.5"
@@ -330,7 +361,7 @@ export default async function TeamPage({
                             {canManage && (
                               <form action={removeGrant.bind(null, m.membershipId, g.applicationId)}>
                                 <ConfirmButton
-                                  confirm={`Remove ${m.email}'s ${g.role} access to ${g.applicationName}?${m.grants.length === 1 ? ' This is their last grant — they will be left with access to no application at all.' : ''}`}
+                                  confirm={`Remove ${m.email}'s ${g.role} access to ${g.applicationName}?${(m.grants ?? []).length === 1 ? ' This is their last grant — they will be left with access to no application at all.' : ''}`}
                                 >
                                   Remove
                                 </ConfirmButton>
@@ -340,6 +371,10 @@ export default async function TeamPage({
                         </li>
                       ))}
                     </ul>
+                  )}
+
+                  {canManage && m.role === 'MEMBER' && (
+                    <ScopeEditor membershipId={m.membershipId} scopes={m.scopes ?? null} />
                   )}
 
                   {canManage && applications.length > 0 && (
@@ -493,5 +528,79 @@ export default async function TeamPage({
         </div>
       )}
     </section>
+  );
+}
+
+
+/**
+ * What this member may DO, workspace-wide, on top of which applications their
+ * grants let them reach. Unrestricted by default — every existing member is —
+ * and the switch makes the restriction an explicit act rather than a default
+ * somebody forgot to lift.
+ */
+function ScopeEditor({
+  membershipId,
+  scopes,
+}: {
+  membershipId: string;
+  scopes: string[] | null;
+}): React.JSX.Element {
+  const restricted = scopes !== null;
+  return (
+    <form
+      action={setScopes.bind(null, membershipId)}
+      className="space-y-3 rounded-md border border-[var(--color-border)] bg-[color-mix(in_srgb,var(--color-surface-muted)_40%,transparent)] px-3 py-3"
+    >
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <div className="text-sm font-medium text-[var(--color-fg)]">Scopes</div>
+          <p className="max-w-xl text-xs text-[var(--color-muted-fg)]">
+            What this member may do inside the applications they are granted. A grant decides{' '}
+            <em>which</em> applications; scopes decide <em>what</em> — the two only ever narrow each
+            other.
+          </p>
+        </div>
+        <label className="flex shrink-0 items-center gap-2 text-xs">
+          <input type="checkbox" name="restricted" defaultChecked={restricted} />
+          Restrict
+        </label>
+      </div>
+      <div className="grid gap-2 sm:grid-cols-2">
+        {SCOPE_DOMAINS.map((d) => {
+          const meta = DOMAIN_LABEL[d];
+          return (
+            <label key={d} className="flex items-start justify-between gap-3 text-xs">
+              <span className="min-w-0">
+                <span className="block font-medium text-[var(--color-fg)]">{meta.label}</span>
+                <span className="block text-[11px] text-[var(--color-muted-fg)]">{meta.hint}</span>
+                {meta.risk && (
+                  <span className="block text-[11px] text-amber-700 dark:text-amber-400">{meta.risk}</span>
+                )}
+              </span>
+              <select
+                name={`scope:${d}`}
+                defaultValue={levelFor(scopes, d)}
+                className="shrink-0 rounded-md border border-[var(--color-border)] bg-[var(--color-surface)] px-2 py-1 text-xs text-[var(--color-fg)]"
+              >
+                <option value="none">None</option>
+                <option value="read">Read</option>
+                <option value="write">Read &amp; write</option>
+              </select>
+            </label>
+          );
+        })}
+      </div>
+      <p className="text-[11px] text-[var(--color-muted-fg)]">
+        With <strong>Restrict</strong> off, every scope applies and the selects are ignored. Grants,
+        roles, invitations, lifecycle, impersonation and erasure are never scopes — they stay with
+        owners and admins.
+      </p>
+      <SubmitButton
+        pendingLabel="Saving…"
+        className="rounded-md border border-[var(--color-border)] px-3 py-1.5 text-sm text-[var(--color-fg)] hover:bg-[var(--color-surface-muted)]"
+      >
+        Save scopes
+      </SubmitButton>
+    </form>
   );
 }

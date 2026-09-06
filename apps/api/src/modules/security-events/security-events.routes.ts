@@ -69,6 +69,7 @@ export async function securityEventsRoutes(app: FastifyInstance): Promise<void> 
   app.get(
     '/',
     {
+      config: { access: { scope: 'activity:read' } },
       preHandler: requireTenantRole(['OWNER', 'ADMIN']),
       schema: {
         tags: ['Tenant · Security'],

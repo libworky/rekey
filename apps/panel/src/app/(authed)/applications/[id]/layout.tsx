@@ -62,7 +62,11 @@ export default async function ApplicationDetailLayout({
         </div>
       </header>
 
-      <AppNav id={id} billingEnabled={app.billingConfig.enabled} />
+      <AppNav
+        id={id}
+        billingEnabled={app.billingConfig.enabled}
+        scopes={app.access?.scopes ?? null}
+      />
 
       {/* In the LAYOUT, not on one page. A disabled application looks entirely
           normal on every tab — the plans are there, the end-users are there,

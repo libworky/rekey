@@ -453,7 +453,13 @@ export function getSubscriptionGrantsMode(): Promise<'enabled' | 'disabled'> {
 
 export interface MeDto {
   user: { id: string; email: string; name: string | null };
-  memberships: Array<{ tenantId: string; tenantName: string; role: 'OWNER' | 'ADMIN' | 'MEMBER' }>;
+  memberships: Array<{
+    tenantId: string;
+    tenantName: string;
+    role: 'OWNER' | 'ADMIN' | 'MEMBER';
+    /** Resolved scopes in that workspace, or null when unrestricted (always null for OWNER/ADMIN). */
+    scopes: string[] | null;
+  }>;
   activeTenantId: string;
   activeRole: 'OWNER' | 'ADMIN' | 'MEMBER';
 }
@@ -543,6 +549,13 @@ export interface ApplicationRow {
   portalBranding?: Record<string, unknown>;
   /** Public MCP server URL, computed API-side from PUBLIC_WEBHOOK_BASE_URL/API_URL. */
   mcpUrl?: string;
+  /**
+   * How the caller reached this Application and their effective scopes on it.
+   * The panel renders navigation from `scopes`: a section whose scope is
+   * absent is not shown, rather than shown and refused. Optional only for the
+   * moment between deploys; the API always sends it.
+   */
+  access?: { level: string; scopes: string[] };
   createdAt: string;
 }
 
@@ -943,7 +956,10 @@ export interface MemberRow {
    * member only sees/uses the granted applications. An empty list means the
    * member can access NO application — unless `legacyWorkspaceRead` is set.
    */
-  grants: MemberGrantRow[];
+  /** Present for OWNER/ADMIN callers only — a MEMBER listing the roster gets the people, not their permissions. */
+  grants?: MemberGrantRow[];
+  /** The member's scopes as stored, or null when unrestricted. OWNER/ADMIN callers only. */
+  scopes?: string[] | null;
   /**
    * True only for MEMBER memberships grandfathered by the 2.0.0-rc.3 backfill:
    * they keep the pre-grants workspace-wide READ over every application.
