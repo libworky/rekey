@@ -18,6 +18,7 @@
  *   - MEMBER: read-only.
  */
 
+import { ALL_SCOPES, invalidScopes } from '../../lib/operator-scopes.js';
 import type {
   ApplicationGrantRole,
   TenantInvitation,
@@ -103,6 +104,12 @@ export interface MemberRow {
    */
   grants: MemberGrantRow[];
   /**
+   * The member's scopes as STORED — `null` when unrestricted. What the editor
+   * shows. The resolved set (lineage applied, reads implied) is what `/me`
+   * returns and what the gate reads; this is the admin-facing raw value.
+   */
+  scopes: string[] | null;
+  /**
    * True only for MEMBER memberships grandfathered by the 2.0.0-rc.3 backfill:
    * they keep the pre-grants workspace-wide READ over every Application.
    *
@@ -182,6 +189,7 @@ export const tenantWorkspacesService = {
       role: r.role,
       joinedAt: r.createdAt,
       legacyWorkspaceRead: r.legacyWorkspaceRead,
+      scopes: r.scopesRestricted ? r.scopes : null,
       grants: r.applicationGrants.map((g) => ({
         applicationId: g.application.id,
         applicationName: g.application.name,
@@ -734,8 +742,83 @@ export const tenantWorkspacesService = {
       role: updated.role,
       joinedAt: updated.createdAt,
       legacyWorkspaceRead: updated.legacyWorkspaceRead,
+      scopes: updated.scopesRestricted ? updated.scopes : null,
       // Grants survive role changes but are only consulted while the role is
       // MEMBER — promoting to ADMIN leaves them inert, demoting re-arms them.
+      grants: updated.applicationGrants.map((g) => ({
+        applicationId: g.application.id,
+        applicationName: g.application.name,
+        applicationSlug: g.application.slug,
+        role: g.role,
+        createdAt: g.createdAt,
+      })),
+    };
+  },
+
+  /**
+   * Set or lift a MEMBER's scopes. `null` lifts every restriction.
+   *
+   * MEMBER only, for the same reason grants are: OWNER/ADMIN short-circuit the
+   * gate before scopes are read, so a value stored on them would be a lie
+   * the row tells and nothing honours. `ensureCanManage` applies, so an
+   * ADMIN edits members and nobody edits an OWNER. A member cannot reach this
+   * route at all — the floor above it is what makes self-escalation
+   * impossible rather than merely forbidden.
+   *
+   * Unknown scopes are REFUSED, naming the entries. Silently dropping one is
+   * the same trap as silently ignoring a filter parameter: the admin believes
+   * they granted something they did not.
+   */
+  async setMemberScopes(args: {
+    tenantId: string;
+    membershipId: string;
+    actorRole: TenantRole;
+    scopes: string[] | null;
+  }): Promise<MemberRow> {
+    const target = await this.loadMembershipOrThrow(args.tenantId, args.membershipId);
+    ensureCanManage(args.actorRole, target.role);
+    if (target.role !== 'MEMBER') {
+      throw new RekeyError({
+        statusCode: 400,
+        code: 'SCOPES_MEMBER_ONLY',
+        message: `Scopes only apply to MEMBER roles — this membership is ${target.role} and is unrestricted by definition.`,
+        fix: 'Change the member role to MEMBER first, then set scopes.',
+      });
+    }
+    if (args.scopes !== null) {
+      const bad = invalidScopes(args.scopes);
+      if (bad.length > 0) {
+        throw new RekeyError({
+          statusCode: 400,
+          code: 'SCOPE_INVALID',
+          message: `Unknown scope${bad.length === 1 ? '' : 's'}: ${bad.join(', ')}.`,
+          fix: `Use \`domain:level\` from the registry: ${ALL_SCOPES.join(', ')}.`,
+        });
+      }
+    }
+    const updated = await prisma.tenantMembership.update({
+      where: { id: target.id },
+      data: {
+        scopesRestricted: args.scopes !== null,
+        scopes: args.scopes === null ? [] : [...new Set(args.scopes)],
+      },
+      include: {
+        tenantUser: { select: { email: true, name: true } },
+        applicationGrants: {
+          include: { application: { select: { id: true, name: true, slug: true } } },
+          orderBy: { createdAt: 'asc' },
+        },
+      },
+    });
+    return {
+      membershipId: updated.id,
+      tenantUserId: updated.tenantUserId,
+      email: updated.tenantUser.email,
+      name: updated.tenantUser.name,
+      role: updated.role,
+      joinedAt: updated.createdAt,
+      legacyWorkspaceRead: updated.legacyWorkspaceRead,
+      scopes: updated.scopesRestricted ? updated.scopes : null,
       grants: updated.applicationGrants.map((g) => ({
         applicationId: g.application.id,
         applicationName: g.application.name,

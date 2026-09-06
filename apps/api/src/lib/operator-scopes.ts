@@ -158,3 +158,48 @@ export function intersectScopes(a: ReadonlySet<Scope>, b: ReadonlySet<Scope>): R
   for (const s of a) if (b.has(s)) out.add(s);
   return out;
 }
+
+/**
+ * Resolve what a membership row stores into the set the gate reads.
+ *
+ * Two columns rather than one nullable array, because Prisma list fields
+ * cannot be null. `scopesRestricted: false` — every pre-existing row, and the
+ * default for every new one — resolves to the whole registry, which is what a
+ * member has today. `true` with `[]` is a parked member: holds grants, reaches
+ * nothing through them.
+ */
+export function resolveMembershipScopes(
+  restricted: boolean,
+  stored: readonly string[],
+): ReadonlySet<Scope> {
+  return restricted ? expandScopes(stored) : UNRESTRICTED;
+}
+
+/**
+ * A personal access token's scopes, in this vocabulary.
+ *
+ *   read                → every domain, read
+ *   applications:write  → every domain, write
+ *   keys:mint           → developer:write
+ *
+ * The auth middleware intersects this with the holder's membership scopes, so
+ * a token can only ever narrow what its holder may do — the principle
+ * `operator-tokens.routes.ts` states and that used to be enforced only by
+ * re-checking the role.
+ */
+export function patTokenScopes(tokenScopes: readonly string[]): ReadonlySet<Scope> {
+  const out = new Set<Scope>();
+  const all = (level: ScopeLevel): void => {
+    for (const d of SCOPE_DOMAINS) out.add(`${d}:${level}` as Scope);
+  };
+  if (tokenScopes.includes('read')) all('read');
+  if (tokenScopes.includes('applications:write')) {
+    all('read');
+    all('write');
+  }
+  if (tokenScopes.includes('keys:mint')) {
+    out.add('developer:read');
+    out.add('developer:write');
+  }
+  return out;
+}

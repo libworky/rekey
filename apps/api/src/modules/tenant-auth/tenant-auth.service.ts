@@ -17,6 +17,7 @@
  */
 
 import type { Tenant, TenantRole, TenantUser } from '@prisma/client';
+import { expandScopes, type Scope } from '../../lib/operator-scopes.js';
 import { prisma } from '../../lib/prisma.js';
 import { RekeyError } from '../../lib/error.js';
 import { hashPassword, verifyPassword, verifyPasswordOrDecoy } from '../../lib/passwords.js';
@@ -193,6 +194,12 @@ export interface MembershipSummary {
   tenantId: string;
   tenantName: string;
   role: TenantRole;
+  /**
+   * The member's RESOLVED scopes in this workspace — lineage applied, reads
+   * implied — or `null` when unrestricted (OWNER, ADMIN, and every member
+   * nobody has restricted). What the panel renders navigation from.
+   */
+  scopes: Scope[] | null;
 }
 
 export interface AuthSessionResult {
@@ -231,7 +238,13 @@ async function loadMemberships(tenantUserId: string): Promise<MembershipSummary[
     include: { tenant: { select: { id: true, name: true } } },
     orderBy: { createdAt: 'asc' },
   });
-  return rows.map((r) => ({ tenantId: r.tenantId, tenantName: r.tenant.name, role: r.role }));
+  return rows.map((r) => ({
+    tenantId: r.tenantId,
+    tenantName: r.tenant.name,
+    role: r.role,
+    scopes:
+      r.role === 'MEMBER' && r.scopesRestricted ? [...expandScopes(r.scopes)].sort() : null,
+  }));
 }
 
 export interface TenantDeviceContext {

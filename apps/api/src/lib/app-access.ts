@@ -66,6 +66,7 @@ import {
   type AppAccessNeed,
   type AppAccessScope,
 } from './access-context.js';
+import { UNRESTRICTED } from './operator-scopes.js';
 
 // The decision itself lives in ./access-context.ts, where the MCP path shares
 // it. These two are the request-shaped adapters the 128 REST call sites use;
@@ -81,7 +82,14 @@ export async function ensureAppAccess(
   applicationId: string,
   need: AppAccessNeed,
 ): Promise<AppAccess> {
-  return applicationAccess(await accessContextFromRequest(req), applicationId, need);
+  // The scope this route needs is its own declaration (lib/route-access.ts),
+  // so the 128 call sites keep their signature and every one is gated.
+  return applicationAccess(
+    await accessContextFromRequest(req),
+    applicationId,
+    need,
+    req.routeOptions?.config?.access,
+  );
 }
 
 /**
@@ -99,6 +107,7 @@ export async function appAccessScope(req: FastifyRequest): Promise<AppAccessScop
     tenantId: req.tenantId!,
     role: req.tenantRole!,
     membershipId: req.tenantMembershipId,
+    scopes: req.tenantScopes ?? UNRESTRICTED,
   });
 }
 

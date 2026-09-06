@@ -128,7 +128,17 @@ const RenameBody = z.object({ name: z.string().min(2).max(80) });
 const CreateBody = z.object({ name: z.string().min(2).max(80) });
 const InvIdParam = z.object({ id: z.string().min(1) });
 const MemberIdParam = z.object({ id: z.string().min(1) });
-const RoleBody = z.object({ role: z.enum(['OWNER', 'ADMIN', 'MEMBER']) });
+// Role and scopes on one route: both are "what may this member do", and an
+// admin editing one is usually looking at the other. Either may be omitted;
+// at least one must be present. `scopes: null` lifts every restriction.
+const MemberPatchBody = z
+  .object({
+    role: z.enum(['OWNER', 'ADMIN', 'MEMBER']).optional(),
+    scopes: z.array(z.string().min(1).max(64)).max(64).nullable().optional(),
+  })
+  .refine((b) => b.role !== undefined || b.scopes !== undefined, {
+    message: 'Provide role, scopes, or both.',
+  });
 const GrantBody = z.object({
   applicationId: z.string().min(1),
   role: z.enum(['APP_ADMIN', 'APP_BILLING', 'APP_VIEWER']),
@@ -427,7 +437,17 @@ export async function tenantWorkspacesRoutes(app: FastifyInstance): Promise<void
         tenantWorkspacesService.listMembers(req.tenantId!, { take, skip }),
         tenantWorkspacesService.countMembers(req.tenantId!),
       ]);
-      return { success: true, data: paged(items, total, take, skip) };
+      // The roster is for everyone — the panel shows teammates to any member.
+      // Each member's GRANTS and SCOPES are not: this route was session-only
+      // and returned every member's grant matrix, so a MEMBER learned their
+      // own permissions by listing their colleagues'. Under scopes that would
+      // be every operator reading everyone's complete permission set. The two
+      // fields ride only for callers who could edit them (the team floor).
+      const canSeePermissions = req.tenantRole === 'OWNER' || req.tenantRole === 'ADMIN';
+      const projected = canSeePermissions
+        ? items
+        : items.map(({ grants: _g, scopes: _s, legacyWorkspaceRead: _l, ...rest }) => rest);
+      return { success: true, data: paged(projected, total, take, skip) };
     },
   );
 
@@ -487,8 +507,18 @@ export async function tenantWorkspacesRoutes(app: FastifyInstance): Promise<void
         params: { type: 'object', properties: { id: { type: 'string' } }, required: ['id'] },
         body: {
           type: 'object',
-          required: ['role'],
-          properties: { role: { type: 'string', enum: ['OWNER', 'ADMIN', 'MEMBER'] } },
+          properties: {
+            role: { type: 'string', enum: ['OWNER', 'ADMIN', 'MEMBER'] },
+            scopes: {
+              type: 'array',
+              nullable: true,
+              items: { type: 'string' },
+              description:
+                'The member\'s scopes (`domain:level`, see the registry). Only valid on a ' +
+                'MEMBER. `null` lifts every restriction; `[]` parks the member. Unknown ' +
+                'scopes are refused, never dropped.',
+            },
+          },
         },
         response: {
           200: ok(ref('WorkspaceMember'), "The member's updated row."),
@@ -496,20 +526,34 @@ export async function tenantWorkspacesRoutes(app: FastifyInstance): Promise<void
             ...TENANT_SESSION_ERRORS,
             403: `${TENANT_SESSION_ERRORS[403]} Or ${OWNER_ADMIN_ROLE_ERROR}`,
             404: 'MEMBERSHIP_NOT_FOUND — no membership with that id in this workspace.',
-            400: 'CANNOT_REMOVE_LAST_OWNER — this would demote the workspace\'s only OWNER.',
+            400:
+              'CANNOT_REMOVE_LAST_OWNER — this would demote the workspace\'s only OWNER. ' +
+              'SCOPES_MEMBER_ONLY — scopes only apply to MEMBER roles. ' +
+              'SCOPE_INVALID — a scope is not one the registry knows.',
           }),
         },
       },
     },
     async (req) => {
       const { id } = MemberIdParam.parse(req.params);
-      const body = RoleBody.parse(req.body);
-      const member = await tenantWorkspacesService.changeMemberRole({
-        tenantId: req.tenantId!,
-        membershipId: id,
-        actorRole: req.tenantRole!,
-        newRole: body.role as TenantRole,
-      });
+      const body = MemberPatchBody.parse(req.body);
+      let member;
+      if (body.role !== undefined) {
+        member = await tenantWorkspacesService.changeMemberRole({
+          tenantId: req.tenantId!,
+          membershipId: id,
+          actorRole: req.tenantRole!,
+          newRole: body.role as TenantRole,
+        });
+      }
+      if (body.scopes !== undefined) {
+        member = await tenantWorkspacesService.setMemberScopes({
+          tenantId: req.tenantId!,
+          membershipId: id,
+          actorRole: req.tenantRole!,
+          scopes: body.scopes,
+        });
+      }
       return { success: true, data: member };
     },
   );

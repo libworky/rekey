@@ -61,6 +61,7 @@ import {
   redactApplicationForBilling,
   stripApplicationSecrets,
 } from '../../lib/app-access.js';
+import { scopeDenied } from '../../lib/access-context.js';
 import { recordSecurityEvent, requestContext } from '../../lib/security-events.js';
 import { refreshCorsOrigins } from '../../lib/cors-origins.js';
 import { mcpIssuer } from '../mcp/oauth.service.js';
@@ -801,7 +802,29 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
           200: ok(
             {
               allOf: [
-                ref('Application'),
+                {
+                  allOf: [
+                    ref('Application'),
+                    {
+                      type: 'object',
+                      properties: {
+                        access: {
+                          type: 'object',
+                          description:
+                            'How the caller reached this Application, and their effective scopes on it. ' +
+                            'The panel renders navigation from `scopes`; a section whose scope is absent ' +
+                            'is not shown rather than shown and refused.',
+                          properties: {
+                            level: { type: 'string' },
+                            scopes: { type: 'array', items: { type: 'string' } },
+                          },
+                          required: ['level', 'scopes'],
+                        },
+                      },
+                      required: ['access'],
+                    },
+                  ],
+                },
                 {
                   type: 'object',
                   properties: {
@@ -830,12 +853,21 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
       // Surface the PUBLIC MCP URL (derived from PUBLIC_WEBHOOK_BASE_URL/API_URL
       // on the API side) so the panel shows the externally-reachable host, not
       // its own in-cluster REKEY_URL (e.g. http://api:3030).
-      const data = { ...application, mcpUrl: mcpIssuer(application.slug) };
-      // Billing managers see money, not sign-in: hide the auth/OAuth config.
+      const data = {
+        ...application,
+        mcpUrl: mcpIssuer(application.slug),
+        // The capabilities the panel renders from. Computed from what the gate
+        // already resolved, so it cannot disagree with what the gate enforces.
+        access: { level: access.level, scopes: [...access.scopes].sort() },
+      };
+      // Sign-in config is projected on the auth-config scope. This is the old
+      // "billing managers see money, not sign-in" rule — APP_BILLING's preset
+      // excludes auth-config — now driven by the scope instead of the literal
+      // role, so a member restricted by scopes gets the same redaction.
       return {
         success: true,
         data: stripApplicationSecrets(
-          access.level === 'APP_BILLING' ? redactApplicationForBilling(data) : data,
+          access.scopes.has('auth-config:read') ? data : redactApplicationForBilling(data),
         ),
       };
     },
@@ -3732,7 +3764,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
     },
     async (req) => {
       const { id } = AppParam.parse(req.params);
-      await ensureAppAccess(req, id, 'read');
+      const access = await ensureAppAccess(req, id, 'read');
       const q = z
         .object({
           search: z.string().max(254).optional(),
@@ -3747,6 +3779,14 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
         })
         .merge(PaginationQuery)
         .parse(req.query);
+      // The rows carry no plan, but this filter is a per-user paying/churned
+      // oracle: ask for ACTIVE, then CANCELED, and you have the book of business
+      // by name. It is a billing question asked of the end-users domain, so it
+      // needs the billing scope. REFUSED rather than ignored: silently dropping
+      // it would return an unfiltered list the caller reads as filtered.
+      if (q.subscriptionStatus !== undefined && !access.scopes.has('billing:read')) {
+        throw scopeDenied('billing:read');
+      }
       const { take, skip } = parsePagination(q, 25);
       const order = q.order ?? 'desc';
       // The endpoint the functional audit caught truncating: 36 rows in the

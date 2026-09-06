@@ -32,6 +32,8 @@ import { Banner } from '@/components/Banner';
 import { CopyLinkButton } from '@/components/CopyLinkButton';
 import { RecordHeader } from '@/components/RecordHeader';
 import { getEndUserDetail } from './shared';
+import { getApplication } from '@/lib/api';
+import { hasScope } from '@/lib/operator-scopes';
 
 export default async function EndUserLayout({
   children,
@@ -41,7 +43,10 @@ export default async function EndUserLayout({
   params: Promise<{ id: string; euid: string }>;
 }): Promise<React.JSX.Element> {
   const { id, euid } = await params;
-  const detail = await getEndUserDetail(id, euid);
+  // Request-cached: the application layout already fetched this row.
+  const [detail, application] = await Promise.all([getEndUserDetail(id, euid), getApplication(id)]);
+  const scopes = application.access?.scopes ?? null;
+  const canBilling = hasScope(scopes, 'billing:read');
   const isErased = detail.endUser.erasedAt !== null;
   const base = `/applications/${id}/end-users/${euid}`;
 
@@ -71,11 +76,13 @@ export default async function EndUserLayout({
         meta={<span className="font-mono">{detail.endUser.id}</span>}
         action={<CopyLinkButton />}
         segmentsLabel="End-user sections"
+        // Subscriptions and Credits are billing reads. Without the scope they
+        // are not offered rather than offered and refused.
         segments={[
           { href: base, label: 'Overview', exact: true },
-          { href: `${base}/subscriptions`, label: 'Subscriptions' },
+          ...(canBilling ? [{ href: `${base}/subscriptions`, label: 'Subscriptions' }] : []),
           { href: `${base}/devices`, label: 'Devices' },
-          { href: `${base}/credits`, label: 'Credits' },
+          ...(canBilling ? [{ href: `${base}/credits`, label: 'Credits' }] : []),
           { href: `${base}/security`, label: 'Security' },
           { href: `${base}/data`, label: 'Data & privacy' },
         ]}

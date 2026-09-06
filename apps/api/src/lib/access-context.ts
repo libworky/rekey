@@ -13,38 +13,47 @@
  * caller warned in a comment that it would not protect a member write tool.
  *
  * The fix is not a fourth copy. It is one decision function that takes a plain
- * context — `{ tenantId, role, membershipId }` — and two thin adapters that
- * build that context from a request or from a tool context. The grants query,
- * the legacy-member rule, the OWNER/ADMIN short-circuit and the
- * denied-is-indistinguishable-from-absent 404 now have exactly one home.
+ * context — `{ tenantId, role, membershipId, scopes }` — and two thin adapters
+ * that build that context from a request or from a tool context. The grants
+ * query, the legacy-member rule, the OWNER/ADMIN short-circuit and the
+ * denied-is-indistinguishable-from-absent 404 have exactly one home.
  *
- * ## What this refactor deliberately does NOT change
+ * ## Scopes
  *
- * Every observable behaviour is preserved byte for byte, including two places
- * where the old copies genuinely differed and a naive merge would have picked
- * one:
+ * A membership carries scopes (`lib/operator-scopes.ts`) — the person's
+ * ceiling, workspace-wide. The three grant roles are presets over the same
+ * vocabulary. For an application request the effective set is the
+ * INTERSECTION of the two, so neither can widen the other:
  *
- *   - `ensureAppAccess` with no membership id falls back to resolving one from
- *     `(tenantUser, tenantId)` and throws 500 if that fails; the MCP path
- *     returns `[]` (fails closed). Both survive: the fallback lives in the
- *     request adapter, and `accessibleApplicationIds` still returns `[]`.
- *   - `accessibleApplicationIds` lists every Application in the workspace for
- *     OWNER/ADMIN and filters for members; `applicationAccess` looks up one
- *     row. Different shapes for different questions, both kept.
+ *     effective = presetScopes(grant.role) ∩ membership.scopes
  *
- * The three behaviours that have to agree — and the comment in the old code
- * saying "all three have to agree" — are now one code path, so the sentence
- * can be retired along with the risk it described.
+ * OWNER and ADMIN are unrestricted, as they always were: `ApplicationGrant`
+ * cannot exist on their membership (`APP_GRANT_MEMBER_ONLY`), and they
+ * short-circuit here before grants are read.
  *
- * `AppAccessNeed` is the vocabulary today: `read | write | billing-write`.
- * Scopes on the membership (the operator-permissions spec) attach here, in the
- * context and the decision, and nowhere else.
+ * The gate runs AFTER the existing checks, deliberately. A cross-tenant or
+ * ungranted application still answers 404 — denied stays indistinguishable
+ * from absent — and only an application the caller can see can answer 403
+ * for a missing scope. There is nothing to enumerate at that point: the
+ * caller already knows the application exists.
+ *
+ * Which scope a route needs is read off the route's own declaration
+ * (`config.access`, see `lib/route-access.ts`), not passed by the handler.
+ * That is what lets 128 call sites keep their signature while every one of
+ * them becomes scope-gated.
  */
 
 import type { FastifyRequest } from 'fastify';
 import type { ApplicationGrantRole, TenantRole } from '@prisma/client';
 import { prisma } from './prisma.js';
 import { RekeyError } from './error.js';
+import {
+  UNRESTRICTED,
+  intersectScopes,
+  presetScopes,
+  type Scope,
+} from './operator-scopes.js';
+import type { RouteAccess } from './route-access.js';
 
 export type AppAccessNeed = 'read' | 'write' | 'billing-write';
 
@@ -56,6 +65,8 @@ export interface AppAccess {
    *  - ApplicationGrantRole   — MEMBER via an explicit grant on this Application
    */
   level: 'workspace-admin' | 'legacy-member' | ApplicationGrantRole;
+  /** The caller's effective scopes on THIS application. What the panel renders from. */
+  scopes: ReadonlySet<Scope>;
 }
 
 export interface AppAccessScope {
@@ -74,11 +85,16 @@ export interface AppAccessScope {
  * check then fails CLOSED — a member whose grants cannot be read must not be
  * handed the workspace — except `applicationAccess`, which treats it as a
  * programming error (see `accessContextFromRequest`).
+ *
+ * `scopes` is the membership's ceiling, already intersected with any token's
+ * scopes by the auth middleware. `UNRESTRICTED` for OWNER/ADMIN and for a
+ * member nobody has restricted, which is every member today.
  */
 export interface AccessContext {
   tenantId: string;
   role: TenantRole;
   membershipId: string | null;
+  scopes: ReadonlySet<Scope>;
 }
 
 function internal(message: string, fix: string): RekeyError {
@@ -88,12 +104,18 @@ function internal(message: string, fix: string): RekeyError {
 /**
  * Build the context from an operator request. Must run after one of the
  * operator auth middlewares (`requireTenantSession`, `resolveOperatorToken`,
- * the MCP bearer resolver) — all three set `tenantId`, `tenantRole` and
- * `tenantMembershipId`.
+ * the MCP bearer resolver) — all three set `tenantId`, `tenantRole`,
+ * `tenantMembershipId` and `tenantScopes`.
  *
  * Async only for the defensive fallback `ensureAppAccess` always had: an auth
  * path that set `tenantUser`/`tenantId` but not the membership id gets one
  * resolved here. No current path needs it; it is preserved, not relied on.
+ *
+ * `tenantScopes` absent is treated as UNRESTRICTED. All three auth paths set
+ * it; a fourth that did not would get today's behaviour rather than a wall,
+ * which keeps the promise that this change alters nothing until an admin
+ * restricts somebody. The scope tests exercise all three paths, so a path
+ * that forgot to set it would fail them, not fail open in production.
  */
 export async function accessContextFromRequest(req: FastifyRequest): Promise<AccessContext> {
   if (!req.tenantId || !req.tenantRole) {
@@ -112,7 +134,12 @@ export async function accessContextFromRequest(req: FastifyRequest): Promise<Acc
     });
     membershipId = membership?.id ?? null;
   }
-  return { tenantId: req.tenantId, role: req.tenantRole, membershipId };
+  return {
+    tenantId: req.tenantId,
+    role: req.tenantRole,
+    membershipId,
+    scopes: req.tenantScopes ?? UNRESTRICTED,
+  };
 }
 
 /** Build the context from an MCP tool context. Synchronous; nothing to resolve. */
@@ -120,8 +147,14 @@ export function accessContextFromTool(ctx: {
   tenantId: string;
   role: TenantRole;
   tenantMembershipId?: string | undefined;
+  scopes?: ReadonlySet<Scope> | undefined;
 }): AccessContext {
-  return { tenantId: ctx.tenantId, role: ctx.role, membershipId: ctx.tenantMembershipId ?? null };
+  return {
+    tenantId: ctx.tenantId,
+    role: ctx.role,
+    membershipId: ctx.tenantMembershipId ?? null,
+    scopes: ctx.scopes ?? UNRESTRICTED,
+  };
 }
 
 export interface GrantSet {
@@ -204,23 +237,50 @@ function grantDenied(need: AppAccessNeed, granted: ApplicationGrantRole): RekeyE
   });
 }
 
+export function scopeDenied(scope: Scope): RekeyError {
+  return new RekeyError({
+    statusCode: 403,
+    code: 'SCOPE_INSUFFICIENT',
+    message: `This action requires the '${scope}' scope, which your membership does not hold.`,
+    fix: 'Ask a workspace owner or admin to extend your scopes via PATCH /api/v1/tenant/workspace/members/:membershipId.',
+  });
+}
+
+/**
+ * The caller's effective scopes on an application, given how access was
+ * satisfied. Workspace admins are unrestricted; a legacy member reads
+ * everything (the APP_VIEWER preset); a grant holder gets the preset for
+ * their role — each intersected with the membership's own ceiling.
+ */
+export function effectiveApplicationScopes(
+  ctx: AccessContext,
+  level: AppAccess['level'],
+): ReadonlySet<Scope> {
+  if (level === 'workspace-admin') return UNRESTRICTED;
+  const preset = level === 'legacy-member' ? presetScopes('APP_VIEWER') : presetScopes(level);
+  return intersectScopes(preset, ctx.scopes);
+}
+
 /**
  * May this caller perform `need` on this Application? Answers BOTH questions
  * the old helper did: does the Application belong to the workspace (404
  * otherwise, same non-disclosure posture), and is the caller allowed `need`
- * on it.
+ * on it — and then, if the route declared a scope, whether the caller's
+ * effective scopes on this application include it.
  *
  *   OWNER / ADMIN   → implicit full access.
  *   MEMBER          → grants are authoritative, INCLUDING when there are none.
  *                     No grant → 404 (denied is indistinguishable from absent).
  *                     APP_VIEWER read · APP_BILLING read + billing-write ·
  *                     APP_ADMIN everything. Insufficient → 403 APP_ACCESS_DENIED.
+ *                     Then: declared scope ∉ effective → 403 SCOPE_INSUFFICIENT.
  *   legacy member   → read only, writes 403 TENANT_ROLE_INSUFFICIENT.
  */
 export async function applicationAccess(
   ctx: AccessContext,
   applicationId: string,
   need: AppAccessNeed,
+  declared?: RouteAccess | undefined,
 ): Promise<AppAccess> {
   const app = await prisma.application.findUnique({
     where: { id: applicationId },
@@ -228,7 +288,7 @@ export async function applicationAccess(
   });
   if (!app || app.tenantId !== ctx.tenantId) throw notFound(applicationId);
 
-  if (isWorkspaceAdmin(ctx.role)) return { level: 'workspace-admin' };
+  if (isWorkspaceAdmin(ctx.role)) return { level: 'workspace-admin', scopes: UNRESTRICTED };
 
   if (ctx.membershipId === null) {
     throw internal(
@@ -238,24 +298,31 @@ export async function applicationAccess(
   }
   const grants = await resolveGrantSet(ctx);
   const role = grants.byApplication.get(applicationId);
+
+  let level: AppAccess['level'];
   if (role === undefined) {
-    if (grants.legacyWorkspaceRead) {
-      if (need === 'read') return { level: 'legacy-member' };
-      throw legacyWriteDenied(ctx.role);
+    if (!grants.legacyWorkspaceRead) {
+      // Default since 2.0.0-rc.3: closed. Same 404 an ungranted Application
+      // already returned for a member who held grants elsewhere.
+      throw notFound(applicationId);
     }
-    // Default since 2.0.0-rc.3: closed. Same 404 an ungranted Application
-    // already returned for a member who held grants elsewhere.
-    throw notFound(applicationId);
+    if (need !== 'read') throw legacyWriteDenied(ctx.role);
+    level = 'legacy-member';
+  } else {
+    if (need === 'billing-write' && role !== 'APP_ADMIN' && role !== 'APP_BILLING') {
+      throw grantDenied(need, role);
+    }
+    if (need === 'write' && role !== 'APP_ADMIN') throw grantDenied(need, role);
+    level = role;
   }
 
-  if (need === 'read') return { level: role };
-  if (need === 'billing-write') {
-    if (role === 'APP_ADMIN' || role === 'APP_BILLING') return { level: role };
-    throw grantDenied(need, role);
+  const scopes = effectiveApplicationScopes(ctx, level);
+  // The scope gate, last. Only `{ scope }` declarations gate; `open`, `floor`
+  // and `project` routes pass here and shape or floor themselves.
+  if (declared !== undefined && 'scope' in declared && !scopes.has(declared.scope)) {
+    throw scopeDenied(declared.scope);
   }
-  // need === 'write'
-  if (role === 'APP_ADMIN') return { level: role };
-  throw grantDenied(need, role);
+  return { level, scopes };
 }
 
 /**

@@ -159,6 +159,14 @@ model TenantMembership {
   // you to grant-scoped" transition, now one-way.
   legacyWorkspaceRead Boolean @default(false) @map("legacy_workspace_read")
 
+  /// The member's ceiling, workspace-wide — see lib/operator-scopes.ts. Two
+  /// columns because a Prisma list cannot be null: `scopesRestricted` is the
+  /// switch, `scopes` the set. false + [] (every existing row) resolves to
+  /// every scope in the registry, which is what a member has today. true + []
+  /// is a parked member: holds grants, reaches nothing through them.
+  scopesRestricted Boolean  @default(false) @map("scopes_restricted")
+  scopes           String[] @default([])
+
   // Per-application access grants. Only consulted when role = MEMBER —
   // OWNER/ADMIN keep implicit full access to every Application. See
   // ApplicationGrant for the exact semantics.
