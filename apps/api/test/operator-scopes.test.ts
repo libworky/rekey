@@ -21,6 +21,8 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { FastifyInstance } from 'fastify';
 import { buildApp } from '../src/app.js';
+import { prisma } from '../src/lib/prisma.js';
+import { flushApiRequestLogs } from '../src/lib/request-log.js';
 
 describe('operator scopes', () => {
   let app: FastifyInstance;
@@ -350,5 +352,36 @@ describe('operator scopes', () => {
       headers: auth(w.memberToken),
     });
     expect(ok.statusCode).toBe(200);
+  });
+
+  // ---------- the request log records the admitting scope (WS7) ----------
+
+  it('the request log records which scope admitted a write', async () => {
+    const w = await world();
+    await setScopes(w, ['end-users:write']);
+    const me = await inject({ method: 'GET', url: '/api/v1/tenant/auth/me', headers: auth(w.memberToken) });
+    const operatorUserId = (me.json().data as { user: { id: string } }).user.id;
+
+    const create = await inject({
+      method: 'POST',
+      url: `/api/v1/tenant/applications/${w.appId}/end-users`,
+      headers: auth(w.memberToken),
+      payload: { email: `logged-${Math.random().toString(36).slice(2, 7)}@example.com`, password: 'pw-one-two-three' },
+    });
+    expect(create.statusCode).toBe(201);
+
+    // The log is buffered and flushed on a timer; flush it now.
+    await flushApiRequestLogs();
+    const row = await prisma.apiRequestLog.findFirst({
+      where: { operatorUserId, method: 'POST', admittedScope: { not: null } },
+      orderBy: { createdAt: 'desc' },
+    });
+    // With three roles, "who" implied "what they were allowed to do". With
+    // scopes it does not — the set changes — so the log keeps the authority
+    // the write ran under, and it survives the membership being edited later.
+    expect(row?.admittedScope).toBe('end-users:write');
+    await setScopes(w, null);
+    const again = await prisma.apiRequestLog.findUnique({ where: { id: row!.id } });
+    expect(again?.admittedScope).toBe('end-users:write');
   });
 });

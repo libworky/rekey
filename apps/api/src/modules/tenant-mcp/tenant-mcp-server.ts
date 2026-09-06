@@ -8,6 +8,7 @@
  */
 
 import type { TenantRole } from '@prisma/client';
+import { UNRESTRICTED, type Scope } from '../../lib/operator-scopes.js';
 import { recordSecurityEvent } from '../../lib/security-events.js';
 import { operatorTools, type OperatorTool, type OperatorToolContext } from './operator-tools.js';
 import { operatorWriteTools } from './operator-write-tools.js';
@@ -17,6 +18,61 @@ const SERVER_INFO = { name: 'rekey-operator', version: '1.0.0' };
 
 /** All operator tools — read tools first, then the phase-1 write tools. */
 const allTools: OperatorTool[] = [...operatorTools, ...operatorWriteTools];
+
+/**
+ * Which scope each application-scoped tool needs. The REST twin of every tool
+ * declares this on its route (`config.access`); tools declare it here, in one
+ * table, and `route-access-completeness`'s MCP sibling asserts every tool
+ * appears either here or in `WORKSPACE_TOOLS` — so a new tool cannot ship
+ * ungoverned. Workspace-level tools are floors (role-gated) and take no scope.
+ */
+export const TOOL_SCOPES: Readonly<Record<string, Scope>> = {
+  get_workspace_overview: 'overview:read',
+  application_health: 'overview:read',
+  recent_payments: 'billing:read',
+  recent_subscriptions: 'billing:read',
+  cancel_subscription: 'billing:write',
+  configure_billing_provider: 'billing:write',
+  list_plans: 'billing:read',
+  create_plan: 'billing:write',
+  update_plan: 'billing:write',
+  set_plan_active: 'billing:write',
+  register_plan_with_provider: 'billing:write',
+  list_plan_entitlements: 'billing:read',
+  put_plan_entitlement: 'billing:write',
+  list_usage_meters: 'billing:read',
+  create_usage_meter: 'billing:write',
+  recent_security_events: 'activity:read',
+  recent_webhook_events: 'developer:read',
+  recent_failed_webhook_deliveries: 'developer:read',
+  create_webhook_endpoint: 'developer:write',
+  update_webhook_endpoint: 'developer:write',
+  list_api_keys: 'developer:read',
+  revoke_api_key: 'developer:write',
+  mint_api_key: 'developer:write',
+  get_end_user: 'end-users:read',
+  list_devices: 'end-users:read',
+  release_device: 'end-users:write',
+  block_device: 'end-users:write',
+  unblock_device: 'end-users:write',
+  list_organization_roles: 'organizations:read',
+  create_organization_role: 'organizations:write',
+  update_organization_role: 'organizations:write',
+  delete_organization_role: 'organizations:write',
+  update_auth_config: 'auth-config:write',
+};
+
+/** Tools that are workspace-level floors: role-gated, scoped by nothing. */
+export const WORKSPACE_TOOLS: ReadonlySet<string> = new Set([
+  'list_applications',
+  'list_members',
+  'list_invitations',
+  'invite_member',
+  'revoke_invitation',
+  'change_member_role',
+  'remove_member',
+  'create_application',
+]);
 
 /** OWNER > ADMIN > MEMBER. A higher rank clears a lower `minRole` threshold. */
 const ROLE_RANK: Record<TenantRole, number> = { OWNER: 3, ADMIN: 2, MEMBER: 1 } as Record<
@@ -46,6 +102,15 @@ function roleAllows(role: TenantRole, minRole: TenantRole): boolean {
  * `accessibleApplicationIds` in operator-tools.ts.
  */
 function toolAllowed(ctx: OperatorToolContext, tool: OperatorTool): boolean {
+  // The scope gate, first: a tool the caller's membership does not admit is
+  // neither listed nor callable, whatever the token or role say. OWNER and
+  // ADMIN hold every scope, so this only ever bites a restricted member.
+  // A context built without scopes (the direct-dispatch tests do this) is
+  // unrestricted — the same rule the request adapter applies, so a fourth
+  // auth path that forgot to set it would get today's behaviour, not a wall.
+  const held = ctx.scopes ?? UNRESTRICTED;
+  const need = TOOL_SCOPES[tool.name];
+  if (need !== undefined && !held.has(need)) return false;
   // Admin tools (destructive/financial/secret) need admin scope + role.
   if (tool.admin) return ctx.canAdmin && roleAllows(ctx.role, tool.minRole ?? 'ADMIN');
   // Write tools need write scope + role.
@@ -125,6 +190,8 @@ export async function handleOperatorMcpMessage(
         } else if (tool.write && !ctx.canWrite) {
           reason =
             'This tool requires write access. Re-authorize the connector with the "mcp:operator:write" scope (or use a PAT with the "applications:write" scope).';
+        } else if (TOOL_SCOPES[tool.name] !== undefined && !(ctx.scopes ?? UNRESTRICTED).has(TOOL_SCOPES[tool.name]!)) {
+          reason = `This tool requires the '${TOOL_SCOPES[tool.name]}' scope, which your membership does not hold. Ask a workspace owner or admin to extend your scopes.`;
         } else {
           reason = `This tool requires at least the ${tool.minRole ?? 'ADMIN'} role in this workspace.`;
         }

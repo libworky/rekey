@@ -445,6 +445,10 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
       tenantId: req.tenantId ?? req.application?.tenantId ?? null,
       operatorUserId: req.tenantUser?.id ?? null,
       ip: req.ip || null,
+      // Under scopes, "who" no longer implies "what they were allowed to do":
+      // a membership's scopes change, and the log would otherwise lose the
+      // authority a past write ran under. Recorded whenever a scope gate ran.
+      admittedScope: req.accessDecision?.scope ?? null,
     });
     done();
   });

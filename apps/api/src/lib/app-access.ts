@@ -84,12 +84,19 @@ export async function ensureAppAccess(
 ): Promise<AppAccess> {
   // The scope this route needs is its own declaration (lib/route-access.ts),
   // so the 128 call sites keep their signature and every one is gated.
-  return applicationAccess(
+  const declared = req.routeOptions?.config?.access;
+  const access = await applicationAccess(
     await accessContextFromRequest(req),
     applicationId,
     need,
-    req.routeOptions?.config?.access,
+    declared,
   );
+  // For the request log: the scope that admitted this, if one did.
+  req.accessDecision = {
+    scope: declared !== undefined && 'scope' in declared ? declared.scope : null,
+    level: access.level,
+  };
+  return access;
 }
 
 /**

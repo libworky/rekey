@@ -45,6 +45,7 @@
  */
 
 import type { TenantRole } from '@prisma/client';
+import { UNRESTRICTED, type Scope } from '../../lib/operator-scopes.js';
 import { prisma } from '../../lib/prisma.js';
 import {
   accessContextFromTool,
@@ -68,6 +69,13 @@ export interface OperatorToolContext {
   canWrite: boolean;
   /** Whether this token carries admin scope (`mcp:operator:admin`) — destructive/financial ops. */
   canAdmin: boolean;
+  /**
+   * The caller's effective scopes: membership ceiling ∩ token authority.
+   * Set by the route from `req.tenantScopes`. `toolAllowed` consults it for
+   * every tool that names a scope; the per-application helpers carry it into
+   * the access decision.
+   */
+  scopes: ReadonlySet<Scope>;
   /** Inbound request context, threaded through for the security audit log. */
   ip?: string | null;
   userAgent?: string | null;
@@ -138,7 +146,7 @@ function clampLimit(raw: unknown, def = 25): number {
  * relies on.
  */
 export async function accessibleApplicationIds(ctx: OperatorToolContext): Promise<string[]> {
-  return sharedAccessibleApplicationIds(accessContextFromTool(ctx));
+  return sharedAccessibleApplicationIds(accessContextFromTool({ ...ctx, scopes: ctx.scopes }));
 }
 
 export const operatorTools: OperatorTool[] = [
@@ -196,8 +204,14 @@ export const operatorTools: OperatorTool[] = [
         endUserCount,
         organizationCount: orgCount,
         activeSubscriptions: activeSubsRows.length,
-        mrrMinor,
-        currencies: [...mrrByCurrency.entries()].map(([currency, mrr]) => ({ currency, mrrMinor: mrr })),
+        // Counts are the overview; MRR is money. `overview:read` gets the
+        // tool, `billing:read` gets the amounts — omitted, never zeroed.
+        ...((ctx.scopes ?? UNRESTRICTED).has('billing:read')
+          ? {
+              mrrMinor,
+              currencies: [...mrrByCurrency.entries()].map(([currency, mrr]) => ({ currency, mrrMinor: mrr })),
+            }
+          : {}),
       };
     },
   },

@@ -203,3 +203,12 @@ export function patTokenScopes(tokenScopes: readonly string[]): ReadonlySet<Scop
   }
   return out;
 }
+
+/**
+ * An OAuth MCP token's authority in this vocabulary. `mcp:operator:write`
+ * maps to every write; without it the token reads only. Admin tools stay
+ * role-and-`canAdmin`-gated — they are floors, not scopes.
+ */
+export function mcpTokenScopes(canWrite: boolean): ReadonlySet<Scope> {
+  return canWrite ? UNRESTRICTED : new Set(SCOPE_DOMAINS.map((d) => `${d}:read` as Scope));
+}

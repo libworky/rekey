@@ -20,6 +20,8 @@ export interface PaletteApplication {
   name: string;
   slug: string;
   billingEnabled: boolean;
+  /** The caller's effective scopes on this application; null = unrestricted. */
+  scopes: string[] | null;
 }
 
 export async function GET(): Promise<Response> {
@@ -37,6 +39,7 @@ export async function GET(): Promise<Response> {
       name: a.name,
       slug: a.slug,
       billingEnabled: a.billingConfig.enabled,
+      scopes: a.access?.scopes ?? null,
     }));
     return NextResponse.json(slim, { headers: { 'cache-control': 'no-store' } });
   } catch (err) {
