@@ -24,6 +24,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { FastifyInstance } from 'fastify';
 import { buildApp } from '../src/app.js';
 import { prisma } from '../src/lib/prisma.js';
+import { waitForSecurityEvents } from './wait-for-security-events.js';
 
 describe('operator subscription grants', () => {
   let app: FastifyInstance;
@@ -248,12 +249,14 @@ describe('operator subscription grants', () => {
     const w = await world();
     await grant(w, w.ownerToken, { note: 'comped for the pilot' });
 
-    const audit = await prisma.securityEvent.findFirstOrThrow({
-      where: { applicationId: w.applicationId, type: 'app.subscription_granted' },
-    });
-    expect(audit.actorType).toBe('operator');
-    expect(audit.actorId).not.toBeNull();
-    expect(audit.metadata).toMatchObject({
+    // recordSecurityEvent is fire-and-forget (`void`), so the row is not
+    // guaranteed to exist the instant the grant returns. Reading it with an
+    // immediate findFirstOrThrow failed roughly one run in ten.
+    const [audit] = await waitForSecurityEvents({ applicationId: w.applicationId, type: 'app.subscription_granted' });
+    expect(audit).toBeDefined();
+    expect(audit!.actorType).toBe('operator');
+    expect(audit!.actorId).not.toBeNull();
+    expect(audit!.metadata).toMatchObject({
       endUserId: w.endUserId,
       planSlug: w.planSlug,
       note: 'comped for the pilot',
