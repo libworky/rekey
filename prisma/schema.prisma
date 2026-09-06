@@ -159,6 +159,14 @@ model TenantMembership {
   // you to grant-scoped" transition, now one-way.
   legacyWorkspaceRead Boolean @default(false) @map("legacy_workspace_read")
 
+  /// The member's ceiling, workspace-wide — see lib/operator-scopes.ts. Two
+  /// columns because a Prisma list cannot be null: `scopesRestricted` is the
+  /// switch, `scopes` the set. false + [] (every existing row) resolves to
+  /// every scope in the registry, which is what a member has today. true + []
+  /// is a parked member: holds grants, reaches nothing through them.
+  scopesRestricted Boolean  @default(false) @map("scopes_restricted")
+  scopes           String[] @default([])
+
   // Per-application access grants. Only consulted when role = MEMBER —
   // OWNER/ADMIN keep implicit full access to every Application. See
   // ApplicationGrant for the exact semantics.
@@ -470,6 +478,17 @@ model Application {
   // with RESEND_DEFAULT_FROM); a BYO transport with no `fromAddress` is an
   // error, not a fallback.
   emailConfig                  Json    @default("{}") @map("email_config")
+  // Master switch for every Application-scoped email: verification, reset,
+  // magic link, welcome, dunning — everything `emailService.dispatch` sends for
+  // this Application. Workspace/system mail goes through `dispatchSystem` and is
+  // deliberately unaffected: an Application-level switch must not be able to
+  // lock operators out of their own workspace.
+  //
+  // A COLUMN, not a key inside `emailConfig`, because `setCredentials` rewrites
+  // that object wholesale — a flag living there would be silently cleared every
+  // time somebody saved transport credentials. `authConfig.appUrl` sits where it
+  // does for exactly the same reason, and says so.
+  emailsEnabled                Boolean @default(true) @map("emails_enabled")
   // Encrypted per-Application transport credentials. AES-256-GCM via
   // lib/secrets.ts. Shape is the `EmailCredentials` union in
   // lib/email-transport.ts: `{ provider: 'resend', apiKey }` or
@@ -579,6 +598,9 @@ model Application {
   organizationRoles   OrganizationRoleDef[]
   emailTemplates      EmailTemplate[]
   emailLogs           EmailLog[]
+  emailEventSettings  EmailEventSetting[]
+  emailSuppressions   EmailSuppression[]
+  subscriptionImports SubscriptionImportRun[]
   webhookEndpoints    WebhookEndpoint[]
   organizations       Organization[]
   creditBalances      CreditBalance[]
@@ -628,6 +650,134 @@ model EmailTemplate {
 }
 
 // ============================================================================
+// Per-event send switch.
+//
+// SEPARATE from EmailTemplate on purpose. `EmailTemplate` existing is what
+// "customised" means in the panel, and turning an event OFF must not require
+// customising its body first — nor should deleting a customisation silently
+// re-enable an event somebody switched off.
+//
+// A missing row means enabled: the default is that Rekey sends what it always
+// sent, so an upgrade changes nothing until an operator says otherwise.
+// ============================================================================
+model EmailEventSetting {
+  id            String   @id @default(cuid())
+  applicationId String   @map("application_id")
+  /** An `EmailEventKey` (modules/email/events.ts). */
+  eventKey      String   @map("event_key")
+  enabled       Boolean  @default(true)
+  updatedAt     DateTime @updatedAt @map("updated_at")
+
+  application Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+
+  @@unique([applicationId, eventKey])
+  @@index([applicationId])
+  @@map("email_event_settings")
+}
+
+// ============================================================================
+// Addresses this Application must not email, whatever it is trying to send.
+//
+// The narrowest of the three gates and the only one that is about a PERSON
+// rather than about configuration: a bounce, a spam complaint, an unsubscribe,
+// or an operator who was asked to stop. It outranks everything, including a
+// password reset — an address that hard-bounced cannot receive one anyway, and
+// mailing a complainant again is how a sending domain gets blocked.
+//
+// Rekey never writes these itself yet (no provider bounce webhooks are
+// consumed); `reason` is carried so that when it does, a bounce and a manual
+// entry stay distinguishable.
+// ============================================================================
+model EmailSuppression {
+  id            String   @id @default(cuid())
+  applicationId String   @map("application_id")
+  /** Lowercased, matching how EmailLog stores `toAddress`. */
+  address       String
+  /** bounce | complaint | manual | unsubscribe */
+  reason        String   @default("manual")
+  note          String?
+  /** Operator id for a manual entry; null when Rekey added it itself. */
+  createdBy     String?  @map("created_by")
+  createdAt     DateTime @default(now()) @map("created_at")
+
+  application Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+
+  @@unique([applicationId, address])
+  @@index([applicationId, createdAt])
+  @@map("email_suppressions")
+}
+
+// ============================================================================
+// Subscription import — reading what a billing system already sold.
+//
+// An import is a RUN, not a call. The operator presses a button and gets a
+// preview: every row the provider returned, what would happen to it, and why —
+// then applies it, or does not. A one-shot "import now" would be an
+// irreversible bulk write against somebody else's data, decided from a button
+// with no way to look first.
+//
+// A run is therefore its own row with its own items, and `mode` records which
+// half it stopped at. `dry_run` never writes a Subscription; `applied` does.
+// ============================================================================
+model SubscriptionImportRun {
+  id            String    @id @default(cuid())
+  applicationId String    @map("application_id")
+  /** Provider module name — the source that was read. */
+  provider      String
+  /** dry_run | applied */
+  mode          String    @default("dry_run")
+  /** queued | running | ready | applying | applied | failed */
+  status        String    @default("queued")
+  /** email | email_or_create */
+  matchStrategy String    @map("match_strategy")
+  /** Operator who started it. */
+  startedBy     String    @map("started_by")
+  /** Tallies by outcome, so a summary needs no scan of the items. */
+  counts        Json      @default("{}")
+  error         String?
+  createdAt     DateTime  @default(now()) @map("created_at")
+  completedAt   DateTime? @map("completed_at")
+
+  application Application             @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  items       SubscriptionImportItem[]
+
+  @@index([applicationId, createdAt])
+  @@map("subscription_import_runs")
+}
+
+// ============================================================================
+// One provider subscription, and what the run decided about it.
+//
+// Kept after an apply, deliberately: "why does this customer have this
+// subscription" is answered by the run that created it, and an import that
+// deletes its own working is an import nobody can audit.
+// ============================================================================
+model SubscriptionImportItem {
+  id             String  @id @default(cuid())
+  runId          String  @map("run_id")
+  /** The provider's own id for the subscription. The idempotency key. */
+  externalId     String  @map("external_id")
+  email          String?
+  /** The provider's plan identifier, before mapping. */
+  planRef        String? @map("plan_ref")
+  /** match | create | skip_no_plan | skip_active | skip_invalid | error */
+  outcome        String
+  /** Set once matched or created. */
+  endUserId      String? @map("end_user_id")
+  /** Local plan the `planRef` mapped to. */
+  planSlug       String? @map("plan_slug")
+  /** Set by an apply. */
+  subscriptionId String? @map("subscription_id")
+  /** Anything worth showing in the preview: the refusal, the raw status, the term. */
+  detail         Json    @default("{}")
+
+  run SubscriptionImportRun @relation(fields: [runId], references: [id], onDelete: Cascade)
+
+  @@index([runId, outcome])
+  @@map("subscription_import_items")
+}
+
+// ============================================================================
 // Email send log — one row per outbound email attempt (transactional auth
 // mail + operator/workspace system mail). Recorded at the transport boundary
 // (lib/email-transport.ts) so EVERY send is captured regardless of caller.
@@ -656,7 +806,7 @@ model EmailLog {
   eventKey      String?  @map("event_key")
   /** Transport used: byo_resend | default_resend | byo_smtp | none. */
   via           String
-  /** Outcome: sent | error | no_transport. */
+  /** Outcome: sent | error | no_transport | suppressed. */
   status        String
   /** Provider message id when status=sent (nullable — some providers omit). */
   messageId     String?  @map("message_id")

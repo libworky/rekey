@@ -24,6 +24,7 @@ import { RekeyError } from '../lib/error.js';
 import { verifyTenantAccessToken } from '../lib/tenant-jwt.js';
 import { prisma } from '../lib/prisma.js';
 import type { PublicTenantUser } from '../modules/tenant-auth/tenant-auth.service.js';
+import { resolveMembershipScopes, type Scope } from '../lib/operator-scopes.js';
 
 declare module 'fastify' {
   interface FastifyRequest {
@@ -32,6 +33,13 @@ declare module 'fastify' {
     tenantRole?: TenantRole;
     /** Membership row id for (tenantUser, tenant) — used by per-app grant checks. */
     tenantMembershipId?: string;
+    /**
+     * The caller's effective scopes: the membership's ceiling, already
+     * intersected with the token's scopes on the PAT and MCP paths. Read by
+     * `ensureAppAccess` via the access context. UNRESTRICTED for OWNER/ADMIN
+     * and for every member nobody has restricted.
+     */
+    tenantScopes?: ReadonlySet<Scope>;
   }
 }
 
@@ -94,6 +102,7 @@ export async function requireTenantSession(
   // Use the LIVE role from DB, not the token — mirrors role downgrades.
   request.tenantRole = membership.role;
   request.tenantMembershipId = membership.id;
+  request.tenantScopes = resolveMembershipScopes(membership.scopesRestricted, membership.scopes);
 }
 
 /**

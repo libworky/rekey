@@ -61,15 +61,174 @@ import {
   redactApplicationForBilling,
   stripApplicationSecrets,
 } from '../../lib/app-access.js';
+import { scopeDenied } from '../../lib/access-context.js';
 import { recordSecurityEvent, requestContext } from '../../lib/security-events.js';
 import { refreshCorsOrigins } from '../../lib/cors-origins.js';
 import { mcpIssuer } from '../mcp/oauth.service.js';
 import { eraseEndUser } from './end-user-erasure.service.js';
 import { billingService } from '../billing/billing.service.js';
+import { subscriptionGrantsService } from '../billing/grant.service.js';
+import { subscriptionImportService } from '../billing/import.service.js';
+import { env } from '../../config/env.js';
 import { emitDetached } from '../webhooks/webhook.service.js';
-import { euLoginLockScope, getScopeLockState, LOGIN_POLICY } from '../../lib/brute-force.js';
+import {
+  clearFailures,
+  euLoginLockScope,
+  getScopeLockState,
+  LOGIN_POLICY,
+} from '../../lib/brute-force.js';
+import {
+  listActiveSessions,
+  revokeAllForEndUser,
+  revokeSessionForEndUser,
+} from '../../lib/refresh-tokens.js';
+import { authService, deliverVerificationEmail } from '../auth/auth.service.js';
+import { authRateLimit } from '../../lib/rate-limit.js';
 import { moneyAmount, positiveBoundedInt } from '../../lib/bounded-int.js';
 import { ok, okPage, okArray, okFlag, errs, ref, type JsonSchema } from '../../lib/openapi.js';
+
+const ImportRunBody = z.object({
+  provider: z.string().min(1).max(40),
+  matchStrategy: z.enum(['email', 'email_or_create']).default('email'),
+});
+
+/** One import run, as the routes return it. */
+const IMPORT_RUN: JsonSchema = {
+  type: 'object',
+  properties: {
+    id: { type: 'string' },
+    applicationId: { type: 'string' },
+    provider: { type: 'string' },
+    mode: { type: 'string', enum: ['dry_run', 'applied'] },
+    status: {
+      type: 'string',
+      enum: ['queued', 'running', 'ready', 'applying', 'applied', 'failed'],
+    },
+    matchStrategy: { type: 'string', enum: ['email', 'email_or_create'] },
+    startedBy: { type: 'string' },
+    counts: { type: 'object', additionalProperties: true },
+    error: { type: 'string', nullable: true },
+    createdAt: { type: 'string', format: 'date-time' },
+    completedAt: { type: 'string', format: 'date-time', nullable: true },
+  },
+  required: ['id', 'applicationId', 'provider', 'mode', 'status', 'matchStrategy', 'createdAt'],
+};
+
+const IMPORT_ITEM: JsonSchema = {
+  type: 'object',
+  properties: {
+    id: { type: 'string' },
+    externalId: { type: 'string' },
+    email: { type: 'string', nullable: true },
+    planRef: { type: 'string', nullable: true },
+    outcome: {
+      type: 'string',
+      enum: ['match', 'create', 'skip_no_plan', 'skip_active', 'skip_invalid', 'error'],
+    },
+    endUserId: { type: 'string', nullable: true },
+    planSlug: { type: 'string', nullable: true },
+    subscriptionId: { type: 'string', nullable: true },
+    detail: {
+      type: 'object',
+      additionalProperties: true,
+      description: 'Why this row was decided the way it was — the refusal, and what to do about it.',
+    },
+  },
+  required: ['id', 'externalId', 'outcome', 'detail'],
+};
+
+const IMPORT_RUN_WITH_ITEMS: JsonSchema = {
+  type: 'object',
+  properties: {
+    run: IMPORT_RUN,
+    items: {
+      type: 'object',
+      properties: {
+        items: { type: 'array', items: IMPORT_ITEM },
+        page: { type: 'object', additionalProperties: true },
+      },
+      required: ['items', 'page'],
+    },
+  },
+  required: ['run', 'items'],
+};
+
+/**
+ * Why an operator did something to somebody. Optional on the verification
+ * re-send, required on the password reset: both put mail in a real inbox that
+ * nobody asked for, and at the recipient's end that is indistinguishable from
+ * an attacker who reached the panel — but a reset mail is the one that actually
+ * hands over an account, so it does not go out unexplained.
+ */
+const SupportReasonBody = z.object({ reason: z.string().min(1).max(280).optional() });
+const SupportReasonRequiredBody = z.object({ reason: z.string().min(1).max(280) });
+
+/**
+ * One live refresh token, as an operator sees it. Same shape the end-user's own
+ * `GET /auth/sessions` returns — one session is one concept, and two surfaces
+ * describing it differently is how an operator and a customer end up comparing
+ * screens that disagree.
+ */
+const END_USER_SESSION: JsonSchema = {
+  type: 'object',
+  properties: {
+    id: { type: 'string' },
+    createdAt: { type: 'string', format: 'date-time' },
+    expiresAt: { type: 'string', format: 'date-time' },
+    userAgent: { type: 'string', nullable: true },
+    ip: { type: 'string', nullable: true },
+    deviceId: {
+      type: 'string',
+      nullable: true,
+      description: 'The device this session is bound to, when the client sent a fingerprint.',
+    },
+  },
+  required: ['id', 'createdAt', 'expiresAt', 'userAgent', 'ip', 'deviceId'],
+};
+
+/**
+ * Operator subscription grant. The subscriber is the path's end-user, so
+ * unlike the super-admin route there is no `endUserId`-xor-`email` to settle:
+ * the URL already answered "who".
+ *
+ * `currentPeriodEnd` stays a string here and is converted at the call site —
+ * the service takes a Date, and parsing it in two places is how the two
+ * disagree about time zones.
+ */
+const GrantSubscriptionBody = z.object({
+  planSlug: z.string().min(1).max(40),
+  organizationId: z.string().min(1).max(64).optional(),
+  currentPeriodEnd: z.string().datetime().optional(),
+  note: z.string().max(500).optional(),
+});
+
+/**
+ * Cancel defaults to period end, matching what the end-user's own self-service
+ * path does to the same row. Two operator-visible cancels disagreeing about
+ * the same subscription is a bug this codebase has already had once.
+ */
+const CancelSubscriptionBody = z.object({
+  atPeriodEnd: z.boolean().optional(),
+});
+
+/**
+ * Same shape and the same 201/200 split as the super-admin grant route. The row
+ * reads ACTIVE either way, so the status code and `activated` are the only two
+ * things telling a retrying caller "I did this" from "it was already so", and
+ * two grant routes disagreeing about which code means which would make both
+ * useless.
+ */
+const GRANT_RESULT: JsonSchema = {
+  type: 'object',
+  properties: {
+    subscription: ref('Subscription'),
+    activated: {
+      type: 'boolean',
+      description: 'True when THIS call activated the subscription and emitted `subscription.activated`.',
+    },
+  },
+  required: ['subscription', 'activated'],
+};
 
 /**
  * OpenAPI/Fastify body schema for the auth-config patch.
@@ -512,6 +671,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.get(
     '/',
     {
+      config: { access: { open: true } },
       schema: {
         tags: ['Tenant · Applications'],
         security: [{ tenantSession: [] }],
@@ -567,6 +727,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.get(
     '/check-slug',
     {
+      config: { access: { open: true } },
       schema: {
         tags: ['Tenant · Applications'],
         security: [{ tenantSession: [] }],
@@ -628,6 +789,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.get(
     '/:id',
     {
+      config: { access: { project: 'application' } },
       schema: {
         tags: ['Tenant · Applications'],
         security: [{ tenantSession: [] }],
@@ -640,7 +802,29 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
           200: ok(
             {
               allOf: [
-                ref('Application'),
+                {
+                  allOf: [
+                    ref('Application'),
+                    {
+                      type: 'object',
+                      properties: {
+                        access: {
+                          type: 'object',
+                          description:
+                            'How the caller reached this Application, and their effective scopes on it. ' +
+                            'The panel renders navigation from `scopes`; a section whose scope is absent ' +
+                            'is not shown rather than shown and refused.',
+                          properties: {
+                            level: { type: 'string' },
+                            scopes: { type: 'array', items: { type: 'string' } },
+                          },
+                          required: ['level', 'scopes'],
+                        },
+                      },
+                      required: ['access'],
+                    },
+                  ],
+                },
                 {
                   type: 'object',
                   properties: {
@@ -669,12 +853,21 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
       // Surface the PUBLIC MCP URL (derived from PUBLIC_WEBHOOK_BASE_URL/API_URL
       // on the API side) so the panel shows the externally-reachable host, not
       // its own in-cluster REKEY_URL (e.g. http://api:3030).
-      const data = { ...application, mcpUrl: mcpIssuer(application.slug) };
-      // Billing managers see money, not sign-in: hide the auth/OAuth config.
+      const data = {
+        ...application,
+        mcpUrl: mcpIssuer(application.slug),
+        // The capabilities the panel renders from. Computed from what the gate
+        // already resolved, so it cannot disagree with what the gate enforces.
+        access: { level: access.level, scopes: [...access.scopes].sort() },
+      };
+      // Sign-in config is projected on the auth-config scope. This is the old
+      // "billing managers see money, not sign-in" rule — APP_BILLING's preset
+      // excludes auth-config — now driven by the scope instead of the literal
+      // role, so a member restricted by scopes gets the same redaction.
       return {
         success: true,
         data: stripApplicationSecrets(
-          access.level === 'APP_BILLING' ? redactApplicationForBilling(data) : data,
+          access.scopes.has('auth-config:read') ? data : redactApplicationForBilling(data),
         ),
       };
     },
@@ -683,6 +876,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.get(
     '/:id/stats',
     {
+      config: { access: { scope: 'overview:read' } },
       schema: {
         tags: ['Tenant · Applications'],
         security: [{ tenantSession: [] }],
@@ -766,6 +960,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.get(
     '/:id/requests',
     {
+      config: { access: { scope: 'activity:read' } },
       preHandler: requireTenantRole(['OWNER', 'ADMIN']),
       schema: {
         tags: ['Tenant · Applications'],
@@ -806,6 +1001,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.post(
     '/',
     {
+      config: { access: { floor: true } },
       preHandler: requireTenantRole(['OWNER', 'ADMIN']),
       schema: {
         tags: ['Tenant · Applications'],
@@ -885,6 +1081,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.post(
     '/:id/promote',
     {
+      config: { access: { floor: true } },
       preHandler: requireTenantRole(['OWNER']),
       schema: {
         tags: ['Tenant · Applications'],
@@ -941,6 +1138,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.post(
     '/:id/disable',
     {
+      config: { access: { floor: true } },
       preHandler: requireTenantRole(['OWNER']),
       schema: {
         tags: ['Tenant · Applications'],
@@ -1006,6 +1204,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.delete(
     '/:id/disable',
     {
+      config: { access: { floor: true } },
       preHandler: requireTenantRole(['OWNER']),
       schema: {
         tags: ['Tenant · Applications'],
@@ -1062,6 +1261,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.patch(
     '/:id/subscriptions/:subId/entitlement-overrides',
     {
+      config: { access: { scope: 'billing:write' } },
       schema: {
         tags: ['Tenant · Billing'],
         security: [{ tenantSession: [] }],
@@ -1208,6 +1408,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.patch(
     '/:id/auth-config',
     {
+      config: { access: { scope: 'auth-config:write' } },
       schema: {
         tags: ['Tenant · Applications'],
         security: [{ tenantSession: [] }],
@@ -1234,6 +1435,10 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
       const { id } = AppParam.parse(req.params);
       await ensureAppAccess(req, id, 'write');
       const body = AUTH_CONFIG_PATCH_BODY.parse(req.body ?? {});
+      // The email coupling is enforced inside `updateAuthConfig` rather than
+      // here: the operator MCP tool calls that service directly, so a check on
+      // this route alone would leave the walk-around it exists to close wide
+      // open through the other door.
       const updated = await applicationsService.updateAuthConfig({
         applicationId: id,
         patch: body,
@@ -1257,6 +1462,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.patch(
     '/:id/billing-config',
     {
+      config: { access: { scope: 'billing:write' } },
       schema: {
         tags: ['Tenant · Applications'],
         security: [{ tenantSession: [] }],
@@ -1395,6 +1601,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.get(
     '/:id/api-keys',
     {
+      config: { access: { scope: 'developer:read' } },
       schema: {
         tags: ['Tenant · API Keys'],
         security: [{ tenantSession: [] }],
@@ -1423,7 +1630,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
     {
       // Generic Idempotency-Key header support (scoped to the workspace) — a
       // retried mint would otherwise create a second key whose rawKey nobody saw.
-      config: { idempotency: true },
+      config: { access: { scope: 'developer:write' }, idempotency: true },
       schema: {
         tags: ['Tenant · API Keys'],
         security: [{ tenantSession: [] }],
@@ -1500,6 +1707,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.delete(
     '/:id/api-keys/:keyId',
     {
+      config: { access: { scope: 'developer:write' } },
       schema: {
         tags: ['Tenant · API Keys'],
         security: [{ tenantSession: [] }],
@@ -1543,6 +1751,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.get(
     '/:id/plans',
     {
+      config: { access: { scope: 'billing:read' } },
       schema: {
         tags: ['Tenant · Plans'],
         security: [{ tenantSession: [] }],
@@ -1585,7 +1794,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
     '/:id/plans',
     {
       // Generic Idempotency-Key header support (scoped to the workspace).
-      config: { idempotency: true },
+      config: { access: { scope: 'billing:write' }, idempotency: true },
       schema: {
         tags: ['Tenant · Plans'],
         security: [{ tenantSession: [] }],
@@ -1681,6 +1890,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.patch(
     '/:id/plans/:slug',
     {
+      config: { access: { scope: 'billing:write' } },
       schema: {
         tags: ['Tenant · Plans'],
         security: [{ tenantSession: [] }],
@@ -1778,6 +1988,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.post(
     '/:id/plans/:slug/register',
     {
+      config: { access: { scope: 'billing:write' } },
       schema: {
         tags: ['Tenant · Plans'],
         security: [{ tenantSession: [] }],
@@ -1838,6 +2049,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.get(
     '/:id/plans/:slug/entitlements',
     {
+      config: { access: { scope: 'billing:read' } },
       schema: {
         tags: ['Tenant · Plans'],
         security: [{ tenantSession: [] }],
@@ -1909,6 +2121,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.put(
     '/:id/plans/:slug/entitlements',
     {
+      config: { access: { scope: 'billing:write' } },
       schema: {
         tags: ['Tenant · Plans'],
         security: [{ tenantSession: [] }],
@@ -2005,6 +2218,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.delete(
     '/:id/plans/:slug/entitlements/:entId',
     {
+      config: { access: { scope: 'billing:write' } },
       schema: {
         tags: ['Tenant · Plans'],
         security: [{ tenantSession: [] }],
@@ -2056,6 +2270,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.get(
     '/:id/coupons',
     {
+      config: { access: { scope: 'billing:read' } },
       schema: {
         tags: ['Tenant · Coupons'],
         security: [{ tenantSession: [] }],
@@ -2106,7 +2321,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
     '/:id/coupons',
     {
       // Generic Idempotency-Key header support (scoped to the workspace).
-      config: { idempotency: true },
+      config: { access: { scope: 'billing:write' }, idempotency: true },
       schema: {
         tags: ['Tenant · Coupons'],
         security: [{ tenantSession: [] }],
@@ -2177,6 +2392,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.patch(
     '/:id/coupons/:code',
     {
+      config: { access: { scope: 'billing:write' } },
       schema: {
         tags: ['Tenant · Coupons'],
         security: [{ tenantSession: [] }],
@@ -2242,6 +2458,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.get(
     '/:id/billing/providers',
     {
+      config: { access: { scope: 'billing:read' } },
       schema: {
         tags: ['Tenant · Billing'],
         security: [{ tenantSession: [] }],
@@ -2367,6 +2584,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.get(
     '/:id/billing-credentials',
     {
+      config: { access: { scope: 'billing:read' } },
       schema: {
         tags: ['Tenant · Billing'],
         security: [{ tenantSession: [] }],
@@ -2410,6 +2628,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.put(
     '/:id/billing-credentials/:provider',
     {
+      config: { access: { scope: 'billing:write' } },
       schema: {
         tags: ['Tenant · Billing'],
         security: [{ tenantSession: [] }],
@@ -2506,6 +2725,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.patch(
     '/:id/billing-credentials/:provider',
     {
+      config: { access: { scope: 'billing:write' } },
       schema: {
         tags: ['Tenant · Billing'],
         security: [{ tenantSession: [] }],
@@ -2595,6 +2815,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.delete(
     '/:id/billing-credentials/:provider',
     {
+      config: { access: { scope: 'billing:write' } },
       schema: {
         tags: ['Tenant · Billing'],
         security: [{ tenantSession: [] }],
@@ -2652,6 +2873,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.post(
     '/:id/billing-credentials/:provider/register-webhook',
     {
+      config: { access: { scope: 'billing:write' } },
       schema: {
         tags: ['Tenant · Billing'],
         security: [{ tenantSession: [] }],
@@ -2715,6 +2937,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.get(
     '/:id/billing-credentials/webhook-events',
     {
+      config: { access: { scope: 'billing:read' } },
       schema: {
         tags: ['Tenant · Billing'],
         security: [{ tenantSession: [] }],
@@ -2807,6 +3030,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.get(
     '/:id/billing/stats',
     {
+      config: { access: { scope: 'billing:read' } },
       schema: {
         tags: ['Tenant · Billing'],
         security: [{ tenantSession: [] }],
@@ -2837,6 +3061,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.get(
     '/:id/payments',
     {
+      config: { access: { scope: 'billing:read' } },
       schema: {
         tags: ['Tenant · Billing'],
         security: [{ tenantSession: [] }],
@@ -2999,6 +3224,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.get(
     '/:id/unapplied-payments',
     {
+      config: { access: { scope: 'billing:read' } },
       schema: {
         tags: ['Tenant · Billing'],
         security: [{ tenantSession: [] }],
@@ -3048,6 +3274,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.post(
     '/:id/unapplied-payments/:caseId/refund',
     {
+      config: { access: { scope: 'billing:write' } },
       schema: {
         tags: ['Tenant · Billing'],
         security: [{ tenantSession: [] }],
@@ -3113,6 +3340,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.post(
     '/:id/unapplied-payments/:caseId/extend',
     {
+      config: { access: { scope: 'billing:write' } },
       schema: {
         tags: ['Tenant · Billing'],
         security: [{ tenantSession: [] }],
@@ -3178,6 +3406,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.post(
     '/:id/unapplied-payments/:caseId/dismiss',
     {
+      config: { access: { scope: 'billing:write' } },
       schema: {
         tags: ['Tenant · Billing'],
         security: [{ tenantSession: [] }],
@@ -3232,6 +3461,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.get(
     '/:id/dunning',
     {
+      config: { access: { scope: 'billing:read' } },
       schema: {
         tags: ['Tenant · Billing'],
         security: [{ tenantSession: [] }],
@@ -3357,6 +3587,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.put(
     '/:id/oauth-config/:provider',
     {
+      config: { access: { scope: 'auth-config:write' } },
       schema: {
         tags: ['Tenant · OAuth'],
         security: [{ tenantSession: [] }],
@@ -3439,6 +3670,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.delete(
     '/:id/oauth-config/:provider',
     {
+      config: { access: { scope: 'auth-config:write' } },
       schema: {
         tags: ['Tenant · OAuth'],
         security: [{ tenantSession: [] }],
@@ -3486,6 +3718,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.get(
     '/:id/end-users',
     {
+      config: { access: { scope: 'end-users:read' } },
       schema: {
         tags: ['Tenant · End-users'],
         security: [{ tenantSession: [] }],
@@ -3531,7 +3764,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
     },
     async (req) => {
       const { id } = AppParam.parse(req.params);
-      await ensureAppAccess(req, id, 'read');
+      const access = await ensureAppAccess(req, id, 'read');
       const q = z
         .object({
           search: z.string().max(254).optional(),
@@ -3546,6 +3779,14 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
         })
         .merge(PaginationQuery)
         .parse(req.query);
+      // The rows carry no plan, but this filter is a per-user paying/churned
+      // oracle: ask for ACTIVE, then CANCELED, and you have the book of business
+      // by name. It is a billing question asked of the end-users domain, so it
+      // needs the billing scope. REFUSED rather than ignored: silently dropping
+      // it would return an unfiltered list the caller reads as filtered.
+      if (q.subscriptionStatus !== undefined && !access.scopes.has('billing:read')) {
+        throw scopeDenied('billing:read');
+      }
       const { take, skip } = parsePagination(q, 25);
       const order = q.order ?? 'desc';
       // The endpoint the functional audit caught truncating: 36 rows in the
@@ -3587,7 +3828,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
     '/:id/end-users',
     {
       // Generic Idempotency-Key header support (scoped to the workspace).
-      config: { idempotency: true },
+      config: { access: { scope: 'end-users:write' }, idempotency: true },
       schema: {
         tags: ['Tenant · End-users'],
         security: [{ tenantSession: [] }],
@@ -3706,6 +3947,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.get(
     '/:id/end-users/:euid',
     {
+      config: { access: { scope: 'end-users:read' } },
       schema: {
         tags: ['Tenant · End-users'],
         security: [{ tenantSession: [] }],
@@ -3853,6 +4095,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.get(
     '/:id/end-users/:euid/billing',
     {
+      config: { access: { scope: 'billing:read' } },
       schema: {
         tags: ['Tenant · End-users'],
         security: [{ tenantSession: [] }],
@@ -4035,6 +4278,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.patch(
     '/:id/end-users/:euid',
     {
+      config: { access: { scope: 'end-users:write' } },
       schema: {
         tags: ['Tenant · End-users'],
         security: [{ tenantSession: [] }],
@@ -4131,31 +4375,40 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
     },
   );
 
-  // DELETE /:id/end-users/:euid           → plain delete (back-compat, unchanged)
+  // DELETE /:id/end-users/:euid           → plain delete (cascade)
   // DELETE /:id/end-users/:euid?erasure=true → GDPR erasure (tombstone + retain)
   //
+  // BOTH are workspace-OWNER only. See the gate in the handler for why they are
+  // now the same floor rather than two.
+  //
   // Plain delete relies on the schema's onDelete:Cascade FKs: the EndUser row
-  // and EVERY dependent row (including financial records) are removed. Kept for
-  // back-compat — same behavior as before this feature.
+  // and EVERY dependent row (including the financial records) are removed. It
+  // predates erasure and is the more destructive of the two, which is the
+  // opposite of how the two floors used to read.
   //
   // Erasure (roadmap §10) is the GDPR-correct path: it hard-deletes PII/auth
   // rows, TOMBSTONES the EndUser (email anonymized, passwordHash cleared,
   // `erasedAt` set — the user can never authenticate again), and RETAINS but
   // PII-scrubs financial rows (Payment/Subscription/License/CreditLedger/Usage)
-  // so accounting/legal-retention obligations are met. OWNER/ADMIN only (same
-  // gate as the DSAR export — this is an irreversible, PII-dense operation).
+  // so accounting/legal-retention obligations are met.
   // See docs/data-erasure.md for the per-model matrix.
   app.delete(
     '/:id/end-users/:euid',
     {
+      config: { access: { floor: true } },
       schema: {
         tags: ['Tenant · End-users'],
         security: [{ tenantSession: [] }],
         summary:
           'Delete an end-user (cascade), or GDPR-erase them with ?erasure=true (tombstone + retain financials)',
         description:
-          'Requires **write** access to this Application — OWNER/ADMIN, or a MEMBER with an ' +
-          '`APP_ADMIN` grant on it.',
+          'Requires the **workspace OWNER** role, for both forms. No application grant unlocks ' +
+          'either, and neither does ADMIN.\n\n' +
+          'A plain delete cascades: the end-user and every dependent row go, including payments, ' +
+          'subscriptions, licenses, the credit ledger and usage. It is unrecoverable and it ' +
+          'destroys the accounting record. An erasure (`?erasure=true`) tombstones the account and ' +
+          '**retains** those rows, anonymized — it is what a data-subject request actually asks ' +
+          'for, and the one to reach for.',
         params: {
           type: 'object',
           properties: { id: { type: 'string' }, euid: { type: 'string' } },
@@ -4169,7 +4422,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
               enum: ['true', 'false'],
               description:
                 'When "true", performs a GDPR erasure (tombstone + anonymized financial retention) ' +
-                'instead of a hard cascade delete. OWNER/ADMIN only.',
+                'instead of a hard cascade delete. Both forms are workspace-OWNER only.',
             },
           },
         },
@@ -4200,7 +4453,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
           ...errs({
             403:
               APP_WRITE_ERRORS[403] +
-              ' Or TENANT_ROLE_INSUFFICIENT — `?erasure=true` requires the OWNER or ADMIN workspace role (no grant unlocks it).',
+              ' Or TENANT_ROLE_INSUFFICIENT — both forms require the workspace OWNER role (no grant unlocks either, and ADMIN does not).',
             404: 'END_USER_NOT_FOUND — no end-user with that id in this Application.',
             401: APP_WRITE_ERRORS[401],
             502: 'PROVIDER_CANCEL_FAILED — a plain delete (not erasure) is refused when the billing provider will not cancel the end-user\'s active subscription (avoids leaving a live charge behind).',
@@ -4217,16 +4470,38 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
         .parse(req.query);
       const isErasure = query.erasure === 'true';
 
+      // Access check first, so a MEMBER with no grant on this Application gets
+      // the 404 non-disclosure answer rather than learning from a 403 that the
+      // end-user id it named is real.
       await ensureAppAccess(req, params.id, 'write');
 
-      // Erasure is irreversible + PII-dense — gate it to OWNER/ADMIN, matching
-      // the DSAR export. (Plain delete keeps the 'write' grant authz.)
-      if (isErasure && req.tenantRole !== 'OWNER' && req.tenantRole !== 'ADMIN') {
+      // BOTH branches are OWNER-only.
+      //
+      // Erasure was already OWNER/ADMIN here. The plain delete was the 'write'
+      // grant and nothing else — so the path that RETAINS the accounting record
+      // was gated harder than the path that destroys it, and the more
+      // destructive of the two was reachable by the least privileged role that
+      // can reach the Application at all: a MEMBER holding `APP_ADMIN` could
+      // cascade an end-user and every payment, subscription, licence,
+      // credit-ledger and usage row with them, unrecoverably. That asymmetry
+      // was not a decision anyone made. It is what you get when a floor is
+      // added to the newer verb and the older, plainer one keeps whatever it
+      // started with.
+      //
+      // Neither is routine support work: one answers a legal request, the other
+      // cannot be undone. Both answer to the workspace owner. Breaking for
+      // deployments that had an ADMIN or a granted MEMBER doing this, and
+      // deliberately so.
+      if (req.tenantRole !== 'OWNER') {
         throw new RekeyError({
           statusCode: 403,
           code: 'TENANT_ROLE_INSUFFICIENT',
-          message: 'Only workspace owners and admins can erase (GDPR) an end-user.',
-          fix: 'Ask an OWNER or ADMIN to process the erasure request.',
+          message: isErasure
+            ? 'Only the workspace owner can erase (GDPR) an end-user.'
+            : 'Only the workspace owner can delete an end-user.',
+          fix: isErasure
+            ? 'Ask an OWNER to process the erasure request.'
+            : 'Ask an OWNER to delete this end-user. If you are answering a data-subject request, erasure (?erasure=true) is the operation you want, and it retains the financial record.',
         });
       }
 
@@ -4370,6 +4645,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.get(
     '/:id/end-users/:euid/credits',
     {
+      config: { access: { scope: 'billing:read' } },
       schema: {
         tags: ['Tenant · Credits'],
         security: [{ tenantSession: [] }],
@@ -4426,7 +4702,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
       // Generic Idempotency-Key HEADER support (scoped to the workspace).
       // Distinct from the body-level `idempotencyKey`, which dedupes at the
       // credit-ledger level and keeps working unchanged.
-      config: { idempotency: true },
+      config: { access: { scope: 'billing:write' }, idempotency: true },
       schema: {
         tags: ['Tenant · Credits'],
         security: [{ tenantSession: [] }],
@@ -4494,6 +4770,1028 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
     },
   );
 
+  // ---------- Subscription import ----------
+  //
+  // Two steps, deliberately. An import is the most dangerous shape a button can
+  // have — a bulk write against somebody else's data, matching strangers to
+  // local accounts by email — so the first call only ever PREVIEWS, and a second
+  // explicit call applies what the operator has read.
+
+  app.post(
+    '/:id/subscription-imports',
+    {
+      config: { access: { scope: 'billing:write' } },
+      preHandler: requireTenantRole(['OWNER', 'ADMIN']),
+      schema: {
+        tags: ['Tenant · Billing'],
+        security: [{ tenantSession: [] }],
+        summary: 'Preview importing subscriptions from a billing provider',
+        description:
+          'Requires the **OWNER or ADMIN** workspace role AND **billing-write** access.\n\n' +
+          '**Writes no subscriptions.** Reads the provider, decides what would happen to every row, ' +
+          'and records that as a run you can read back. Apply it with ' +
+          '`POST …/subscription-imports/:runId/apply` once you have looked.\n\n' +
+          'Outcomes per row: `match` (an existing end-user), `create` (a new unlinked one, only ' +
+          'under `email_or_create`), `skip_no_plan` (the provider plan maps to no local plan), ' +
+          '`skip_active` (already entitled in Rekey — an import never overwrites), `skip_invalid` ' +
+          '(no email, unusable status, or an erased user).\n\n' +
+          'Only providers exposing a list API can be imported from; the rest answer 400 ' +
+          '`PROVIDER_CANNOT_LIST_SUBSCRIPTIONS`.',
+        body: {
+          type: 'object',
+          required: ['provider'],
+          properties: {
+            provider: { type: 'string', description: 'Provider module name, e.g. `external`.' },
+            matchStrategy: {
+              type: 'string',
+              enum: ['email', 'email_or_create'],
+              default: 'email',
+              description:
+                '`email` imports only for people Rekey already knows. `email_or_create` also ' +
+                'creates unlinked end-users — no password, unverified — for buyers it has never seen.',
+            },
+          },
+        },
+        response: {
+          201: ok(
+            {
+              type: 'object',
+              properties: { runId: { type: 'string' } },
+              required: ['runId'],
+            },
+            'The run to read back.',
+          ),
+          ...errs({
+            400:
+              'PROVIDER_CANNOT_LIST_SUBSCRIPTIONS — this provider has no list API; or ' +
+              'EXTERNAL_PULL_NOT_CONFIGURED — no subscriptions endpoint is configured; or ' +
+              'EXTERNAL_PULL_URL_REFUSED — the endpoint is not a permitted target.',
+            ...APP_BILLING_WRITE_ERRORS,
+            502: 'EXTERNAL_PULL_UNREACHABLE / EXTERNAL_PULL_FAILED / EXTERNAL_PULL_MALFORMED — the provider endpoint did not answer usefully.',
+          }),
+        },
+      },
+    },
+    async (req, reply) => {
+      const params = z.object({ id: z.string().min(1) }).parse(req.params);
+      await ensureAppAccess(req, params.id, 'billing-write');
+      const body = ImportRunBody.parse(req.body ?? {});
+      const application = await prisma.application.findUniqueOrThrow({ where: { id: params.id } });
+      const result = await subscriptionImportService.dryRun({
+        application,
+        provider: body.provider as never,
+        matchStrategy: body.matchStrategy,
+        startedBy: req.tenantUser!.id,
+      });
+      return reply.status(201).send({ success: true, data: result });
+    },
+  );
+
+  app.get(
+    '/:id/subscription-imports/:runId',
+    {
+      config: { access: { scope: 'billing:read' } },
+      schema: {
+        tags: ['Tenant · Billing'],
+        security: [{ tenantSession: [] }],
+        summary: 'Read an import run and its rows',
+        description:
+          'Requires **read** access to this Application. The rows are kept after an apply, so ' +
+          '"why does this customer have this subscription" is answerable from the run that made it.',
+        querystring: {
+          type: 'object',
+          properties: {
+            outcome: {
+              type: 'string',
+              enum: ['match', 'create', 'skip_no_plan', 'skip_active', 'skip_invalid', 'error'],
+            },
+            ...paginationJsonSchema,
+          },
+        },
+        response: {
+          200: ok(IMPORT_RUN_WITH_ITEMS, 'The run, its tallies, and a page of its rows.'),
+          ...errs({
+            ...APP_READ_ERRORS,
+            404: 'IMPORT_RUN_NOT_FOUND — no such run on this Application.',
+          }),
+        },
+      },
+    },
+    async (req) => {
+      const params = z
+        .object({ id: z.string().min(1), runId: z.string().min(1) })
+        .parse(req.params);
+      await ensureAppAccess(req, params.id, 'read');
+      const query = z
+        .object({
+          outcome: z
+            .enum(['match', 'create', 'skip_no_plan', 'skip_active', 'skip_invalid', 'error'])
+            .optional(),
+        })
+        .parse(req.query);
+      const run = await prisma.subscriptionImportRun.findFirst({
+        where: { id: params.runId, applicationId: params.id },
+      });
+      if (!run) {
+        throw new RekeyError({
+          statusCode: 404,
+          code: 'IMPORT_RUN_NOT_FOUND',
+          message: `Import run "${params.runId}" not found for this Application.`,
+          fix: 'List recent runs to find one.',
+        });
+      }
+      const { take, skip } = parsePagination(PaginationQuery.parse(req.query));
+      const where = {
+        runId: run.id,
+        ...(query.outcome !== undefined && { outcome: query.outcome }),
+      };
+      const [items, total] = await Promise.all([
+        prisma.subscriptionImportItem.findMany({ where, take, skip, orderBy: { id: 'asc' } }),
+        prisma.subscriptionImportItem.count({ where }),
+      ]);
+      return { success: true, data: { run, items: paged(items, total, take, skip) } };
+    },
+  );
+
+  app.post(
+    '/:id/subscription-imports/:runId/apply',
+    {
+      config: { access: { scope: 'billing:write' } },
+      preHandler: requireTenantRole(['OWNER', 'ADMIN']),
+      schema: {
+        tags: ['Tenant · Billing'],
+        security: [{ tenantSession: [] }],
+        summary: 'Apply a previewed import',
+        description:
+          'Requires the **OWNER or ADMIN** workspace role AND **billing-write** access.\n\n' +
+          'Acts only on the `match` and `create` rows the preview decided — nothing is re-decided ' +
+          'here, so nothing is applied that the operator did not see. Each goes through the same ' +
+          'grant path a hand-recorded sale takes: entitlements are materialised and ' +
+          '`subscription.activated` is announced.\n\n' +
+          'A row that fails is recorded as `error` and the run continues: an import that stops ' +
+          'halfway leaves nobody able to say what landed.\n\n' +
+          'Refused for a run that is not `ready` — including one already applied, so a ' +
+          'double-click cannot import twice.',
+        body: {
+          type: 'object',
+          required: ['confirm'],
+          properties: {
+            confirm: {
+              type: 'string',
+              description:
+                "The Application's slug, typed back. This is a bulk write against real customers.",
+            },
+          },
+        },
+        response: {
+          200: ok(
+            {
+              type: 'object',
+              properties: {
+                imported: { type: 'integer' },
+                failed: { type: 'integer' },
+              },
+              required: ['imported', 'failed'],
+            },
+            'What the apply did.',
+          ),
+          ...errs({
+            400: 'IMPORT_CONFIRM_MISMATCH — `confirm` does not match the Application slug.',
+            ...APP_BILLING_WRITE_ERRORS,
+            404: 'IMPORT_RUN_NOT_FOUND — no such run on this Application.',
+            409: 'IMPORT_RUN_NOT_READY — the run is not in a state that can be applied.',
+          }),
+        },
+      },
+    },
+    async (req) => {
+      const params = z
+        .object({ id: z.string().min(1), runId: z.string().min(1) })
+        .parse(req.params);
+      await ensureAppAccess(req, params.id, 'billing-write');
+      const body = z.object({ confirm: z.string().min(1) }).parse(req.body ?? {});
+      const application = await prisma.application.findUniqueOrThrow({ where: { id: params.id } });
+      if (body.confirm !== application.slug) {
+        throw new RekeyError({
+          statusCode: 400,
+          code: 'IMPORT_CONFIRM_MISMATCH',
+          message: 'The confirmation did not match this Application\'s slug.',
+          fix: `Type "${application.slug}" to confirm. This writes subscriptions for real customers.`,
+        });
+      }
+      const result = await subscriptionImportService.apply({
+        application,
+        runId: params.runId,
+        actorId: req.tenantUser!.id,
+      });
+      return { success: true, data: result };
+    },
+  );
+
+  app.get(
+    '/:id/subscription-imports',
+    {
+      config: { access: { scope: 'billing:read' } },
+      schema: {
+        tags: ['Tenant · Billing'],
+        security: [{ tenantSession: [] }],
+        summary: 'List recent import runs',
+        description: 'Requires **read** access to this Application. Newest first.',
+        querystring: { type: 'object', properties: { ...paginationJsonSchema } },
+        response: {
+          200: okPage(IMPORT_RUN, 'A page of import runs.'),
+          ...errs(APP_READ_ERRORS),
+        },
+      },
+    },
+    async (req) => {
+      const params = z.object({ id: z.string().min(1) }).parse(req.params);
+      await ensureAppAccess(req, params.id, 'read');
+      const { take, skip } = parsePagination(PaginationQuery.parse(req.query));
+      const where = { applicationId: params.id };
+      const [items, total] = await Promise.all([
+        prisma.subscriptionImportRun.findMany({
+          where,
+          take,
+          skip,
+          orderBy: { createdAt: 'desc' },
+        }),
+        prisma.subscriptionImportRun.count({ where }),
+      ]);
+      return { success: true, data: paged(items, total, take, skip) };
+    },
+  );
+
+  // ---------- Operator support actions on one end-user ----------
+  //
+  // The five things a support agent needs on a ticket and could not do from the
+  // panel: clear a lockout, re-send a verification mail, start a password
+  // reset, see the sessions somebody has open, and end them.
+  //
+  // All are `write` on the Application. None is OWNER/ADMIN-gated: these are
+  // routine support, they are reversible or additive, and holding them at the
+  // workspace-admin floor is what made a support agent file a ticket with a
+  // developer in the first place. The two destructive things on this end-user
+  // (delete, erase) stay OWNER-only, and impersonation stays OWNER/ADMIN.
+  //
+  // The two that send mail carry an audited `reason` and a rate limit. An
+  // unexpected reset mail is indistinguishable, at the recipient's inbox, from
+  // an attacker who reached the panel — so the trail has to say who asked for
+  // it and why, and a compromised operator session must not become a mail
+  // cannon.
+
+  /** Shared 404 for "that end-user is not in this Application". */
+  async function assertEndUser(
+    applicationId: string,
+    euid: string,
+  ): Promise<{ id: string; email: string; erasedAt: Date | null }> {
+    const endUser = await prisma.endUser.findUnique({
+      where: { id: euid },
+      select: { id: true, email: true, applicationId: true, erasedAt: true },
+    });
+    if (!endUser || endUser.applicationId !== applicationId) {
+      throw new RekeyError({
+        statusCode: 404,
+        code: 'END_USER_NOT_FOUND',
+        message: `End-user "${euid}" not found in this Application.`,
+        fix: 'List end-users to confirm the id.',
+      });
+    }
+    return { id: endUser.id, email: endUser.email, erasedAt: endUser.erasedAt };
+  }
+
+  /**
+   * A tombstone has no inbox, no password and no way back in. Every support
+   * action that would mail them or restore access is refused on it rather than
+   * silently doing nothing — `erasedAt` anonymises the address, so a "reset"
+   * would post a live token at a scrubbed string.
+   */
+  function assertNotErased(endUser: { erasedAt: Date | null }): void {
+    if (endUser.erasedAt !== null) {
+      throw new RekeyError({
+        statusCode: 410,
+        code: 'END_USER_ERASED',
+        message: 'That end-user was erased; support actions no longer apply to the tombstone.',
+        fix: 'An erasure cannot be undone. If this person is a customer again, they create a new account.',
+      });
+    }
+  }
+
+  app.post(
+    '/:id/end-users/:euid/unlock',
+    {
+      config: { access: { scope: 'end-users:write' } },
+      schema: {
+        tags: ['Tenant · End-users'],
+        security: [{ tenantSession: [] }],
+        summary: "Clear an end-user's sign-in lockout",
+        description:
+          'Requires **write** access to this Application.\n\n' +
+          'Clears the brute-force lock and the failure counter for this end-user in THIS ' +
+          'Application. The lock lives in Redis under `bf:lock:eu:login:<appId>:<email>`, not on ' +
+          'the end-user row, and it is per-Application by design: the same human in two ' +
+          'Applications is two end-users and only the one you name is unlocked.\n\n' +
+          'Idempotent — unlocking an account that is not locked is a no-op and still answers 200.',
+        params: {
+          type: 'object',
+          properties: { id: { type: 'string' }, euid: { type: 'string' } },
+          required: ['id', 'euid'],
+        },
+        response: {
+          200: ok(
+            {
+              type: 'object',
+              properties: {
+                unlocked: {
+                  type: 'boolean',
+                  description: 'True when a lock or a failure counter was actually cleared.',
+                },
+              },
+              required: ['unlocked'],
+            },
+            'Whether anything was cleared.',
+          ),
+          ...errs({
+            ...APP_WRITE_ERRORS,
+            404: 'END_USER_NOT_FOUND — no end-user with that id in this Application.',
+            410: 'END_USER_ERASED — that end-user is a tombstone.',
+          }),
+        },
+      },
+    },
+    async (req) => {
+      const params = z.object({ id: z.string().min(1), euid: z.string().min(1) }).parse(req.params);
+      await ensureAppAccess(req, params.id, 'write');
+      const endUser = await assertEndUser(params.id, params.euid);
+      assertNotErased(endUser);
+
+      const scope = euLoginLockScope(params.id, endUser.email);
+      const before = await getScopeLockState(scope);
+      await clearFailures(scope);
+
+      // `getScopeLockState` returns null ONLY when the store itself failed; a
+      // healthy, unlocked scope returns `{ lockedForSec: null, failuresInWindow: 0 }`.
+      // Treating null as "was locked" would report success on a Redis outage
+      // and claim an unlock on every account that was never locked — exactly
+      // backwards on both counts. `unlocked` means "there was something to
+      // clear", counting a partial failure streak, because clearing that is
+      // also a real effect the operator asked for.
+      const unlocked =
+        before !== null && (before.lockedForSec !== null || before.failuresInWindow > 0);
+      void recordSecurityEvent({
+        type: 'end_user.unlocked_by_operator',
+        actorType: 'operator',
+        actorId: req.tenantUser!.id,
+        tenantId: req.tenantId!,
+        applicationId: params.id,
+        ...requestContext(req),
+        // Not `wasLocked`: `unlocked` is also true for a partial failure
+        // streak with no lock in force, and an audit row asserting a lockout
+        // that never happened is worse than one that says nothing.
+        metadata: { endUserId: params.euid, hadLockoutState: unlocked },
+      });
+      return { success: true, data: { unlocked } };
+    },
+  );
+
+  app.post(
+    '/:id/end-users/:euid/send-verification',
+    {
+      config: { access: { scope: 'end-users:write' }, rateLimit: authRateLimit(10) },
+      schema: {
+        tags: ['Tenant · End-users'],
+        security: [{ tenantSession: [] }],
+        summary: "Re-send an end-user's verification email",
+        description:
+          'Requires **write** access to this Application.\n\n' +
+          'Mints a fresh verification token and posts the `email_verification` mail through this ' +
+          "Application's configured transport — the same path sign-up uses, so the link, the " +
+          'lifetime and the delivery bookkeeping are identical.\n\n' +
+          'The raw token is never returned: this is an operator surface, and the point of the call ' +
+          'is that the mail reaches the person. `emailSent: false` means no transport is ' +
+          'configured or the send failed; check Email → Delivery.',
+        params: {
+          type: 'object',
+          properties: { id: { type: 'string' }, euid: { type: 'string' } },
+          required: ['id', 'euid'],
+        },
+        body: {
+          type: 'object',
+          properties: {
+            reason: {
+              type: 'string',
+              maxLength: 280,
+              description: 'Why, for the audit trail. Recommended — this puts mail in a real inbox.',
+            },
+          },
+        },
+        response: {
+          200: ok(
+            {
+              type: 'object',
+              properties: { emailSent: { type: 'boolean' } },
+              required: ['emailSent'],
+            },
+            'Whether the mail reached the transport.',
+          ),
+          ...errs({
+            ...APP_WRITE_ERRORS,
+            404: 'END_USER_NOT_FOUND — no end-user with that id in this Application.',
+            409: 'EMAIL_ALREADY_VERIFIED — nothing to verify.',
+            410: 'END_USER_ERASED — that end-user is a tombstone.',
+            429: 'RATE_LIMITED — too many sends. Honour the `Retry-After` header.',
+          }),
+        },
+      },
+    },
+    async (req) => {
+      const params = z.object({ id: z.string().min(1), euid: z.string().min(1) }).parse(req.params);
+      const body = SupportReasonBody.parse(req.body ?? {});
+      await ensureAppAccess(req, params.id, 'write');
+      const endUser = await assertEndUser(params.id, params.euid);
+      assertNotErased(endUser);
+
+      const full = await prisma.endUser.findUniqueOrThrow({ where: { id: params.euid } });
+      if (full.emailVerified) {
+        throw new RekeyError({
+          statusCode: 409,
+          code: 'EMAIL_ALREADY_VERIFIED',
+          message: 'That address is already verified.',
+          fix: 'Nothing to do.',
+        });
+      }
+      const application = await prisma.application.findUniqueOrThrow({ where: { id: params.id } });
+      const result = await deliverVerificationEmail({
+        application,
+        endUser: { id: full.id, email: full.email },
+        requireResolvableUrl: true,
+      });
+
+      void recordSecurityEvent({
+        type: 'end_user.verification_resent',
+        actorType: 'operator',
+        actorId: req.tenantUser!.id,
+        tenantId: req.tenantId!,
+        applicationId: params.id,
+        ...requestContext(req),
+        metadata: {
+          endUserId: params.euid,
+          emailSent: result.emailSent,
+          ...(body.reason !== undefined && { reason: body.reason }),
+        },
+      });
+      return { success: true, data: { emailSent: result.emailSent } };
+    },
+  );
+
+  app.post(
+    '/:id/end-users/:euid/send-password-reset',
+    {
+      config: { access: { scope: 'end-users:write' }, rateLimit: authRateLimit(10) },
+      schema: {
+        tags: ['Tenant · End-users'],
+        security: [{ tenantSession: [] }],
+        summary: "Send an end-user a password-reset email on their behalf",
+        description:
+          'Requires **write** access to this Application.\n\n' +
+          'Takes the same path the end-user\'s own "forgot password" request takes, so the token ' +
+          'lifetime and the link are identical. The raw token is never returned to the operator: ' +
+          'the reset must reach the person, not the person who pressed the button.\n\n' +
+          '**The recipient cannot tell this apart from an attacker who reached your panel.** That ' +
+          'is why `reason` is audited and why this is rate-limited; the mail itself does not yet ' +
+          'say it was support-initiated, which is tracked as an email-template change.\n\n' +
+          'Refused for an account with no password identity — an OAuth-only user has no password ' +
+          'to reset.',
+        params: {
+          type: 'object',
+          properties: { id: { type: 'string' }, euid: { type: 'string' } },
+          required: ['id', 'euid'],
+        },
+        body: {
+          type: 'object',
+          required: ['reason'],
+          properties: {
+            reason: {
+              type: 'string',
+              minLength: 1,
+              maxLength: 280,
+              description: 'Why. Required here, unlike the verification re-send, because an unasked-for reset mail is the one most easily mistaken for an attack.',
+            },
+          },
+        },
+        response: {
+          200: ok(
+            {
+              type: 'object',
+              properties: { emailSent: { type: 'boolean' } },
+              required: ['emailSent'],
+            },
+            'Whether the mail reached the transport.',
+          ),
+          ...errs({
+            ...APP_WRITE_ERRORS,
+            404: 'END_USER_NOT_FOUND — no end-user with that id in this Application.',
+            409: 'END_USER_HAS_NO_PASSWORD — the account signs in with OAuth or a passkey; there is no password to reset.',
+            410: 'END_USER_ERASED — that end-user is a tombstone.',
+            429: 'RATE_LIMITED — too many sends. Honour the `Retry-After` header.',
+          }),
+        },
+      },
+    },
+    async (req) => {
+      const params = z.object({ id: z.string().min(1), euid: z.string().min(1) }).parse(req.params);
+      const body = SupportReasonRequiredBody.parse(req.body ?? {});
+      await ensureAppAccess(req, params.id, 'write');
+      const endUser = await assertEndUser(params.id, params.euid);
+      assertNotErased(endUser);
+
+      const full = await prisma.endUser.findUniqueOrThrow({ where: { id: params.euid } });
+      if (full.passwordHash === null) {
+        throw new RekeyError({
+          statusCode: 409,
+          code: 'END_USER_HAS_NO_PASSWORD',
+          message: 'That end-user has no password set, so there is nothing to reset.',
+          fix: 'They sign in with OAuth, a passkey or a magic link. Sending a reset would strand them on a form they cannot complete.',
+        });
+      }
+      const application = await prisma.application.findUniqueOrThrow({ where: { id: params.id } });
+      // `authKind: 'secret'` — this is an operator surface, not a browser one,
+      // so the constant publishable response (which hides whether anything
+      // happened) would only hide the outcome from the person who needs it.
+      const result = await authService.requestPasswordReset({
+        application,
+        email: full.email,
+        authKind: 'secret',
+      });
+
+      void recordSecurityEvent({
+        type: 'end_user.password_reset_sent',
+        actorType: 'operator',
+        actorId: req.tenantUser!.id,
+        tenantId: req.tenantId!,
+        applicationId: params.id,
+        ...requestContext(req),
+        metadata: { endUserId: params.euid, emailSent: result.emailSent, reason: body.reason },
+      });
+      return { success: true, data: { emailSent: result.emailSent } };
+    },
+  );
+
+  app.get(
+    '/:id/end-users/:euid/sessions',
+    {
+      config: { access: { scope: 'end-users:read' } },
+      schema: {
+        tags: ['Tenant · End-users'],
+        security: [{ tenantSession: [] }],
+        summary: "List an end-user's active sessions",
+        description:
+          'Requires **read** access to this Application.\n\n' +
+          'Live refresh tokens, newest first, with the User-Agent and IP captured at issue time ' +
+          'and the device the session is bound to when the client sent a fingerprint. A session is ' +
+          'not a device: releasing a device revokes its sessions, but a session can exist with no ' +
+          'device on an Application that does not use device binding.',
+        params: {
+          type: 'object',
+          properties: { id: { type: 'string' }, euid: { type: 'string' } },
+          required: ['id', 'euid'],
+        },
+        querystring: { type: 'object', properties: { ...paginationJsonSchema } },
+        response: {
+          200: okPage(END_USER_SESSION, "A page of the end-user's live sessions, newest first."),
+          ...errs({
+            400: 'VALIDATION_ERROR — a query parameter is out of range.',
+            ...APP_READ_ERRORS,
+            404: 'END_USER_NOT_FOUND — no end-user with that id in this Application.',
+          }),
+        },
+      },
+    },
+    async (req) => {
+      const params = z.object({ id: z.string().min(1), euid: z.string().min(1) }).parse(req.params);
+      await ensureAppAccess(req, params.id, 'read');
+      await assertEndUser(params.id, params.euid);
+      const { take, skip } = parsePagination(PaginationQuery.parse(req.query));
+      const { items, total } = await listActiveSessions(params.euid, { take, skip });
+      return { success: true, data: paged(items, total, take, skip) };
+    },
+  );
+
+  app.delete(
+    '/:id/end-users/:euid/sessions/:sessionId',
+    {
+      config: { access: { scope: 'end-users:write' } },
+      schema: {
+        tags: ['Tenant · End-users'],
+        security: [{ tenantSession: [] }],
+        summary: "Revoke one of an end-user's sessions",
+        description:
+          'Requires **write** access to this Application. Idempotent: a session already revoked, ' +
+          'expired or belonging to somebody else answers `revoked: false` rather than 404, so a ' +
+          'retry is safe and the response is not an existence oracle.',
+        params: {
+          type: 'object',
+          properties: { id: { type: 'string' }, euid: { type: 'string' }, sessionId: { type: 'string' } },
+          required: ['id', 'euid', 'sessionId'],
+        },
+        response: {
+          200: ok(
+            {
+              type: 'object',
+              properties: { revoked: { type: 'boolean' } },
+              required: ['revoked'],
+            },
+            'Whether this call revoked the session.',
+          ),
+          ...errs({
+            ...APP_WRITE_ERRORS,
+            404: 'END_USER_NOT_FOUND — no end-user with that id in this Application.',
+          }),
+        },
+      },
+    },
+    async (req) => {
+      const params = z
+        .object({ id: z.string().min(1), euid: z.string().min(1), sessionId: z.string().min(1) })
+        .parse(req.params);
+      await ensureAppAccess(req, params.id, 'write');
+      await assertEndUser(params.id, params.euid);
+      const revoked = await revokeSessionForEndUser(params.euid, params.sessionId);
+      if (revoked) {
+        void recordSecurityEvent({
+          type: 'end_user.sessions_revoked_by_operator',
+          actorType: 'operator',
+          actorId: req.tenantUser!.id,
+          tenantId: req.tenantId!,
+          applicationId: params.id,
+          ...requestContext(req),
+          metadata: { endUserId: params.euid, sessionId: params.sessionId, count: 1 },
+        });
+      }
+      return { success: true, data: { revoked } };
+    },
+  );
+
+  app.post(
+    '/:id/end-users/:euid/sessions/revoke-all',
+    {
+      config: { access: { scope: 'end-users:write' } },
+      schema: {
+        tags: ['Tenant · End-users'],
+        security: [{ tenantSession: [] }],
+        summary: 'Sign an end-user out everywhere',
+        description:
+          'Requires **write** access to this Application. Revokes every live refresh token the ' +
+          'end-user holds. Access tokens already minted stay valid until they expire — this ends ' +
+          'the ability to obtain new ones. To cut access immediately, rotate the Application ' +
+          "token generation instead.\n\nDoes not touch devices: a released device frees a slot, " +
+          'this only ends sessions.',
+        params: {
+          type: 'object',
+          properties: { id: { type: 'string' }, euid: { type: 'string' } },
+          required: ['id', 'euid'],
+        },
+        response: {
+          200: ok(
+            {
+              type: 'object',
+              properties: { revoked: { type: 'integer', description: 'Sessions ended by this call.' } },
+              required: ['revoked'],
+            },
+            'How many sessions were revoked.',
+          ),
+          ...errs({
+            ...APP_WRITE_ERRORS,
+            404: 'END_USER_NOT_FOUND — no end-user with that id in this Application.',
+          }),
+        },
+      },
+    },
+    async (req) => {
+      const params = z.object({ id: z.string().min(1), euid: z.string().min(1) }).parse(req.params);
+      await ensureAppAccess(req, params.id, 'write');
+      await assertEndUser(params.id, params.euid);
+      const revoked = await revokeAllForEndUser(params.euid);
+      if (revoked > 0) {
+        void recordSecurityEvent({
+          type: 'end_user.sessions_revoked_by_operator',
+          actorType: 'operator',
+          actorId: req.tenantUser!.id,
+          tenantId: req.tenantId!,
+          applicationId: params.id,
+          ...requestContext(req),
+          metadata: { endUserId: params.euid, count: revoked, all: true },
+        });
+      }
+      return { success: true, data: { revoked } };
+    },
+  );
+
+  // ---------- Operator subscription grant + cancel ----------
+  //
+  // Granting a subscription with no payment provider behind it: a sale settled
+  // by invoice or bank transfer, a comped account, an enterprise deal signed on
+  // paper, a migration off a previous billing system. None of those has a
+  // provider event to wait for, and until these routes the only ways to record
+  // one were the super-admin key or SQL against production.
+  //
+  // ## Why this is OWNER/ADMIN and why that is not simply a loosening
+  //
+  // `billing-admin.routes.ts` held granting at the super-admin key and argued
+  // it at length: it is the only billing write that CREATES entitlement on an
+  // assertion rather than following money that demonstrably moved, and on a
+  // deployment where the operator is also the buyer it is a lever aimed at the
+  // deployment's own ceiling. It named `requireTenantRole(['OWNER'])` as the
+  // eventual opening.
+  //
+  // This opens it one notch wider, to ADMIN, on the strength of a control that
+  // argument does not account for: `ensureCanManage` in
+  // tenant-workspaces.service.ts permits an ADMIN to manage MEMBER only. An
+  // ADMIN cannot invite an ADMIN, cannot promote a MEMBER to one, and cannot
+  // touch an OWNER. So the escalation the header worries about — an operator
+  // quietly widening the set of people who may mint entitlement — is already
+  // closed at the membership layer, on both the invite and the role-change
+  // path. The ADMIN population of a workspace is fixed by its OWNERs.
+  //
+  // What that does NOT close is the literal case the header describes: an
+  // operator of the workspace that owns the DEPLOYMENT's own Application
+  // granting themselves a subscription that raises their own limits. Tenant
+  // scoping contains it incidentally, and the header says so, and says the
+  // incidental-ness is the reason it stayed shut. So it is closed on purpose
+  // instead: `TENANT_SUBSCRIPTION_GRANTS=disabled` makes both routes 404 and
+  // keeps granting on the super-admin key, for exactly that deployment shape.
+  //
+  // The service is reused unchanged. That is the point of the header's "it goes
+  // through the same door a real activation does": entitlements are
+  // materialised, `subscription.activated` is enqueued in the same transaction
+  // as the status flip, deliveries are kicked after the commit. Re-implementing
+  // any of it here would produce a subscription that looks active and behaves
+  // like nothing.
+
+  /**
+   * 404 rather than 403 when the deployment has switched these off, matching
+   * the non-disclosure posture of the rest of the tenant surface. The code is
+   * still self-describing: "this deployment does not offer this" is not a
+   * secret, and an operator hunting a missing button deserves to find out why.
+   */
+  function assertTenantGrantsEnabled(): void {
+    if (env.TENANT_SUBSCRIPTION_GRANTS === 'disabled') {
+      throw new RekeyError({
+        statusCode: 404,
+        code: 'TENANT_SUBSCRIPTION_GRANTS_DISABLED',
+        message: 'Operator subscription grants are switched off on this deployment.',
+        fix: 'Grant through POST /api/v1/admin/applications/:id/subscriptions with the super-admin key, or set TENANT_SUBSCRIPTION_GRANTS=enabled on the API.',
+      });
+    }
+  }
+
+  app.post(
+    '/:id/end-users/:euid/subscriptions',
+    {
+      config: { access: { scope: 'billing:write' }, idempotency: true },
+      preHandler: requireTenantRole(['OWNER', 'ADMIN']),
+      schema: {
+        tags: ['Tenant · Billing'],
+        security: [{ tenantSession: [] }],
+        summary: 'Grant an end-user a subscription (no payment provider)',
+        description:
+          'Requires the **OWNER or ADMIN** workspace role AND **billing-write** access to this ' +
+          'Application. No application grant unlocks it on its own.\n\n' +
+          'Activates a subscription against a named plan without a checkout — for a sale settled ' +
+          'somewhere this deployment cannot observe, and for comped accounts. It takes the same ' +
+          "path a provider activation takes: the plan's entitlements are materialised onto the " +
+          'beneficiary and `subscription.activated` is emitted through the same outbox, so ' +
+          'anything already listening for a sale hears this one too.\n\n' +
+          '**Idempotent.** A subscriber already ACTIVE or PAST_DUE on the plan comes back ' +
+          'unchanged with `activated: false`, and `200` rather than `201` — nothing written, ' +
+          'nothing re-provisioned, nothing re-announced, and no second audit entry. It does not ' +
+          'extend a live period; to move a grant to a new term, cancel it and grant again.\n\n' +
+          'The subscription carries no provider, which is what lets it be cancelled locally.\n\n' +
+          'Absent (404) when the deployment sets `TENANT_SUBSCRIPTION_GRANTS=disabled`.',
+        params: {
+          type: 'object',
+          properties: { id: { type: 'string' }, euid: { type: 'string' } },
+          required: ['id', 'euid'],
+        },
+        body: {
+          type: 'object',
+          required: ['planSlug'],
+          properties: {
+            planSlug: {
+              type: 'string',
+              minLength: 1,
+              maxLength: 40,
+              description:
+                'Plan in this Application. Inactive plans are allowed — grandfathering someone onto a withdrawn plan is a deliberate operator act.',
+            },
+            organizationId: {
+              type: 'string',
+              maxLength: 64,
+              description:
+                'Beneficiary organization. Required when the Application bills per organization.',
+            },
+            currentPeriodEnd: {
+              type: 'string',
+              format: 'date-time',
+              description:
+                'When the granted period ends. Must be in the future. **Omit it and the grant is open-ended** — nothing renews a grant and nothing expires it, so a comped account stays comped until somebody cancels. Consequence worth knowing before you rely on it: cancelling an open-ended grant takes effect immediately rather than at period end, because `cancelEffect` has no period to schedule against.',
+            },
+            note: {
+              type: 'string',
+              maxLength: 500,
+              description:
+                'Why this was granted. Kept on the row under `metadata.grant` and in the audit trail — a comped subscription with no stated reason is unauditable six months later.',
+            },
+          },
+        },
+        response: {
+          200: ok(GRANT_RESULT, 'The subscriber was already entitled — nothing changed.'),
+          201: ok(GRANT_RESULT, 'The subscription is now active.'),
+          ...errs({
+            400:
+              'BILLING_ORGANIZATION_REQUIRED — the Application bills per organization and none was ' +
+              'named; or SUBSCRIPTION_PERIOD_END_IN_PAST — `currentPeriodEnd` is not in the future.',
+            ...APP_BILLING_WRITE_ERRORS,
+            403:
+              APP_BILLING_WRITE_ERRORS[403] +
+              ' TENANT_ROLE_INSUFFICIENT also covers a MEMBER holding `APP_BILLING` or `APP_ADMIN`: ' +
+              'this route requires OWNER or ADMIN and no grant unlocks it.',
+            404:
+              'END_USER_NOT_FOUND — no end-user with that id in this Application; or ' +
+              'PLAN_NOT_FOUND — no plan with that slug; or ORGANIZATION_NOT_FOUND — `organizationId` ' +
+              'names no organization in this Application; or TENANT_SUBSCRIPTION_GRANTS_DISABLED — ' +
+              'this deployment does not offer operator grants.',
+            410:
+              'END_USER_ERASED — that end-user is a GDPR tombstone. Nothing can be granted to it, ' +
+              'and an erasure cannot be undone.',
+          }),
+        },
+      },
+    },
+    async (req, reply) => {
+      const params = z.object({ id: z.string().min(1), euid: z.string().min(1) }).parse(req.params);
+      assertTenantGrantsEnabled();
+      await ensureAppAccess(req, params.id, 'billing-write');
+      const body = GrantSubscriptionBody.parse(req.body ?? {});
+
+      const existing = await prisma.endUser.findUnique({ where: { id: params.euid } });
+      if (!existing || existing.applicationId !== params.id) {
+        throw new RekeyError({
+          statusCode: 404,
+          code: 'END_USER_NOT_FOUND',
+          message: `End-user "${params.euid}" not found in this Application.`,
+          fix: 'List end-users to confirm the id.',
+        });
+      }
+
+      const application = await prisma.application.findUniqueOrThrow({
+        where: { id: params.id },
+      });
+      const result = await subscriptionGrantsService.grantSubscription({
+        application,
+        planSlug: body.planSlug,
+        endUserId: params.euid,
+        ...(body.organizationId !== undefined && { organizationId: body.organizationId }),
+        ...(body.currentPeriodEnd !== undefined && {
+          currentPeriodEnd: new Date(body.currentPeriodEnd),
+        }),
+        ...(body.note !== undefined && { note: body.note }),
+      });
+
+      // Only when this call did something. An idempotent no-op that wrote an
+      // audit row would put a fresh "granted" entry in the trail every time
+      // somebody double-clicked, for a sale that happened once.
+      if (result.activated) {
+        void recordSecurityEvent({
+          type: 'app.subscription_granted',
+          actorType: 'operator',
+          actorId: req.tenantUser!.id,
+          tenantId: req.tenantId!,
+          applicationId: params.id,
+          ...requestContext(req),
+          metadata: {
+            endUserId: params.euid,
+            planSlug: body.planSlug,
+            subscriptionId: result.subscription.id,
+            ...(body.note !== undefined && { note: body.note }),
+            via: 'operator',
+          },
+        });
+      }
+      return reply.status(result.activated ? 201 : 200).send({ success: true, data: result });
+    },
+  );
+
+  app.post(
+    '/:id/end-users/:euid/subscriptions/:subId/cancel',
+    {
+      config: { access: { scope: 'billing:write' } },
+      preHandler: requireTenantRole(['OWNER', 'ADMIN']),
+      schema: {
+        tags: ['Tenant · Billing'],
+        security: [{ tenantSession: [] }],
+        summary: "Cancel one of an end-user's subscriptions",
+        description:
+          'Requires the **OWNER or ADMIN** workspace role AND **billing-write** access to this ' +
+          'Application.\n\n' +
+          'Asks for cancellation at period end by default, which is what the end-user\'s own ' +
+          'self-service path does to the same row. Whether that is what HAPPENS is `cancelEffect` ' +
+          "in `@rekey.dev/shared-types`: only an ACTIVE or TRIALING subscription that has a " +
+          '`currentPeriodEnd` can be scheduled, and everything else — including an open-ended ' +
+          'grant, which is what a grant is unless a term was named — stops immediately. Import ' +
+          'that predicate to say which before you ask; the panel does.\n\n' +
+          '`atPeriodEnd: false` ends it immediately regardless. A provider-backed subscription is ' +
+          'cancelled at the provider; a granted one ends locally.\n\n' +
+          'Idempotent: a subscription already CANCELED or EXPIRED comes back unchanged.\n\n' +
+          'This surface previously existed only as an operator MCP tool, so an agent could cancel ' +
+          'a subscription and the panel could not.',
+        params: {
+          type: 'object',
+          properties: { id: { type: 'string' }, euid: { type: 'string' }, subId: { type: 'string' } },
+          required: ['id', 'euid', 'subId'],
+        },
+        body: {
+          type: 'object',
+          properties: {
+            atPeriodEnd: {
+              type: 'boolean',
+              default: true,
+              description: 'False ends it immediately instead of at the end of the paid period.',
+            },
+          },
+        },
+        response: {
+          200: ok(ref('Subscription'), 'The subscription in its post-cancel state.'),
+          ...errs({
+            ...APP_BILLING_WRITE_ERRORS,
+            403:
+              APP_BILLING_WRITE_ERRORS[403] +
+              ' TENANT_ROLE_INSUFFICIENT also covers a MEMBER holding `APP_BILLING` or `APP_ADMIN`: ' +
+              'this route requires OWNER or ADMIN and no grant unlocks it.',
+            404:
+              'SUBSCRIPTION_NOT_FOUND — no subscription with that id belonging to that end-user in ' +
+              'this Application.',
+            409: 'SUBSCRIPTION_MANAGED_EXTERNALLY — an inbound-only provider owns this subscription; cancel it there.',
+          }),
+        },
+      },
+    },
+    async (req) => {
+      const params = z
+        .object({ id: z.string().min(1), euid: z.string().min(1), subId: z.string().min(1) })
+        .parse(req.params);
+      // Deliberately NOT gated by `TENANT_SUBSCRIPTION_GRANTS`. That switch is
+      // about the one write that CREATES entitlement on an assertion; cancel
+      // removes entitlement and fails safe. Gating it here would also have been
+      // incoherent, because the operator MCP `cancel_subscription` tool ignores
+      // the flag — so a `disabled` deployment would be back to an agent being
+      // able to cancel a subscription while the panel could not, which is the
+      // asymmetry these routes exist to remove.
+      await ensureAppAccess(req, params.id, 'billing-write');
+      const body = CancelSubscriptionBody.parse(req.body ?? {});
+
+      // Scope the lookup by application AND end-user in the query itself. Read
+      // by id and check afterwards and this becomes an existence oracle, which
+      // is the exact bug the operator MCP tool's cancel had to fix.
+      const owned = await prisma.subscription.findFirst({
+        where: { id: params.subId, applicationId: params.id, endUserId: params.euid },
+        select: { id: true },
+      });
+      if (!owned) {
+        throw new RekeyError({
+          statusCode: 404,
+          code: 'SUBSCRIPTION_NOT_FOUND',
+          message: `Subscription "${params.subId}" not found for that end-user in this Application.`,
+          fix: "List the end-user's billing to find a subscription id.",
+        });
+      }
+
+      const application = await prisma.application.findUniqueOrThrow({
+        where: { id: params.id },
+      });
+      const atPeriodEnd = body.atPeriodEnd !== false;
+      const updated = await billingService.cancelSubscriptionById(application, params.subId, {
+        atPeriodEnd,
+      });
+
+      void recordSecurityEvent({
+        type: 'app.subscription_canceled',
+        actorType: 'operator',
+        actorId: req.tenantUser!.id,
+        tenantId: req.tenantId!,
+        applicationId: params.id,
+        ...requestContext(req),
+        metadata: {
+          endUserId: params.euid,
+          subscriptionId: params.subId,
+          atPeriodEnd,
+          status: updated.status,
+        },
+      });
+      return { success: true, data: updated };
+    },
+  );
+
   // ---------- GDPR / DSAR data export ----------
   //
   // GET /:id/end-users/:euid/export
@@ -4509,6 +5807,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.get(
     '/:id/end-users/:euid/export',
     {
+      config: { access: { floor: true } },
       preHandler: requireTenantRole(['OWNER', 'ADMIN']),
       schema: {
         tags: ['Tenant · End-users'],
@@ -4913,6 +6212,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.post(
     '/:id/end-users/:euid/impersonate',
     {
+      config: { access: { floor: true } },
       preHandler: requireTenantRole(['OWNER', 'ADMIN']),
       schema: {
         tags: ['Tenant · End-users'],
@@ -4970,7 +6270,11 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
       const body = z
         .object({ reason: z.string().max(280).optional() })
         .parse(req.body ?? {});
-      await ensureAppAccess(req, params.id, 'read');
+      // 'write', not 'read': this mints a token that ACTS AS the end-user. It
+      // was classified as a read and saved only by the OWNER/ADMIN preHandler
+      // above — which is why nobody noticed. The preHandler stays; the need is
+      // now honest about what the route does.
+      await ensureAppAccess(req, params.id, 'write');
       const endUser = await prisma.endUser.findUnique({ where: { id: params.euid } });
       if (!endUser || endUser.applicationId !== params.id) {
         throw new RekeyError({
@@ -5051,6 +6355,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.post(
     '/:id/end-users/:euid/impersonate/end',
     {
+      config: { access: { floor: true } },
       preHandler: requireTenantRole(['OWNER', 'ADMIN']),
       schema: {
         tags: ['Tenant · End-users'],
@@ -5078,7 +6383,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
       const params = z
         .object({ id: z.string().min(1), euid: z.string().min(1) })
         .parse(req.params);
-      await ensureAppAccess(req, params.id, 'read');
+      await ensureAppAccess(req, params.id, 'write');
       const endUser = await prisma.endUser.findUnique({ where: { id: params.euid } });
       if (!endUser || endUser.applicationId !== params.id) {
         throw new RekeyError({
@@ -5105,6 +6410,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.post(
     '/:id/rotate-sessions',
     {
+      config: { access: { scope: 'auth-config:write' } },
       schema: {
         tags: ['Tenant · Applications'],
         security: [{ tenantSession: [] }],
@@ -5170,6 +6476,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.post(
     '/:id/rotate-public-key',
     {
+      config: { access: { scope: 'auth-config:write' } },
       // Every field is optional, so a caller may POST with no body at all.
       // Fastify validates a missing body against `{type:'object'}` and answers
       // 400 "body must be object" — the same trap documented on tenant-mfa's
@@ -5270,6 +6577,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.patch(
     '/:id/portal',
     {
+      config: { access: { scope: 'auth-config:write' } },
       schema: {
         tags: ['Tenant · Applications'],
         security: [{ tenantSession: [] }],
@@ -5367,6 +6675,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.get(
     '/:id/oauth-clients',
     {
+      config: { access: { scope: 'auth-config:read' } },
       schema: {
         tags: ['Tenant · Applications'],
         security: [{ tenantSession: [] }],
@@ -5437,6 +6746,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.delete(
     '/:id/oauth-clients/:clientId',
     {
+      config: { access: { scope: 'auth-config:write' } },
       schema: {
         tags: ['Tenant · Applications'],
         security: [{ tenantSession: [] }],
@@ -5507,6 +6817,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.get(
     '/:id/access',
     {
+      config: { access: { scope: 'auth-config:read' } },
       schema: {
         tags: ['Tenant · Applications'],
         security: [{ tenantSession: [] }],
@@ -5535,6 +6846,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.put(
     '/:id/access',
     {
+      config: { access: { scope: 'auth-config:write' } },
       schema: {
         tags: ['Tenant · Applications'],
         security: [{ tenantSession: [] }],
@@ -5650,6 +6962,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.get(
     '/:id/application-roles',
     {
+      config: { access: { scope: 'organizations:read' } },
       schema: {
         tags: ['Tenant · End-users'],
         security: [{ tenantSession: [] }],
@@ -5690,6 +7003,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.post(
     '/:id/application-roles',
     {
+      config: { access: { scope: 'organizations:write' } },
       schema: {
         tags: ['Tenant · End-users'],
         security: [{ tenantSession: [] }],
@@ -5750,6 +7064,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.patch(
     '/:id/application-roles/:name',
     {
+      config: { access: { scope: 'organizations:write' } },
       schema: {
         tags: ['Tenant · End-users'],
         security: [{ tenantSession: [] }],
@@ -5809,6 +7124,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.delete(
     '/:id/application-roles/:name',
     {
+      config: { access: { scope: 'organizations:write' } },
       schema: {
         tags: ['Tenant · End-users'],
         security: [{ tenantSession: [] }],
@@ -5865,7 +7181,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
 
   const legacyRoleAlias = { hide: true, tags: ['Tenant · End-users'] } as const;
 
-  app.get('/:id/end-user-roles', { schema: legacyRoleAlias }, async (req) => {
+  app.get('/:id/end-user-roles', { config: { access: { scope: 'organizations:read' } }, schema: legacyRoleAlias }, async (req) => {
     const { id } = AppParam.parse(req.params);
     await ensureAppAccess(req, id, 'read');
     return { success: true, data: await applicationRolesService.list(id) };
@@ -5873,7 +7189,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
 
   app.post(
     '/:id/end-user-roles',
-    { schema: { ...legacyRoleAlias, body: APPLICATION_ROLE_CREATE_BODY } },
+    { config: { access: { scope: 'organizations:write' } }, schema: { ...legacyRoleAlias, body: APPLICATION_ROLE_CREATE_BODY } },
     async (req, reply) => {
     const { id } = AppParam.parse(req.params);
     await ensureAppAccess(req, id, 'write');
@@ -5897,7 +7213,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
 
   app.patch(
     '/:id/end-user-roles/:name',
-    { schema: { ...legacyRoleAlias, body: APPLICATION_ROLE_PATCH_BODY } },
+    { config: { access: { scope: 'organizations:write' } }, schema: { ...legacyRoleAlias, body: APPLICATION_ROLE_PATCH_BODY } },
     async (req) => {
     const params = z.object({ id: z.string().min(1), name: z.string().min(1) }).parse(req.params);
     await ensureAppAccess(req, params.id, 'write');
@@ -5920,7 +7236,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
 
   app.delete(
     '/:id/end-user-roles/:name',
-    { schema: { ...legacyRoleAlias, querystring: APPLICATION_ROLE_DELETE_QUERY } },
+    { config: { access: { scope: 'organizations:write' } }, schema: { ...legacyRoleAlias, querystring: APPLICATION_ROLE_DELETE_QUERY } },
     async (req) => {
     const params = z.object({ id: z.string().min(1), name: z.string().min(1) }).parse(req.params);
     const q = z.object({ reassignTo: z.string().min(1).max(40).optional() }).parse(req.query);
@@ -5952,6 +7268,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.get(
     '/:id/organization-roles',
     {
+      config: { access: { scope: 'organizations:read' } },
       schema: {
         tags: ['Tenant · Organizations'],
         security: [{ tenantSession: [] }],
@@ -6006,6 +7323,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.post(
     '/:id/organization-roles',
     {
+      config: { access: { scope: 'organizations:write' } },
       schema: {
         tags: ['Tenant · Organizations'],
         security: [{ tenantSession: [] }],
@@ -6105,6 +7423,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.patch(
     '/:id/organization-roles/:name',
     {
+      config: { access: { scope: 'organizations:write' } },
       schema: {
         tags: ['Tenant · Organizations'],
         security: [{ tenantSession: [] }],
@@ -6177,6 +7496,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.delete(
     '/:id/organization-roles/:name',
     {
+      config: { access: { scope: 'organizations:write' } },
       schema: {
         tags: ['Tenant · Organizations'],
         security: [{ tenantSession: [] }],
@@ -6249,6 +7569,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.get(
     '/:id/licenses',
     {
+      config: { access: { scope: 'billing:read' } },
       schema: {
         tags: ['Tenant · Licenses'],
         security: [{ tenantSession: [] }],
@@ -6280,7 +7601,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
     {
       // Generic Idempotency-Key header support (scoped to the workspace) — a
       // retried issue would otherwise mint a second license key nobody saw.
-      config: { idempotency: true },
+      config: { access: { scope: 'billing:write' }, idempotency: true },
       schema: {
         tags: ['Tenant · Licenses'],
         security: [{ tenantSession: [] }],
@@ -6394,6 +7715,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.delete(
     '/:id/licenses/:licenseId',
     {
+      config: { access: { scope: 'billing:write' } },
       schema: {
         tags: ['Tenant · Licenses'],
         security: [{ tenantSession: [] }],
@@ -6430,6 +7752,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.get(
     '/:id/usage-meters',
     {
+      config: { access: { scope: 'billing:read' } },
       schema: {
         tags: ['Tenant · Usage'],
         security: [{ tenantSession: [] }],
@@ -6459,6 +7782,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.post(
     '/:id/usage-meters',
     {
+      config: { access: { scope: 'billing:write' } },
       schema: {
         tags: ['Tenant · Usage'],
         security: [{ tenantSession: [] }],
@@ -6507,6 +7831,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.patch(
     '/:id/usage-meters/:slug',
     {
+      config: { access: { scope: 'billing:write' } },
       schema: {
         tags: ['Tenant · Usage'],
         security: [{ tenantSession: [] }],
@@ -6586,6 +7911,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.delete(
     '/:id/usage-meters/:slug',
     {
+      config: { access: { scope: 'billing:write' } },
       schema: {
         tags: ['Tenant · Usage'],
         security: [{ tenantSession: [] }],
@@ -6626,6 +7952,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.get(
     '/:id/organizations',
     {
+      config: { access: { scope: 'organizations:read' } },
       schema: {
         tags: ['Tenant · Organizations'],
         security: [{ tenantSession: [] }],
@@ -6689,6 +8016,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.get(
     '/:id/organizations/:orgId',
     {
+      config: { access: { scope: 'organizations:read' } },
       schema: {
         tags: ['Tenant · Organizations'],
         security: [{ tenantSession: [] }],
@@ -6801,6 +8129,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.delete(
     '/:id/organizations/:orgId',
     {
+      config: { access: { scope: 'organizations:write' } },
       schema: {
         tags: ['Tenant · Organizations'],
         security: [{ tenantSession: [] }],
@@ -6844,6 +8173,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.post(
     '/:id/organizations',
     {
+      config: { access: { scope: 'organizations:write' } },
       schema: {
         tags: ['Tenant · Organizations'],
         security: [{ tenantSession: [] }],
@@ -6922,6 +8252,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.patch(
     '/:id/organizations/:orgId',
     {
+      config: { access: { scope: 'organizations:write' } },
       schema: {
         tags: ['Tenant · Organizations'],
         security: [{ tenantSession: [] }],
@@ -6996,6 +8327,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.post(
     '/:id/organizations/:orgId/members',
     {
+      config: { access: { scope: 'organizations:write' } },
       schema: {
         tags: ['Tenant · Organizations'],
         security: [{ tenantSession: [] }],
@@ -7089,6 +8421,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.patch(
     '/:id/organizations/:orgId/members/:euid',
     {
+      config: { access: { scope: 'organizations:write' } },
       schema: {
         tags: ['Tenant · Organizations'],
         security: [{ tenantSession: [] }],
@@ -7160,6 +8493,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.delete(
     '/:id/organizations/:orgId/members/:euid',
     {
+      config: { access: { scope: 'organizations:write' } },
       schema: {
         tags: ['Tenant · Organizations'],
         security: [{ tenantSession: [] }],
@@ -7209,6 +8543,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.get(
     '/:id/organizations/:orgId/billing',
     {
+      config: { access: { scope: 'billing:read' } },
       schema: {
         tags: ['Tenant · Organizations'],
         security: [{ tenantSession: [] }],
@@ -7353,6 +8688,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   app.post(
     '/:id/organizations/:orgId/licenses/:licenseId/rotate-key',
     {
+      config: { access: { scope: 'billing:write' } },
       schema: {
         tags: ['Tenant · Organizations'],
         security: [{ tenantSession: [] }],

@@ -24,6 +24,7 @@
 import type { TenantUser } from '@prisma/client';
 import { prisma } from '../../lib/prisma.js';
 import { RekeyError } from '../../lib/error.js';
+import { expandScopes } from '../../lib/operator-scopes.js';
 import {
   buildTenantRegistrationOptions,
   verifyTenantRegistration,
@@ -75,7 +76,16 @@ async function loadMemberships(tenantUserId: string): Promise<MembershipSummary[
     include: { tenant: { select: { id: true, name: true } } },
     orderBy: { createdAt: 'asc' },
   });
-  return rows.map((r) => ({ tenantId: r.tenantId, tenantName: r.tenant.name, role: r.role }));
+  // Same shape as tenant-auth.service.ts's loadMemberships — a second copy
+  // of it lives here for the passkey sign-in path, and MembershipSummary now
+  // carries the member's resolved scopes so the panel can render from them.
+  return rows.map((r) => ({
+    tenantId: r.tenantId,
+    tenantName: r.tenant.name,
+    role: r.role,
+    scopes:
+      r.role === 'MEMBER' && r.scopesRestricted ? [...expandScopes(r.scopes)].sort() : null,
+  }));
 }
 
 export const tenantPasskeysService = {

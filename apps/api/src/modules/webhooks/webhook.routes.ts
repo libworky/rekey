@@ -148,6 +148,7 @@ export async function tenantWebhookRoutes(app: FastifyInstance): Promise<void> {
   app.get(
     '/:id/webhooks',
     {
+      config: { access: { scope: 'developer:read' } },
       schema: {
         tags: ['Tenant · Webhooks'],
         security: [{ tenantSession: [] }],
@@ -196,6 +197,7 @@ export async function tenantWebhookRoutes(app: FastifyInstance): Promise<void> {
   app.post(
     '/:id/webhooks',
     {
+      config: { access: { scope: 'developer:write' } },
       schema: {
         tags: ['Tenant · Webhooks'],
         security: [{ tenantSession: [] }],
@@ -282,6 +284,7 @@ export async function tenantWebhookRoutes(app: FastifyInstance): Promise<void> {
   app.patch(
     '/:id/webhooks/:endpointId',
     {
+      config: { access: { scope: 'developer:write' } },
       schema: {
         tags: ['Tenant · Webhooks'],
         security: [{ tenantSession: [] }],
@@ -355,6 +358,7 @@ export async function tenantWebhookRoutes(app: FastifyInstance): Promise<void> {
   app.delete(
     '/:id/webhooks/:endpointId',
     {
+      config: { access: { scope: 'developer:write' } },
       schema: {
         tags: ['Tenant · Webhooks'],
         security: [{ tenantSession: [] }],
@@ -389,6 +393,7 @@ export async function tenantWebhookRoutes(app: FastifyInstance): Promise<void> {
   app.post(
     '/:id/webhooks/:endpointId/rotate-secret',
     {
+      config: { access: { scope: 'developer:write' } },
       schema: {
         tags: ['Tenant · Webhooks'],
         security: [{ tenantSession: [] }],
@@ -434,6 +439,7 @@ export async function tenantWebhookRoutes(app: FastifyInstance): Promise<void> {
   app.get(
     '/:id/webhooks/:endpointId/deliveries',
     {
+      config: { access: { scope: 'developer:read' } },
       schema: {
         tags: ['Tenant · Webhooks'],
         security: [{ tenantSession: [] }],
@@ -564,6 +570,7 @@ export async function tenantWebhookRoutes(app: FastifyInstance): Promise<void> {
   app.post(
     '/:id/webhooks/:endpointId/deliveries/:deliveryId/retry',
     {
+      config: { access: { scope: 'developer:write' } },
       schema: {
         tags: ['Tenant · Webhooks'],
         security: [{ tenantSession: [] }],

@@ -429,11 +429,37 @@ export function getMe(): Promise<MeDto> {
   return apiGet<MeDto>('/api/v1/tenant/auth/me');
 }
 
+/**
+ * Whether this deployment lets operators grant subscriptions with no payment
+ * provider behind them (`TENANT_SUBSCRIPTION_GRANTS`).
+ *
+ * A UX hint, like `creation-mode` and `signup-mode`: it decides whether the
+ * affordance renders, never whether the action is allowed. The routes refuse
+ * with `TENANT_SUBSCRIPTION_GRANTS_DISABLED` on their own. Degrades to
+ * 'disabled' if the endpoint is unreachable — hiding a button on a deployment
+ * that does support grants is recoverable by asking; offering one that 404s
+ * teaches an operator to distrust the page.
+ */
+export function getSubscriptionGrantsMode(): Promise<'enabled' | 'disabled'> {
+  return apiGet<{ mode: 'enabled' | 'disabled' }>(
+    '/api/v1/tenant/workspace/subscription-grants-mode',
+    { interruptOnAccessError: false },
+  )
+    .then((r) => r.mode)
+    .catch(() => 'disabled' as const);
+}
+
 // ---------- DTOs ----------
 
 export interface MeDto {
   user: { id: string; email: string; name: string | null };
-  memberships: Array<{ tenantId: string; tenantName: string; role: 'OWNER' | 'ADMIN' | 'MEMBER' }>;
+  memberships: Array<{
+    tenantId: string;
+    tenantName: string;
+    role: 'OWNER' | 'ADMIN' | 'MEMBER';
+    /** Resolved scopes in that workspace, or null when unrestricted (always null for OWNER/ADMIN). */
+    scopes: string[] | null;
+  }>;
   activeTenantId: string;
   activeRole: 'OWNER' | 'ADMIN' | 'MEMBER';
 }
@@ -486,6 +512,12 @@ export interface ApplicationRow {
     passwordBreachCheckEnabled?: boolean;
     sendVerificationEmailOnSignUp?: boolean;
     requireEmailVerification?: boolean;
+    /**
+     * Whether a sign-in must carry a device fingerprint. `required` refuses
+     * one that does not; `optional` binds the device when a fingerprint is
+     * sent and lets the sign-in through when it is not.
+     */
+    deviceBinding?: 'optional' | 'required';
   };
   billingConfig: {
     /** Master switch. When false the whole billing surface is gated server-side. */
@@ -494,6 +526,14 @@ export interface ApplicationRow {
     dunningEnabled?: boolean;
     /** Default billing subject: individual end-user, or their organization. */
     billingSubject?: 'user' | 'org';
+    /**
+     * Free-tier fallback. Slug of a plan whose FEATURE entitlements and
+     * included usage quota apply to end-users with NO active subscription.
+     * Read-time only: no Subscription row stands behind it, so a user on the
+     * default plan shows an empty subscriptions list while still being
+     * entitled. Unset = no free tier.
+     */
+    defaultPlanSlug?: string;
     provider: string;
     currency: string;
     metadata: Record<string, unknown>;
@@ -509,6 +549,13 @@ export interface ApplicationRow {
   portalBranding?: Record<string, unknown>;
   /** Public MCP server URL, computed API-side from PUBLIC_WEBHOOK_BASE_URL/API_URL. */
   mcpUrl?: string;
+  /**
+   * How the caller reached this Application and their effective scopes on it.
+   * The panel renders navigation from `scopes`: a section whose scope is
+   * absent is not shown, rather than shown and refused. Optional only for the
+   * moment between deploys; the API always sends it.
+   */
+  access?: { level: string; scopes: string[] };
   createdAt: string;
 }
 
@@ -854,7 +901,7 @@ export interface OrganizationDetail {
   invitations: OrganizationInvitationRow[];
 }
 
-export type EmailLogStatus = 'sent' | 'error' | 'no_transport';
+export type EmailLogStatus = 'sent' | 'error' | 'no_transport' | 'suppressed';
 
 export interface EmailLogRow {
   id: string;
@@ -909,7 +956,10 @@ export interface MemberRow {
    * member only sees/uses the granted applications. An empty list means the
    * member can access NO application — unless `legacyWorkspaceRead` is set.
    */
-  grants: MemberGrantRow[];
+  /** Present for OWNER/ADMIN callers only — a MEMBER listing the roster gets the people, not their permissions. */
+  grants?: MemberGrantRow[];
+  /** The member's scopes as stored, or null when unrestricted. OWNER/ADMIN callers only. */
+  scopes?: string[] | null;
   /**
    * True only for MEMBER memberships grandfathered by the 2.0.0-rc.3 backfill:
    * they keep the pre-grants workspace-wide READ over every application.

@@ -381,8 +381,16 @@ const HAND_WRITTEN_COMPONENTS: Record<string, JsonSchema> = {
       tenantId: { type: 'string' },
       tenantName: { type: 'string' },
       role: { type: 'string', enum: ['OWNER', 'ADMIN', 'MEMBER'] },
+      scopes: {
+        type: 'array',
+        nullable: true,
+        items: { type: 'string' },
+        description:
+          'The member\'s resolved scopes in this workspace (`domain:level`), or null when ' +
+          'unrestricted. OWNER and ADMIN are always null. Drive navigation from this.',
+      },
     },
-    required: ['tenantId', 'tenantName', 'role'],
+    required: ['tenantId', 'tenantName', 'role', 'scopes'],
   },
 
   /**
@@ -421,8 +429,17 @@ const HAND_WRITTEN_COMPONENTS: Record<string, JsonSchema> = {
       role: { type: 'string', enum: ['OWNER', 'ADMIN', 'MEMBER'] },
       joinedAt: { type: 'string', format: 'date-time' },
       grants: { type: 'array', items: { $ref: 'MemberGrant#' } },
+      scopes: {
+        type: 'array',
+        nullable: true,
+        items: { type: 'string' },
+        description:
+          'The member\'s scopes as stored, or null when unrestricted. Only meaningful on a MEMBER.',
+      },
     },
-    required: ['membershipId', 'tenantUserId', 'email', 'role', 'joinedAt', 'grants'],
+    // `grants` and `scopes` are present for OWNER/ADMIN callers only. A MEMBER
+    // listing the roster gets the people, not their permissions.
+    required: ['membershipId', 'tenantUserId', 'email', 'role', 'joinedAt'],
   },
 
   /**
@@ -676,7 +693,7 @@ const HAND_WRITTEN_COMPONENTS: Record<string, JsonSchema> = {
         description: 'Which template fired (e.g. `verify_email`). Null for ad-hoc sends.',
       },
       via: { type: 'string', description: 'The transport that carried it (e.g. `resend`, `smtp`).' },
-      status: { type: 'string', enum: ['sent', 'error', 'no_transport'] },
+      status: { type: 'string', enum: ['sent', 'error', 'no_transport', 'suppressed'] },
       messageId: { type: 'string', nullable: true },
       error: { type: 'string', nullable: true },
       createdAt: { type: 'string', format: 'date-time' },

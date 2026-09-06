@@ -102,7 +102,17 @@ async function withEmailDeadline<T>(work: Promise<T>): Promise<T> {
 export type SendOutcome =
   | { kind: 'sent'; messageId: string | null; via: SentVia }
   | { kind: 'no_transport' }
-  | { kind: 'error'; message: string };
+  /**
+   * Nothing was sent and the caller must withhold whatever token it minted.
+   *
+   * `suppressed` marks the sub-case where the refusal was a CONFIGURATION
+   * CHOICE — the Application's email switch, a disabled event, or an address
+   * on the suppression list — rather than a transport that broke. Callers that
+   * raise a delivery-failure alarm must not raise it for this: an operator who
+   * turns an event off should not then find their own activity feed filling
+   * with `auth.email_delivery_failed` alerts about the thing they just did.
+   */
+  | { kind: 'error'; message: string; suppressed?: true };
 
 export interface SendInput {
   to: string;
@@ -414,6 +424,46 @@ async function sendDefaultResend(
     return { kind: 'sent', messageId: res.data?.id ?? null, via: 'default_resend' };
   } catch (e) {
     return { kind: 'error', message: (e as Error).message };
+  }
+}
+
+/**
+ * Persist an EmailLog row for a send that was deliberately NOT attempted.
+ *
+ * Exported so every `email_logs` write still happens in this file — the
+ * invariant the table's own comment states ("Recorded at the transport boundary
+ * so EVERY send is captured regardless of caller"). A suppression never reaches
+ * a transport, so without this it would be the one outcome leaving no trace,
+ * and "the customer never got the email" would have no answer in the single
+ * place an operator looks for send outcomes.
+ *
+ * `status: 'suppressed'` is a fourth value alongside sent / error /
+ * no_transport, and deliberately not `error`: nothing failed.
+ */
+export async function recordSuppressedSend(args: {
+  tenantId: string | null;
+  applicationId: string | null;
+  to: string;
+  subject: string;
+  eventKey: string | null;
+  reason: string;
+}): Promise<void> {
+  try {
+    await prisma.emailLog.create({
+      data: {
+        tenantId: args.tenantId,
+        applicationId: args.applicationId,
+        toAddress: args.to.toLowerCase(),
+        subject: args.subject,
+        eventKey: args.eventKey,
+        via: 'none',
+        status: 'suppressed',
+        messageId: null,
+        error: args.reason,
+      },
+    });
+  } catch {
+    // Same contract as `recordLog`: a log write must never break the caller.
   }
 }
 

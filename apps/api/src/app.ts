@@ -13,6 +13,7 @@ import rateLimit from '@fastify/rate-limit';
 import sensible from '@fastify/sensible';
 import formbody from '@fastify/formbody';
 import rawBody from 'fastify-raw-body';
+import { collectRouteAccess } from './lib/route-access.js';
 import { getRedis, closeRedis } from './lib/redis.js';
 import { isQueueEnabled } from './lib/queue.js';
 import { primeCorsOrigins, isRegisteredAppOrigin } from './lib/cors-origins.js';
@@ -216,6 +217,12 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
     requestIdHeader: false,
     genReqId: (req) => requestIdFor(req.headers as Record<string, unknown>),
   });
+
+  // Collect every route's `config.access` declaration as it registers. Must
+  // sit before the first route plugin — `onRoute` only sees routes added
+  // after it. The completeness test reads the table this builds; the scope
+  // gate will read the same declarations. See lib/route-access.ts.
+  collectRouteAccess(app);
 
   // CORS — strict allowlist. Reflective `origin: true` is forbidden because
   // browsers will happily send our `rekey_*` credential cookies from any

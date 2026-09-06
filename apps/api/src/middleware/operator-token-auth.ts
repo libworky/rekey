@@ -27,6 +27,7 @@
  */
 
 import type { FastifyRequest, FastifyReply } from 'fastify';
+import { intersectScopes, patTokenScopes, resolveMembershipScopes } from '../lib/operator-scopes.js';
 import type { TenantRole } from '@prisma/client';
 import { RekeyError } from '../lib/error.js';
 import { prisma } from '../lib/prisma.js';
@@ -103,6 +104,13 @@ export async function resolveOperatorToken(
   request.tenantRole = membership.role as TenantRole;
   request.tenantMembershipId = membership.id;
   request.operatorTokenScopes = token.scopes;
+  // A token can only narrow what its holder may do. "Scopes bound what a
+  // token may do. They cannot stand in for whether its holder is still
+  // allowed to do it" — enforced structurally now, not by re-checking the role.
+  request.tenantScopes = intersectScopes(
+    resolveMembershipScopes(membership.scopesRestricted, membership.scopes),
+    patTokenScopes(token.scopes),
+  );
 
   // Best-effort lastUsedAt bump, at most once per token per minute (see
   // lib/last-used-throttle.ts). Fire-and-forget: a failed write here must

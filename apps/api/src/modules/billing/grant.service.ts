@@ -95,10 +95,14 @@ export interface GrantSubscriptionInput {
   /** Beneficiary org (owner+beneficiary, ORG_BILLING.md). Must belong to `application`. */
   organizationId?: string;
   /**
-   * When the granted period ends. Defaults to one plan interval from now for a
-   * recurring plan, and to null for a one-off (see `resolvePeriodEnd`). Must be
-   * in the future — a subscription born already expired entitles nobody and
-   * would be reaped by `expireIfDue` on the next read.
+   * When the granted period ends. **Omitted means open-ended** — null, for a
+   * recurring plan and a one-off alike (see `resolvePeriodEnd`). Must be in the
+   * future — a subscription born already expired entitles nobody and would be
+   * reaped by `expireIfDue` on the next read.
+   *
+   * Open-ended has a consequence at the other end of the lifecycle: with no
+   * period, `cancelEffect` has nothing to schedule against, so cancelling that
+   * subscription stops access immediately rather than at period end.
    */
   currentPeriodEnd?: Date;
   /** Free-text reason, kept on the row and in the audit trail. */
@@ -144,14 +148,20 @@ function isOneTime(plan: { kind: string; licenseKind: string | null }): boolean 
  *
  * An explicit value always wins — an invoice is for whatever term was agreed,
  * and guessing a year deal is a month is the kind of error nobody notices until
- * renewal. Absent one, a recurring plan gets one interval from now via the same
- * calendar-aware helper the provider period mirror uses (`advanceBillingPeriod`
- * — anniversary billing, not 30-day arithmetic), and a one-off gets null.
+ * renewal. **Absent one the answer is null: a grant is open-ended.** The
+ * comment on the return below says why that changed.
+ *
+ * (This paragraph used to say a recurring plan got one interval from now, and
+ * kept saying it after the behaviour changed six lines below. Corrected rather
+ * than deleted, because a stale doc that contradicts its own implementation is
+ * load-bearing misinformation: a reader who trusts it concludes that cancelling
+ * a fresh grant schedules for period end, when it stops access on the spot.)
  *
  * Null is not a shortcut here. It is what `cancelEffect` reads to decide
- * whether "cancel at the end of the period" is even a meaningful request, and
- * what `entitlementsService.provision` falls back to as the `'initial'` grant
- * anchor for a purchase that happens exactly once.
+ * whether "cancel at the end of the period" is even a meaningful request — with
+ * no period there is nothing to schedule, so the cancel is immediate — and what
+ * `entitlementsService.provision` falls back to as the `'initial'` grant anchor
+ * for a purchase that happens exactly once.
  */
 function resolvePeriodEnd(
   plan: { kind: string; licenseKind: string | null; interval: string | null },
@@ -297,7 +307,7 @@ export const subscriptionGrantsService = {
         statusCode: 400,
         code: 'SUBSCRIPTION_PERIOD_END_IN_PAST',
         message: 'A granted subscription cannot end in the past.',
-        fix: 'Pass a `currentPeriodEnd` in the future, or omit it to get one plan interval from now.',
+        fix: 'Pass a `currentPeriodEnd` in the future, or omit it for an open-ended grant.',
       });
     }
 
@@ -416,13 +426,13 @@ async function resolveEndUser(
   const endUser = input.endUserId
     ? await prisma.endUser.findFirst({
         where: { id: input.endUserId, applicationId },
-        select: { id: true },
+        select: { id: true, erasedAt: true },
       })
     : await prisma.endUser.findUnique({
         // Stored lowercased at sign-up; an operator typing the address off an
         // invoice will not match the casing.
         where: { applicationId_email: { applicationId, email: (input.email ?? '').toLowerCase() } },
-        select: { id: true },
+        select: { id: true, erasedAt: true },
       });
   if (!endUser) {
     throw new RekeyError({
@@ -434,5 +444,26 @@ async function resolveEndUser(
         'to them. Have them sign up, or find them with GET /api/v1/admin/metrics/end-users?q=.',
     });
   }
-  return endUser;
+  // Nothing can be granted to a tombstone.
+  //
+  // `subscriber.service.ts` has refused this since the external provider
+  // landed; this path did not, and that asymmetry is a live hazard now that an
+  // operator can reach granting from the same end-user page that carries the
+  // Erase button. Erasure's contract is that financial rows are RETAINED and
+  // PII-scrubbed; a grant afterwards writes a fresh, un-scrubbed one — with the
+  // operator's free-text note, typically a name or an invoice reference, on a
+  // subject the workspace has legally committed to scrubbing — and announces
+  // `subscription.activated` for an id that just announced `user.erased`.
+  //
+  // Guarded here rather than at either route so both the operator and the
+  // super-admin surface inherit it.
+  if (endUser.erasedAt !== null) {
+    throw new RekeyError({
+      statusCode: 410,
+      code: 'END_USER_ERASED',
+      message: 'That end-user was erased; nothing can be granted to the tombstone.',
+      fix: 'If this person is a customer again, they must create a new account — an erasure cannot be undone. Remove them from the billing system that produced this grant as well.',
+    });
+  }
+  return { id: endUser.id };
 }

@@ -2,9 +2,12 @@
 @tailwind components;
 @tailwind utilities;
 
-/* Design tokens — see /design.md at the repo root for the rationale.
-   Use these in className via `bg-[var(--color-primary)]`,
-   `border-[var(--color-border)]`, etc. */
+/* Design tokens. Use these in className via `bg-[var(--color-primary)]`,
+   `border-[var(--color-border)]`, etc.
+
+   This block used to cite /design.md at the repo root. There is no such file
+   and there never has been, so the rationale lives in the comments below and
+   on the components that spend these tokens. */
 
 :root {
   color-scheme: light;

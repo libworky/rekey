@@ -38,12 +38,51 @@
 import * as React from 'react';
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
+import { hasScope, type Scope } from '@/lib/operator-scopes';
 
 interface SubTab {
   /** Path segment under `/applications/{id}`. Empty string = the group landing. */
   seg: string;
   label: string;
 }
+
+/**
+ * Which scope a section needs to be worth showing. Mirrors the API's route
+ * declarations (`config.access` on each route) — a section whose reads would
+ * all 403 is not offered. `null` = always shown: the landing page and
+ * Lifecycle, which floor themselves.
+ *
+ * This is presentation, not enforcement (see Sidebar.tsx). The API refuses
+ * on its own; this stops the panel showing somebody a door that will slam.
+ */
+const SEG_SCOPE: Record<string, Scope | null> = {
+  '': null,
+  'end-users': 'end-users:read',
+  roles: 'organizations:read',
+  organizations: 'organizations:read',
+  activity: 'activity:read',
+  auth: 'auth-config:read',
+  oauth: 'auth-config:read',
+  'oauth-clients': 'auth-config:read',
+  mcp: 'auth-config:read',
+  revenue: 'billing:read',
+  billing: 'billing:read',
+  plans: 'billing:read',
+  payments: 'billing:read',
+  dunning: 'billing:read',
+  'unapplied-payments': 'billing:read',
+  imports: 'billing:read',
+  coupons: 'billing:read',
+  licenses: 'billing:read',
+  usage: 'billing:read',
+  portal: 'auth-config:read',
+  'api-keys': 'developer:read',
+  webhooks: 'developer:read',
+  requests: 'activity:read',
+  access: 'auth-config:read',
+  lifecycle: null,
+  email: 'developer:read',
+};
 
 /**
  * Billing children the API gates behind `requireBillingEnabled`. While billing
@@ -56,6 +95,7 @@ const BILLING_GATED_SEGS = [
   'payments',
   'dunning',
   'unapplied-payments',
+  'imports',
   'coupons',
   'licenses',
   'usage',
@@ -80,10 +120,17 @@ interface Group {
 export function AppNav({
   id,
   billingEnabled,
+  scopes = null,
 }: {
   id: string;
   billingEnabled: boolean;
+  /** The caller's effective scopes on this Application; null = unrestricted. */
+  scopes?: string[] | null;
 }): React.JSX.Element {
+  const visible = (seg: string): boolean => {
+    const need = SEG_SCOPE[seg];
+    return need === null || need === undefined || hasScope(scopes, need);
+  };
   const pathname = usePathname() ?? '';
   const base = `/applications/${id}`;
   const suffix = pathname.startsWith(base) ? pathname.slice(base.length) : '';
@@ -144,6 +191,7 @@ export function AppNav({
         { seg: 'payments', label: 'Payments' },
         { seg: 'dunning', label: 'Dunning' },
         { seg: 'unapplied-payments', label: 'Unapplied' },
+        { seg: 'imports', label: 'Imports' },
         { seg: 'coupons', label: 'Coupons' },
         { seg: 'licenses', label: 'Licenses' },
         { seg: 'usage', label: 'Usage' },
@@ -187,8 +235,17 @@ export function AppNav({
     }
   }, [currentSeg]);
 
+  // Sections the caller cannot read are not offered. A group with nothing
+  // left is not offered either. The active-group lookup runs on the full
+  // list so a URL the caller typed still resolves to the right group.
+  const scoped = groups
+    .map((g) => ({ ...g, children: g.children.filter((c) => visible(c.seg)) }))
+    .filter((g) => g.children.length > 0);
   const activeGroup =
-    groups.find((g) => g.children.some((c) => c.seg === currentSeg)) ?? groups[0]!;
+    scoped.find((g) => g.children.some((c) => c.seg === currentSeg)) ??
+    groups.find((g) => g.children.some((c) => c.seg === currentSeg)) ??
+    scoped[0] ??
+    groups[0]!;
   const hidden = new Set<string>(activeGroup.hiddenSegs ?? []);
   // Keep a hidden child visible while you are standing on it, otherwise the row
   // would render without the current page in it.
@@ -209,7 +266,7 @@ export function AppNav({
             hasSubRow ? '' : 'border-b border-[var(--color-border)]'
           }`}
         >
-          {groups.map((g) => {
+          {scoped.map((g) => {
             const isActive = g.key === activeGroup.key;
             // The pill for the active group links to the current path (a
             // deliberate no-op). For any other group it links to `entrySeg`

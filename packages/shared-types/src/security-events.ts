@@ -95,6 +95,9 @@ export const SECURITY_EVENT_LABEL = {
   // CREATES entitlement on somebody's say-so rather than following money the
   // deployment can see, which is exactly why it is in the trail.
   'app.subscription_granted': 'Subscription granted without a payment provider',
+  // A bulk write against somebody else's data. Worth its own entry so the
+  // trail says which run produced a batch of subscriptions.
+  'app.subscriptions_imported': 'Subscriptions imported from a billing provider',
   'app.webhook_endpoint_created': 'Webhook endpoint created',
   'app.webhook_endpoint_updated': 'Webhook endpoint updated',
 
@@ -142,6 +145,20 @@ export const SECURITY_EVENT_LABEL = {
   'end_user.device_released': 'Device released by an operator or the application server',
   'end_user.device_blocked': 'Device blocked',
   'end_user.device_unblocked': 'Device unblocked',
+  'end_user.devices_released_by_operator': 'All devices released by an operator',
+  'end_user.created_by_import': 'End-user created by a subscription import',
+
+  // ── Operator support actions on one end-user ──
+  // An operator acting ON somebody, rather than the person acting for
+  // themselves — hence `end_user.*` with an operator actor and the subject in
+  // `metadata.endUserId`. Two of these put mail in a real person's inbox that
+  // they did not ask for, so both carry an audited reason: at the recipient's
+  // end, support-initiated mail and an attacker who reached the panel look
+  // identical, and the trail is the only thing that tells them apart.
+  'end_user.unlocked_by_operator': 'Sign-in lockout cleared by an operator',
+  'end_user.verification_resent': 'Verification email re-sent by an operator',
+  'end_user.password_reset_sent': 'Password reset email sent by an operator',
+  'end_user.sessions_revoked_by_operator': 'Sessions revoked by an operator',
 
   // ── Workspace / team ──
   'workspace.member_invited': 'Teammate invited',

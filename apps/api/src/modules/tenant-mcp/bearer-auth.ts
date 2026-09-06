@@ -25,6 +25,7 @@
  */
 
 import type { FastifyRequest, FastifyReply } from 'fastify';
+import { intersectScopes, patTokenScopes, resolveMembershipScopes } from '../../lib/operator-scopes.js';
 import type { TenantRole } from '@prisma/client';
 import { RekeyError } from '../../lib/error.js';
 import { prisma } from '../../lib/prisma.js';
@@ -119,6 +120,10 @@ async function resolveByPat(request: FastifyRequest, raw: string): Promise<void>
   request.tenantRole = membership.role as TenantRole;
   request.tenantMembershipId = membership.id;
   request.operatorTokenScopes = token.scopes;
+  request.tenantScopes = intersectScopes(
+    resolveMembershipScopes(membership.scopesRestricted, membership.scopes),
+    patTokenScopes(token.scopes),
+  );
 
   // Best-effort lastUsedAt bump, at most once per token per minute (see
   // lib/last-used-throttle.ts) — never blocks the request. Same "pat:"
@@ -155,4 +160,5 @@ async function resolveByOAuthJwt(request: FastifyRequest, token: string): Promis
   request.tenantRole = membership.role as TenantRole;
   request.tenantMembershipId = membership.id;
   request.operatorMcpClaims = claims;
+  request.tenantScopes = resolveMembershipScopes(membership.scopesRestricted, membership.scopes);
 }

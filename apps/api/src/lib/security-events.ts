@@ -110,14 +110,58 @@ export interface SecurityEventQuery {
 }
 
 /**
+ * The Applications a workspace owns, for scoping a read.
+ *
+ * `SecurityEvent` carries `tenantId` and `applicationId` as bare scalars with
+ * no FK relations, deliberately — the same reason `ApiRequestLog` does, so that
+ * writing an audit row can never contend with or block the request it records.
+ * That rules out a join, so the ids are fetched. One small query per read, on a
+ * table an operator lists a page of at a time.
+ */
+async function tenantApplicationIds(tenantId: string): Promise<string[]> {
+  const rows = await prisma.application.findMany({ where: { tenantId }, select: { id: true } });
+  return rows.map((r) => r.id);
+}
+
+/**
  * The filter `listSecurityEvents` and `countSecurityEvents` share.
  *
  * One builder for both: a `total` computed over a different filter than the
  * rows is a pager that walks off the end of the log.
+ *
+ * ## Why an event is scoped two ways
+ *
+ * This used to be `tenantId: query.tenantId` alone, and a row written without a
+ * `tenantId` was therefore durable, correct, and invisible: in the table, and in
+ * no operator's log. Six emit sites had exactly that shape — the five device
+ * events (`user.device_registered`, `user.device_limit_reached`, both
+ * `*.device_released`, `end_user.device_blocked`, `end_user.device_unblocked`)
+ * and `user.session_handoff_granted` — against 53 that pass it. So the whole
+ * device audit trail was written and surfaced nowhere: blocking someone's device
+ * recorded an event that appeared neither in the workspace Activity log nor on
+ * the end-user it happened to.
+ *
+ * The obvious repair is to derive the tenant when the event is WRITTEN. That was
+ * tried and reverted: it puts a read on the audit-write path, which is precisely
+ * what the scalar-only schema exists to avoid, and it measurably reordered
+ * detached webhook emission in `devices.test.ts` (~53% failure) by contending
+ * for a connection with the `emitDetached` beside it.
+ *
+ * An event that names an Application already identifies its workspace — the
+ * fact was never missing, only unjoined. So the scoping is done here, where a
+ * query costs an operator's page load rather than somebody's sign-in, and it
+ * fixes the rows already written: no backfill.
+ *
+ * `application: { tenantId }` is NOT expressible (no relation), hence the id
+ * list. An empty list yields `in: []`, which matches nothing — correct for a
+ * workspace with no Applications.
  */
-function securityEventWhere(query: SecurityEventQuery) {
+async function securityEventWhere(query: SecurityEventQuery) {
+  const ownedApplicationIds = await tenantApplicationIds(query.tenantId);
   return {
-    tenantId: query.tenantId,
+    // Either the row names this workspace, or it names an Application this
+    // workspace owns. Both are the same claim; only one of them was recorded.
+    OR: [{ tenantId: query.tenantId }, { applicationId: { in: ownedApplicationIds } }],
     ...(query.applicationId !== undefined && { applicationId: query.applicationId }),
     ...(query.type !== undefined && { type: query.type }),
     ...(query.actorType !== undefined && { actorType: query.actorType }),
@@ -132,7 +176,7 @@ function securityEventWhere(query: SecurityEventQuery) {
 
 /** Total events matching the same filters `listSecurityEvents` applies. */
 export async function countSecurityEvents(query: SecurityEventQuery): Promise<number> {
-  return prisma.securityEvent.count({ where: securityEventWhere(query) });
+  return prisma.securityEvent.count({ where: await securityEventWhere(query) });
 }
 
 /** List recent security events for a tenant (newest first, capped at `cap` — default 200). */
@@ -150,7 +194,7 @@ export async function listSecurityEvents(query: SecurityEventQuery): Promise<
   }>
 > {
   const rows = await prisma.securityEvent.findMany({
-    where: securityEventWhere(query),
+    where: await securityEventWhere(query),
     // Stable secondary order by id keeps pagination consistent on ties.
     orderBy: [
       query.sort === 'type'

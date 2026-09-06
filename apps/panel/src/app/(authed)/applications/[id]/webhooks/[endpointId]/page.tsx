@@ -1,5 +1,5 @@
 import * as React from 'react';
-import Link from 'next/link';
+import { RecordHeader } from '@/components/RecordHeader';
 import { redirect } from 'next/navigation';
 import { cookies } from 'next/headers';
 import { api } from '@/lib/api';
@@ -10,7 +10,6 @@ import { SavedBanner } from '@/components/SavedBanner';
 import { formatDateTime } from '@/lib/date';
 import { CopyButton } from '@/components/CopyButton';
 import { CopyLinkButton } from '@/components/CopyLinkButton';
-import { PageHeader } from '@/components/PageHeader';
 import { Card, SectionHeader } from '@/components/Card';
 import { Table, THead, TBody, TR, TH, TD } from '@/components/Table';
 import { Badge, type BadgeTone } from '@/components/Badge';
@@ -265,22 +264,14 @@ export default async function WebhookDetailPage({
   const endpoints = endpointPage.items;
   const deliveries = deliveryPage.items;
 
-  const backLink = (
-    <Link
-      href={`/applications/${id}/webhooks`}
-      className="inline-flex items-center gap-1 rounded text-xs text-[var(--color-muted-fg)] transition-colors hover:text-[var(--color-fg)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[color-mix(in_srgb,var(--color-primary)_50%,transparent)]"
-    >
-      ← Webhooks
-    </Link>
-  );
+  const webhooksCrumb = { label: 'Webhooks', href: `/applications/${id}/webhooks` };
 
   const failedCount = deliveries.filter((d) => d.status === 'FAILED').length;
   const endpoint = endpoints.find((e) => e.id === endpointId);
   if (!endpoint) {
     return (
       <div className="space-y-5">
-        <PageHeader
-        level={2} eyebrow={backLink} title="Endpoint not found" />
+        <RecordHeader crumbs={[webhooksCrumb, { label: 'Not found' }]} title="Endpoint not found" />
         <EmptyState
           variant="inline"
           title="This webhook endpoint no longer exists"
@@ -292,10 +283,9 @@ export default async function WebhookDetailPage({
 
   return (
     <div className="space-y-5">
-      <PageHeader
-        level={2}
-        eyebrow={backLink}
-        title={<span className="break-all font-mono text-lg">{endpoint.url}</span>}
+      <RecordHeader
+        crumbs={[webhooksCrumb, { label: endpoint.url }]}
+        title={<span className="min-w-0 break-all font-mono">{endpoint.url}</span>}
         description={
           endpoint.events.includes('*')
             ? 'Subscribed to all events.'
