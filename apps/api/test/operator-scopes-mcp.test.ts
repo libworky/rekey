@@ -21,6 +21,7 @@ import { TOOL_SCOPES, WORKSPACE_TOOLS } from '../src/modules/tenant-mcp/tenant-m
 import { operatorTools } from '../src/modules/tenant-mcp/operator-tools.js';
 import { operatorWriteTools } from '../src/modules/tenant-mcp/operator-write-tools.js';
 import { isScope } from '../src/lib/operator-scopes.js';
+import { waitForSecurityEvents } from './wait-for-security-events.js';
 import { createHash, randomBytes } from 'node:crypto';
 
 /** A loopback redirect the AS accepts for a native client. */
@@ -53,7 +54,7 @@ describe('operator scopes over MCP', () => {
   const auth = (t: string) => ({ authorization: `Bearer ${t}` });
 
   /** Owner + app + a MEMBER holding APP_ADMIN, plus a PAT minted BY the member. */
-  async function world(): Promise<{ ownerToken: string; membershipId: string; appId: string; pat: string }> {
+  async function world(): Promise<{ ownerToken: string; membershipId: string; appId: string; pat: string; tenantId: string }> {
     currentIp = `10.96.${++n}.1`;
     const tag = `mcp-${n}-${Math.random().toString(36).slice(2, 7)}`;
     const su = await inject({
@@ -145,7 +146,7 @@ describe('operator scopes over MCP', () => {
       payload: { grant_type: 'authorization_code', code, code_verifier: verifier, redirect_uri: REDIRECT, client_id: clientId },
     });
     expect(tok.statusCode).toBe(200);
-    return { ownerToken, membershipId, appId, pat: (tok.json() as { access_token: string }).access_token };
+    return { ownerToken, membershipId, appId, tenantId, pat: (tok.json() as { access_token: string }).access_token };
   }
 
   const setScopes = (w: { ownerToken: string; membershipId: string }, scopes: string[] | null) =>
@@ -208,5 +209,67 @@ describe('operator scopes over MCP', () => {
     const known = new Set(all);
     expect([...Object.keys(TOOL_SCOPES), ...WORKSPACE_TOOLS].filter((n) => !known.has(n))).toEqual([]);
     for (const s of Object.values(TOOL_SCOPES)) expect(isScope(s)).toBe(true);
+    // And the two tables are disjoint: a tool is scoped or a floor, not both.
+    expect(Object.keys(TOOL_SCOPES).filter((n) => WORKSPACE_TOOLS.has(n))).toEqual([]);
+  });
+
+  it('promotion clears scopes: a restricted member made ADMIN holds every tool', async () => {
+    const w = await world();
+    await setScopes(w, ['organizations:read']);
+    expect((await rpc(w.pat, 'tools/list')).result!.tools!.map((t) => t.name)).not.toContain('list_plans');
+
+    const promoted = await inject({
+      method: 'PATCH',
+      url: `/api/v1/tenant/workspace/members/${w.membershipId}`,
+      headers: auth(w.ownerToken),
+      payload: { role: 'ADMIN' },
+    });
+    expect(promoted.statusCode).toBe(200);
+    // The row is cleared, not merely hidden: the roster (which shows stored
+    // scopes) reports none.
+    expect((promoted.json().data as { scopes: string[] | null }).scopes).toBeNull();
+    const roster = await inject({ method: 'GET', url: '/api/v1/tenant/workspace/members', headers: auth(w.ownerToken) });
+    const row = (roster.json().data as { items: Array<{ membershipId: string; scopes: string[] | null }> }).items.find(
+      (m) => m.membershipId === w.membershipId,
+    )!;
+    expect(row.scopes).toBeNull();
+    // Same token, now an admin: the tool it was refused a moment ago is listed and runs.
+    expect((await rpc(w.pat, 'tools/list')).result!.tools!.map((t) => t.name)).toContain('list_plans');
+    const ok = await rpc(w.pat, 'tools/call', { name: 'list_plans', arguments: { applicationId: w.appId } });
+    expect(ok.result!.isError).toBeUndefined();
+
+    // Demoted again: starts unrestricted (the row was cleared), so the admin
+    // restricts afresh rather than inheriting a restriction they cannot see.
+    const demoted = await inject({
+      method: 'PATCH',
+      url: `/api/v1/tenant/workspace/members/${w.membershipId}`,
+      headers: auth(w.ownerToken),
+      payload: { role: 'MEMBER' },
+    });
+    expect(demoted.statusCode).toBe(200);
+    expect((demoted.json().data as { scopes: string[] | null }).scopes).toBeNull();
+    expect((await rpc(w.pat, 'tools/list')).result!.tools!.map((t) => t.name)).toContain('list_plans');
+  });
+
+  it('the tool-call security event records the admitting scope', async () => {
+    const w = await world();
+    await setScopes(w, ['organizations:read']);
+    const ok = await rpc(w.pat, 'tools/call', { name: 'list_organization_roles', arguments: { applicationId: w.appId } });
+    expect(ok.result!.isError).toBeUndefined();
+    const [ev] = await waitForSecurityEvents({ tenantId: w.tenantId, type: 'operator.mcp_tool_called' });
+    expect(ev).toBeDefined();
+    expect(ev!.metadata).toMatchObject({ tool: 'list_organization_roles', scope: 'organizations:read' });
+  });
+
+  it('per-app counts and the end-user subscription are omitted without their domain', async () => {
+    const w = await world();
+    await setScopes(w, ['end-users:read']);
+    const apps = called(await rpc(w.pat, 'tools/call', { name: 'list_applications', arguments: {} })) as unknown as {
+      applications: Array<Record<string, unknown>>;
+    };
+    const row = apps.applications.find((a) => a.id === w.appId)!;
+    expect(row).toHaveProperty('endUserCount');
+    expect(row).not.toHaveProperty('activeSubscriptions');
+    expect(row).not.toHaveProperty('apiRequestsLast24h');
   });
 });

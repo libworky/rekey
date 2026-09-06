@@ -48,7 +48,14 @@ import { RekeyError } from '../../lib/error.js';
 import { requestContext } from '../../lib/security-events.js';
 import { resolveOperatorMcpBearer } from './bearer-auth.js';
 import { scopeHasWrite, scopeHasAdmin } from './oauth.service.js';
-import { UNRESTRICTED, intersectScopes, mcpTokenScopes } from '../../lib/operator-scopes.js';
+import { intersectScopes, mcpTokenScopes, type Scope } from '../../lib/operator-scopes.js';
+
+/**
+ * Every auth path sets `req.tenantScopes`; a fourth one that forgot would
+ * land here. Fail closed, the same way `req.tenantRole ?? 'MEMBER'` does
+ * below: a MEMBER with no scopes, not an unrestricted caller.
+ */
+const NO_SCOPES: ReadonlySet<Scope> = new Set();
 import { handleOperatorMcpMessage, type JsonRpcMessage } from './tenant-mcp-server.js';
 import { errs, type JsonSchema } from '../../lib/openapi.js';
 
@@ -192,8 +199,8 @@ export async function tenantMcpRoutes(app: FastifyInstance): Promise<void> {
           // intersected in bearer-auth; the OAuth path's authority is its
           // write flag, applied here where that flag is computed.
           scopes: req.operatorMcpClaims
-            ? intersectScopes(req.tenantScopes ?? UNRESTRICTED, mcpTokenScopes(canWrite))
-            : (req.tenantScopes ?? UNRESTRICTED),
+            ? intersectScopes(req.tenantScopes ?? NO_SCOPES, mcpTokenScopes(canWrite))
+            : (req.tenantScopes ?? NO_SCOPES),
           ip,
           userAgent,
         },

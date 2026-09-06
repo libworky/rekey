@@ -200,7 +200,7 @@ export async function resolveGrantSet(ctx: AccessContext): Promise<GrantSet> {
   };
 }
 
-function isWorkspaceAdmin(role: TenantRole): boolean {
+export function isWorkspaceAdmin(role: TenantRole): boolean {
   return role === 'OWNER' || role === 'ADMIN';
 }
 

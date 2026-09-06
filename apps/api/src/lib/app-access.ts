@@ -91,9 +91,12 @@ export async function ensureAppAccess(
     need,
     declared,
   );
-  // For the request log: the scope that admitted this, if one did.
+  // For the request log: the scope that admitted this, if a gate ran. An
+  // OWNER/ADMIN is never gated, so recording the route's scope for them
+  // would claim an authority check that did not happen.
   req.accessDecision = {
-    scope: declared !== undefined && 'scope' in declared ? declared.scope : null,
+    scope:
+      access.level !== 'workspace-admin' && declared !== undefined && 'scope' in declared ? declared.scope : null,
     level: access.level,
   };
   return access;

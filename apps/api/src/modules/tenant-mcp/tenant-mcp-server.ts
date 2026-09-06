@@ -8,9 +8,9 @@
  */
 
 import type { TenantRole } from '@prisma/client';
-import { UNRESTRICTED, type Scope } from '../../lib/operator-scopes.js';
+import { type Scope } from '../../lib/operator-scopes.js';
 import { recordSecurityEvent } from '../../lib/security-events.js';
-import { operatorTools, type OperatorTool, type OperatorToolContext } from './operator-tools.js';
+import { effectiveToolScopes, operatorTools, type OperatorTool, type OperatorToolContext } from './operator-tools.js';
 import { operatorWriteTools } from './operator-write-tools.js';
 
 const PROTOCOL_VERSION = '2025-06-18';
@@ -103,12 +103,10 @@ function roleAllows(role: TenantRole, minRole: TenantRole): boolean {
  */
 function toolAllowed(ctx: OperatorToolContext, tool: OperatorTool): boolean {
   // The scope gate, first: a tool the caller's membership does not admit is
-  // neither listed nor callable, whatever the token or role say. OWNER and
-  // ADMIN hold every scope, so this only ever bites a restricted member.
-  // A context built without scopes (the direct-dispatch tests do this) is
-  // unrestricted — the same rule the request adapter applies, so a fourth
-  // auth path that forgot to set it would get today's behaviour, not a wall.
-  const held = ctx.scopes ?? UNRESTRICTED;
+  // neither listed nor callable, whatever the token says. Role is the
+  // ceiling: OWNER/ADMIN pass this unconditionally (see effectiveToolScopes),
+  // so it only ever bites a restricted MEMBER.
+  const held = effectiveToolScopes(ctx);
   const need = TOOL_SCOPES[tool.name];
   if (need !== undefined && !held.has(need)) return false;
   // Admin tools (destructive/financial/secret) need admin scope + role.
@@ -190,7 +188,7 @@ export async function handleOperatorMcpMessage(
         } else if (tool.write && !ctx.canWrite) {
           reason =
             'This tool requires write access. Re-authorize the connector with the "mcp:operator:write" scope (or use a PAT with the "applications:write" scope).';
-        } else if (TOOL_SCOPES[tool.name] !== undefined && !(ctx.scopes ?? UNRESTRICTED).has(TOOL_SCOPES[tool.name]!)) {
+        } else if (TOOL_SCOPES[tool.name] !== undefined && !effectiveToolScopes(ctx).has(TOOL_SCOPES[tool.name]!)) {
           reason = `This tool requires the '${TOOL_SCOPES[tool.name]}' scope, which your membership does not hold. Ask a workspace owner or admin to extend your scopes.`;
         } else {
           reason = `This tool requires at least the ${tool.minRole ?? 'ADMIN'} role in this workspace.`;
@@ -220,6 +218,11 @@ export async function handleOperatorMcpMessage(
           tool: tool.name,
           write: tool.write === true,
           admin: tool.admin === true,
+          // The scope that admitted the call (null for a workspace-floor
+          // tool). Durable, unlike the request log: a membership's scopes
+          // change, and the audit trail must still say what authority a
+          // past call ran under.
+          scope: TOOL_SCOPES[tool.name] ?? null,
           argKeys: Object.keys(args).sort(),
         },
       });

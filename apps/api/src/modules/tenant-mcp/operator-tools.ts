@@ -46,6 +46,28 @@
 
 import type { TenantRole } from '@prisma/client';
 import { UNRESTRICTED, type Scope } from '../../lib/operator-scopes.js';
+import { isWorkspaceAdmin } from '../../lib/access-context.js';
+
+/**
+ * The scopes a tool call runs under. OWNER and ADMIN hold every scope
+ * whatever the membership row says — the REST gate short-circuits on role
+ * before it reads scopes, and this is the MCP twin of that rule. A member
+ * promoted while restricted has the row cleared on promotion, but the gate
+ * must not depend on that: role is the ceiling, scopes narrow a MEMBER only.
+ *
+ * A context built without scopes (the direct-dispatch tests do this) is
+ * unrestricted here; the route adapter never omits them.
+ *
+ * MCP checks the membership ceiling only. REST intersects that with the
+ * grant preset per application; a tool that fans out over every grant
+ * cannot, so a MEMBER holding APP_VIEWER on one app and APP_ADMIN on
+ * another sees the union, bounded by the membership. Narrowing is a
+ * per-tool concern where a tool takes an applicationId.
+ */
+export function effectiveToolScopes(ctx: Pick<OperatorToolContext, 'role' | 'scopes'>): ReadonlySet<Scope> {
+  if (isWorkspaceAdmin(ctx.role)) return UNRESTRICTED;
+  return ctx.scopes ?? UNRESTRICTED;
+}
 import { prisma } from '../../lib/prisma.js';
 import {
   accessContextFromTool,
@@ -155,7 +177,7 @@ export const operatorTools: OperatorTool[] = [
     description:
       "Top-level rollup for the Applications the authenticated operator can " +
       'read in their active workspace: application count, end-user count, ' +
-      'organization count, active subscriptions and MRR (in minor currency ' +
+      'organization count, active subscriptions and, with billing:read, MRR (in minor currency ' +
       'units, e.g. cents).',
     inputSchema: NO_ARGS,
     handler: async (ctx) => {
@@ -166,6 +188,7 @@ export const operatorTools: OperatorTool[] = [
         where: { id: { in: appIds } },
         select: { id: true, slug: true, name: true },
       });
+      const held = effectiveToolScopes(ctx);
       if (appIds.length === 0) {
         return {
           tenantId: ctx.tenantId,
@@ -173,8 +196,8 @@ export const operatorTools: OperatorTool[] = [
           endUserCount: 0,
           organizationCount: 0,
           activeSubscriptions: 0,
-          mrrMinor: 0,
-          currencies: [],
+          // Same projection as the populated path: zero is still an amount.
+          ...(held.has('billing:read') ? { mrrMinor: 0, currencies: [] } : {}),
         };
       }
       const [endUserCount, orgCount, activeSubsRows] = await Promise.all([
@@ -206,7 +229,7 @@ export const operatorTools: OperatorTool[] = [
         activeSubscriptions: activeSubsRows.length,
         // Counts are the overview; MRR is money. `overview:read` gets the
         // tool, `billing:read` gets the amounts — omitted, never zeroed.
-        ...((ctx.scopes ?? UNRESTRICTED).has('billing:read')
+        ...(held.has('billing:read')
           ? {
               mrrMinor,
               currencies: [...mrrByCurrency.entries()].map(([currency, mrr]) => ({ currency, mrrMinor: mrr })),
@@ -230,22 +253,30 @@ export const operatorTools: OperatorTool[] = [
         orderBy: { createdAt: 'asc' },
         select: { id: true, slug: true, name: true, createdAt: true },
       });
+      // A workspace floor lists the applications; each count is a domain's
+      // data and is omitted (never zeroed) without that domain's read scope.
+      const held = effectiveToolScopes(ctx);
+      const wantUsers = held.has('end-users:read');
+      const wantSubs = held.has('billing:read');
+      const wantRequests = held.has('activity:read');
       const enriched = await Promise.all(
         apps.map(async (a) => {
           const [endUserCount, activeSubs, requests24h] = await Promise.all([
-            prisma.endUser.count({ where: { applicationId: a.id } }),
-            prisma.subscription.count({ where: { applicationId: a.id, status: 'ACTIVE' } }),
-            prisma.apiRequestLog.count({
-              where: { applicationId: a.id, createdAt: { gte: since24h } },
-            }),
+            wantUsers ? prisma.endUser.count({ where: { applicationId: a.id } }) : null,
+            wantSubs ? prisma.subscription.count({ where: { applicationId: a.id, status: 'ACTIVE' } }) : null,
+            wantRequests
+              ? prisma.apiRequestLog.count({
+                  where: { applicationId: a.id, createdAt: { gte: since24h } },
+                })
+              : null,
           ]);
           return {
             id: a.id,
             slug: a.slug,
             name: a.name,
-            endUserCount,
-            activeSubscriptions: activeSubs,
-            apiRequestsLast24h: requests24h,
+            ...(endUserCount !== null ? { endUserCount } : {}),
+            ...(activeSubs !== null ? { activeSubscriptions: activeSubs } : {}),
+            ...(requests24h !== null ? { apiRequestsLast24h: requests24h } : {}),
             createdAt: a.createdAt.toISOString(),
           };
         }),
@@ -637,15 +668,21 @@ export const operatorTools: OperatorTool[] = [
           });
       if (!user) return { found: false };
 
-      const subscription = await prisma.subscription.findFirst({
-        where: {
-          applicationId: app.id,
-          endUserId: user.id,
-          status: { in: ['ACTIVE', 'TRIALING', 'PAST_DUE'] },
-        },
-        orderBy: { createdAt: 'desc' },
-        include: { plan: { select: { slug: true, name: true } } },
-      });
+      // The subscription is billing data; end-users:read gets the person,
+      // billing:read gets what they pay for. Omitted, not nulled, so a
+      // caller can tell "no subscription" from "not allowed to see".
+      const wantSubscription = effectiveToolScopes(ctx).has('billing:read');
+      const subscription = wantSubscription
+        ? await prisma.subscription.findFirst({
+            where: {
+              applicationId: app.id,
+              endUserId: user.id,
+              status: { in: ['ACTIVE', 'TRIALING', 'PAST_DUE'] },
+            },
+            orderBy: { createdAt: 'desc' },
+            include: { plan: { select: { slug: true, name: true } } },
+          })
+        : undefined;
 
       return {
         found: true,
@@ -657,14 +694,18 @@ export const operatorTools: OperatorTool[] = [
           environment: app.environment,
           createdAt: user.createdAt.toISOString(),
         },
-        currentSubscription: subscription
+        ...(wantSubscription
           ? {
-              id: subscription.id,
-              status: subscription.status,
-              planSlug: subscription.plan?.slug ?? null,
-              planName: subscription.plan?.name ?? null,
+              currentSubscription: subscription
+                ? {
+                    id: subscription.id,
+                    status: subscription.status,
+                    planSlug: subscription.plan?.slug ?? null,
+                    planName: subscription.plan?.name ?? null,
+                  }
+                : null,
             }
-          : null,
+          : {}),
       };
     },
   },
