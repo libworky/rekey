@@ -203,3 +203,21 @@ export function patTokenScopes(tokenScopes: readonly string[]): ReadonlySet<Scop
   }
   return out;
 }
+
+/**
+ * An OAuth MCP token's authority in this vocabulary. `mcp:operator:write`
+ * maps to every write; without it the token reads only. Admin tools stay
+ * role-and-`canAdmin`-gated — they are floors, not scopes.
+ */
+export function mcpTokenScopes(canWrite: boolean): ReadonlySet<Scope> {
+  return canWrite ? UNRESTRICTED : new Set(SCOPE_DOMAINS.map((d) => `${d}:read` as Scope));
+}
+
+/**
+ * The default when a request reaches a scope consumer without
+ * `req.tenantScopes` set. Every auth path sets it and the scope tests
+ * exercise all of them, so a fourth path that forgot would fail those tests
+ * rather than fail open in production: a MEMBER with no scopes, not an
+ * unrestricted caller. The same default REST and the operator MCP route use.
+ */
+export const NO_SCOPES: ReadonlySet<Scope> = new Set();

@@ -16,6 +16,7 @@ interface WorkspaceDto {
   id: string;
   name: string;
   createdAt: string;
+  operatorMcpEnabled: boolean;
 }
 
 async function renameWorkspace(formData: FormData): Promise<void> {
@@ -62,6 +63,21 @@ function supportEmail(): string | null {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(raw) ? raw : null;
 }
 
+// The per-workspace switch for the operator MCP server. Same PATCH as the
+// rename, its own field; `card=mcp` tells the page which card owns the
+// error banner, since both forms redirect back here.
+async function setOperatorMcp(formData: FormData): Promise<void> {
+  'use server';
+  const enabled = formData.get('operatorMcpEnabled') === 'on';
+  try {
+    await api({ method: 'PATCH', path: '/api/v1/tenant/workspace', body: { operatorMcpEnabled: enabled } });
+  } catch (err) {
+    if (err instanceof PanelApiError) redirect(`/workspace?${await errorQuery(err)}&card=mcp`);
+    throw err;
+  }
+  redirect('/workspace?saved=mcp');
+}
+
 // Workspace deletion isn't a self-serve API call — there is no DELETE on
 // /api/v1/tenant/workspace, by design. This action is the type-to-confirm
 // gate: it records no state, it just routes a deliberate owner to the
@@ -75,6 +91,9 @@ const ERR: Record<string, string> = {
   missing: 'Name is required.',
   WORKSPACE_NAME_INVALID: 'Workspace name must be 2–80 characters.',
   TENANT_ROLE_INSUFFICIENT: 'Only owners and admins can rename a workspace.',
+};
+const ERR_MCP: Record<string, string> = {
+  TENANT_ROLE_INSUFFICIENT: 'Only owners and admins can switch operator MCP.',
 };
 
 export default async function WorkspaceSettingsPage({
@@ -90,6 +109,9 @@ export default async function WorkspaceSettingsPage({
   // panel's own error banner.
   const { detail: errorDetail, fix: errorFix } = await readErrorFlash(error);
   const renamed = typeof sp.renamed === 'string';
+  const savedMcp = sp.saved === 'mcp';
+  // Which card the error belongs to; both forms on this page redirect here.
+  const errorCard = sp.card === 'mcp' ? 'mcp' : 'general';
   const deletionRequested = typeof sp.deletionRequested === 'string';
 
   const [workspace, me] = await Promise.all([
@@ -127,6 +149,44 @@ export default async function WorkspaceSettingsPage({
       />
 
       {renamed && <SavedBanner params={['renamed']} message="Workspace renamed." />}
+      {savedMcp && <SavedBanner message="Operator MCP setting saved." />}
+
+      {/* Operator MCP — the per-workspace switch */}
+      <Card className="space-y-3">
+        <div>
+          <h2 className="text-sm font-semibold text-[var(--color-fg)]">Operator MCP</h2>
+          <p className="max-w-2xl text-xs text-[var(--color-muted-fg)]">
+            Whether AI agents may act in this workspace through the operator MCP server. Off refuses
+            every connected agent on its next request and grants no new consent. Nothing is revoked:
+            an agent keeps its connection and turning this back on restores it as it was. The
+            end-user MCP server is a separate switch on each application.
+          </p>
+        </div>
+        {error && errorCard === 'mcp' && (
+          <Banner tone="error">
+            <ApiErrorText code={error} detail={errorDetail} fix={errorFix} map={ERR_MCP} fallback="Something went wrong. Please try again." />
+          </Banner>
+        )}
+        <form action={setOperatorMcp} className="flex flex-wrap items-center gap-3">
+          <label className="flex items-center gap-2 text-sm">
+            <input
+              type="checkbox"
+              name="operatorMcpEnabled"
+              defaultChecked={workspace.operatorMcpEnabled}
+              disabled={!canEdit}
+            />
+            Allow operator MCP in this workspace
+          </label>
+          {canEdit && (
+            <SubmitButton
+              pendingLabel="Saving…"
+              className="rounded-md border border-[var(--color-border)] px-3 py-1.5 text-sm text-[var(--color-fg)] hover:bg-[var(--color-surface-muted)]"
+            >
+              Save
+            </SubmitButton>
+          )}
+        </form>
+      </Card>
 
       {/* General — rename */}
       <Card className="space-y-4">
@@ -137,7 +197,7 @@ export default async function WorkspaceSettingsPage({
           </p>
         </div>
         <form action={renameWorkspace} className="space-y-4">
-          {error && (
+          {error && errorCard === 'general' && (
             <Banner tone="error">
               <ApiErrorText code={error} detail={errorDetail} fix={errorFix} map={ERR} fallback="Something went wrong. Please try again." />
             </Banner>

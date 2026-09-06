@@ -18,7 +18,10 @@
  * Security:
  *   - One Bearer at a time (no chained credentials).
  *   - Generic 401 on any failure — unknown / revoked / expired tokens are
- *     indistinguishable to a caller.
+ *     indistinguishable to a caller. One deliberate exception: a valid
+ *     credential whose workspace has switched operator MCP off answers 403
+ *     OPERATOR_MCP_DISABLED with a fix (see workspace-mcp-switch.ts). The
+ *     check runs after membership, so non-members still get the 401.
  *   - Membership re-check on every request stops a token minted while the
  *     operator was a workspace member from working after their role was
  *     revoked or they were removed.
@@ -36,6 +39,7 @@ import {
   type OperatorMcpAccessClaims,
 } from '../../lib/operator-mcp-jwt.js';
 import { operatorMcpIssuer } from './oauth.service.js';
+import { operatorMcpDisabled } from './workspace-mcp-switch.js';
 
 declare module 'fastify' {
   interface FastifyRequest {
@@ -110,8 +114,10 @@ async function resolveByPat(request: FastifyRequest, raw: string): Promise<void>
     where: {
       tenantUserId_tenantId: { tenantUserId: token.tenantUserId, tenantId: token.tenantId },
     },
+    include: { tenant: { select: { operatorMcpEnabled: true } } },
   });
   if (!membership) throw unauthorized();
+  if (!membership.tenant.operatorMcpEnabled) throw operatorMcpDisabled();
 
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
   const { passwordHash, ...publicUser } = user;
@@ -147,8 +153,10 @@ async function resolveByOAuthJwt(request: FastifyRequest, token: string): Promis
     where: {
       tenantUserId_tenantId: { tenantUserId: claims.sub, tenantId: claims.tid },
     },
+    include: { tenant: { select: { operatorMcpEnabled: true } } },
   });
   if (!membership) throw unauthorized();
+  if (!membership.tenant.operatorMcpEnabled) throw operatorMcpDisabled();
 
   const user = await prisma.tenantUser.findUnique({ where: { id: claims.sub } });
   if (!user) throw unauthorized();

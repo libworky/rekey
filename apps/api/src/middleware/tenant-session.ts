@@ -40,6 +40,12 @@ declare module 'fastify' {
      * and for every member nobody has restricted.
      */
     tenantScopes?: ReadonlySet<Scope>;
+    /**
+     * What the access decision on this request resolved to, for the request
+     * log. `scope` is the declaration that admitted it (null for open,
+     * floor and project routes); `level` is how access was satisfied.
+     */
+    accessDecision?: { scope: Scope | null; level: string };
   }
 }
 

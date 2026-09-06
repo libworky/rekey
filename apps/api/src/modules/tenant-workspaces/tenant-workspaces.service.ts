@@ -189,7 +189,9 @@ export const tenantWorkspacesService = {
       role: r.role,
       joinedAt: r.createdAt,
       legacyWorkspaceRead: r.legacyWorkspaceRead,
-      scopes: r.scopesRestricted ? r.scopes : null,
+      // Scopes narrow a MEMBER only; mirror /me so a row promoted before
+      // promotion cleared scopes does not show a restriction nothing enforces.
+      scopes: r.role === 'MEMBER' && r.scopesRestricted ? r.scopes : null,
       grants: r.applicationGrants.map((g) => ({
         applicationId: g.application.id,
         applicationName: g.application.name,
@@ -723,9 +725,16 @@ export const tenantWorkspacesService = {
       }
     }
 
+    // Scopes narrow a MEMBER only. Leaving them on a promoted row would be
+    // a stale restriction nothing reads today and something might tomorrow,
+    // and the editor refuses non-members, so it could not be cleared. A
+    // later demotion starts unrestricted; the admin restricts again.
     const updated = await prisma.tenantMembership.update({
       where: { id: target.id },
-      data: { role: args.newRole },
+      data:
+        args.newRole === 'MEMBER'
+          ? { role: args.newRole }
+          : { role: args.newRole, scopesRestricted: false, scopes: [] },
       include: {
         tenantUser: { select: { email: true, name: true } },
         applicationGrants: {
@@ -829,10 +838,43 @@ export const tenantWorkspacesService = {
     };
   },
 
-  async getWorkspace(tenantId: string): Promise<{ id: string; name: string; createdAt: Date }> {
+  /**
+   * Name and the operator-MCP switch, both OWNER/ADMIN. `renameWorkspace` is
+   * kept for its callers; this is the route's entry point.
+   */
+  async updateWorkspace(args: {
+    tenantId: string;
+    name?: string;
+    operatorMcpEnabled?: boolean;
+  }): Promise<{ id: string; name: string; operatorMcpEnabled: boolean }> {
+    let name: string | undefined;
+    if (args.name !== undefined) {
+      name = args.name.trim();
+      if (name.length < 2 || name.length > 80) {
+        throw new RekeyError({
+          statusCode: 400,
+          code: 'WORKSPACE_NAME_INVALID',
+          message: 'Workspace name must be 2–80 characters.',
+          fix: 'Pick a shorter or longer name.',
+        });
+      }
+    }
+    return prisma.tenant.update({
+      where: { id: args.tenantId },
+      data: {
+        ...(name !== undefined && { name }),
+        ...(args.operatorMcpEnabled !== undefined && { operatorMcpEnabled: args.operatorMcpEnabled }),
+      },
+      select: { id: true, name: true, operatorMcpEnabled: true },
+    });
+  },
+
+  async getWorkspace(
+    tenantId: string,
+  ): Promise<{ id: string; name: string; createdAt: Date; operatorMcpEnabled: boolean }> {
     const t = await prisma.tenant.findUnique({
       where: { id: tenantId },
-      select: { id: true, name: true, createdAt: true },
+      select: { id: true, name: true, createdAt: true, operatorMcpEnabled: true },
     });
     if (!t) {
       throw new RekeyError({

@@ -8,8 +8,10 @@
  */
 
 import type { TenantRole } from '@prisma/client';
+import { type Scope } from '../../lib/operator-scopes.js';
+import { isWorkspaceAdmin } from '../../lib/access-context.js';
 import { recordSecurityEvent } from '../../lib/security-events.js';
-import { operatorTools, type OperatorTool, type OperatorToolContext } from './operator-tools.js';
+import { effectiveToolScopes, operatorTools, type OperatorTool, type OperatorToolContext } from './operator-tools.js';
 import { operatorWriteTools } from './operator-write-tools.js';
 
 const PROTOCOL_VERSION = '2025-06-18';
@@ -17,6 +19,61 @@ const SERVER_INFO = { name: 'rekey-operator', version: '1.0.0' };
 
 /** All operator tools — read tools first, then the phase-1 write tools. */
 const allTools: OperatorTool[] = [...operatorTools, ...operatorWriteTools];
+
+/**
+ * Which scope each application-scoped tool needs. The REST twin of every tool
+ * declares this on its route (`config.access`); tools declare it here, in one
+ * table, and `route-access-completeness`'s MCP sibling asserts every tool
+ * appears either here or in `WORKSPACE_TOOLS` — so a new tool cannot ship
+ * ungoverned. Workspace-level tools are floors (role-gated) and take no scope.
+ */
+export const TOOL_SCOPES: Readonly<Record<string, Scope>> = {
+  get_workspace_overview: 'overview:read',
+  application_health: 'overview:read',
+  recent_payments: 'billing:read',
+  recent_subscriptions: 'billing:read',
+  cancel_subscription: 'billing:write',
+  configure_billing_provider: 'billing:write',
+  list_plans: 'billing:read',
+  create_plan: 'billing:write',
+  update_plan: 'billing:write',
+  set_plan_active: 'billing:write',
+  register_plan_with_provider: 'billing:write',
+  list_plan_entitlements: 'billing:read',
+  put_plan_entitlement: 'billing:write',
+  list_usage_meters: 'billing:read',
+  create_usage_meter: 'billing:write',
+  recent_security_events: 'activity:read',
+  recent_webhook_events: 'developer:read',
+  recent_failed_webhook_deliveries: 'developer:read',
+  create_webhook_endpoint: 'developer:write',
+  update_webhook_endpoint: 'developer:write',
+  list_api_keys: 'developer:read',
+  revoke_api_key: 'developer:write',
+  mint_api_key: 'developer:write',
+  get_end_user: 'end-users:read',
+  list_devices: 'end-users:read',
+  release_device: 'end-users:write',
+  block_device: 'end-users:write',
+  unblock_device: 'end-users:write',
+  list_organization_roles: 'organizations:read',
+  create_organization_role: 'organizations:write',
+  update_organization_role: 'organizations:write',
+  delete_organization_role: 'organizations:write',
+  update_auth_config: 'auth-config:write',
+};
+
+/** Tools that are workspace-level floors: role-gated, scoped by nothing. */
+export const WORKSPACE_TOOLS: ReadonlySet<string> = new Set([
+  'list_applications',
+  'list_members',
+  'list_invitations',
+  'invite_member',
+  'revoke_invitation',
+  'change_member_role',
+  'remove_member',
+  'create_application',
+]);
 
 /** OWNER > ADMIN > MEMBER. A higher rank clears a lower `minRole` threshold. */
 const ROLE_RANK: Record<TenantRole, number> = { OWNER: 3, ADMIN: 2, MEMBER: 1 } as Record<
@@ -46,6 +103,13 @@ function roleAllows(role: TenantRole, minRole: TenantRole): boolean {
  * `accessibleApplicationIds` in operator-tools.ts.
  */
 function toolAllowed(ctx: OperatorToolContext, tool: OperatorTool): boolean {
+  // The scope gate, first: a tool the caller's membership does not admit is
+  // neither listed nor callable, whatever the token says. Role is the
+  // ceiling: OWNER/ADMIN pass this unconditionally (see effectiveToolScopes),
+  // so it only ever bites a restricted MEMBER.
+  const held = effectiveToolScopes(ctx);
+  const need = TOOL_SCOPES[tool.name];
+  if (need !== undefined && !held.has(need)) return false;
   // Admin tools (destructive/financial/secret) need admin scope + role.
   if (tool.admin) return ctx.canAdmin && roleAllows(ctx.role, tool.minRole ?? 'ADMIN');
   // Write tools need write scope + role.
@@ -125,6 +189,8 @@ export async function handleOperatorMcpMessage(
         } else if (tool.write && !ctx.canWrite) {
           reason =
             'This tool requires write access. Re-authorize the connector with the "mcp:operator:write" scope (or use a PAT with the "applications:write" scope).';
+        } else if (TOOL_SCOPES[tool.name] !== undefined && !effectiveToolScopes(ctx).has(TOOL_SCOPES[tool.name]!)) {
+          reason = `This tool requires the '${TOOL_SCOPES[tool.name]}' scope, which your membership does not hold. Ask a workspace owner or admin to extend your scopes.`;
         } else {
           reason = `This tool requires at least the ${tool.minRole ?? 'ADMIN'} role in this workspace.`;
         }
@@ -135,9 +201,10 @@ export async function handleOperatorMcpMessage(
       }
       const args =
         (msg.params?.arguments as Record<string, unknown> | undefined) ?? {};
-      // Log the call before running it, and log it whether it succeeds or not.
-      // A refused or failed call is exactly what an operator reviewing an
-      // agent's behaviour wants to see.
+      // Log the call before running it, whether or not the handler then
+      // succeeds: a failed call is exactly what an operator reviewing an
+      // agent's behaviour wants to see. A call refused above is not logged;
+      // nothing ran, and the refusal is returned to the client.
       //
       // Arguments are recorded by KEY only. They routinely carry credentials —
       // configure_billing_provider takes a provider secret — and an audit trail
@@ -153,6 +220,12 @@ export async function handleOperatorMcpMessage(
           tool: tool.name,
           write: tool.write === true,
           admin: tool.admin === true,
+          // The scope that admitted the call: null for a workspace-floor
+          // tool, and null for OWNER/ADMIN, whom no scope gate checked (the
+          // same rule the request log applies). Durable, unlike the request
+          // log: a membership's scopes change, and the audit trail must
+          // still say what authority a past call ran under.
+          scope: isWorkspaceAdmin(ctx.role) ? null : (TOOL_SCOPES[tool.name] ?? null),
           argKeys: Object.keys(args).sort(),
         },
       });
