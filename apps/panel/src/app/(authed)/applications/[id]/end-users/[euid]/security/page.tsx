@@ -23,7 +23,7 @@ import { CopyButton } from '@/components/CopyButton';
 import { SubmitButton } from '@/components/SubmitButton';
 import Link from 'next/link';
 import { ConfirmButton } from '@/components/ConfirmButton';
-import { impersonate, revokeAllSessions, revokeSession, unlockAccount } from '../actions';
+import { endImpersonations, impersonate, revokeAllSessions, revokeSession, unlockAccount } from '../actions';
 import { SupportFeedback } from '../support-feedback';
 import {
   getEndUserDetail,
@@ -428,6 +428,19 @@ export default async function EndUserSecurityPage({
         <SectionHeader
           title="Recent impersonations"
           count={`(${detail.recentImpersonations.length})`}
+          action={
+            detail.recentImpersonations.some((r) => r.endedAt === null) ? (
+              <form action={endImpersonations.bind(null, id, euid)}>
+                <ConfirmButton
+                  title="End every live impersonation?"
+                  confirm="Every open impersonation of this end-user ends now, whoever minted it, and the tokens they issued stop working immediately. The audit rows stay."
+                  confirmLabel="End impersonations"
+                >
+                  End live impersonations
+                </ConfirmButton>
+              </form>
+            ) : undefined
+          }
         />
         {detail.recentImpersonations.length === 0 ? (
           <EmptyState variant="inline" title="No operator has impersonated this user" />

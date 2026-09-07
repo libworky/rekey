@@ -616,6 +616,8 @@ export interface ApiRequestLogRow {
   tenantId: string | null;
   operatorUserId: string | null;
   ip: string | null;
+  /** The membership scope that admitted the request, when a scope gate ran. Null otherwise. */
+  admittedScope?: string | null;
   createdAt: string;
 }
 

@@ -141,8 +141,11 @@ describe('devices service', () => {
     // Exactly one row for the fingerprint, whatever happened to it.
     expect(await prisma.device.count({ where: { endUserId: userId } })).toBe(1);
 
-    // registered → (refresh: nothing) → released → registered(reactivated)
-    expect(await emitted(3)).toEqual(['device.registered', 'device.released', 'device.registered']);
+    // registered → (refresh: nothing) → released → registered(reactivated).
+    // Compared as a multiset: each emit is detached, so the three rows race
+    // to createdAt and their order is not a contract. Ordering them was a
+    // ~8% flake that became deterministic on a loaded machine.
+    expect((await emitted(3)).sort()).toEqual(['device.registered', 'device.registered', 'device.released']);
   });
 
   it('is uncapped when no plan grants max_devices', async () => {

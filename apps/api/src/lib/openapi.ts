@@ -669,6 +669,15 @@ const HAND_WRITTEN_COMPONENTS: Record<string, JsonSchema> = {
         description: 'Set for operator/panel traffic. Null for API-key and anonymous requests.',
       },
       ip: { type: 'string', nullable: true },
+      admittedScope: {
+        type: 'string',
+        nullable: true,
+        description:
+          'The membership scope that admitted this request, when a scope gate ran (a restricted ' +
+          'MEMBER on a scoped route). Null for OWNER/ADMIN, role-floor routes, open routes and ' +
+          'API-key traffic. The durable record of authority is the security event; this is the ' +
+          'per-request companion.',
+      },
       createdAt: { type: 'string', format: 'date-time' },
     },
     required: ['id', 'method', 'routePath', 'statusCode', 'durationMs', 'createdAt'],

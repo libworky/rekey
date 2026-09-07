@@ -69,8 +69,9 @@ export function SupportFeedback({
 }): React.JSX.Element | null {
   const result = done ? SUPPORT_DONE[done] : undefined;
   const signedOut = done?.startsWith('signed-out:') ? Number(done.split(':')[1]) : null;
+  const impEnded = done?.startsWith('impersonations-ended:') ? Number(done.split(':')[1]) : null;
 
-  if (!result && signedOut === null && error === undefined) return null;
+  if (!result && signedOut === null && impEnded === null && error === undefined) return null;
 
   return (
     <>
@@ -82,6 +83,13 @@ export function SupportFeedback({
             : `Signed out of ${signedOut} session${
                 signedOut === 1 ? '' : 's'
               }. Access tokens already issued stay valid until they expire.`}
+        </Banner>
+      )}
+      {impEnded !== null && !Number.isNaN(impEnded) && (
+        <Banner tone={impEnded === 0 ? 'info' : 'success'}>
+          {impEnded === 0
+            ? 'No impersonation was live — nothing to end.'
+            : `Ended ${impEnded} live impersonation${impEnded === 1 ? '' : 's'}. The tokens they issued are invalid now.`}
         </Banner>
       )}
       {error !== undefined && <Banner tone="error">{SUPPORT_ERR[error] ?? error}</Banner>}

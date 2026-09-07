@@ -380,6 +380,13 @@ describe('operator scopes', () => {
     // scopes it does not — the set changes — so the log keeps the authority
     // the write ran under, and it survives the membership being edited later.
     expect(row?.admittedScope).toBe('end-users:write');
+    // And it reaches a client: the read schema declares the column, so the
+    // serializer keeps it. It was dropped, unnoticed, until the panel tried
+    // to render it.
+    const mine = await inject({ method: 'GET', url: '/api/v1/tenant/auth/requests?limit=50', headers: auth(w.memberToken) });
+    expect(mine.statusCode).toBe(200);
+    const items = (mine.json().data as { items: Array<{ id: string; admittedScope?: string | null }> }).items;
+    expect(items.find((r) => r.id === row!.id)?.admittedScope).toBe('end-users:write');
     await setScopes(w, null);
     const again = await prisma.apiRequestLog.findUnique({ where: { id: row!.id } });
     expect(again?.admittedScope).toBe('end-users:write');
