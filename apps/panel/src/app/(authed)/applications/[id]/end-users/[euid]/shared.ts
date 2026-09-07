@@ -85,6 +85,8 @@ export interface SubscriptionRow {
   cancelAt: string | null;
   canceledAt: string | null;
   beneficiaryOrgId: string | null;
+  /** Sparse `KIND:key` → value map the operator has layered over the plan. Null when none. */
+  entitlementOverrides: Record<string, unknown> | null;
   createdAt: string;
   plan: {
     slug: string;

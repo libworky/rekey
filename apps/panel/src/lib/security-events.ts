@@ -24,6 +24,67 @@ import { apiGet, type EndUserRow, type MemberRow } from '@/lib/api';
 import type { Page } from '@/lib/paginate';
 
 // ────────────────────────────────────────────────────────────────────────────
+// Metadata presentation
+// ────────────────────────────────────────────────────────────────────────────
+
+/** One chip rendered next to an event's label. */
+export interface EventDetail {
+  label: string;
+  /** Display value, truncated for the cell. */
+  value: string;
+  /** The untruncated value, for the title. */
+  full: string;
+}
+
+/**
+ * The keys worth surfacing from `metadata`, in display order. The audit log
+ * and Activity rendered the event type and actor only, so everything an event
+ * actually said (which tool an agent called and under which scope, whether a
+ * switch went on or off, which plan was granted and why) was written and shown
+ * nowhere. Whitelisted rather than dumped: metadata routinely carries ids and
+ * argument shapes that mean nothing in a table cell.
+ */
+const DETAIL_KEYS: ReadonlyArray<{ key: string; label: string }> = [
+  { key: 'tool', label: 'tool' },
+  { key: 'scope', label: 'scope' },
+  { key: 'enabled', label: 'state' },
+  { key: 'via', label: 'via' },
+  { key: 'role', label: 'role' },
+  { key: 'planSlug', label: 'plan' },
+  { key: 'reason', label: 'reason' },
+  { key: 'note', label: 'note' },
+  { key: 'admin', label: 'admin' },
+  { key: 'write', label: 'write' },
+];
+
+const MAX_DETAILS = 5;
+const MAX_VALUE_CHARS = 48;
+
+export function eventDetails(metadata: unknown): EventDetail[] {
+  if (!metadata || typeof metadata !== 'object') return [];
+  const m = metadata as Record<string, unknown>;
+  const out: EventDetail[] = [];
+  for (const { key, label } of DETAIL_KEYS) {
+    if (!(key in m)) continue;
+    const v = m[key];
+    let value: string | null = null;
+    if (typeof v === 'string') value = v.replace(/_/g, ' ');
+    else if (typeof v === 'number') value = String(v);
+    else if (typeof v === 'boolean') {
+      // `enabled` reads as a state; the other flags only matter when set.
+      if (key === 'enabled') value = v ? 'on' : 'off';
+      else if (v) value = 'yes';
+    }
+    if (value === null || value === '') continue;
+    const full = value;
+    if (value.length > MAX_VALUE_CHARS) value = value.slice(0, MAX_VALUE_CHARS - 1) + '…';
+    out.push({ label, value, full });
+    if (out.length === MAX_DETAILS) break;
+  }
+  return out;
+}
+
+// ────────────────────────────────────────────────────────────────────────────
 // Actor resolution
 // ────────────────────────────────────────────────────────────────────────────
 
