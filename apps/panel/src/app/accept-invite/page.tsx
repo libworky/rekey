@@ -51,10 +51,7 @@ async function acceptAuthed(formData: FormData): Promise<void> {
       path: '/api/v1/tenant/invitations/accept',
       body: { token },
     });
-    await setSessionCookies({
-      accessToken: result.accessToken,
-      refreshToken: result.refreshToken,
-    });
+    await setSessionCookies(result);
   } catch (err) {
     if (err instanceof PanelApiError) {
       redirect(`/accept-invite?token=${encodeURIComponent(token)}&error=${encodeURIComponent(err.code)}`);

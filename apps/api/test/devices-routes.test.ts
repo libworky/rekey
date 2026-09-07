@@ -119,6 +119,17 @@ describe('device management routes', () => {
     expect(rel.statusCode).toBe(200);
     expect(rel.json().data.sessionsRevoked).toBe(1);
     expect(rel.json().data.device.status).toBe('RELEASED');
+    // The release stamps the user, so the laptop's pre-release access token
+    // is refused on its next use; its refresh token is live and renews it,
+    // which is what a real client does on that 401.
+    const laptopRenewed = await app.inject({
+      method: 'POST',
+      url: '/api/v1/auth/refresh',
+      headers: publishable(),
+      payload: { refreshToken: laptop.refreshToken },
+    });
+    expect(laptopRenewed.statusCode).toBe(200);
+    const laptopNow = laptopRenewed.json().data as Session;
     const refreshDesktop = await app.inject({
       method: 'POST',
       url: '/api/v1/auth/refresh',
@@ -126,11 +137,11 @@ describe('device management routes', () => {
       payload: { refreshToken: desktop.refreshToken },
     });
     expect(refreshDesktop.statusCode).toBe(401);
-    const active = await app.inject({ method: 'GET', url: '/api/v1/users/me/devices?status=ACTIVE', headers: userHeaders(laptop) });
+    const active = await app.inject({ method: 'GET', url: '/api/v1/users/me/devices?status=ACTIVE', headers: userHeaders(laptopNow) });
     expect((active.json().data.items as unknown[]).length).toBe(1);
 
     // Idempotent.
-    const again = await app.inject({ method: 'DELETE', url: `/api/v1/users/me/devices/${desktop.deviceId}`, headers: userHeaders(laptop) });
+    const again = await app.inject({ method: 'DELETE', url: `/api/v1/users/me/devices/${desktop.deviceId}`, headers: userHeaders(laptopNow) });
     expect(again.statusCode).toBe(200);
     expect(again.json().data.sessionsRevoked).toBe(0);
 

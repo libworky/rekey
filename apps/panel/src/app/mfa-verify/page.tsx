@@ -43,10 +43,7 @@ async function verify(formData: FormData): Promise<void> {
     throw err;
   }
 
-  await setSessionCookies({
-    accessToken: result.accessToken,
-    refreshToken: result.refreshToken,
-  });
+  await setSessionCookies(result);
   if (next) redirect(`${next}${next.includes('?') ? '&' : '?'}e=login_mfa`);
   redirect('/applications?e=login_mfa');
 }

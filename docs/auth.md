@@ -305,8 +305,25 @@ Sign-up and sign-in return **two** tokens, used for different jobs:
 
 | Token | Format | Lifetime | Where to send | What it's for |
 |---|---|---|---|---|
-| **Access** | JWT (HS256 default; RS256 opt-in) | 15 minutes | `X-Rekey-User-Token` header | Identifies the end-user on every per-user call (e.g. `GET /users/me`) |
-| **Refresh** | Opaque base64url, 32 bytes random | 30 days, sliding | `body.refreshToken` of `POST /auth/refresh` | Mints a fresh access + refresh pair when the access expires |
+| **Access** | JWT (HS256 default; RS256 opt-in) | 15 minutes by default (`END_USER_ACCESS_TOKEN_TTL_SECONDS`, up to 24 hours) | `X-Rekey-User-Token` header | Identifies the end-user on every per-user call (e.g. `GET /users/me`) |
+| **Refresh** | Opaque base64url, 32 bytes random | 30 days by default (`END_USER_REFRESH_TOKEN_TTL_DAYS`, up to 365), sliding | `body.refreshToken` of `POST /auth/refresh` | Mints a fresh access + refresh pair when the access expires |
+
+Both lifetimes are deployment settings, not per-Application ones. Sliding
+means each refresh issues a fresh full window, so a client stays signed in as
+long as it refreshes at least once per window; size the window to the longest
+gap between uses (a desktop app opened monthly wants 60 or 90 days) and keep
+the access token short, since a revoked session keeps acting until its next
+refresh re-checks it. Every sign-in and refresh response carries
+`accessTokenExpiresAt` and `refreshTokenExpiresAt`, so a client never has
+to know the configured values.
+
+A long access lifetime does not extend a session somebody ended. A password
+change, sign-out everywhere, an operator revoking a session, and a device
+release or block all stamp the user, and an access token minted before the
+stamp is refused on its next use with `401 USER_TOKEN_INVALID` and a message
+naming the cause; it is the code SDKs already refresh on, so sessions that
+were not ended renew silently from their refresh token and only the ended
+one, whose refresh is gone, lands on sign-in. A password reset stamps too.
 
 ### The access JWT
 
@@ -327,7 +344,7 @@ Sign-up and sign-in return **two** tokens, used for different jobs:
 
 ### Sign-out
 
-`POST /auth/sign-out` revokes the presented refresh token. Idempotent — unknown tokens return 200 (no enumeration). The access token paired with the refresh remains valid until its 15-minute expiry; clear it client-side for full logout.
+`POST /auth/sign-out` revokes the presented refresh token. Idempotent — unknown tokens return 200 (no enumeration). The access token paired with the refresh remains valid until its expiry (`accessTokenExpiresAt`; 15 minutes by default); clear it client-side for full logout.
 
 ### Sign-out everywhere
 
@@ -369,7 +386,7 @@ Headers: Authorization: Bearer rp_live_…  +  X-Rekey-User-Token: <jwt>
 ```
 
 - Verifies `currentPassword` first — wrong returns `INVALID_CREDENTIALS`.
-- On success, every refresh token for the user is revoked. The caller's *current* access token stays valid until its 15-min expiry.
+- On success, every refresh token for the user is revoked. Access tokens minted before the call, the caller's own included, are refused on their next use.
 
 ### What's still deliberately not here
 

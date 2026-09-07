@@ -9,15 +9,13 @@
  */
 
 import { type NextRequest, NextResponse } from 'next/server';
-import { publicPost, PanelApiError, ACCESS_COOKIE, REFRESH_COOKIE } from '@/lib/api';
+import { publicPost, PanelApiError, ACCESS_COOKIE, REFRESH_COOKIE, sessionCookieMaxAges } from '@/lib/api';
 import { cookieSecure } from '@/lib/cookie-secure';
 
 type VerifyResult =
   | { mfaRequired: true; mfaChallengeToken: string }
-  | { mfaRequired: false; accessToken: string; refreshToken: string };
+  | { mfaRequired: false; accessToken: string; refreshToken: string; accessTokenExpiresAt: string; refreshTokenExpiresAt: string };
 
-const ACCESS_MAX_AGE = 60 * 15; // 15 min — mirrors setSessionCookies
-const REFRESH_MAX_AGE = 60 * 60 * 24 * 30; // 30 days
 
 // Redirect with a RELATIVE Location so the browser resolves it against the
 // public URL it's on (panel.rekey.dev) — NOT `req.url`, which behind a proxy
@@ -48,11 +46,12 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
 
   const secure = await cookieSecure();
   const res = seeOther('/applications');
+  const maxAges = sessionCookieMaxAges(result);
   res.cookies.set(ACCESS_COOKIE, result.accessToken, {
-    httpOnly: true, sameSite: 'strict', secure, path: '/', maxAge: ACCESS_MAX_AGE,
+    httpOnly: true, sameSite: 'strict', secure, path: '/', maxAge: maxAges.access,
   });
   res.cookies.set(REFRESH_COOKIE, result.refreshToken, {
-    httpOnly: true, sameSite: 'strict', secure, path: '/', maxAge: REFRESH_MAX_AGE,
+    httpOnly: true, sameSite: 'strict', secure, path: '/', maxAge: maxAges.refresh,
   });
   return res;
 }

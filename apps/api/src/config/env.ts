@@ -11,6 +11,26 @@ export const env = createEnv({
     // freely (an external billing system) would otherwise grow the table
     // without bound.
     WEBHOOK_EVENT_RETENTION_DAYS: z.coerce.number().int().min(1).max(3650).default(90),
+
+    // Session lifetimes. Access tokens are short-lived JWTs that a client
+    // renews with its refresh token; refresh tokens are opaque, rotated on
+    // every use and SLIDING (each rotation issues a fresh full window), so a
+    // client that checks in at least once per window stays signed in
+    // indefinitely. The window only has to cover the longest gap between
+    // uses. Defaults are the values these were hard-coded to before they
+    // became configurable.
+    //
+    // End-user tokens (an Application's own users; a desktop app that opens
+    // once a month wants a long refresh window and a short access token):
+    END_USER_ACCESS_TOKEN_TTL_SECONDS: z.coerce.number().int().min(60).max(24 * 60 * 60).default(15 * 60),
+    END_USER_REFRESH_TOKEN_TTL_DAYS: z.coerce.number().int().min(1).max(365).default(30),
+    // Operator tokens (panel sessions, API clients on a session token). The
+    // panel renews silently on expiry, so the access lifetime is how long a
+    // revoked membership can keep acting before the next renewal re-checks
+    // it, not how long an operator stays signed in. Raise it for shift-long
+    // sessions on trusted machines; the ceiling is 12 hours.
+    OPERATOR_ACCESS_TOKEN_TTL_SECONDS: z.coerce.number().int().min(60).max(12 * 60 * 60).default(15 * 60),
+    OPERATOR_REFRESH_TOKEN_TTL_DAYS: z.coerce.number().int().min(1).max(365).default(30),
     HOST: z.string().default('0.0.0.0'),
 
     // Global rate limit (the `@fastify/rate-limit` plugin). Defaults to

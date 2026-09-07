@@ -47,7 +47,7 @@ async function signUp(formData: FormData): Promise<void> {
       workspaceName,
       ...(inviteKey ? { inviteKey } : {}),
     });
-    await setSessionCookies({ accessToken: auth.accessToken, refreshToken: auth.refreshToken });
+    await setSessionCookies(auth);
   } catch (err) {
     if (err instanceof PanelApiError) {
       const code = normalizeErrorCode(err.code, ERROR_MESSAGES);
