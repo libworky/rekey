@@ -358,6 +358,10 @@ export const devicesService = {
         where: { deviceId: current.id, revokedAt: null },
         data: { revokedAt: now },
       });
+      // And the access tokens those sessions hold, from now: the session
+      // middleware refuses tokens issued before this stamp. Other devices'
+      // sessions renew silently; this device's cannot, its refresh is gone.
+      await tx.endUser.updateMany({ where: { id: current.endUserId }, data: { sessionsInvalidBefore: now } });
       return { device, sessionsRevoked: revoked.count, changed: true };
     });
     if (!result.changed) return { device: result.device, sessionsRevoked: 0 };
@@ -417,6 +421,10 @@ export const devicesService = {
         where: { deviceId: current.id, revokedAt: null },
         data: { revokedAt: now },
       });
+      // And the access tokens those sessions hold, from now: the session
+      // middleware refuses tokens issued before this stamp. Other devices'
+      // sessions renew silently; this device's cannot, its refresh is gone.
+      await tx.endUser.updateMany({ where: { id: current.endUserId }, data: { sessionsInvalidBefore: now } });
       return { device, sessionsRevoked: revoked.count, changed: true };
     });
     if (!result.changed) return { device: result.device, sessionsRevoked: 0 };

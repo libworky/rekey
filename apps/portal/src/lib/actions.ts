@@ -24,7 +24,7 @@ export async function signInAction(slug: string, formData: FormData): Promise<vo
       // the code step (same pattern the operator panel uses).
       redirect(`/${slug}/login?mfa=${encodeURIComponent(out.mfaChallengeToken)}`);
     }
-    await setSession(slug, out.accessToken, out.refreshToken);
+    await setSession(slug, out.accessToken, out.refreshToken, out);
   } catch (err) {
     if (err instanceof RekeyError) {
       // Carry the email back so a mistyped password doesn't cost the customer
@@ -46,7 +46,7 @@ export async function mfaVerifyAction(slug: string, formData: FormData): Promise
   if (!challenge || !code) redirect(`/${slug}/login`);
   try {
     const out = await client.mfaVerify({ mfaChallengeToken: challenge, code });
-    await setSession(slug, out.accessToken, out.refreshToken);
+    await setSession(slug, out.accessToken, out.refreshToken, out);
   } catch (err) {
     if (err instanceof RekeyError) {
       // Keep the challenge so a mistyped code doesn't force a fresh sign-in.

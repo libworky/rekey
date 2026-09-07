@@ -4,7 +4,7 @@ import Link from 'next/link';
 import { redirect } from 'next/navigation';
 import { cookies } from 'next/headers';
 import { randomUUID } from 'node:crypto';
-import { publicPost, publicGet, setSessionCookies, PanelApiError, type SignInResponse } from '@/lib/api';
+import { publicPost, publicGet, setSessionCookies, PanelApiError, type SignInResponse, type AuthResponse } from '@/lib/api';
 import { PasskeyLoginButton } from '@/components/PasskeyLoginButton';
 import { SubmitButton } from '@/components/SubmitButton';
 import { AuthCard, OrDivider } from '@/components/AuthCard';
@@ -46,7 +46,7 @@ async function signIn(formData: FormData): Promise<void> {
     );
   }
 
-  await setSessionCookies({ accessToken: result.accessToken, refreshToken: result.refreshToken });
+  await setSessionCookies(result);
   if (next) redirect(`${next}${next.includes('?') ? '&' : '?'}e=login`);
   redirect('/applications?e=login');
 }
@@ -85,9 +85,9 @@ async function completePasskeyLogin(formData: FormData): Promise<void> {
   } catch {
     redirect(`/login?error=PASSKEY_RESPONSE_INVALID${keep}`);
   }
-  let result: { accessToken: string; refreshToken: string };
+  let result: Pick<AuthResponse, 'accessToken' | 'refreshToken' | 'accessTokenExpiresAt' | 'refreshTokenExpiresAt'>;
   try {
-    result = await publicPost<{ accessToken: string; refreshToken: string }>(
+    result = await publicPost<typeof result>(
       '/api/v1/tenant/auth/passkeys/authenticate/complete',
       { response, expectedChallenge },
     );
@@ -97,7 +97,7 @@ async function completePasskeyLogin(formData: FormData): Promise<void> {
     }
     throw err;
   }
-  await setSessionCookies({ accessToken: result.accessToken, refreshToken: result.refreshToken });
+  await setSessionCookies(result);
   if (next) redirect(`${next}${next.includes('?') ? '&' : '?'}e=login_passkey`);
   redirect('/applications?e=login_passkey');
 }
@@ -312,6 +312,11 @@ export default async function LoginPage({
         )}
         {reason === 'reset' && (
           <Banner tone="success">Password updated. Sign in with your new password.</Banner>
+        )}
+        {reason === 'password_changed' && (
+          <Banner tone="success">
+            Password changed, and every session was signed out, this one included. Sign in with the new password.
+          </Banner>
         )}
         {/* Only render for codes we actually emit. An unknown ?error= (stale
             bookmark, crafted link) used to paint an unexplained failure on the

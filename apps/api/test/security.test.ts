@@ -553,13 +553,24 @@ describe('Phase-1 security hardening', () => {
     expect(del.statusCode).toBe(200);
     expect(del.json().data.revoked).toBe(true);
 
+    // Revoking a session stamps the user, so the second session's own
+    // pre-revoke access token is refused next; it renews from its refresh.
+    const secondRenewed = await app
+      .inject({
+        method: 'POST',
+        url: '/api/v1/auth/refresh',
+        headers: { authorization: `Bearer ${b.liveKey}` },
+        payload: { refreshToken: secondSession.refreshToken },
+      })
+      .then((r) => r.json().data as { accessToken: string });
+
     // Idempotent — second revoke returns revoked=false.
     const del2 = await app.inject({
       method: 'DELETE',
       url: `/api/v1/auth/sessions/${deviceA.id}`,
       headers: {
         authorization: `Bearer ${b.liveKey}`,
-        'x-rekey-user-token': secondSession.accessToken,
+        'x-rekey-user-token': secondRenewed.accessToken,
       },
     });
     expect(del2.json().data.revoked).toBe(false);

@@ -1044,7 +1044,7 @@ export async function authenticatedAuthRoutes(app: FastifyInstance): Promise<voi
         summary: 'Change the current user\'s password',
         description:
           'Requires the current password. On success, revokes every refresh token for this user — ' +
-          'other devices are signed out. The caller\'s access token stays valid until its 15-min expiry.',
+          'other devices are signed out. Access tokens minted before this call are refused on their next use, whatever their expiry.',
         security: [
           { publishableKey: [], userToken: [] },
           { apiKey: [], userToken: [] },
@@ -1509,7 +1509,7 @@ export async function authenticatedAuthRoutes(app: FastifyInstance): Promise<voi
         summary: 'Revoke every refresh token for the current user',
         description:
           'Used for "sign out of all devices" / suspected compromise. The caller\'s ' +
-          'access token stays valid until its 15-min expiry; clear it client-side for full logout.',
+          'access token paired with it is refused on its next use; clear it client-side too.',
         security: [
           { publishableKey: [], userToken: [] },
           { apiKey: [], userToken: [] },

@@ -65,7 +65,7 @@ import {
  *
  * NB: after first deploy of this scheme, tokens minted under the old global
  * secret stop verifying — end-users transparently re-mint via refresh (the
- * 15-minute access token is short-lived and refresh tokens survive). A one-time
+ * access token is short-lived and refresh tokens survive). A one-time
  * blip, not a logout storm.
  */
 function appSigningKey(applicationId: string, tokenGeneration: number): string {
@@ -132,7 +132,7 @@ export interface EndUserClaims<TType extends EndUserTokenType = EndUserTokenType
    * the per-app session kill-switch is preserved by embedding the generation
    * as a claim — API-side verification rejects tokens whose `gen` doesn't
    * match the app's current counter. Offline (JWKS) verifiers can't see a
-   * bump; the 15-minute access lifetime bounds that window.
+   * bump; the access lifetime bounds that window.
    */
   gen?: number;
   /**
@@ -148,7 +148,7 @@ export interface EndUserClaims<TType extends EndUserTokenType = EndUserTokenType
    * identified itself at sign-in or refresh. A claim, not an authorization:
    * `requireUserSession` surfaces it as `request.deviceId`, and anything that
    * needs to trust it resolves the row and checks `status` — a device blocked
-   * after the token was minted is still blocked. The 15-minute access lifetime
+   * after the token was minted is still blocked. The access lifetime
    * bounds that window exactly as it does for `gen`.
    */
   dev?: string;
@@ -160,12 +160,13 @@ export type UserSessionClaims = EndUserClaims<'eu_access'>;
 export type MfaChallengeClaims = EndUserClaims<'eu_mfa_challenge'>;
 
 // Short access lifetime — paired with a 30-day refresh token.
-const DEFAULT_ACCESS_LIFETIME_SECONDS = 15 * 60;
+// Configurable per deployment (END_USER_ACCESS_TOKEN_TTL_SECONDS, default 15 minutes).
+const DEFAULT_ACCESS_LIFETIME_SECONDS = env.END_USER_ACCESS_TOKEN_TTL_SECONDS;
 // MFA challenge is even shorter — enough to scan a code, not enough to be useful if leaked.
 const DEFAULT_MFA_CHALLENGE_LIFETIME_SECONDS = 5 * 60;
 
 export interface IssueOptions {
-  /** Token lifetime in seconds. Defaults to 15 minutes for access; 5 for challenge. */
+  /** Token lifetime in seconds. Defaults to END_USER_ACCESS_TOKEN_TTL_SECONDS for access; 5 minutes for challenge. */
   lifetimeSeconds?: number;
   /** Active organization id → embedded as the `oid` claim (access tokens only). */
   activeOrganizationId?: string;

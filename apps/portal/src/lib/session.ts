@@ -14,8 +14,16 @@ import { cookieSecure } from './cookie-secure';
 
 const ACCESS = 'rekey_portal_access';
 const REFRESH = 'rekey_portal_refresh';
-const ACCESS_MAX_AGE = 60 * 15; // 15 min
-const REFRESH_MAX_AGE = 60 * 60 * 24 * 30; // 30 days
+// Fallbacks only: the API's lifetimes are deployment settings and every auth
+// response carries the expiries, which `setSession` prefers.
+const ACCESS_MAX_AGE = 60 * 15;
+const REFRESH_MAX_AGE = 60 * 60 * 24 * 30;
+
+function secondsUntil(iso: string | undefined): number | null {
+  if (!iso) return null;
+  const ms = Date.parse(iso) - Date.now();
+  return Number.isNaN(ms) ? null : Math.max(60, Math.floor(ms / 1000));
+}
 
 async function cookieOpts(slug: string, maxAge: number) {
   return {
@@ -47,11 +55,16 @@ function tolerateRenderContext(err: unknown): void {
   throw err;
 }
 
-export async function setSession(slug: string, accessToken: string, refreshToken: string): Promise<void> {
+export async function setSession(
+  slug: string,
+  accessToken: string,
+  refreshToken: string,
+  expiries: { accessTokenExpiresAt?: string; refreshTokenExpiresAt?: string } = {},
+): Promise<void> {
   try {
     const jar = await cookies();
-    jar.set(ACCESS, accessToken, await cookieOpts(slug, ACCESS_MAX_AGE));
-    jar.set(REFRESH, refreshToken, await cookieOpts(slug, REFRESH_MAX_AGE));
+    jar.set(ACCESS, accessToken, await cookieOpts(slug, secondsUntil(expiries.accessTokenExpiresAt) ?? ACCESS_MAX_AGE));
+    jar.set(REFRESH, refreshToken, await cookieOpts(slug, secondsUntil(expiries.refreshTokenExpiresAt) ?? REFRESH_MAX_AGE));
   } catch (err) {
     tolerateRenderContext(err);
   }

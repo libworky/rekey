@@ -123,7 +123,10 @@ async function changePassword(formData: FormData): Promise<void> {
     }
     throw err;
   }
-  redirect('/account/security?pwchanged=1');
+  // The change revoked every session, this one included: the API refuses the
+  // access token on its next use and the refresh is gone. Sign out cleanly
+  // rather than letting the next page load discover it as "expired".
+  redirect('/sign-out?reason=password_changed');
 }
 
 async function revokeSession(formData: FormData): Promise<void> {
@@ -180,7 +183,6 @@ export default async function SecurityPage({
   }
   const confirmed = sp.confirmed === '1';
   const disabled = sp.disabled === '1';
-  const pwchanged = sp.pwchanged === '1';
 
   const status = await api<MfaStatus>({
     method: 'GET',
@@ -436,11 +438,6 @@ export default async function SecurityPage({
           {pwerror && (
             <Banner tone="error">
               {ERR[pwerror] ?? pwerror}
-            </Banner>
-          )}
-          {pwchanged && (
-            <Banner tone="success">
-              Password changed.
             </Banner>
           )}
           <label className="block space-y-1">

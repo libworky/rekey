@@ -19,6 +19,7 @@ import { RekeyError } from '../lib/error.js';
 import { verifyUserAccessTokenAnyAlg } from '../lib/jwt.js';
 import { prisma } from '../lib/prisma.js';
 import { authService, type PublicEndUser } from '../modules/auth/auth.service.js';
+import { sessionIssuedBefore } from '../lib/session-stamp.js';
 
 /** Who is really behind an impersonated session. Set only for `imp` tokens. */
 export interface ImpersonationContext {
@@ -148,7 +149,27 @@ export async function requireUserSession(
     request.impersonation = { auditId: claims.impid, operatorUserId: audit.operatorUserId };
   }
 
-  const endUser = await authService.getById(request.application.id, claims.sub);
+  const { endUser, sessionsInvalidBefore } = await authService.getByIdForSession(
+    request.application.id,
+    claims.sub,
+  );
+  // A token minted before the user's last password change, sign-out
+  // everywhere, session revoke or device release is refused now rather than
+  // at its expiry. Compared at second granularity (`iat` is seconds), so a
+  // token minted in the same second as the stamp, which is the pair the
+  // password-change response itself hands back, survives.
+  // Same code the SDKs already treat as "refresh me" (USER_TOKEN_INVALID), so
+  // a session that was NOT ended renews silently from its live refresh token
+  // and only the ended one, whose refresh is gone, lands on sign-in. The
+  // message says which it was.
+  if (sessionIssuedBefore(claims, sessionsInvalidBefore)) {
+    throw new RekeyError({
+      statusCode: 401,
+      code: 'USER_TOKEN_INVALID',
+      message: 'This access token predates a password change, sign-out everywhere, session revoke or device release.',
+      fix: 'Refresh the session; if the refresh token was revoked too, sign in again.',
+    });
+  }
 
   request.endUser = endUser;
   if (claims.dev) request.deviceId = claims.dev;

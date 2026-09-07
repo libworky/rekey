@@ -23,6 +23,7 @@ import { authService } from './auth.service.js';
 import { applicationDisabled } from '../../middleware/api-key-auth.js';
 import { organizationsService } from '../organizations/organizations.service.js';
 import { ok, errs, ref } from '../../lib/openapi.js';
+import { sessionIssuedBefore } from '../../lib/session-stamp.js';
 
 const TOKEN_HEADER = 'x-rekey-user-token';
 
@@ -168,7 +169,10 @@ export async function userTokenMeRoutes(app: FastifyInstance): Promise<void> {
       );
       if (!claims) throw invalid;
 
-      const endUser = await authService.getById(claims.applicationId, claims.sub);
+      const { endUser, sessionsInvalidBefore } = await authService.getByIdForSession(claims.applicationId, claims.sub);
+      // The same kill switch requireUserSession applies: a token that predates
+      // the user's last revocation must not read their record here either.
+      if (sessionIssuedBefore(claims, sessionsInvalidBefore)) throw invalid;
       const active = await organizationsService.activeRoleFor({
         applicationId: claims.applicationId,
         endUserId: claims.sub,

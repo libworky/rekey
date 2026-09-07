@@ -149,11 +149,11 @@ const CONSTANT_RESET_RESPONSE = { delivered: true, resetToken: null } as const;
 /** The magic-link twin of `CONSTANT_RESET_RESPONSE`. Same reasoning. */
 const CONSTANT_MAGIC_LINK_RESPONSE = { delivered: true, token: null } as const;
 
-export type PublicTenantUser = Omit<TenantUser, 'passwordHash'>;
+export type PublicTenantUser = Omit<TenantUser, 'passwordHash' | 'sessionsInvalidBefore'>;
 
 function redact(user: TenantUser): PublicTenantUser {
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  const { passwordHash, ...rest } = user;
+  const { passwordHash, sessionsInvalidBefore, ...rest } = user;
   return rest;
 }
 

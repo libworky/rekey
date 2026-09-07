@@ -13,15 +13,17 @@
  * ApiKey). Refresh tokens are 32 bytes of CSPRNG entropy — fast hash is
  * correct, Argon2 is for user-chosen passwords (see lib/passwords.ts).
  *
- * Lifetime: 30 days, sliding (each rotation issues a fresh 30-day window).
+ * Lifetime: END_USER_REFRESH_TOKEN_TTL_DAYS (default 30), sliding: each
+ * rotation issues a fresh full window.
  */
 
 import { createHash, randomBytes } from 'node:crypto';
 import type { RefreshToken } from '@prisma/client';
 import { prisma } from './prisma.js';
+import { env } from '../config/env.js';
 
 const REFRESH_TOKEN_BYTES = 32;
-const REFRESH_TOKEN_LIFETIME_MS = 30 * 24 * 60 * 60 * 1000;
+const REFRESH_TOKEN_LIFETIME_MS = env.END_USER_REFRESH_TOKEN_TTL_DAYS * 24 * 60 * 60 * 1000;
 
 export function hashRefreshToken(raw: string): string {
   return createHash('sha256').update(raw).digest('hex');
@@ -199,6 +201,11 @@ export async function revokeRefreshToken(raw: string): Promise<void> {
  * change, account compromise, "sign out everywhere".
  */
 export async function revokeAllForEndUser(endUserId: string): Promise<number> {
+  // Refresh tokens are revoked row by row; the access tokens they paired with
+  // are refused from this instant by the session middleware (see
+  // EndUser.sessionsInvalidBefore), so the caller's remaining access token
+  // does not ride out its lifetime.
+  await prisma.endUser.updateMany({ where: { id: endUserId }, data: { sessionsInvalidBefore: new Date() } });
   const result = await prisma.refreshToken.updateMany({
     where: { endUserId, revokedAt: null },
     data: { revokedAt: new Date() },
@@ -214,7 +221,7 @@ export async function revokeAllForEndUser(endUserId: string): Promise<number> {
  * rotate-sessions`), which bumps `Application.tokenGeneration` AND revokes the
  * refresh tokens in ONE transaction. Doing the two halves separately is the
  * failure mode worth avoiding: revoke without the bump and outstanding access
- * tokens keep working for up to 15 minutes; bump without the revoke and clients
+ * tokens keep working until their expiry; bump without the revoke and clients
  * refresh straight back in.
  */
 export async function revokeAllForApplication(applicationId: string): Promise<number> {
@@ -282,5 +289,12 @@ export async function revokeSessionForEndUser(
     where: { id: sessionId, endUserId, revokedAt: null },
     data: { revokedAt: new Date() },
   });
+  // The revoked session's access token must stop now, not at its expiry.
+  // The stamp is per user, so the user's OTHER sessions also lose their
+  // current access token, but they hold live refresh tokens and renew
+  // silently on the next request; only the revoked one cannot.
+  if (result.count === 1) {
+    await prisma.endUser.updateMany({ where: { id: endUserId }, data: { sessionsInvalidBefore: new Date() } });
+  }
   return result.count === 1;
 }

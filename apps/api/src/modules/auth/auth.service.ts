@@ -154,11 +154,11 @@ const PUBLISHABLE_MAGIC_LINK_RESPONSE = {
 } as const;
 
 /** Public-safe shape of an EndUser — `passwordHash` stripped. */
-export type PublicEndUser = Omit<EndUser, 'passwordHash'>;
+export type PublicEndUser = Omit<EndUser, 'passwordHash' | 'sessionsInvalidBefore'>;
 
 function redact(user: EndUser): PublicEndUser {
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  const { passwordHash, ...rest } = user;
+  const { passwordHash, sessionsInvalidBefore, ...rest } = user;
   return rest;
 }
 
@@ -1419,7 +1419,9 @@ export const authService = {
       });
       return tx.endUser.update({
         where: { id: outcome.token.endUserId },
-        data: { passwordHash },
+        // A reset is the compromise-recovery path: the attacker's access token
+        // must stop now, not at its expiry.
+        data: { passwordHash, sessionsInvalidBefore: new Date() },
       });
     });
 
@@ -2374,6 +2376,28 @@ export const authService = {
     // token minted before erasure is rejected the moment it's used.
     assertEndUserNotErased(endUser);
     return redact(endUser);
+  },
+
+  /**
+   * `getById` plus the one private field the session middleware needs:
+   * `sessionsInvalidBefore`, which never leaves the server. Same 404 and
+   * erasure rules as `getById`.
+   */
+  async getByIdForSession(
+    applicationId: string,
+    endUserId: string,
+  ): Promise<{ endUser: PublicEndUser; sessionsInvalidBefore: Date | null }> {
+    const row = await prisma.endUser.findUnique({ where: { id: endUserId } });
+    if (!row || row.applicationId !== applicationId) {
+      throw new RekeyError({
+        statusCode: 404,
+        code: 'END_USER_NOT_FOUND',
+        message: `EndUser "${endUserId}" not found in this application.`,
+        fix: 'Verify the user id and that the calling secret key belongs to the right Application.',
+      });
+    }
+    assertEndUserNotErased(row);
+    return { endUser: redact(row), sessionsInvalidBefore: row.sessionsInvalidBefore };
   },
 
   /**
