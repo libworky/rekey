@@ -24,6 +24,7 @@ import jwt from 'jsonwebtoken';
 import { buildApp } from '../src/app.js';
 import { prisma } from '../src/lib/prisma.js';
 import { devicesService } from '../src/modules/devices/devices.service.js';
+import { authService } from '../src/modules/auth/auth.service.js';
 import {
   makeEndUser as makeEndUserFor,
   setDefaultDeviceLimit as setDefaultDeviceLimitFor,
@@ -210,19 +211,33 @@ describe('device-bound sessions', () => {
         payload: { name: 'team', slug: 'team', ownerEndUserId: userId },
       })
       .then((r) => (r.json().data as { id: string }).id);
+    // Step past the sign-in's second first: the release stamps the user, and
+    // the stamp is compared at second granularity.
+    await new Promise((r) => setTimeout(r, 1_100));
     await devicesService.release({ applicationId: appId, endUserId: userId, deviceId: s.deviceId!, actor: { type: 'end_user', id: userId } });
 
-    // The access token is refused either way now: the device check answers
-    // first on this route (SESSION_DEVICE_RELEASED), and the release also
-    // stamped the user so any other route refuses it too. The re-mint it asks
-    // for must not reactivate the device it is bound to.
+    // Over HTTP the session middleware answers first: the release stamped the
+    // user, so the pre-release access token is refused before the handler
+    // runs. That is the kill switch doing its job on this route.
     const switched = await app.inject({
       method: 'POST',
       url: `/api/v1/users/me/organizations/${orgId}/switch`,
       headers: { ...keyAuth(), 'x-rekey-user-token': s.accessToken },
     });
     expect(switched.statusCode).toBe(401);
-    expect(switched.json().error.code).toBe('SESSION_DEVICE_RELEASED');
+    expect(switched.json().error.code).toBe('USER_TOKEN_INVALID');
+
+    // The device check itself, with nothing in front of it: a re-mint bound
+    // to a released device is refused and must not reactivate the device.
+    const application = await prisma.application.findUniqueOrThrow({ where: { id: appId } });
+    await expect(
+      authService.switchActiveOrganization({
+        application,
+        endUserId: userId,
+        activeOrganizationId: orgId,
+        device: { deviceId: s.deviceId, primary: false },
+      }),
+    ).rejects.toMatchObject({ code: 'SESSION_DEVICE_RELEASED' });
     const device = await prisma.device.findUniqueOrThrow({ where: { id: s.deviceId! } });
     expect(device.status).toBe('RELEASED');
     expect(await prisma.refreshToken.count({ where: { endUserId: userId, revokedAt: null } })).toBe(0);

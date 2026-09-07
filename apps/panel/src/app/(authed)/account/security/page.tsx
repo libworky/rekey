@@ -183,7 +183,6 @@ export default async function SecurityPage({
   }
   const confirmed = sp.confirmed === '1';
   const disabled = sp.disabled === '1';
-  const pwchanged = sp.pwchanged === '1';
 
   const status = await api<MfaStatus>({
     method: 'GET',
@@ -439,11 +438,6 @@ export default async function SecurityPage({
           {pwerror && (
             <Banner tone="error">
               {ERR[pwerror] ?? pwerror}
-            </Banner>
-          )}
-          {pwchanged && (
-            <Banner tone="success">
-              Password changed.
             </Banner>
           )}
           <label className="block space-y-1">

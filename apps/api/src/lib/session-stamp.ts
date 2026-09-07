@@ -11,5 +11,7 @@
  */
 export function sessionIssuedBefore(claims: { iat?: number }, stamp: Date | null | undefined): boolean {
   if (!stamp) return false;
-  return typeof claims.iat === 'number' && claims.iat < Math.floor(stamp.getTime() / 1000);
+  // Every token this API mints carries `iat`; one without it is not ours, and
+  // once a stamp exists it is refused rather than admitted.
+  return typeof claims.iat !== 'number' || claims.iat < Math.floor(stamp.getTime() / 1000);
 }

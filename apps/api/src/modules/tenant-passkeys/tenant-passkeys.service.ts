@@ -66,7 +66,9 @@ function shape(c: {
 }
 
 function redact(user: TenantUser): PublicTenantUser {
-  const { passwordHash: _pw, ...rest } = user;
+  // Same two private fields tenant-auth.service strips; the stamp behind the
+  // session kill switch never leaves the server.
+  const { passwordHash: _pw, sessionsInvalidBefore: _stamp, ...rest } = user;
   return rest;
 }
 
