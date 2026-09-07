@@ -154,11 +154,11 @@ const PUBLISHABLE_MAGIC_LINK_RESPONSE = {
 } as const;
 
 /** Public-safe shape of an EndUser — `passwordHash` stripped. */
-export type PublicEndUser = Omit<EndUser, 'passwordHash'>;
+export type PublicEndUser = Omit<EndUser, 'passwordHash' | 'sessionsInvalidBefore'>;
 
 function redact(user: EndUser): PublicEndUser {
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  const { passwordHash, ...rest } = user;
+  const { passwordHash, sessionsInvalidBefore, ...rest } = user;
   return rest;
 }
 
@@ -1419,7 +1419,9 @@ export const authService = {
       });
       return tx.endUser.update({
         where: { id: outcome.token.endUserId },
-        data: { passwordHash },
+        // A reset is the compromise-recovery path: the attacker's access token
+        // must stop now, not at its expiry.
+        data: { passwordHash, sessionsInvalidBefore: new Date() },
       });
     });
 

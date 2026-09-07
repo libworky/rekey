@@ -313,6 +313,11 @@ export default async function LoginPage({
         {reason === 'reset' && (
           <Banner tone="success">Password updated. Sign in with your new password.</Banner>
         )}
+        {reason === 'password_changed' && (
+          <Banner tone="success">
+            Password changed, and every session was signed out, this one included. Sign in with the new password.
+          </Banner>
+        )}
         {/* Only render for codes we actually emit. An unknown ?error= (stale
             bookmark, crafted link) used to paint an unexplained failure on the
             page where trust is decided — render nothing instead. */}

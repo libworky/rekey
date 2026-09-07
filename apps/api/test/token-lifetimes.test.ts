@@ -14,7 +14,7 @@ import { buildApp } from '../src/app.js';
 import { env } from '../src/config/env.js';
 import { issueTenantAccessToken } from '../src/lib/tenant-jwt.js';
 import { issueUserAccessToken } from '../src/lib/jwt.js';
-import { issueRefreshToken } from '../src/lib/refresh-tokens.js';
+import { issueRefreshToken, revokeAllForEndUser } from '../src/lib/refresh-tokens.js';
 import { issueTenantRefreshToken, revokeAllTenantRefreshTokensForUser } from '../src/lib/tenant-refresh-tokens.js';
 
 function lifetimeOf(token: string): number {
@@ -86,6 +86,57 @@ describe('refresh lifetimes and the session kill switch', () => {
     expect(Math.abs(euRefresh.record.expiresAt.getTime() - Date.now() - env.END_USER_REFRESH_TOKEN_TTL_DAYS * day)).toBeLessThan(5_000);
     const opRefresh = await issueTenantRefreshToken(user.id);
     expect(Math.abs(opRefresh.record.expiresAt.getTime() - Date.now() - env.OPERATOR_REFRESH_TOKEN_TTL_DAYS * day)).toBeLessThan(5_000);
+  });
+
+  it('an end-user access token minted before sign-out-everywhere is refused on both session routes', async () => {
+    const su = await inject({
+      method: 'POST',
+      url: '/api/v1/tenant/auth/sign-up',
+      payload: { email: `${tag}-euop@example.com`, password: 'pw-one-two-three', workspaceName: 'EU Kill Co' },
+    });
+    const opToken = (su.json().data as { accessToken: string }).accessToken;
+    const mk = await inject({ method: 'POST', url: '/api/v1/tenant/applications', headers: auth(opToken), payload: { name: `${tag}-eu`, slug: `${tag}-eu` } });
+    const appId = (mk.json().data as { id: string }).id;
+    const key = await inject({
+      method: 'POST',
+      url: `/api/v1/admin/applications/${appId}/api-keys`,
+      headers: auth(process.env.SUPER_ADMIN_KEY!),
+      payload: { name: 'k', mode: 'live' },
+    });
+    expect(key.statusCode).toBe(201);
+    const liveKey = (key.json().data as { rawKey: string }).rawKey;
+    const eu = await inject({
+      method: 'POST',
+      url: `/api/v1/tenant/applications/${appId}/end-users`,
+      headers: auth(opToken),
+      payload: { email: `${tag}-victim@example.com`, password: 'pw-one-two-three', emailVerified: true },
+    });
+    expect(eu.statusCode).toBe(201);
+    const euid = (eu.json().data as { id?: string; endUser?: { id: string } }).id ?? (eu.json().data as { endUser: { id: string } }).endUser.id;
+    const signIn = await inject({
+      method: 'POST',
+      url: '/api/v1/auth/sign-in',
+      headers: auth(liveKey),
+      payload: { email: `${tag}-victim@example.com`, password: 'pw-one-two-three' },
+    });
+    expect(signIn.statusCode).toBe(200);
+    const userToken = (signIn.json().data as { accessToken: string }).accessToken;
+    const me = (t: string) => inject({ method: 'GET', url: '/api/v1/users/me', headers: { ...auth(liveKey), 'x-rekey-user-token': t } });
+    const authMe = (t: string) => inject({ method: 'GET', url: '/api/v1/auth/me', headers: { 'x-rekey-user-token': t } });
+    expect((await me(userToken)).statusCode).toBe(200);
+    expect((await authMe(userToken)).statusCode).toBe(200);
+    await new Promise((r) => setTimeout(r, 1_100));
+    await revokeAllForEndUser(euid);
+    const after = await me(userToken);
+    expect(after.statusCode).toBe(401);
+    expect(after.json().error.code).toBe('USER_TOKEN_INVALID');
+    // /auth/me is the SDK's user read and takes the same door.
+    expect((await authMe(userToken)).statusCode).toBe(401);
+    // The stamp never leaves the server.
+    const again = await inject({ method: 'POST', url: '/api/v1/auth/sign-in', headers: auth(liveKey), payload: { email: `${tag}-victim@example.com`, password: 'pw-one-two-three' } });
+    expect(again.statusCode).toBe(200);
+    expect(JSON.stringify(again.json())).not.toContain('sessionsInvalidBefore');
+    expect((await me((again.json().data as { accessToken: string }).accessToken)).statusCode).toBe(200);
   });
 
   it('an operator access token minted before sign-out-everywhere is refused, whatever its lifetime', async () => {

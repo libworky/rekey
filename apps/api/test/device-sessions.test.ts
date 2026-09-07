@@ -212,7 +212,9 @@ describe('device-bound sessions', () => {
       .then((r) => (r.json().data as { id: string }).id);
     await devicesService.release({ applicationId: appId, endUserId: userId, deviceId: s.deviceId!, actor: { type: 'end_user', id: userId } });
 
-    // The access token is still valid for its lifetime; the re-mint it asks
+    // The access token is refused either way now: the device check answers
+    // first on this route (SESSION_DEVICE_RELEASED), and the release also
+    // stamped the user so any other route refuses it too. The re-mint it asks
     // for must not reactivate the device it is bound to.
     const switched = await app.inject({
       method: 'POST',

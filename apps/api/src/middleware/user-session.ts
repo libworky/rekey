@@ -18,12 +18,8 @@ import type { FastifyRequest, FastifyReply } from 'fastify';
 import { RekeyError } from '../lib/error.js';
 import { verifyUserAccessTokenAnyAlg } from '../lib/jwt.js';
 import { prisma } from '../lib/prisma.js';
-
-/** Whether a token's `iat` (seconds) falls before the stamp's second. */
-export function sessionIssuedBefore(claims: { iat?: number }, stamp: Date): boolean {
-  return typeof claims.iat === 'number' && claims.iat < Math.floor(stamp.getTime() / 1000);
-}
 import { authService, type PublicEndUser } from '../modules/auth/auth.service.js';
+import { sessionIssuedBefore } from '../lib/session-stamp.js';
 
 /** Who is really behind an impersonated session. Set only for `imp` tokens. */
 export interface ImpersonationContext {
@@ -162,12 +158,16 @@ export async function requireUserSession(
   // at its expiry. Compared at second granularity (`iat` is seconds), so a
   // token minted in the same second as the stamp, which is the pair the
   // password-change response itself hands back, survives.
-  if (sessionsInvalidBefore !== null && sessionIssuedBefore(claims, sessionsInvalidBefore)) {
+  // Same code the SDKs already treat as "refresh me" (USER_TOKEN_INVALID), so
+  // a session that was NOT ended renews silently from its live refresh token
+  // and only the ended one, whose refresh is gone, lands on sign-in. The
+  // message says which it was.
+  if (sessionIssuedBefore(claims, sessionsInvalidBefore)) {
     throw new RekeyError({
       statusCode: 401,
-      code: 'SESSION_REVOKED',
-      message: 'This session was ended (password changed, signed out everywhere, or the device released).',
-      fix: 'Sign in again.',
+      code: 'USER_TOKEN_INVALID',
+      message: 'This access token predates a password change, sign-out everywhere, session revoke or device release.',
+      fix: 'Refresh the session; if the refresh token was revoked too, sign in again.',
     });
   }
 

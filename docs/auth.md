@@ -320,8 +320,10 @@ to know the configured values.
 A long access lifetime does not extend a session somebody ended. A password
 change, sign-out everywhere, an operator revoking a session, and a device
 release or block all stamp the user, and an access token minted before the
-stamp is refused on its next use with `401 SESSION_REVOKED`. Sessions that
-were not ended renew silently from their refresh token.
+stamp is refused on its next use with `401 USER_TOKEN_INVALID` and a message
+naming the cause; it is the code SDKs already refresh on, so sessions that
+were not ended renew silently from their refresh token and only the ended
+one, whose refresh is gone, lands on sign-in. A password reset stamps too.
 
 ### The access JWT
 

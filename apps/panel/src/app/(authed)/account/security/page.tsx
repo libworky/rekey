@@ -123,7 +123,10 @@ async function changePassword(formData: FormData): Promise<void> {
     }
     throw err;
   }
-  redirect('/account/security?pwchanged=1');
+  // The change revoked every session, this one included: the API refuses the
+  // access token on its next use and the refresh is gone. Sign out cleanly
+  // rather than letting the next page load discover it as "expired".
+  redirect('/sign-out?reason=password_changed');
 }
 
 async function revokeSession(formData: FormData): Promise<void> {

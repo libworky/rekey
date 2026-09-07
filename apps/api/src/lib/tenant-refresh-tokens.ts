@@ -167,5 +167,10 @@ export async function revokeSessionForTenantUser(
     where: { id: sessionId, tenantUserId, revokedAt: null },
     data: { revokedAt: new Date() },
   });
+  // The revoked session's access token stops now; the operator's other
+  // sessions renew silently (the panel refreshes on any 401).
+  if (result.count === 1) {
+    await prisma.tenantUser.updateMany({ where: { id: tenantUserId }, data: { sessionsInvalidBefore: new Date() } });
+  }
   return result.count === 1;
 }

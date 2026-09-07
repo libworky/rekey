@@ -24,7 +24,7 @@ import { RekeyError } from '../lib/error.js';
 import { verifyTenantAccessToken } from '../lib/tenant-jwt.js';
 import { prisma } from '../lib/prisma.js';
 import type { PublicTenantUser } from '../modules/tenant-auth/tenant-auth.service.js';
-import { sessionIssuedBefore } from './user-session.js';
+import { sessionIssuedBefore } from '../lib/session-stamp.js';
 import { resolveMembershipScopes, type Scope } from '../lib/operator-scopes.js';
 
 declare module 'fastify' {
@@ -85,7 +85,7 @@ export async function requireTenantSession(
   }
   // Minted before the operator's last password change or sign-out
   // everywhere: refused now, whatever the configured access lifetime.
-  if (user.sessionsInvalidBefore !== null && sessionIssuedBefore(claims, user.sessionsInvalidBefore)) {
+  if (sessionIssuedBefore(claims, user.sessionsInvalidBefore)) {
     throw new RekeyError({
       statusCode: 401,
       code: 'TENANT_SESSION_INVALID',
