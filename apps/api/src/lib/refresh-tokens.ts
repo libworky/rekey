@@ -13,15 +13,17 @@
  * ApiKey). Refresh tokens are 32 bytes of CSPRNG entropy — fast hash is
  * correct, Argon2 is for user-chosen passwords (see lib/passwords.ts).
  *
- * Lifetime: 30 days, sliding (each rotation issues a fresh 30-day window).
+ * Lifetime: END_USER_REFRESH_TOKEN_TTL_DAYS (default 30), sliding: each
+ * rotation issues a fresh full window.
  */
 
 import { createHash, randomBytes } from 'node:crypto';
 import type { RefreshToken } from '@prisma/client';
 import { prisma } from './prisma.js';
+import { env } from '../config/env.js';
 
 const REFRESH_TOKEN_BYTES = 32;
-const REFRESH_TOKEN_LIFETIME_MS = 30 * 24 * 60 * 60 * 1000;
+const REFRESH_TOKEN_LIFETIME_MS = env.END_USER_REFRESH_TOKEN_TTL_DAYS * 24 * 60 * 60 * 1000;
 
 export function hashRefreshToken(raw: string): string {
   return createHash('sha256').update(raw).digest('hex');

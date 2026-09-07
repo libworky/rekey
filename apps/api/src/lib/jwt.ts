@@ -160,7 +160,8 @@ export type UserSessionClaims = EndUserClaims<'eu_access'>;
 export type MfaChallengeClaims = EndUserClaims<'eu_mfa_challenge'>;
 
 // Short access lifetime — paired with a 30-day refresh token.
-const DEFAULT_ACCESS_LIFETIME_SECONDS = 15 * 60;
+// Configurable per deployment (END_USER_ACCESS_TOKEN_TTL_SECONDS, default 15 minutes).
+const DEFAULT_ACCESS_LIFETIME_SECONDS = env.END_USER_ACCESS_TOKEN_TTL_SECONDS;
 // MFA challenge is even shorter — enough to scan a code, not enough to be useful if leaked.
 const DEFAULT_MFA_CHALLENGE_LIFETIME_SECONDS = 5 * 60;
 

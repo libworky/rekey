@@ -46,7 +46,7 @@ async function signIn(formData: FormData): Promise<void> {
     );
   }
 
-  await setSessionCookies({ accessToken: result.accessToken, refreshToken: result.refreshToken });
+  await setSessionCookies(result);
   if (next) redirect(`${next}${next.includes('?') ? '&' : '?'}e=login`);
   redirect('/applications?e=login');
 }
@@ -97,7 +97,7 @@ async function completePasskeyLogin(formData: FormData): Promise<void> {
     }
     throw err;
   }
-  await setSessionCookies({ accessToken: result.accessToken, refreshToken: result.refreshToken });
+  await setSessionCookies(result);
   if (next) redirect(`${next}${next.includes('?') ? '&' : '?'}e=login_passkey`);
   redirect('/applications?e=login_passkey');
 }

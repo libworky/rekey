@@ -61,7 +61,7 @@ async function switchWorkspace(formData: FormData): Promise<void> {
     path: '/api/v1/tenant/auth/switch-workspace',
     body: { tenantId },
   });
-  await setSessionCookies({ accessToken: result.accessToken, refreshToken: result.refreshToken });
+  await setSessionCookies(result);
   redirect('/applications?e=ws_switched');
 }
 
@@ -95,7 +95,7 @@ async function createWorkspace(formData: FormData): Promise<void> {
     path: '/api/v1/tenant/auth/switch-workspace',
     body: { tenantId: created.id },
   });
-  await setSessionCookies({ accessToken: switched.accessToken, refreshToken: switched.refreshToken });
+  await setSessionCookies(switched);
   redirect('/applications?e=ws_created');
 }
 

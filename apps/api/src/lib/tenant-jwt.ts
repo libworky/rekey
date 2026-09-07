@@ -44,7 +44,8 @@ export interface TenantMfaChallengeClaims {
   exp: number;
 }
 
-const DEFAULT_LIFETIME_SECONDS = 15 * 60;
+// Configurable per deployment (OPERATOR_ACCESS_TOKEN_TTL_SECONDS, default 15 minutes).
+const DEFAULT_LIFETIME_SECONDS = env.OPERATOR_ACCESS_TOKEN_TTL_SECONDS;
 // Short-enough that a leaked challenge token is useless before email phishes
 // can be acted on; long enough for a real user to fish their authenticator
 // app out of their pocket.

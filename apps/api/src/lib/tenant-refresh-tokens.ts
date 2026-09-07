@@ -14,9 +14,11 @@
 import { createHash, randomBytes } from 'node:crypto';
 import type { TenantRefreshToken } from '@prisma/client';
 import { prisma } from './prisma.js';
+import { env } from '../config/env.js';
 
 const REFRESH_TOKEN_BYTES = 32;
-const REFRESH_TOKEN_LIFETIME_MS = 30 * 24 * 60 * 60 * 1000;
+// OPERATOR_REFRESH_TOKEN_TTL_DAYS (default 30), sliding like the end-user one.
+const REFRESH_TOKEN_LIFETIME_MS = env.OPERATOR_REFRESH_TOKEN_TTL_DAYS * 24 * 60 * 60 * 1000;
 
 export function hashTenantRefreshToken(raw: string): string {
   return createHash('sha256').update(raw).digest('hex');

@@ -181,6 +181,16 @@ security event.
 2. Refetches membership for `(sub, tid)` from the DB — if the user was removed since the token was issued, the request is rejected with `TENANT_MEMBERSHIP_REVOKED`.
 3. Uses the **live** role from the membership row, not the JWT's `rol` — this means role downgrades take effect immediately on the next request.
 
+Lifetimes: the access token lasts `OPERATOR_ACCESS_TOKEN_TTL_SECONDS`
+(default 15 minutes, up to 12 hours) and the refresh token
+`OPERATOR_REFRESH_TOKEN_TTL_DAYS` (default 30, up to 365), sliding on every
+rotation. The panel renews the access token silently when it expires, so an
+operator is signed in for as long as their refresh token keeps rotating; the
+access lifetime bounds how long a removed member can keep acting before the
+next renewal re-checks the membership, which is why the default is short.
+Every auth response carries `accessTokenExpiresAt` and
+`refreshTokenExpiresAt`, and the panel sets its session cookies from them.
+
 ## Endpoints
 
 ### Unauthenticated
