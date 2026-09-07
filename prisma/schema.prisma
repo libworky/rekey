@@ -98,6 +98,9 @@ model TenantUser {
   // migration; safe to drop in a later cleanup once confirmed unused in prod.
   failedSignInAttempts Int       @default(0) @map("failed_sign_in_attempts")
   lockedUntil          DateTime? @map("locked_until")
+  // See EndUser.sessionsInvalidBefore: stamped by password change and
+  // sign-out-everywhere; the session middleware refuses older access tokens.
+  sessionsInvalidBefore DateTime? @map("sessions_invalid_before")
   createdAt     DateTime @default(now()) @map("created_at")
   updatedAt     DateTime @updatedAt @map("updated_at")
 
@@ -1283,6 +1286,13 @@ model EndUser {
   erasedAt      DateTime? @map("erased_at")
   // The operator (TenantUser id) who processed the erasure, for the audit trail.
   erasedBy      String?   @map("erased_by")
+  // Access tokens issued before this instant are refused on their next use.
+  // Stamped by every user-wide revocation (password change, sign-out
+  // everywhere), single-session revoke and device release, so a long access
+  // lifetime never extends a session somebody already ended. Refresh tokens
+  // are revoked row by row as before; this closes the gap the access token
+  // would otherwise ride out.
+  sessionsInvalidBefore DateTime? @map("sessions_invalid_before")
   createdAt     DateTime  @default(now()) @map("created_at")
   updatedAt     DateTime  @updatedAt @map("updated_at")
 

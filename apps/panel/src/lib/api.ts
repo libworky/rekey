@@ -3,8 +3,8 @@
  *
  * Two cookies, both httpOnly + SameSite=Lax (see `setSessionCookies` for why
  * not Strict) + Secure whenever the request wasn't plain-HTTP loopback:
- *   - rekey_access  — short-lived (15 min) operator JWT
- *   - rekey_refresh — long-lived (30 days) opaque token
+ *   - rekey_access  — short-lived operator JWT (OPERATOR_ACCESS_TOKEN_TTL_SECONDS on the API)
+ *   - rekey_refresh — long-lived opaque token (OPERATOR_REFRESH_TOKEN_TTL_DAYS)
  *
  * Auto-refresh on 401: when the access token expires, we exchange the
  * refresh token, rotate cookies, and retry the original request once.
@@ -100,6 +100,22 @@ function jwtExpiryIso(token: string): string | undefined {
   }
 }
 
+/**
+ * Cookie lifetimes for a session, from the auth response's expiries. Shared
+ * with the route handlers (magic link, OAuth callback, cloud handoff) that set
+ * cookies on a Response rather than through `cookies()`.
+ */
+export function sessionCookieMaxAges(result: {
+  accessToken: string;
+  accessTokenExpiresAt?: string;
+  refreshTokenExpiresAt?: string;
+}): { access: number; refresh: number } {
+  return {
+    access: secondsUntil(result.accessTokenExpiresAt ?? jwtExpiryIso(result.accessToken)) ?? 60 * 15,
+    refresh: secondsUntil(result.refreshTokenExpiresAt) ?? ONE_DAY * 30,
+  };
+}
+
 export async function setSessionCookies(args: {
   accessToken: string;
   refreshToken: string;
@@ -114,8 +130,7 @@ export async function setSessionCookies(args: {
 }): Promise<void> {
   const jar = await cookies();
   const secure = await cookieSecure();
-  const accessMaxAge = secondsUntil(args.accessTokenExpiresAt ?? jwtExpiryIso(args.accessToken)) ?? 60 * 15;
-  const refreshMaxAge = secondsUntil(args.refreshTokenExpiresAt) ?? ONE_DAY * 30;
+  const { access: accessMaxAge, refresh: refreshMaxAge } = sessionCookieMaxAges(args);
   // `lax`, not `strict`: an operator can legitimately ARRIVE at the panel via a
   // top-level cross-site navigation — most importantly the MCP OAuth consent
   // flow, which enters /mcp-consent through a redirect that originated at the
@@ -175,7 +190,7 @@ async function setSessionCookiesSafe(args: {
  * presented token, so a second concurrent exchange of the SAME token gets a
  * 401. That is correct server behaviour — reuse detection is a security
  * feature — but every RSC on a page calls `api()` independently, so a
- * navigation after the 15-minute access token expires fires several 401s at
+ * navigation after the access token expires fires several 401s at
  * once and each one tried to refresh. One won; the rest were told their token
  * was already spent and bounced the operator to `/login?reason=expired`,
  * discarding whatever they had typed.
@@ -1114,8 +1129,8 @@ export interface AuthResponse {
   activeRole: 'OWNER' | 'ADMIN' | 'MEMBER';
   accessToken: string;
   refreshToken: string;
-  accessTokenExpiresAt?: string;
-  refreshTokenExpiresAt?: string;
+  accessTokenExpiresAt: string;
+  refreshTokenExpiresAt: string;
 }
 
 export async function publicPost<T>(path: string, body: unknown): Promise<T> {

@@ -13,7 +13,7 @@
  * `tenantRole` is re-read from `tenant_memberships` on every request; the
  * token's `rol` claim is ignored. A role downgrade or removal therefore takes
  * effect immediately (removal → 403 `TENANT_MEMBERSHIP_REVOKED`) instead of
- * waiting out the 15-minute access token. That costs one indexed lookup per
+ * waiting out the access token. That costs one indexed lookup per
  * request, which is cheaper than every role-gated service having to remember to
  * re-check for itself.
  */
@@ -24,6 +24,7 @@ import { RekeyError } from '../lib/error.js';
 import { verifyTenantAccessToken } from '../lib/tenant-jwt.js';
 import { prisma } from '../lib/prisma.js';
 import type { PublicTenantUser } from '../modules/tenant-auth/tenant-auth.service.js';
+import { sessionIssuedBefore } from './user-session.js';
 import { resolveMembershipScopes, type Scope } from '../lib/operator-scopes.js';
 
 declare module 'fastify' {
@@ -80,6 +81,16 @@ export async function requireTenantSession(
       code: 'TENANT_SESSION_INVALID',
       message: 'Operator account no longer exists.',
       fix: 'Sign in again to obtain a valid session.',
+    });
+  }
+  // Minted before the operator's last password change or sign-out
+  // everywhere: refused now, whatever the configured access lifetime.
+  if (user.sessionsInvalidBefore !== null && sessionIssuedBefore(claims, user.sessionsInvalidBefore)) {
+    throw new RekeyError({
+      statusCode: 401,
+      code: 'TENANT_SESSION_INVALID',
+      message: 'Operator session was ended (password changed or signed out everywhere).',
+      fix: 'Sign in again.',
     });
   }
 

@@ -4,7 +4,7 @@ import Link from 'next/link';
 import { redirect } from 'next/navigation';
 import { cookies } from 'next/headers';
 import { randomUUID } from 'node:crypto';
-import { publicPost, publicGet, setSessionCookies, PanelApiError, type SignInResponse } from '@/lib/api';
+import { publicPost, publicGet, setSessionCookies, PanelApiError, type SignInResponse, type AuthResponse } from '@/lib/api';
 import { PasskeyLoginButton } from '@/components/PasskeyLoginButton';
 import { SubmitButton } from '@/components/SubmitButton';
 import { AuthCard, OrDivider } from '@/components/AuthCard';
@@ -85,9 +85,9 @@ async function completePasskeyLogin(formData: FormData): Promise<void> {
   } catch {
     redirect(`/login?error=PASSKEY_RESPONSE_INVALID${keep}`);
   }
-  let result: { accessToken: string; refreshToken: string };
+  let result: Pick<AuthResponse, 'accessToken' | 'refreshToken' | 'accessTokenExpiresAt' | 'refreshTokenExpiresAt'>;
   try {
-    result = await publicPost<{ accessToken: string; refreshToken: string }>(
+    result = await publicPost<typeof result>(
       '/api/v1/tenant/auth/passkeys/authenticate/complete',
       { response, expectedChallenge },
     );

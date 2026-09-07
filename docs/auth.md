@@ -317,6 +317,12 @@ refresh re-checks it. Every sign-in and refresh response carries
 `accessTokenExpiresAt` and `refreshTokenExpiresAt`, so a client never has
 to know the configured values.
 
+A long access lifetime does not extend a session somebody ended. A password
+change, sign-out everywhere, an operator revoking a session, and a device
+release or block all stamp the user, and an access token minted before the
+stamp is refused on its next use with `401 SESSION_REVOKED`. Sessions that
+were not ended renew silently from their refresh token.
+
 ### The access JWT
 
 ```
@@ -378,7 +384,7 @@ Headers: Authorization: Bearer rp_live_…  +  X-Rekey-User-Token: <jwt>
 ```
 
 - Verifies `currentPassword` first — wrong returns `INVALID_CREDENTIALS`.
-- On success, every refresh token for the user is revoked. The caller's *current* access token stays valid until its 15-min expiry.
+- On success, every refresh token for the user is revoked. Access tokens minted before the call, the caller's own included, are refused on their next use.
 
 ### What's still deliberately not here
 

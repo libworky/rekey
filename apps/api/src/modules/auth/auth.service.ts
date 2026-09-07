@@ -2377,6 +2377,28 @@ export const authService = {
   },
 
   /**
+   * `getById` plus the one private field the session middleware needs:
+   * `sessionsInvalidBefore`, which never leaves the server. Same 404 and
+   * erasure rules as `getById`.
+   */
+  async getByIdForSession(
+    applicationId: string,
+    endUserId: string,
+  ): Promise<{ endUser: PublicEndUser; sessionsInvalidBefore: Date | null }> {
+    const row = await prisma.endUser.findUnique({ where: { id: endUserId } });
+    if (!row || row.applicationId !== applicationId) {
+      throw new RekeyError({
+        statusCode: 404,
+        code: 'END_USER_NOT_FOUND',
+        message: `EndUser "${endUserId}" not found in this application.`,
+        fix: 'Verify the user id and that the calling secret key belongs to the right Application.',
+      });
+    }
+    assertEndUserNotErased(row);
+    return { endUser: redact(row), sessionsInvalidBefore: row.sessionsInvalidBefore };
+  },
+
+  /**
    * Self-service update of the caller's OWN EndUser record.
    *
    * The field list is a **closed allowlist**, and it is closed rather than

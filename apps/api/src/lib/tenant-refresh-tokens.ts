@@ -6,7 +6,7 @@
  * with a polymorphic helper, but the cost is one extra type parameter
  * everywhere; the duplication is tiny and stays auditable.
  *
- * 30-day lifetime, single-use, hash-only DB. Race-safe rotation via
+ * Configurable lifetime (30 days by default), single-use, hash-only DB. Race-safe rotation via
  * updateMany. Mirror the contract of `lib/refresh-tokens.ts` exactly so
  * the parallel structure is the documentation.
  */
@@ -115,6 +115,9 @@ export async function revokeTenantRefreshToken(raw: string): Promise<void> {
 export async function revokeAllTenantRefreshTokensForUser(
   tenantUserId: string,
 ): Promise<number> {
+  // See TenantUser.sessionsInvalidBefore: the operator's live access tokens
+  // are refused from this instant, whatever OPERATOR_ACCESS_TOKEN_TTL_SECONDS is.
+  await prisma.tenantUser.updateMany({ where: { id: tenantUserId }, data: { sessionsInvalidBefore: new Date() } });
   const result = await prisma.tenantRefreshToken.updateMany({
     where: { tenantUserId, revokedAt: null },
     data: { revokedAt: new Date() },

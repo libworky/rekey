@@ -190,6 +190,9 @@ access lifetime bounds how long a removed member can keep acting before the
 next renewal re-checks the membership, which is why the default is short.
 Every auth response carries `accessTokenExpiresAt` and
 `refreshTokenExpiresAt`, and the panel sets its session cookies from them.
+A password change or sign-out everywhere stamps the operator, and an access
+token minted before the stamp is refused on its next use, so a long access
+lifetime never extends an ended session.
 
 ## Endpoints
 

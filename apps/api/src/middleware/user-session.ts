@@ -18,6 +18,11 @@ import type { FastifyRequest, FastifyReply } from 'fastify';
 import { RekeyError } from '../lib/error.js';
 import { verifyUserAccessTokenAnyAlg } from '../lib/jwt.js';
 import { prisma } from '../lib/prisma.js';
+
+/** Whether a token's `iat` (seconds) falls before the stamp's second. */
+export function sessionIssuedBefore(claims: { iat?: number }, stamp: Date): boolean {
+  return typeof claims.iat === 'number' && claims.iat < Math.floor(stamp.getTime() / 1000);
+}
 import { authService, type PublicEndUser } from '../modules/auth/auth.service.js';
 
 /** Who is really behind an impersonated session. Set only for `imp` tokens. */
@@ -148,7 +153,23 @@ export async function requireUserSession(
     request.impersonation = { auditId: claims.impid, operatorUserId: audit.operatorUserId };
   }
 
-  const endUser = await authService.getById(request.application.id, claims.sub);
+  const { endUser, sessionsInvalidBefore } = await authService.getByIdForSession(
+    request.application.id,
+    claims.sub,
+  );
+  // A token minted before the user's last password change, sign-out
+  // everywhere, session revoke or device release is refused now rather than
+  // at its expiry. Compared at second granularity (`iat` is seconds), so a
+  // token minted in the same second as the stamp, which is the pair the
+  // password-change response itself hands back, survives.
+  if (sessionsInvalidBefore !== null && sessionIssuedBefore(claims, sessionsInvalidBefore)) {
+    throw new RekeyError({
+      statusCode: 401,
+      code: 'SESSION_REVOKED',
+      message: 'This session was ended (password changed, signed out everywhere, or the device released).',
+      fix: 'Sign in again.',
+    });
+  }
 
   request.endUser = endUser;
   if (claims.dev) request.deviceId = claims.dev;

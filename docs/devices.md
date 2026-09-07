@@ -186,7 +186,7 @@ another Application is indistinguishable from a typo.
 **Release** gives the slot back and revokes every session minted on the
 device, in one transaction — including the caller's own refresh chain when it
 is the same device; the access token in hand stays valid until it expires
-(up to 15 minutes), because `requireUserSession` reads the `dev` claim and
+(up to the access lifetime for an offline verifier; the API refuses the token on its next use, since a release stamps the user), because `requireUserSession` reads the `dev` claim and
 does not look the device up per request. It is idempotent. A blocked device is
 not its owner's to release. `data.releasedBy` on the webhook and the
 security-events trail say who asked: `end_user`, `operator`, or `server`
