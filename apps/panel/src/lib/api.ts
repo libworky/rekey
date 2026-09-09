@@ -15,6 +15,7 @@
  */
 
 import { cache } from 'react';
+import { revalidatePath } from 'next/cache';
 import { cookies, headers } from 'next/headers';
 import { forbidden, notFound, redirect } from 'next/navigation';
 import { cookieSecure } from './cookie-secure';
@@ -388,6 +389,36 @@ export async function api<T>(args: RequestArgs): Promise<T> {
         : { code: 'PANEL_HTTP_ERROR', message: `HTTP ${res.status}` };
     throw new PanelApiError({ ...err, statusCode: res.status });
   }
+
+  // A write happened, so every cached segment is now potentially a lie.
+  //
+  // This is central rather than per-action on purpose. Actions end with
+  // `redirect('/…?granted=1')`, and the Router Cache is keyed by segment path,
+  // not by search params — so the redirect lands on the entry the operator
+  // already has, the flash message renders from the query string, and the data
+  // underneath does not move. It reads as a dead UI, and it gets worse the
+  // longer a session runs because more segments are cached. Of 45 files with
+  // `'use server'`, five called `revalidatePath`; the whole end-user surface,
+  // which is the most write-heavy screen in the console, called it nowhere.
+  //
+  // Doing it here means every mutation is covered, including the ones nobody
+  // has written yet — the alternative is ~250 call sites and a rule that has
+  // to be remembered forever.
+  //
+  // `'/'` with `'layout'` invalidates the whole tree. A narrower path would be
+  // wrong more often than right: granting a subscription changes the end-user
+  // row, the subscriptions tab, the plan's subscriber count and the audit log,
+  // and only the caller knows some of that. This console is low-traffic and
+  // every page is dynamic and `no-store` already, so the cost of over-
+  // invalidating is a refetch, and the cost of under-invalidating is an
+  // operator acting on stale state.
+  //
+  // GET is excluded because it is the render path: `revalidatePath` throws
+  // when called during render, and a read has nothing to invalidate anyway.
+  if (args.method !== 'GET') {
+    revalidatePath('/', 'layout');
+  }
+
   return (json as { success: true; data: T }).data;
 }
 
