@@ -51,6 +51,25 @@ const nextConfig = {
     // the UI could not distinguish "not yours" from "we're down".
     // `notFound()` is stable and needs no flag; `forbidden()` does.
     authInterrupts: true,
+    // Client Router Cache off.
+    //
+    // `lib/api.ts` invalidates on every write, which fixes the case where the
+    // operator caused the change. It does nothing for the case where somebody
+    // ELSE did: a second operator, a webhook, an end-user signing in. Next's
+    // defaults (dynamic 0, static 300) still let a revisited segment render
+    // from a payload fetched minutes ago, and a support console showing a
+    // stale device list or subscription state is worse than one that takes an
+    // extra moment.
+    //
+    // The cost is a refetch on every navigation, which is exactly what this
+    // console is for. It has no anonymous traffic, a handful of operators, and
+    // every page is already dynamic and `no-store` — so the saving the Router
+    // Cache offers was never large, and the staleness it bought was expensive.
+    //
+    // Raise these if the operator count ever makes the extra reads matter;
+    // they interact with the API's rate limit (RATE_LIMIT_MAX), which has to
+    // be sized for the traffic this setting produces.
+    staleTimes: { dynamic: 0, static: 0 },
   },
 };
 export default nextConfig;
