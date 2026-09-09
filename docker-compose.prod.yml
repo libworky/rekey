@@ -137,6 +137,16 @@ services:
       # propagation path. 0 disables the cache. See docs/organization-roles.md.
       ORG_ROLE_CACHE_TTL_MS: ${ORG_ROLE_CACHE_TTL_MS:-}
 
+      # ── Token lifetimes ──────────────────────────────────────────────────
+      # Refresh tokens rotate on every use and slide, so these windows only
+      # have to cover the longest gap between two uses, not how long someone
+      # stays signed in. Empty = the values they were hard-coded to before
+      # they became configurable: 15 minute access, 30 day refresh.
+      END_USER_ACCESS_TOKEN_TTL_SECONDS: ${END_USER_ACCESS_TOKEN_TTL_SECONDS:-}
+      END_USER_REFRESH_TOKEN_TTL_DAYS: ${END_USER_REFRESH_TOKEN_TTL_DAYS:-}
+      OPERATOR_ACCESS_TOKEN_TTL_SECONDS: ${OPERATOR_ACCESS_TOKEN_TTL_SECONDS:-}
+      OPERATOR_REFRESH_TOKEN_TTL_DAYS: ${OPERATOR_REFRESH_TOKEN_TTL_DAYS:-}
+
       # ── Secrets ──────────────────────────────────────────────────────────
       JWT_SECRET: ${JWT_SECRET}
       ENCRYPTION_KEY: ${ENCRYPTION_KEY}
