@@ -51,32 +51,38 @@ const nextConfig = {
     // the UI could not distinguish "not yours" from "we're down".
     // `notFound()` is stable and needs no flag; `forbidden()` does.
     authInterrupts: true,
-    // Page data always refetches; the shell around it does not.
+    // BOTH of these must be non-zero. See README.md "Navigation performance"
+    // before changing either — zero here does not mean "always fresh", it
+    // means "prefetching is dead", and the console gets slower, not fresher.
     //
-    // `dynamic: 0` is already Next's default, and it is what keeps a revisited
-    // tab from rendering yesterday's device list. It is stated rather than
-    // omitted because the value that matters sits next to it.
+    // `dynamic` (Next's default is 0) is the lifetime of a prefetched page
+    // segment. At 0 the router still ISSUES every prefetch a <Link> in the
+    // viewport asks for, then throws the result away, so a click starts from
+    // nothing and a client-side navigation is strictly slower than opening the
+    // same URL in a new tab. That is measurable here: one tab click rendered
+    // the page three to four times about a second apart — viewport prefetch,
+    // hover prefetch, then the real navigation — each one a full render, none
+    // reusable.
     //
-    // `static` governs the shared shell — layouts and loading boundaries — and
-    // it was briefly set to 0 here. That was a mistake worth recording. The
-    // end-user screen is `[euid]/layout.tsx` (identity header plus the tab
-    // strip) wrapping six routed tabs, so `static: 0` made every tab click
-    // re-render and re-fetch the layout as well as the page. On a screen whose
-    // shell calls `getEndUserDetail` and whose overview and security tabs each
-    // pull THREE 200-row `security-events` scans to show twenty rows (the API
-    // has no `actorId` filter, so the panel narrows in memory), that roughly
-    // doubled the work per click and took the tab strip's instant render with
-    // it. Request volume went from ~50/min to 210/min for the same browsing.
+    // `static` is the shared shell: layouts and loading boundaries. It was
+    // briefly 0 too, which made every tab click re-render and re-fetch
+    // `[euid]/layout.tsx` (identity header plus tab strip) as well as the page.
+    // Request volume went from ~50/min to 210/min for the same browsing.
     //
-    // 180s of shell reuse does not risk the staleness the 0 was meant to
-    // prevent: `lib/api.ts` calls `revalidatePath('/', 'layout')` on every
-    // write, so any operator action drops the layout immediately. What 180s
-    // buys back is that navigating between tabs of the SAME record does not
-    // re-fetch the record's header each time.
+    // Neither value risks showing an operator a stale write: `lib/api.ts`
+    // calls `revalidatePath('/', 'layout')` on every non-GET, so any mutation
+    // drops the whole tree immediately. These windows only cover the case
+    // where somebody ELSE changed something, and 30s of that on a support
+    // console is a better trade than a UI that stalls on every click.
+    //
+    // The reason the stall is so visible on the end-user tabs specifically:
+    // the overview and security tabs each pull THREE 200-row `security-events`
+    // scans to render twenty rows, because the API has no `actorId` filter and
+    // the panel narrows in memory. Fix that and these windows matter less.
     //
     // These interact with the API's RATE_LIMIT_MAX, which has to be sized for
     // the traffic they produce.
-    staleTimes: { dynamic: 0, static: 180 },
+    staleTimes: { dynamic: 30, static: 180 },
   },
 };
 export default nextConfig;
