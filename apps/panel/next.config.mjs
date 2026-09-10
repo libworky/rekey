@@ -51,25 +51,32 @@ const nextConfig = {
     // the UI could not distinguish "not yours" from "we're down".
     // `notFound()` is stable and needs no flag; `forbidden()` does.
     authInterrupts: true,
-    // Client Router Cache off.
+    // Page data always refetches; the shell around it does not.
     //
-    // `lib/api.ts` invalidates on every write, which fixes the case where the
-    // operator caused the change. It does nothing for the case where somebody
-    // ELSE did: a second operator, a webhook, an end-user signing in. Next's
-    // defaults (dynamic 0, static 300) still let a revisited segment render
-    // from a payload fetched minutes ago, and a support console showing a
-    // stale device list or subscription state is worse than one that takes an
-    // extra moment.
+    // `dynamic: 0` is already Next's default, and it is what keeps a revisited
+    // tab from rendering yesterday's device list. It is stated rather than
+    // omitted because the value that matters sits next to it.
     //
-    // The cost is a refetch on every navigation, which is exactly what this
-    // console is for. It has no anonymous traffic, a handful of operators, and
-    // every page is already dynamic and `no-store` — so the saving the Router
-    // Cache offers was never large, and the staleness it bought was expensive.
+    // `static` governs the shared shell — layouts and loading boundaries — and
+    // it was briefly set to 0 here. That was a mistake worth recording. The
+    // end-user screen is `[euid]/layout.tsx` (identity header plus the tab
+    // strip) wrapping six routed tabs, so `static: 0` made every tab click
+    // re-render and re-fetch the layout as well as the page. On a screen whose
+    // shell calls `getEndUserDetail` and whose overview and security tabs each
+    // pull THREE 200-row `security-events` scans to show twenty rows (the API
+    // has no `actorId` filter, so the panel narrows in memory), that roughly
+    // doubled the work per click and took the tab strip's instant render with
+    // it. Request volume went from ~50/min to 210/min for the same browsing.
     //
-    // Raise these if the operator count ever makes the extra reads matter;
-    // they interact with the API's rate limit (RATE_LIMIT_MAX), which has to
-    // be sized for the traffic this setting produces.
-    staleTimes: { dynamic: 0, static: 0 },
+    // 180s of shell reuse does not risk the staleness the 0 was meant to
+    // prevent: `lib/api.ts` calls `revalidatePath('/', 'layout')` on every
+    // write, so any operator action drops the layout immediately. What 180s
+    // buys back is that navigating between tabs of the SAME record does not
+    // re-fetch the record's header each time.
+    //
+    // These interact with the API's RATE_LIMIT_MAX, which has to be sized for
+    // the traffic they produce.
+    staleTimes: { dynamic: 0, static: 180 },
   },
 };
 export default nextConfig;
