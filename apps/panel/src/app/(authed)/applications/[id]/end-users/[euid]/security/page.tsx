@@ -6,8 +6,9 @@
  * scan `actorType=end_user` only, which meant everything an OPERATOR did to
  * this person (block a device, unblock it, release one on their behalf, erase
  * them) and everything the SYSTEM did (create them from a billing event) was
- * recorded and then shown nowhere on their page. `getEndUserEvents` scans all
- * three actor types and merges on either `actorId` or `metadata.endUserId`.
+ * recorded and then shown nowhere on their page. `getEndUserEvents` now asks
+ * the API for events ABOUT this user (`?endUserId=`), which covers all three
+ * actor types in one indexed read.
  */
 
 import * as React from 'react';
@@ -29,7 +30,6 @@ import {
   getEndUserDetail,
   getEndUserEvents,
   getEndUserSessions,
-  AUTH_EVENT_SCAN,
   AUTH_EVENTS_SHOWN,
   IMPERSONATE_COOKIE,
   LOGIN_LOCK_MINUTES,
@@ -313,7 +313,7 @@ export default async function EndUserSecurityPage({
           <EmptyState
             variant="inline"
             title="No recorded events"
-            description={`Nothing for this user in the application's most recent ${AUTH_EVENT_SCAN} events per actor type. On a busy application that window may not reach back far.`}
+            description="Nothing has been recorded for this user yet."
           />
         ) : (
           <Table minWidth="min-w-[44rem]">

@@ -6,7 +6,8 @@
  * only: the log carries IPs and event metadata that a plain MEMBER shouldn't
  * see. Read-only; the log is append-only and written best-effort elsewhere.
  *
- * Filters: `applicationId`, `type`, `actorType`, plus an inclusive
+ * Filters: `applicationId`, `type`, `actorType`, `endUserId` (events ABOUT
+ * that end-user from any actor, not just ones they performed), plus an inclusive
  * `from`/`to` createdAt window. `?format=csv` returns a downloadable CSV
  * instead of JSON — capped at CSV_MAX_ROWS rows (newest first), same
  * OWNER/ADMIN gate.
@@ -43,6 +44,7 @@ const Query = z.object({
   applicationId: z.string().min(1).optional(),
   type: z.string().min(1).max(80).optional(),
   actorType: z.enum(['operator', 'end_user', 'system']).optional(),
+  endUserId: z.string().min(1).max(64).optional(),
   from: z.coerce.date().optional(),
   to: z.coerce.date().optional(),
   sort: z.enum(['createdAt', 'type']).optional(),
@@ -83,6 +85,14 @@ export async function securityEventsRoutes(app: FastifyInstance): Promise<void> 
             applicationId: { type: 'string' },
             type: { type: 'string', maxLength: 80 },
             actorType: { type: 'string', enum: ['operator', 'end_user', 'system'] },
+            endUserId: {
+              type: 'string',
+              maxLength: 64,
+              description:
+                'Events about this end-user from ANY actor: their own sign-ins and device registrations, ' +
+                'and what operators or the system did to them (a blocked device, an account created by a ' +
+                'billing webhook). Not equivalent to `actorType=end_user`, which misses the latter.',
+            },
             from: { type: 'string', format: 'date-time' },
             to: { type: 'string', format: 'date-time' },
             sort: { type: 'string', enum: ['createdAt', 'type'] },
@@ -127,6 +137,7 @@ export async function securityEventsRoutes(app: FastifyInstance): Promise<void> 
           applicationId: q.applicationId,
           type: q.type,
           actorType: q.actorType,
+          endUserId: q.endUserId,
           from: q.from,
           to: q.to,
           limit: CSV_MAX_ROWS,
@@ -157,6 +168,7 @@ export async function securityEventsRoutes(app: FastifyInstance): Promise<void> 
         applicationId: q.applicationId,
         type: q.type,
         actorType: q.actorType,
+        endUserId: q.endUserId,
         from: q.from,
         to: q.to,
       };

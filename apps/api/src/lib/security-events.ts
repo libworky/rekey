@@ -69,6 +69,33 @@ export function requestContext(req: FastifyRequest): {
   };
 }
 
+/**
+ * The end-user an event is ABOUT, whoever performed it.
+ *
+ * An end-user's own events name them as the actor. Everything done TO them by
+ * someone else — an operator blocking a device, the billing webhook creating
+ * their account — names the subject in `metadata.endUserId` instead, with the
+ * operator or the system as the actor. "Show me this person's history" needs
+ * both, and the panel used to get it by pulling the application's last 200
+ * events three times over (once per actor type) and matching either field in
+ * memory: 600 rows fetched to render twenty, on every view of the end-user
+ * screen.
+ *
+ * Deriving it here, at the only place an event is written, turns that into an
+ * indexed equality. The explicit subject wins over the actor; the two have
+ * never disagreed in recorded data (checked against every row on the bench
+ * when this column was introduced), and if they ever did, the event is about
+ * whoever it says it is about.
+ */
+export function subjectEndUserIdOf(
+  input: Pick<SecurityEventInput, 'actorType' | 'actorId' | 'metadata'>,
+): string | null {
+  const explicit = input.metadata?.endUserId;
+  if (typeof explicit === 'string' && explicit.length > 0) return explicit;
+  if (input.actorType === 'end_user' && input.actorId) return input.actorId;
+  return null;
+}
+
 export async function recordSecurityEvent(input: SecurityEventInput): Promise<void> {
   try {
     await prisma.securityEvent.create({
@@ -76,6 +103,7 @@ export async function recordSecurityEvent(input: SecurityEventInput): Promise<vo
         type: input.type,
         actorType: input.actorType,
         actorId: input.actorId ?? null,
+        subjectEndUserId: subjectEndUserIdOf(input),
         tenantId: input.tenantId ?? null,
         applicationId: input.applicationId ?? null,
         ip: input.ip ?? null,
@@ -93,6 +121,12 @@ export interface SecurityEventQuery {
   applicationId?: string | undefined;
   type?: string | undefined;
   actorType?: SecurityActorType | undefined;
+  /**
+   * Events ABOUT this end-user, from any actor — see `subjectEndUserIdOf`.
+   * Not the same as `actorType=end_user` plus an actor id: that misses every
+   * operator and system action taken on them.
+   */
+  endUserId?: string | undefined;
   /** Inclusive createdAt window. */
   from?: Date | undefined;
   to?: Date | undefined;
@@ -165,6 +199,7 @@ async function securityEventWhere(query: SecurityEventQuery) {
     ...(query.applicationId !== undefined && { applicationId: query.applicationId }),
     ...(query.type !== undefined && { type: query.type }),
     ...(query.actorType !== undefined && { actorType: query.actorType }),
+    ...(query.endUserId !== undefined && { subjectEndUserId: query.endUserId }),
     ...((query.from || query.to) && {
       createdAt: {
         ...(query.from && { gte: query.from }),
