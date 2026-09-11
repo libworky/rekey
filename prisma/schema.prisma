@@ -2690,6 +2690,11 @@ model SecurityEvent {
   // 'operator' | 'end_user' | 'system'
   actorType     String   @map("actor_type")
   actorId       String?  @map("actor_id")
+  // The end-user this event is ABOUT, whoever performed it: the actor for an
+  // end-user's own events, `metadata.endUserId` for anything done to them.
+  // Derived once in `recordSecurityEvent` so "this person's history" is an
+  // indexed equality instead of three 200-row scans matched in memory.
+  subjectEndUserId String? @map("subject_end_user_id")
   type          String
   ip            String?
   userAgent     String?  @map("user_agent")
@@ -2698,6 +2703,7 @@ model SecurityEvent {
 
   @@index([tenantId, createdAt])
   @@index([applicationId, createdAt])
+  @@index([applicationId, subjectEndUserId, createdAt])
   @@index([type])
   @@map("security_events")
 }

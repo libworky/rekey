@@ -282,13 +282,11 @@ export const LOGIN_LOCK_THRESHOLD = 10;
 export const LOGIN_LOCK_MINUTES = 15;
 
 /**
- * Recent auth events for ONE end-user.
+ * How many of one end-user's events a page reads.
  *
- * `GET /tenant/security-events` has no `actorId` filter, so the panel pulls the
- * application's most recent events (200 is the API's `limit` ceiling) and
- * narrows in memory. On a busy application that window may not reach far back
- * for a quiet user — the pages say so rather than implying the list is
- * exhaustive.
+ * 200 is the API's `limit` ceiling. Since `?endUserId=` these are 200 of THIS
+ * user's events, newest first — not 200 of the whole application's, which is
+ * what the three-scan workaround below this used to read.
  */
 export const AUTH_EVENT_SCAN = 200;
 export const AUTH_EVENTS_SHOWN = 20;
@@ -306,67 +304,41 @@ export function shortFingerprint(fingerprint: string): string {
 }
 
 /**
- * Every recorded event about ONE end-user, from all three actor types.
+ * Every recorded event about ONE end-user, from any actor.
  *
- * ## Why three scans and not one
+ * An end-user's own events name them as the actor; everything an operator or
+ * the system does TO them names them in `metadata.endUserId` instead. The API
+ * derives one `subject_end_user_id` from those at write time and filters on it
+ * with `?endUserId=`, so this is one indexed read.
  *
- * `GET /tenant/security-events` has no `actorId` filter, so the panel pulls the
- * application's most recent events and narrows in memory. The page it replaced
- * pulled `actorType=end_user` only, and that is a real hole rather than an
- * optimisation: an end-user's own events name them in `actorId`, but everything
- * an OPERATOR does *to* them (block a device, unblock it, release one on their
- * behalf, erase them) is recorded with the operator as the actor and the
- * subject in `metadata.endUserId`, and everything the SYSTEM does (creating a
- * subscriber from a billing event) with no actor at all. So blocking a device
- * left no trace on the page of the person it was blocked on.
+ * It replaces three reads of the application's latest 200 events — one per
+ * actor type, because filtering on `actorType=end_user` alone silently dropped
+ * every operator action taken on the person — matched in memory. That was 600
+ * rows fetched to render twenty on every view of the end-user screen, and it
+ * missed a quiet user's history entirely on a busy application.
  *
- * Three scans, merged on either identifier, newest first.
+ * Still capped at the API's 200, newest first, so an empty result means
+ * "nothing in this user's latest 200", which on a single user is effectively
+ * everything; the pages no longer need to caveat it.
  *
- * ## What this can and cannot say
- *
- * Each scan is capped at the API's 200-row ceiling, so this is evidence of
- * presence only: a row here happened, but an empty result means "nothing in the
- * application's most recent 200 events of that actor type", not "nothing ever".
- * The pages say so rather than implying the list is exhaustive, and nothing
- * infers a negative from it.
- *
- * The endpoint is OWNER/ADMIN-only, so a MEMBER gets 403 on all three and the
- * caller degrades to no timeline rather than a 403 page.
+ * The endpoint is OWNER/ADMIN-only, so a MEMBER gets 403 and this degrades to
+ * no timeline rather than a 403 page.
  */
-const EVENT_ACTOR_TYPES = ['end_user', 'operator', 'system'] as const;
-
 export async function getEndUserEvents(
   applicationId: string,
   euid: string,
 ): Promise<SecurityEventRow[] | null> {
-  const pages = await Promise.all(
-    EVENT_ACTOR_TYPES.map((actorType) => {
-      const q = new URLSearchParams({
-        applicationId,
-        actorType,
-        limit: String(AUTH_EVENT_SCAN),
-      });
-      return apiGet<Page<SecurityEventRow>>(
-        `/api/v1/tenant/security-events?${q.toString()}`,
-        { interruptOnAccessError: false },
-      ).catch(() => null);
-    }),
-  );
-  // All three failing is "you cannot read this"; one failing is a blip we can
-  // render around, so only a total failure suppresses the panel.
-  if (pages.every((p) => p === null)) return null;
-
-  const mine = pages
-    .filter((p): p is Page<SecurityEventRow> => p !== null)
-    .flatMap((p) => p.items)
-    .filter((e) => e.actorId === euid || e.metadata?.endUserId === euid);
-
-  // The same event cannot arrive twice (one actorType each), but dedupe on id
-  // anyway — the three scans are three separate reads of a moving table.
-  const seen = new Set<string>();
-  return mine
-    .filter((e) => (seen.has(e.id) ? false : (seen.add(e.id), true)))
-    .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  const q = new URLSearchParams({
+    applicationId,
+    endUserId: euid,
+    limit: String(AUTH_EVENT_SCAN),
+  });
+  const page = await apiGet<Page<SecurityEventRow>>(
+    `/api/v1/tenant/security-events?${q.toString()}`,
+    { interruptOnAccessError: false },
+  ).catch(() => null);
+  // Newest first is the API's default order; nothing to merge or dedupe.
+  return page?.items ?? null;
 }
 
 /**
