@@ -76,6 +76,9 @@ importers:
       argon2:
         specifier: ^0.41.1
         version: 0.41.1
+      aws4fetch:
+        specifier: ^1.0.20
+        version: 1.0.20
       bcryptjs:
         specifier: ^3.0.3
         version: 3.0.3
@@ -296,7 +299,7 @@ importers:
         version: link:../sdk-node
       astro:
         specifier: ^4.0.0 || ^5.0.0 || ^6.0.0 || ^7.0.0
-        version: 7.2.0(@emnapi/core@1.11.1)(@emnapi/runtime@1.11.1)(@types/node@22.19.17)(ioredis@5.11.0)(jiti@2.7.0)(tsx@4.21.0)(yaml@2.8.4)
+        version: 7.2.0(@emnapi/core@1.11.1)(@emnapi/runtime@1.11.1)(@types/node@22.19.17)(aws4fetch@1.0.20)(ioredis@5.11.0)(jiti@2.7.0)(tsx@4.21.0)(yaml@2.8.4)
     devDependencies:
       '@types/node':
         specifier: ^22.9.0
@@ -2048,8 +2051,8 @@ packages:
   '@ungap/structured-clone@1.3.1':
     resolution: {integrity: sha512-mUFwbeTqrVgDQxFveS+df2yfap6iuP20NAKAsBt5jDEoOTDew+zwLAOilHCeQJOVSvmgCX4ogqIrA0mnyr08yQ==}
 
-  '@unlayer/types@1.477.0':
-    resolution: {integrity: sha512-yTadBVaN7IjBEo8S9CELJvFTxS960x6KHRsPsgW+nBQwPMAaKnCL8Eg4RV/dYdQ6pd2IOUxNjKjVIjTIEMXJzQ==}
+  '@unlayer/types@1.488.0':
+    resolution: {integrity: sha512-O4OEuJlh6l7ZTZJUeTZbFzgxipImQ0Yvruh4aSPXUESGLGP7/hqY/r/LalMKAazQDl6me3emyJFtHR68xyReRQ==}
 
   '@vitejs/plugin-react@4.7.0':
     resolution: {integrity: sha512-gUu9hwfWvvEDBBmgtAowQCojwZmJ5mcLn3aufeCsitijs3+f2NsrPtlAWIR6OPiqljl96GVCUbLe0HyqIpVaoA==}
@@ -2207,6 +2210,9 @@ packages:
 
   avvio@9.2.0:
     resolution: {integrity: sha512-2t/sy01ArdHHE0vRH5Hsay+RtCZt3dLPji7W7/MMOCEgze5b7SNDC4j5H6FnVgPkI1MTNFGzHdHrVXDDl7QSSQ==}
+
+  aws4fetch@1.0.20:
+    resolution: {integrity: sha512-/djoAN709iY65ETD6LKCtyyEI04XIBP5xVvfmNxsEP0uJB5tyaGBztSryRr4HqMStr9R06PisQE7m9zDTXKu6g==}
 
   axios@1.16.0:
     resolution: {integrity: sha512-6hp5CwvTPlN2A31g5dxnwAX0orzM7pmCRDLnZSX772mv8WDqICwFjowHuPs04Mc8deIld1+ejhtaMn5vp6b+1w==}
@@ -5977,7 +5983,7 @@ snapshots:
 
   '@ungap/structured-clone@1.3.1': {}
 
-  '@unlayer/types@1.477.0': {}
+  '@unlayer/types@1.488.0': {}
 
   '@vitejs/plugin-react@4.7.0(vite@8.1.5(@types/node@24.12.4)(esbuild@0.27.7)(jiti@2.7.0)(tsx@4.21.0)(yaml@2.8.4))':
     dependencies:
@@ -6128,7 +6134,7 @@ snapshots:
 
   assertion-error@2.0.1: {}
 
-  astro@7.2.0(@emnapi/core@1.11.1)(@emnapi/runtime@1.11.1)(@types/node@22.19.17)(ioredis@5.11.0)(jiti@2.7.0)(tsx@4.21.0)(yaml@2.8.4):
+  astro@7.2.0(@emnapi/core@1.11.1)(@emnapi/runtime@1.11.1)(@types/node@22.19.17)(aws4fetch@1.0.20)(ioredis@5.11.0)(jiti@2.7.0)(tsx@4.21.0)(yaml@2.8.4):
     dependencies:
       '@astrojs/compiler-rs': 0.3.2(@emnapi/core@1.11.1)(@emnapi/runtime@1.11.1)
       '@astrojs/internal-helpers': 0.10.2
@@ -6176,7 +6182,7 @@ snapshots:
       tinyglobby: 0.2.16
       ultrahtml: 1.7.0
       unifont: 0.7.4
-      unstorage: 1.17.5(ioredis@5.11.0)
+      unstorage: 1.17.5(aws4fetch@1.0.20)(ioredis@5.11.0)
       vite: 8.1.5(@types/node@22.19.17)(esbuild@0.28.1)(jiti@2.7.0)(tsx@4.21.0)(yaml@2.8.4)
       vitefu: 1.1.3(vite@8.1.5(@types/node@22.19.17)(esbuild@0.28.1)(jiti@2.7.0)(tsx@4.21.0)(yaml@2.8.4))
       xxhash-wasm: 1.1.0
@@ -6235,6 +6241,8 @@ snapshots:
     dependencies:
       '@fastify/error': 4.2.0
       fastq: 1.20.1
+
+  aws4fetch@1.0.20: {}
 
   axios@1.16.0:
     dependencies:
@@ -7787,7 +7795,7 @@ snapshots:
 
   react-email-editor@1.8.0(react@19.2.5):
     dependencies:
-      '@unlayer/types': 1.477.0
+      '@unlayer/types': 1.488.0
       react: 19.2.5
 
   react-is@17.0.2: {}
@@ -8370,7 +8378,7 @@ snapshots:
 
   unpipe@1.0.0: {}
 
-  unstorage@1.17.5(ioredis@5.11.0):
+  unstorage@1.17.5(aws4fetch@1.0.20)(ioredis@5.11.0):
     dependencies:
       anymatch: 3.1.3
       chokidar: 5.0.0
@@ -8381,6 +8389,7 @@ snapshots:
       ofetch: 1.5.1
       ufo: 1.6.4
     optionalDependencies:
+      aws4fetch: 1.0.20
       ioredis: 5.11.0
 
   update-browserslist-db@1.2.3(browserslist@4.28.2):
