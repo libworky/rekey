@@ -42,6 +42,8 @@ import { pruneExpiredChallenges } from './lib/webauthn-challenge.js';
 import { processDueWebhookDeliveries } from './modules/webhooks/webhook.service.js';
 import { processDueDunningCases } from './modules/billing/dunning.service.js';
 import { pruneWebhookEvents } from './modules/billing/webhooks/retention.js';
+import { pruneLogs } from './lib/log-retention.js';
+import { createS3LogArchiver, resolveLogArchiveConfig } from './lib/log-archive.js';
 import { registerSwagger } from './lib/swagger.js';
 import { tenantsRoutes } from './modules/tenants/index.js';
 import { applicationsRoutes } from './modules/applications/index.js';
@@ -473,6 +475,25 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
     }, FLUSH_INTERVAL_MS);
     flushTimer.unref();
 
+    // Resolved once, before the timer exists. A half-configured archive must
+    // stop the boot: found ten minutes later inside a sweep, it would be a
+    // warning in a log while rows were already being deleted unarchived.
+    const logArchiveConfig = resolveLogArchiveConfig(env);
+    const logArchiver = logArchiveConfig ? createS3LogArchiver(logArchiveConfig) : null;
+    app.log.info(
+      {
+        retentionDays: env.LOG_RETENTION_DAYS,
+        archive: logArchiveConfig
+          ? `${new URL(logArchiveConfig.endpoint).host}/${logArchiveConfig.bucket}/${logArchiveConfig.prefix}`
+          : 'off',
+      },
+      'log retention',
+    );
+    // A sweep that outlives the interval (a first run against a large backlog,
+    // a slow archive) must not overlap the next one and upload the same rows
+    // twice while both race to delete them.
+    let logPruneRunning = false;
+
     const PRUNE_INTERVAL_MS = 10 * 60 * 1000;
     const pruneTimer = setInterval(() => {
       void pruneApiRequestLogs().then((deleted) => {
@@ -513,6 +534,29 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
           if (deleted > 0) app.log.debug({ deleted }, 'pruned inbound webhook receipts');
         })
         .catch((err) => app.log.warn({ err }, 'webhook-event prune failed'));
+      if (!logPruneRunning) {
+        logPruneRunning = true;
+        void pruneLogs({ retentionDays: env.LOG_RETENTION_DAYS, archiver: logArchiver })
+          .then((result) => {
+            const deleted = Object.values(result.deleted).reduce((a, b) => a + b, 0);
+            if (deleted > 0 || result.archivedObjects > 0) {
+              app.log.debug(
+                { deleted: result.deleted, archivedObjects: result.archivedObjects },
+                'pruned log tables',
+              );
+            }
+            for (const failure of result.failures) {
+              app.log.warn(
+                { table: failure.table, err: failure.error },
+                'log-table prune failed; rows left in place for the next sweep',
+              );
+            }
+          })
+          .catch((err) => app.log.warn({ err }, 'log-table prune failed'))
+          .finally(() => {
+            logPruneRunning = false;
+          });
+      }
     }, PRUNE_INTERVAL_MS);
     pruneTimer.unref();
 

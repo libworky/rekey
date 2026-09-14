@@ -64,7 +64,7 @@ For an erasure of end-user `E` in application `A`:
 | `CreditBalance` | **retain** | Numeric balance only — no free-form PII to scrub. Kept via FK. |
 | `UsageRecord` | **retain + scrub** | Kept (scalar `endUserId`, scoped by meter). `metadata` cleared. Quantities/timestamps untouched. |
 | `OrganizationMembership` | **retain** | Not PII about the subject; left intact (team rosters). The tombstone keeps the FK valid. |
-| `SecurityEvent` | **retain** | Security audit trail (including the erasure event itself) is retained for forensics. |
+| `SecurityEvent` | **retain, bounded** | Security audit trail (including the erasure event itself) is retained for forensics for `LOG_RETENTION_DAYS` (default 30), then pruned. If `LOG_ARCHIVE_S3_*` is configured, rows are copied to the archive first and **erasure does not reach that copy**: its `ip` and `user_agent` persist for as long as the bucket keeps them. Give the bucket a lifecycle rule that matches your policy, and do not enable Object Lock unless you have decided erasure never applies to the archive. |
 | `ImpersonationAudit` | **retain** | Operator-accountability trail — retained. |
 | `DunningCase` | **retain** | Denormalized `endUserId` (no FK); part of the billing record. |
 | Redis brute-force lock | **delete** | `bf:fail:` / `bf:lock:eu:login:<appId>:<email>` for the erased address. The key embeds the email in plaintext and the super-admin locked-accounts dashboard enumerates those keys, so a surviving lock would keep the address readable for the rest of its 15-minute TTL. Best-effort, outside the transaction (Redis can't join it). |
