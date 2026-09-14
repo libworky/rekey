@@ -6080,7 +6080,12 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
           take: USAGE_CAP,
         }),
         prisma.securityEvent.findMany({
-          where: { applicationId: params.id, actorType: 'end_user', actorId: endUser.id },
+          // Events ABOUT this person, from any actor. Filtering on actorType=end_user
+          // returned only what they did themselves and silently omitted everything
+          // done TO them - an operator blocking their device, an account created by a
+          // billing event - so a subject-access request under-reported. The actor is
+          // still not selected: an operator's id is not the data subject's data.
+          where: { applicationId: params.id, subjectEndUserId: endUser.id },
           select: { id: true, type: true, ip: true, userAgent: true, metadata: true, createdAt: true },
           orderBy: { createdAt: 'desc' },
           take: EVENTS_CAP,
