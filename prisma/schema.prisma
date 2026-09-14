@@ -829,6 +829,8 @@ model EmailLog {
   @@index([applicationId, createdAt])
   @@index([tenantId, createdAt])
   @@index([status])
+  // Range scan for the retention sweep (lib/log-retention.ts).
+  @@index([createdAt])
   @@map("email_logs")
 }
 
@@ -2595,6 +2597,8 @@ model WebhookDelivery {
   @@index([endpointId, createdAt])
   @@index([applicationId, eventType])
   @@index([status, nextAttemptAt])
+  // Retention sweep: finished deliveries nobody has touched in the window.
+  @@index([status, updatedAt])
   @@map("webhook_deliveries")
 }
 
@@ -2704,6 +2708,8 @@ model SecurityEvent {
   @@index([tenantId, createdAt])
   @@index([applicationId, createdAt])
   @@index([applicationId, subjectEndUserId, createdAt])
+  // Range scan for the retention sweep (lib/log-retention.ts).
+  @@index([createdAt])
   @@index([type])
   @@map("security_events")
 }
