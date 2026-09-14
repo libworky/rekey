@@ -829,6 +829,8 @@ model EmailLog {
   @@index([applicationId, createdAt])
   @@index([tenantId, createdAt])
   @@index([status])
+  // Range scan for the retention sweep (lib/log-retention.ts).
+  @@index([createdAt])
   @@map("email_logs")
 }
 
@@ -2595,6 +2597,8 @@ model WebhookDelivery {
   @@index([endpointId, createdAt])
   @@index([applicationId, eventType])
   @@index([status, nextAttemptAt])
+  // Retention sweep: finished deliveries nobody has touched in the window.
+  @@index([status, updatedAt])
   @@map("webhook_deliveries")
 }
 
@@ -2690,6 +2694,11 @@ model SecurityEvent {
   // 'operator' | 'end_user' | 'system'
   actorType     String   @map("actor_type")
   actorId       String?  @map("actor_id")
+  // The end-user this event is ABOUT, whoever performed it: the actor for an
+  // end-user's own events, `metadata.endUserId` for anything done to them.
+  // Derived once in `recordSecurityEvent` so "this person's history" is an
+  // indexed equality instead of three 200-row scans matched in memory.
+  subjectEndUserId String? @map("subject_end_user_id")
   type          String
   ip            String?
   userAgent     String?  @map("user_agent")
@@ -2698,6 +2707,9 @@ model SecurityEvent {
 
   @@index([tenantId, createdAt])
   @@index([applicationId, createdAt])
+  @@index([applicationId, subjectEndUserId, createdAt])
+  // Range scan for the retention sweep (lib/log-retention.ts).
+  @@index([createdAt])
   @@index([type])
   @@map("security_events")
 }

@@ -11,6 +11,26 @@ export const env = createEnv({
     // freely (an external billing system) would otherwise grow the table
     // without bound.
     WEBHOOK_EVENT_RETENTION_DAYS: z.coerce.number().int().min(1).max(3650).default(90),
+    // How long the append-only log tables keep rows in Postgres:
+    // `security_events`, `email_logs`, and FINISHED `webhook_deliveries` (a
+    // PENDING delivery is live retry state and is never pruned).
+    // `usage_records` is deliberately not covered: it is a billing ledger
+    // whose idempotency keys are what make a replayed usage event a no-op.
+    // 30 days matches the queryable window identity providers offer (Auth0,
+    // Clerk, Stripe). Pair it with the LOG_ARCHIVE_S3_* settings to keep a
+    // longer compliance copy outside the database. See lib/log-retention.ts.
+    LOG_RETENTION_DAYS: z.coerce.number().int().min(1).max(3650).default(30),
+    // Optional S3-compatible archive (Cloudflare R2 or AWS S3) that rows are
+    // written to BEFORE LOG_RETENTION_DAYS prunes them. Endpoint, bucket and
+    // both keys together, or none: a partial set stops the boot, because the
+    // alternative is deleting rows the operator believes are being kept.
+    // Validated as a set in lib/log-archive.ts, not field by field here.
+    LOG_ARCHIVE_S3_ENDPOINT: z.string().url().optional(),
+    LOG_ARCHIVE_S3_BUCKET: z.string().min(3).max(63).optional(),
+    LOG_ARCHIVE_S3_REGION: z.string().min(1).optional(),
+    LOG_ARCHIVE_S3_ACCESS_KEY_ID: z.string().min(1).optional(),
+    LOG_ARCHIVE_S3_SECRET_ACCESS_KEY: z.string().min(1).optional(),
+    LOG_ARCHIVE_S3_PREFIX: z.string().max(200).optional(),
 
     // Session lifetimes. Access tokens are short-lived JWTs that a client
     // renews with its refresh token; refresh tokens are opaque, rotated on

@@ -51,6 +51,38 @@ const nextConfig = {
     // the UI could not distinguish "not yours" from "we're down".
     // `notFound()` is stable and needs no flag; `forbidden()` does.
     authInterrupts: true,
+    // BOTH of these must be non-zero. See README.md "Navigation performance"
+    // before changing either — zero here does not mean "always fresh", it
+    // means "prefetching is dead", and the console gets slower, not fresher.
+    //
+    // `dynamic` (Next's default is 0) is the lifetime of a prefetched page
+    // segment. At 0 the router still ISSUES every prefetch a <Link> in the
+    // viewport asks for, then throws the result away, so a click starts from
+    // nothing and a client-side navigation is strictly slower than opening the
+    // same URL in a new tab. That is measurable here: one tab click rendered
+    // the page three to four times about a second apart — viewport prefetch,
+    // hover prefetch, then the real navigation — each one a full render, none
+    // reusable.
+    //
+    // `static` is the shared shell: layouts and loading boundaries. It was
+    // briefly 0 too, which made every tab click re-render and re-fetch
+    // `[euid]/layout.tsx` (identity header plus tab strip) as well as the page.
+    // Request volume went from ~50/min to 210/min for the same browsing.
+    //
+    // Neither value risks showing an operator a stale write: `lib/api.ts`
+    // calls `revalidatePath('/', 'layout')` on every non-GET, so any mutation
+    // drops the whole tree immediately. These windows only cover the case
+    // where somebody ELSE changed something, and 30s of that on a support
+    // console is a better trade than a UI that stalls on every click.
+    //
+    // The reason the stall is so visible on the end-user tabs specifically:
+    // the overview and security tabs each pull THREE 200-row `security-events`
+    // scans to render twenty rows, because the API has no `actorId` filter and
+    // the panel narrows in memory. Fix that and these windows matter less.
+    //
+    // These interact with the API's RATE_LIMIT_MAX, which has to be sized for
+    // the traffic they produce.
+    staleTimes: { dynamic: 30, static: 180 },
   },
 };
 export default nextConfig;

@@ -137,6 +137,16 @@ services:
       # propagation path. 0 disables the cache. See docs/organization-roles.md.
       ORG_ROLE_CACHE_TTL_MS: ${ORG_ROLE_CACHE_TTL_MS:-}
 
+      # ── Token lifetimes ──────────────────────────────────────────────────
+      # Refresh tokens rotate on every use and slide, so these windows only
+      # have to cover the longest gap between two uses, not how long someone
+      # stays signed in. Empty = the values they were hard-coded to before
+      # they became configurable: 15 minute access, 30 day refresh.
+      END_USER_ACCESS_TOKEN_TTL_SECONDS: ${END_USER_ACCESS_TOKEN_TTL_SECONDS:-}
+      END_USER_REFRESH_TOKEN_TTL_DAYS: ${END_USER_REFRESH_TOKEN_TTL_DAYS:-}
+      OPERATOR_ACCESS_TOKEN_TTL_SECONDS: ${OPERATOR_ACCESS_TOKEN_TTL_SECONDS:-}
+      OPERATOR_REFRESH_TOKEN_TTL_DAYS: ${OPERATOR_REFRESH_TOKEN_TTL_DAYS:-}
+
       # ── Secrets ──────────────────────────────────────────────────────────
       JWT_SECRET: ${JWT_SECRET}
       ENCRYPTION_KEY: ${ENCRYPTION_KEY}
@@ -251,6 +261,19 @@ services:
       # How long a processed inbound billing webhook is remembered, which is
       # what makes a provider's redelivery idempotent. Empty = 90 days.
       WEBHOOK_EVENT_RETENTION_DAYS: ${WEBHOOK_EVENT_RETENTION_DAYS:-}
+      # Days the append-only log tables keep rows in Postgres (security_events,
+      # email_logs, finished webhook_deliveries). Empty = 30. usage_records is
+      # a billing ledger and is never pruned by this.
+      LOG_RETENTION_DAYS: ${LOG_RETENTION_DAYS:-}
+      # Optional S3-compatible archive (Cloudflare R2 or AWS S3) rows are written
+      # to before they are pruned. Endpoint, bucket and both keys together, or
+      # none: a partial set stops the API from booting. Region empty = auto.
+      LOG_ARCHIVE_S3_ENDPOINT: ${LOG_ARCHIVE_S3_ENDPOINT:-}
+      LOG_ARCHIVE_S3_BUCKET: ${LOG_ARCHIVE_S3_BUCKET:-}
+      LOG_ARCHIVE_S3_REGION: ${LOG_ARCHIVE_S3_REGION:-}
+      LOG_ARCHIVE_S3_ACCESS_KEY_ID: ${LOG_ARCHIVE_S3_ACCESS_KEY_ID:-}
+      LOG_ARCHIVE_S3_SECRET_ACCESS_KEY: ${LOG_ARCHIVE_S3_SECRET_ACCESS_KEY:-}
+      LOG_ARCHIVE_S3_PREFIX: ${LOG_ARCHIVE_S3_PREFIX:-}
       # Global rate limit, and the higher per-key cap for usage ingestion.
       # Empty = 100 req / 60s, and 1000 for POST /api/v1/usage/record.
       RATE_LIMIT_MAX: ${RATE_LIMIT_MAX:-}
