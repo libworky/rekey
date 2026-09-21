@@ -7,6 +7,7 @@ import { Table, THead, TBody, TR, TH, TD } from '@/components/Table';
 import { Badge } from '@/components/Badge';
 import { Banner } from '@/components/Banner';
 import { EmptyState } from '@/components/EmptyState';
+import { ActionForm } from '@/components/ActionForm';
 import { SubmitButton } from '@/components/SubmitButton';
 import { ActorCell } from '@/components/ActorCell';
 import { Pager, readOffset, readPageSize } from '@/components/Pager';
@@ -21,7 +22,7 @@ import { eventDetails, humanizeEventType, resolveActorEmails } from '@/lib/secur
  * ## Filtering by email
  *
  * `GET /tenant/security-events` accepts `applicationId`, `type`, `actorType`,
- * `from`, `to`, `limit`, `offset` — and no way to narrow to a person. There is
+ * `from`, `to`, `limit`, `offset`, and no way to narrow to a person. There is
  * no `actorId` filter and no email in the response. So the panel does it: it
  * resolves the address to an end-user id via the end-users search, pulls the
  * largest window the API allows (200), and filters in memory. That is a real
@@ -29,7 +30,7 @@ import { eventDetails, humanizeEventType, resolveActorEmails } from '@/lib/secur
  *
  * ## What is NOT here
  *
- * FAILED sign-ins. The API does not record them as security events at all —
+ * FAILED sign-ins. The API does not record them as security events at all,
  * `auth.service.ts` increments a Redis brute-force counter and throws 401, with
  * no `recordSecurityEvent` on that path; lockout does the same. There is no
  * event type for either, so no amount of panel work can list them. The banner
@@ -40,7 +41,7 @@ import { eventDetails, humanizeEventType, resolveActorEmails } from '@/lib/secur
 const inputCls =
   'rounded-md border border-[var(--color-border)] bg-[var(--color-surface)] px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-[color-mix(in_srgb,var(--color-primary)_30%,transparent)] focus:border-[var(--color-primary)]';
 
-/** Scan window when filtering by email — the API's `limit` ceiling. */
+/** Scan window when filtering by email, the API's `limit` ceiling. */
 const SCAN_LIMIT = 200;
 
 async function applyFilters(appId: string, formData: FormData): Promise<void> {
@@ -65,7 +66,7 @@ export default async function ActivityPage({
   const PAGE_SIZE = readPageSize(sp);
   const email = typeof sp.email === 'string' ? sp.email.trim() : '';
 
-  // Resolve the address to an end-user id first — that's what events carry.
+  // Resolve the address to an end-user id first, that's what events carry.
   let filterActorId: string | null = null;
   let emailNotFound = false;
   if (email !== '') {
@@ -83,7 +84,7 @@ export default async function ActivityPage({
     applicationId: id,
     actorType: 'end_user',
     // Filtering by person has to pull a wide window and narrow it in memory
-    // (see above) — this route declares its own `limit` ceiling of 200, not
+    // (see above), this route declares its own `limit` ceiling of 200, not
     // parsePagination's 100. Unfiltered, we ask for exactly the rows we render.
     limit: String(filterActorId !== null ? SCAN_LIMIT : PAGE_SIZE),
   });
@@ -97,7 +98,7 @@ export default async function ActivityPage({
   const matched = filterActorId === null ? fetched : fetched.filter((e) => e.actorId === filterActorId);
   // Two ways to know there is more, one per branch. Unfiltered: the API says
   // so. Filtered: the API's `hasMore` counts unfiltered rows, so it can't
-  // answer for this narrowed set — but we hold every match in memory, so a row
+  // answer for this narrowed set, but we hold every match in memory, so a row
   // past this page's window IS the proof.
   const shown =
     filterActorId === null
@@ -117,10 +118,10 @@ export default async function ActivityPage({
     <div className="space-y-5">
       <SectionHeader
         title="Activity"
-        description="End-user events for this application — sign-ups, sign-ins, and credential changes. Newest first."
+        description="End-user events for this application: sign-ups, sign-ins, and credential changes. Newest first."
       />
 
-      <form action={applyFilters.bind(null, id)} className="flex flex-wrap items-end gap-2">
+      <ActionForm action={applyFilters.bind(null, id)} className="flex flex-wrap items-end gap-2">
         <label className="block space-y-1">
           <span className="block text-xs font-medium text-[var(--color-fg)]">End-user email</span>
           <input
@@ -142,14 +143,14 @@ export default async function ActivityPage({
             href={`/applications/${id}/activity`}
             className="px-1 py-2 text-sm text-[var(--color-muted-fg)] hover:text-[var(--color-fg)]"
           >
-            filtered — clear
+            filtered (clear)
           </a>
         )}
-      </form>
+      </ActionForm>
 
       {/* Not a caveat we can design away: the events simply do not exist. */}
       <Banner tone="info">
-        Failed sign-ins and lockouts are <strong>not</strong> recorded as events — the API counts
+        Failed sign-ins and lockouts are <strong>not</strong> recorded as events. The API counts
         them in Redis and discards the detail, so they can&apos;t be listed here or anywhere else.
         The live counter and lock state for one person are on their end-user page.
       </Banner>
@@ -163,7 +164,7 @@ export default async function ActivityPage({
       {scanTruncated && (
         <Banner tone="warning">
           Searched the most recent {SCAN_LIMIT} events for this application. Older activity for this
-          person isn&apos;t included — the API can filter events by application and actor type, but
+          person isn&apos;t included, because the API can filter events by application and actor type, but
           not by person.
         </Banner>
       )}

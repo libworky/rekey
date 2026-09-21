@@ -5,6 +5,7 @@ import { cookies } from 'next/headers';
 import { api } from '@/lib/api';
 import type { Page } from '@/lib/paginate';
 import { ConfirmButton } from '@/components/ConfirmButton';
+import { ActionForm } from '@/components/ActionForm';
 import { SubmitButton } from '@/components/SubmitButton';
 import { SavedBanner } from '@/components/SavedBanner';
 import { formatDateTime } from '@/lib/date';
@@ -36,7 +37,7 @@ interface DeliveryRow {
   nextAttemptAt: string | null;
   /**
    * Both are STORED (`WebhookDelivery.payload` / `.responseBody`, the latter
-   * already capped at 4 KB on write) and both are loaded by the service — but
+   * already capped at 4 KB on write) and both are loaded by the service, but
    * the tenant route's serializer drops them before responding, so today these
    * arrive `undefined` on every row.
    *
@@ -94,13 +95,13 @@ async function retryDelivery(
  * Requeue every non-succeeded delivery on this endpoint.
  *
  * A dead endpoint produces a page of a dozen failures and the only control was
- * a per-row Retry — twelve clicks, each a full page navigation, to recover from
+ * a per-row Retry, twelve clicks, each a full page navigation, to recover from
  * one outage. There is no bulk endpoint API-side (`retry-all` does not exist on
  * any surface), so this fans out the per-delivery call. Sequential rather than
  * Promise.all: these all hit the same customer URL that just failed, and a
  * dozen simultaneous POSTs is the wrong way to greet a server coming back up.
  *
- * Failures are counted, not thrown — one delivery that has since been evicted
+ * Failures are counted, not thrown, one delivery that has since been evicted
  * shouldn't abandon the other eleven.
  */
 async function retryAllFailed(applicationId: string, endpointId: string): Promise<void> {
@@ -119,7 +120,7 @@ async function retryAllFailed(applicationId: string, endpointId: string): Promis
       });
       queued += 1;
     } catch {
-      /* already retried, evicted, or raced — keep going */
+      /* already retried, evicted, or raced, keep going */
     }
   }
   redirect(
@@ -176,7 +177,7 @@ function DeliveryDetail({ delivery: d }: { delivery: DeliveryRow }): React.JSX.E
         </div>
         {payloadText === null ? (
           <p className="mt-1 text-xs text-[var(--color-muted-fg)]">
-            Stored, but not returned by the API — the tenant delivery endpoint omits{' '}
+            Stored, but not returned by the API: the tenant delivery endpoint omits{' '}
             <code className="font-mono">payload</code> from its response. This panel renders it as
             soon as the field is served.
           </p>
@@ -193,7 +194,7 @@ function DeliveryDetail({ delivery: d }: { delivery: DeliveryRow }): React.JSX.E
         </div>
         {body === null ? (
           <p className="mt-1 text-xs text-[var(--color-muted-fg)]">
-            Stored (capped at 4 KB), but not returned by the API — the tenant delivery endpoint
+            Stored (capped at 4 KB), but not returned by the API: the tenant delivery endpoint
             omits <code className="font-mono">responseBody</code> from its response.
           </p>
         ) : body.text === '' ? (
@@ -304,7 +305,7 @@ export default async function WebhookDetailPage({
       {rotated && rotatedSecret && (
         <div className="rounded-xl border border-amber-300 bg-amber-50 px-4 py-3 dark:border-amber-700 dark:bg-amber-950/60 space-y-2">
           <div className="text-sm font-medium text-amber-900 dark:text-amber-200">
-            New signing secret — shown once
+            New signing secret, shown once
           </div>
           <p className="text-xs text-amber-800 dark:text-amber-300">
             Update your consumer immediately. Old signatures stop verifying right away.
@@ -329,14 +330,14 @@ export default async function WebhookDetailPage({
         <div>
           <h3 className="text-sm font-semibold text-[var(--color-fg)]">Signing secret</h3>
           <p className="text-xs text-[var(--color-muted-fg)]">
-            We don't store the raw secret — rotate to generate a new one.
+            We don't store the raw secret. Rotate to generate a new one.
           </p>
         </div>
-        <form action={rotateSecret.bind(null, id, endpointId)}>
-          <ConfirmButton confirm="Rotate the signing secret? Old signatures stop verifying immediately — update your consumer with the new value before the next delivery.">
+        <ActionForm action={rotateSecret.bind(null, id, endpointId)}>
+          <ConfirmButton confirm="Rotate the signing secret? Old signatures stop verifying immediately, so update your consumer with the new value before the next delivery.">
             Rotate secret
           </ConfirmButton>
-        </form>
+        </ActionForm>
       </Card>
 
       <section className="space-y-3">
@@ -345,14 +346,14 @@ export default async function WebhookDetailPage({
           count={`${deliveries.length} of last 50`}
           action={
             failedCount > 0 ? (
-              <form action={retryAllFailed.bind(null, id, endpointId)}>
+              <ActionForm action={retryAllFailed.bind(null, id, endpointId)}>
                 <SubmitButton
                   pendingLabel={`Queuing ${failedCount}…`}
                   className="rounded-md border border-[var(--color-border)] px-3 py-1.5 text-sm font-medium hover:bg-[var(--color-surface-muted)] disabled:opacity-60"
                 >
                   Retry all failed ({failedCount})
                 </SubmitButton>
-              </form>
+              </ActionForm>
             ) : undefined
           }
         />
@@ -401,19 +402,19 @@ export default async function WebhookDetailPage({
                     </TD>
                     <TD align="right">
                       {d.status !== 'SUCCEEDED' && (
-                        <form action={retryDelivery.bind(null, id, endpointId, d.id)} className="inline">
+                        <ActionForm action={retryDelivery.bind(null, id, endpointId, d.id)} className="inline">
                           <SubmitButton
                             pendingLabel="Queuing…"
                             className="text-xs font-medium text-[var(--color-primary)] hover:underline disabled:opacity-60"
                           >
                             Retry
                           </SubmitButton>
-                        </form>
+                        </ActionForm>
                       )}
                     </TD>
                   </TR>
                   {/* Expandable detail. A native <details> keeps this a server
-                      component — no client JS, keyboard-operable, and each row
+                      component, no client JS, keyboard-operable, and each row
                       opens independently. Debugging a failed delivery meant
                       leaving the product entirely before this existed: neither
                       what we sent nor what came back was visible anywhere. */}

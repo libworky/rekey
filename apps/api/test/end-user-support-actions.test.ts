@@ -1,7 +1,7 @@
 /**
  * The five things a support agent needs on a ticket and could not do from the
  * panel: clear a lockout, re-send a verification mail, start a password reset,
- * see somebody's sessions, and end them — plus "release every device", which is
+ * see somebody's sessions, and end them, plus "release every device", which is
  * the answer to "I changed laptop and cannot sign in".
  *
  * What these cases are actually about is the EDGES, not the happy paths. Each
@@ -17,6 +17,7 @@ import type { FastifyInstance } from 'fastify';
 import { buildApp } from '../src/app.js';
 import { prisma } from '../src/lib/prisma.js';
 import { euLoginLockScope, getScopeLockState, registerFailure, LOGIN_POLICY } from '../src/lib/brute-force.js';
+import { waitForSecurityEvents } from './wait-for-security-events.js';
 
 interface World {
   ownerToken: string;
@@ -120,7 +121,7 @@ describe('operator support actions on one end-user', () => {
 
     // Trip the limiter for real rather than asserting against a fake.
     for (let i = 0; i < LOGIN_POLICY.threshold; i++) await registerFailure(scope, LOGIN_POLICY);
-    // A healthy unlocked scope returns an OBJECT, not null — null means the
+    // A healthy unlocked scope returns an OBJECT, not null, null means the
     // store itself failed. `lockedForSec` is the lockout signal.
     expect((await getScopeLockState(scope))?.lockedForSec).not.toBeNull();
 
@@ -137,7 +138,7 @@ describe('operator support actions on one end-user', () => {
   it('unlocking is per-Application: the same address elsewhere stays locked', async () => {
     // The lock key carries the application id. Two Applications are two
     // end-users, and an operator must not be able to reach into a lock that is
-    // not theirs — nor accidentally clear one they did not mean to.
+    // not theirs, nor accidentally clear one they did not mean to.
     const a = await world();
     const b = await world();
     const scopeB = euLoginLockScope(b.applicationId, b.email);
@@ -150,8 +151,8 @@ describe('operator support actions on one end-user', () => {
   // ---------- verification re-send ----------
 
   it('re-sends verification, and refuses once the address is verified', async () => {
-    // Operator-created end-users are verified by default (`emailVerified ?? true`
-    // — the operator vouched), so an unverified subject is asked for.
+    // Operator-created end-users are verified by default (`emailVerified ?? true`,
+    // the operator vouched), so an unverified subject is asked for.
     const w = await world({ emailVerified: false });
     const sent = await inject({
       method: 'POST',
@@ -160,7 +161,7 @@ describe('operator support actions on one end-user', () => {
       payload: { reason: 'customer says it never arrived' },
     });
     expect(sent.statusCode).toBe(200);
-    // No transport is configured in test, so the mail cannot leave — the point
+    // No transport is configured in test, so the mail cannot leave, the point
     // is that the route reports that honestly rather than claiming success.
     expect(typeof sent.json().data.emailSent).toBe('boolean');
 
@@ -223,10 +224,13 @@ describe('operator support actions on one end-user', () => {
       await prisma.passwordResetToken.count({ where: { endUserId: w.endUserId } }),
     ).toBeGreaterThan(0);
 
-    const audit = await prisma.securityEvent.findFirstOrThrow({
-      where: { applicationId: w.applicationId, type: 'end_user.password_reset_sent' },
+    // Security events are recorded without awaiting, so poll for the row
+    // rather than reading straight after the response.
+    const [audit] = await waitForSecurityEvents({
+      applicationId: w.applicationId,
+      type: 'end_user.password_reset_sent',
     });
-    expect(audit.metadata).toMatchObject({
+    expect(audit?.metadata).toMatchObject({
       endUserId: w.endUserId,
       reason: 'locked out, verified identity on call',
     });

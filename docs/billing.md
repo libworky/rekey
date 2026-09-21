@@ -50,10 +50,12 @@ All gated by `SUPER_ADMIN_KEY`. Owned by the `plans` module.
 
 ```
 GET    /api/v1/admin/applications/:id/plans?includeInactive=true
-POST   /api/v1/admin/applications/:id/plans
+POST   /api/v1/admin/applications/:id/plans               { slug, name, amount, currency?, interval?, metadata? }
 PATCH  /api/v1/admin/applications/:id/plans/:slug         { active?, name?, amount?, currency?, interval?, metadata? }
 POST   /api/v1/admin/applications/:id/plans/:slug/register
 ```
+
+The create body is **strict**: it builds SUBSCRIPTION plans, and an unknown key (`kind`, `licenseKind`, `creditsAmount`, or a typo) is a 400 `VALIDATION_ERROR` naming the field. It used to drop them and answer 201, so a caller asking for a LICENSE or CREDIT plan got a subscription and a success message. Per-kind plans and `trialDays` live on the tenant route, `POST /api/v1/tenant/applications/:id/plans`.
 
 Creating a plan calls `ensurePlanRegistered()` **only when the Application already has Stripe credentials stored**; the returned price id is persisted into `Plan.metadata.stripe`. PayPal and Razorpay register the plan lazily at first checkout. Making the call unconditional used to be fine when a stub always answered — once the stubs were deleted it meant a PayPal-only or Razorpay-only operator could not create a plan at all, and the error named Stripe, a provider they had never configured.
 
@@ -90,7 +92,10 @@ Publishable **or** secret key (`Authorization: Bearer rp_pub_…` / `rp_live_…
 GET   /api/v1/billing/plans                                  — Application key only (pricing pages)
 GET   /api/v1/billing/subscription                           — Application key + user JWT
 POST  /api/v1/billing/checkout    { planSlug, successUrl, cancelUrl }
+POST  /api/v1/billing/subscribe   { organizationId? }            — Application key + user JWT
 ```
+
+`POST /subscribe` puts the caller on the Application's nominated free plan (`billingConfig.defaultPlanSlug`) with no provider involved. When that plan grants CREDIT or LICENSE entitlements, the claim is **once per end-user**, across their personal account and every organization they own or administer, and it survives cancellation: activating it for a second beneficiary answers `409 BILLING_FREE_TIER_ALREADY_CLAIMED`. Cancelling and reactivating for the same beneficiary is allowed and issues nothing new. A free plan carrying only FEATURE or USAGE entitlements has no such limit, because nothing is handed over that outlives the subscription. To give a second organization the plan anyway, grant it as an operator. Credits already issued stay with their beneficiary after a cancel.
 
 `POST /checkout` asks the **provider first**: it creates the hosted-checkout session, and only once the provider has answered does it upsert the local `PENDING` Subscription (so the row can correlate the eventual webhook). Nothing local is written for a checkout the provider refused. Returns the URL to redirect to and the local Subscription row. **Subscription activation happens via the provider's webhook — not synchronously here.**
 

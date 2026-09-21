@@ -190,9 +190,16 @@ access lifetime bounds how long a removed member can keep acting before the
 next renewal re-checks the membership, which is why the default is short.
 Every auth response carries `accessTokenExpiresAt` and
 `refreshTokenExpiresAt`, and the panel sets its session cookies from them.
-A password change or sign-out everywhere stamps the operator, and an access
-token minted before the stamp is refused on its next use, so a long access
-lifetime never extends an ended session.
+A password change or reset, sign-out everywhere, or refresh-token reuse stamps
+the operator, and an access token minted before the stamp is refused on its
+next use, so a long access lifetime never extends an ended session. The same
+paths revoke every operator MCP OAuth refresh token the operator holds, and an
+operator MCP access token issued before the stamp is refused, so a connected
+MCP client has to be authorized again. Revoking
+one session (`DELETE /tenant/auth/sessions/:id`) does not stamp: the access
+token carries the session in its `sid` claim and is refused once that session
+is revoked, while the operator's other sessions and MCP connections keep
+working.
 
 ## Endpoints
 

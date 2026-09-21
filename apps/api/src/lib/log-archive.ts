@@ -8,7 +8,7 @@
  * SDK is a large dependency to carry for it.
  *
  * Every upload carries `Content-MD5`. That is what lets this write into a
- * bucket with Object Lock enabled — which is what makes an audit archive
+ * bucket with Object Lock enabled, which is what makes an audit archive
  * trustworthy, and also what makes it impossible to erase from. See
  * `docs/data-erasure.md` before turning Object Lock on.
  */
@@ -54,7 +54,7 @@ const SAFE_PREFIX = /^[A-Za-z0-9_\-./]*$/;
  * Null when archiving is off; throws when it is half on.
  *
  * All-or-nothing on purpose. Setting a bucket but forgetting a key must not
- * quietly mean "prune without archiving" — that deletes rows the operator
+ * quietly mean "prune without archiving", that deletes rows the operator
  * believes are being kept. Refusing to boot is the only failure an operator
  * cannot miss.
  */

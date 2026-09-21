@@ -1,5 +1,5 @@
 /**
- * End-user Devices — the machines this account has signed in from.
+ * End-user Devices, the machines this account has signed in from.
  *
  * ## Why this page did not exist
  *
@@ -18,12 +18,13 @@
  * accounts is deliberately two devices.
  *
  * A device slot is not a licence seat. They are two independent pools that do
- * not interact — see the note rendered below the table, which is there because
+ * not interact, see the note rendered below the table, which is there because
  * an operator looking at "2 devices" and a "3 seats" licence will otherwise
  * assume one of the numbers is wrong.
  */
 
 import * as React from 'react';
+import { errorMessage } from '@/lib/error-message';
 import { FilterChips } from '@/components/FilterChips';
 import { formatDateTime } from '@/lib/date';
 import { Card, SectionHeader } from '@/components/Card';
@@ -34,6 +35,7 @@ import { EmptyState } from '@/components/EmptyState';
 import { ConfirmButton } from '@/components/ConfirmButton';
 import { Modal } from '@/components/Modal';
 import { Field } from '@/components/Field';
+import { ActionForm } from '@/components/ActionForm';
 import { SubmitButton } from '@/components/SubmitButton';
 import { CopyButton } from '@/components/CopyButton';
 import { Pager, readOffset, readPageSize } from '@/components/Pager';
@@ -68,9 +70,9 @@ function resultMessage(op: string, revoked: number): string | null {
       : `${revoked} session${revoked === 1 ? '' : 's'} on it ${revoked === 1 ? 'was' : 'were'} revoked.`;
   switch (op) {
     case 'release':
-      return `Device released — its slot is free again. ${sessions}`;
+      return `Device released, so its slot is free again. ${sessions}`;
     case 'block':
-      return `Device blocked — sign-in from this fingerprint is refused until you unblock it. ${sessions}`;
+      return `Device blocked. Sign-in from this fingerprint is refused until you unblock it. ${sessions}`;
     case 'unblock':
       return 'Device unblocked. It comes back as released: it takes a slot again on its next sign-in, and only if the limit allows.';
     // 'release-all' has its own banner: it reports three counts, not one.
@@ -95,7 +97,7 @@ export default async function EndUserDevicesPage({
     | undefined;
   // `readPageSize` clamps to the sizes the Pager actually offers (10/25/100).
   // Reading `?ps=` by hand here meant clicking "25" produced a URL the Pager
-  // omits `ps` from, which this then read back as a different default — so the
+  // omits `ps` from, which this then read back as a different default, so the
   // selector silently disagreed with the page it was on.
   const pageSize = readPageSize(sp);
   const offset = readOffset(sp);
@@ -125,7 +127,7 @@ export default async function EndUserDevicesPage({
       <div className="space-y-4">
         <SectionHeader title="Devices" />
         <Banner tone="error">
-          The device list could not be read — the request failed, or your access to this Application
+          The device list could not be read. Either the request failed, or your access to this Application
           does not cover it. This is <strong>not</strong> an empty device list. Reload; if it
           persists, check the API and your access.
         </Banner>
@@ -141,16 +143,16 @@ export default async function EndUserDevicesPage({
         description="Every machine this end-user has signed in from, newest activity first. Releasing one frees its slot; blocking one refuses sign-in from that fingerprint."
         action={
           page.page.total > 0 ? (
-            <form action={releaseAllDevices.bind(null, id, euid)}>
+            <ActionForm action={releaseAllDevices.bind(null, id, euid)}>
               <ConfirmButton
                 variant="subtle"
                 title="Release every active device?"
-                confirm="Frees every active slot and signs them out on those machines, so their next sign-in from any machine is admitted. Blocked devices are deliberately left blocked — unblock those individually."
+                confirm="Frees every active slot and signs them out on those machines, so their next sign-in from any machine is admitted. Blocked devices are deliberately left blocked, so unblock those individually."
                 confirmLabel="Release all"
               >
                 Release all
               </ConfirmButton>
-            </form>
+            </ActionForm>
           ) : undefined
         }
       />
@@ -159,16 +161,16 @@ export default async function EndUserDevicesPage({
       {releasedAll && (
         <Banner tone={releasedAll.released === 0 ? 'info' : 'success'}>
           {releasedAll.released === 0
-            ? 'Nothing to release — this end-user had no active devices.'
+            ? 'Nothing to release: this end-user had no active devices.'
             : `Released ${releasedAll.released} device${releasedAll.released === 1 ? '' : 's'}, ending ${releasedAll.revoked} session${releasedAll.revoked === 1 ? '' : 's'}. Their next sign-in from any machine is admitted.`}
           {releasedAll.blocked > 0 &&
-            ` ${releasedAll.blocked} blocked device${releasedAll.blocked === 1 ? ' was' : 's were'} left blocked — unblock those individually.`}
+            ` ${releasedAll.blocked} blocked device${releasedAll.blocked === 1 ? ' was' : 's were'} left blocked, so unblock those individually.`}
         </Banner>
       )}
-      {deviceError && <Banner tone="error">{DEVICE_ERR[deviceError] ?? deviceError}</Banner>}
+      {deviceError && <Banner tone="error">{errorMessage(DEVICE_ERR, deviceError)}</Banner>}
 
-      {/* Was flat muted-fill pills — the same treatment AppNav's primary row
-          uses — landing directly under two tab strips and the record switcher,
+      {/* Was flat muted-fill pills, the same treatment AppNav's primary row
+          uses, landing directly under two tab strips and the record switcher,
           so this tab ended in four rows of things that all read as tabs, one of
           which only changed a query string. Outlined chips say "filter", not
           "go". */}
@@ -307,7 +309,7 @@ function DeviceActions({
   return (
     <div className="flex items-center justify-end gap-3">
       {device.status === 'ACTIVE' && (
-        <form action={releaseDevice.bind(null, applicationId, euid, device.id)} className="inline">
+        <ActionForm action={releaseDevice.bind(null, applicationId, euid, device.id)} className="inline">
           <ConfirmButton
             variant="subtle"
             title="Release this device?"
@@ -316,7 +318,7 @@ function DeviceActions({
           >
             Release
           </ConfirmButton>
-        </form>
+        </ActionForm>
       )}
 
       {/* No `modalKey`: nothing redirects with `?blockDevice=<id>`, so the
@@ -326,11 +328,11 @@ function DeviceActions({
       {device.status !== 'BLOCKED' && (
         <Modal
           title="Block this device"
-          description="Sign-in from this fingerprint is refused until you unblock it, and every session on it is revoked now. The reason is operator-facing only — the end-user never sees it."
+          description="Sign-in from this fingerprint is refused until you unblock it, and every session on it is revoked now. The reason is operator-facing only, and the end-user never sees it."
           trigger="Block"
           triggerClassName="text-xs text-red-600 dark:text-red-400 hover:underline"
         >
-          <form
+          <ActionForm
             action={blockDevice.bind(null, applicationId, euid, device.id)}
             className="space-y-3"
           >
@@ -344,12 +346,12 @@ function DeviceActions({
               />
             </Field>
             <SubmitButton pendingLabel="Blocking…">Block device</SubmitButton>
-          </form>
+          </ActionForm>
         </Modal>
       )}
 
       {device.status === 'BLOCKED' && (
-        <form action={unblockDevice.bind(null, applicationId, euid, device.id)} className="inline">
+        <ActionForm action={unblockDevice.bind(null, applicationId, euid, device.id)} className="inline">
           <ConfirmButton
             variant="subtle"
             title="Unblock this device?"
@@ -358,7 +360,7 @@ function DeviceActions({
           >
             Unblock
           </ConfirmButton>
-        </form>
+        </ActionForm>
       )}
     </div>
   );

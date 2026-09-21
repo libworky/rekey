@@ -13,7 +13,7 @@
  * no new consent. It does NOT touch the OAuth refresh chain: an agent that
  * holds a refresh token keeps rotating it while the workspace is off, and
  * every access token that mints is refused at auth like any other. That is
- * the point — nothing is revoked, so on again restores every agent without a
+ * the point, nothing is revoked, so on again restores every agent without a
  * re-consent, which is what an owner flipping this for an incident wants.
  *
  * The one deliberate exception to bearer-auth's "generic 401 on any failure":

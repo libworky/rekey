@@ -1,5 +1,5 @@
 /**
- * The import preview — the screen the whole feature exists for.
+ * The import preview, the screen the whole feature exists for.
  *
  * An import is a bulk write against somebody else's data, matching strangers to
  * local accounts by email. A one-click version of that is a mistake nobody can
@@ -13,13 +13,15 @@
  */
 
 import * as React from 'react';
+import { errorMessage } from '@/lib/error-message';
+import { ActionForm } from '@/components/ActionForm';
 import { FilterChips } from '@/components/FilterChips';
 import { RecordHeader } from '@/components/RecordHeader';
-import Link from 'next/link';
+import Link from '@/components/Link';
 import { redirect } from 'next/navigation';
 import { api, apiGet, getApplication, PanelApiError } from '@/lib/api';
 import { formatDateTime } from '@/lib/date';
-import { Card, SectionHeader } from '@/components/Card';
+import { Card } from '@/components/Card';
 import { Table, THead, TBody, TR, TH, TD } from '@/components/Table';
 import { Badge, type BadgeTone } from '@/components/Badge';
 import { Banner } from '@/components/Banner';
@@ -49,6 +51,8 @@ interface RunDetail {
     error: string | null;
     createdAt: string;
     completedAt: string | null;
+    /** `applying` with no heartbeat for five minutes: the apply was interrupted. */
+    stale: boolean;
   };
   items: { items: ImportItem[]; page: { total: number; hasMore: boolean } };
 }
@@ -68,7 +72,7 @@ const ORDER = ['match', 'create', 'skip_no_plan', 'skip_active', 'skip_invalid',
 const APPLY_ERR: Record<string, string> = {
   IMPORT_CONFIRM_MISMATCH: 'The confirmation did not match the application slug.',
   IMPORT_RUN_NOT_READY:
-    'This run cannot be applied — it has already been applied, or it did not finish.',
+    'This run cannot be applied. It has already been applied, it is being applied right now, or it did not finish.',
   TENANT_ROLE_INSUFFICIENT: 'Only owners and admins can apply an import.',
   APP_ACCESS_DENIED: 'Your grant on this Application does not allow billing writes.',
 };
@@ -130,10 +134,8 @@ export default async function ImportRunPage({
 
   return (
     <div className="space-y-5">
-      {/* The "All runs" link in the action slot was a back link wearing a
-          different hat — right-aligned, underlined, and the only way out of a
-          page four levels deep. It is the trail now, where the other three
-          detail pages put theirs. */}
+      {/* Breadcrumb, not a right-aligned "All runs" link, matching the other
+          detail pages, and the only way out of a page four levels deep. */}
       <RecordHeader
         crumbs={[
           { label: 'Imports', href: `/applications/${id}/imports` },
@@ -157,7 +159,7 @@ export default async function ImportRunPage({
           row.
         </Banner>
       )}
-      {applyError && <Banner tone="error">{APPLY_ERR[applyError] ?? applyError}</Banner>}
+      {applyError && <Banner tone="error">{errorMessage(APPLY_ERR, applyError)}</Banner>}
       {run.status === 'failed' && (
         <Banner tone="error">
           This run failed before it finished reading: {run.error ?? 'no reason recorded'}. Nothing
@@ -165,7 +167,19 @@ export default async function ImportRunPage({
         </Banner>
       )}
 
-      {/* The counts are the summary AND the filter — an operator who wants to
+      {run.stale && (
+        <Banner tone="warning">
+          This apply was interrupted before it finished, most likely by a restart. Rows that already
+          landed are kept. Resume it below to import the rest; nothing is imported twice.
+        </Banner>
+      )}
+      {run.status === 'applying' && !run.stale && (
+        <Banner tone="info">
+          This import is being applied right now. Reload to see it finish.
+        </Banner>
+      )}
+
+      {/* The counts are the summary AND the filter, an operator who wants to
           know what the 382 skipped rows were should not have to scroll. */}
       <FilterChips
         chips={[
@@ -181,17 +195,17 @@ export default async function ImportRunPage({
         label="Filter preview rows by outcome"
       />
 
-      {run.status === 'ready' && (
+      {(run.status === 'ready' || run.stale) && (
         <Card className="space-y-3 border-amber-300 dark:border-amber-800">
           <div>
             <h3 className="text-sm font-semibold text-[var(--color-fg)]">
-              Apply this import
+              {run.stale ? 'Resume this import' : 'Apply this import'}
             </h3>
             <p className="max-w-2xl text-xs text-[var(--color-muted-fg)]">
               This writes <strong>{willImport}</strong> subscription{willImport === 1 ? '' : 's'} for
               real customers, materialises the plan entitlements onto them, and announces{' '}
               <code className="font-mono">subscription.activated</code> for each one to your webhook
-              endpoints — so anything downstream that provisions on a sale will run{' '}
+              endpoints, so anything downstream that provisions on a sale will run{' '}
               {willImport === 1 ? 'once' : `${willImport} times`}. Rows that are skipped above stay
               skipped. It cannot be undone from here.
             </p>
@@ -202,23 +216,23 @@ export default async function ImportRunPage({
               unlinked users to be created, then preview again.
             </p>
           ) : (
-            <form action={applyImport.bind(null, id, runId)}>
+            <ActionForm action={applyImport.bind(null, id, runId)}>
               <TypedConfirmButton
                 expected={application.slug}
                 title={`Import ${willImport} subscription${willImport === 1 ? '' : 's'}?`}
                 description={`This writes real entitlement for real customers and announces a sale for each one. Type the application slug to confirm.`}
-                triggerLabel={`Apply — import ${willImport}`}
+                triggerLabel={run.stale ? 'Resume import' : `Apply and import ${willImport}`}
                 confirmLabel="Import them"
                 triggerClassName="inline-flex items-center gap-1.5 whitespace-nowrap rounded-md border border-amber-400 px-3 py-1.5 text-sm text-amber-800 hover:bg-amber-50 dark:border-amber-700 dark:text-amber-300 dark:hover:bg-amber-950"
               />
-            </form>
+            </ActionForm>
           )}
         </Card>
       )}
 
       {run.status === 'applied' && (
         <Banner tone="info">
-          Applied {run.completedAt ? formatDateTime(run.completedAt) : ''} —{' '}
+          Applied {run.completedAt ? formatDateTime(run.completedAt) : ''}:{' '}
           {counts.imported ?? 0} imported, {counts.failed ?? 0} failed. The rows are kept so this
           stays auditable.
         </Banner>

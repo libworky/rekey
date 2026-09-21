@@ -1,12 +1,12 @@
 import * as React from 'react';
-import Link from 'next/link';
+import Link from '@/components/Link';
 import { redirect } from 'next/navigation';
 import { errorQuery, readErrorFlash, api, PanelApiError } from '@/lib/api';
 import { ConfirmButton } from '@/components/ConfirmButton';
+import { ActionForm } from '@/components/ActionForm';
 import { SubmitButton } from '@/components/SubmitButton';
 import { ApiErrorText } from '@/components/api-error';
 import { SavedBanner } from '@/components/SavedBanner';
-import { Table, TBody, TR, TD } from '@/components/Table';
 import { EmailCredentialsForm } from './EmailCredentialsForm';
 import { Banner } from '@/components/Banner';
 
@@ -135,7 +135,7 @@ const TRANSPORT_LABEL: Record<Transport, string> = {
 const ERR: Record<string, string> = {
   missing: 'Required fields are empty.',
   smtp_missing: 'SMTP needs host, a valid port (1–65535), username, and password.',
-  BILLING_CREDENTIALS_INVALID: 'Credentials were rejected — check the values and try again.',
+  BILLING_CREDENTIALS_INVALID: 'Credentials were rejected. Check the values and try again.',
 };
 
 export default async function EmailPage({
@@ -227,17 +227,17 @@ export default async function EmailPage({
           <div>
             <h2 className="text-base font-semibold">BYO email transport</h2>
             <p className="text-xs text-[var(--color-muted-fg)]">
-              Send from your own provider — Resend (API key) or any SMTP server (Amazon SES,
+              Send from your own provider: Resend (API key) or any SMTP server (Amazon SES,
               Postmark, SendGrid, Mailgun, Gmail/Workspace, or a custom relay). Credentials are
               encrypted at rest.
             </p>
           </div>
           {config.hasCustomCredentials && (
-            <form action={removeCredsBound}>
+            <ActionForm action={removeCredsBound}>
               <ConfirmButton confirm="Remove BYO credentials? The Application will fall back to the default transport.">
                 Remove
               </ConfirmButton>
-            </form>
+            </ActionForm>
           )}
         </header>
         <EmailCredentialsForm
@@ -269,7 +269,7 @@ export default async function EmailPage({
           </div>
           <p className="text-xs text-[var(--color-muted-fg)]">
             <strong>Suppressed</strong> means Rekey deliberately did not send: the switch below, the
-            event, or the address. It is an outcome, not a failure — the detail is on{' '}
+            event, or the address. It is an outcome, not a failure, and the detail is on{' '}
             <Link
               href={`/applications/${id}/email/logs`}
               className="font-medium text-[var(--color-primary)] hover:underline"
@@ -289,18 +289,18 @@ export default async function EmailPage({
             </h2>
             <p className="max-w-2xl text-xs text-[var(--color-muted-fg)]">
               The master switch for every email this Application sends to its end-users. Turning it
-              off stops all of them — verification, reset, magic link, welcome, dunning. Attempted
+              off stops all of them: verification, reset, magic link, welcome, dunning. Attempted
               sends are still recorded on Delivery, so &ldquo;why did they not get it&rdquo; stays
               answerable.
             </p>
             <p className="mt-1 max-w-2xl text-xs text-[var(--color-muted-fg)]">
-              Workspace mail — operator invitations and the like — is unaffected. And this does{' '}
+              Workspace mail (operator invitations and the like) is unaffected. And this does{' '}
               <strong>not</strong> hand you the tokens instead: a suppressed send withholds the
               reset or magic-link token rather than returning it. If your own backend delivers
               those, leave email on and remove the transport credentials below.
             </p>
           </div>
-          <form action={setEmailsEnabled.bind(null, id, !control.emailsEnabled)}>
+          <ActionForm action={setEmailsEnabled.bind(null, id, !control.emailsEnabled)}>
             {control.emailsEnabled ? (
               <ConfirmButton
                 confirm="Stop every email this Application sends to its end-users? Password resets, verification and magic links stop arriving. Events that a live sign-in method depends on are protected individually, but this switch overrides all of them."
@@ -312,7 +312,7 @@ export default async function EmailPage({
             ) : (
               <SubmitButton pendingLabel="Turning on…">Turn email on</SubmitButton>
             )}
-          </form>
+          </ActionForm>
         </div>
       </section>
     </div>

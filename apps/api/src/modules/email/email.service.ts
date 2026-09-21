@@ -1,5 +1,5 @@
 /**
- * Email service — the seam between an auth flow ("a reset link was just
+ * Email service, the seam between an auth flow ("a reset link was just
  * minted, deliver it to the user") and the transport ("Resend
  * sent it"). Three responsibilities:
  *
@@ -9,7 +9,7 @@
  *   2. Render the subject + body with the supplied variables, escaping
  *      runtime values against template-injection / stored-XSS.
  *   3. Hand off to the transport (`lib/email-transport.ts`). The transport
- *      tells us whether it actually sent — auth flows use that to decide
+ *      tells us whether it actually sent, auth flows use that to decide
  *      between "email delivered, drop the raw token" and "no transport
  *      configured, return the raw token to the API caller for them to
  *      forward it themselves."
@@ -19,7 +19,7 @@
  * `Application` row that authorises the send.
  */
 
-import type { Application, EmailSuppression, EmailTemplate } from '@prisma/client';
+import type { Application, EmailSuppression, EmailTemplate, Prisma } from '@prisma/client';
 import { prisma } from '../../lib/prisma.js';
 import { RekeyError } from '../../lib/error.js';
 import {
@@ -85,7 +85,7 @@ export interface RenderResult {
  * An `eventKey` that is not in the registry.
  *
  * Every one of these reaches the service from a URL path segment, so it is
- * user input, and a bare `throw new Error` made it a 500 INTERNAL_ERROR — an
+ * user input, and a bare `throw new Error` made it a 500 INTERNAL_ERROR, an
  * operator typing a stale event name got "something went wrong on our end" and
  * a page in the error log. The two routes that already parsed the segment
  * themselves answered 404 EMAIL_EVENT_UNKNOWN; the preview and test-send routes
@@ -154,6 +154,39 @@ const SYSTEM_SCOPED_EVENTS: ReadonlySet<string> = new Set([
 ]);
 
 /**
+ * The events a live auth method can depend on. `essentialBlocker` decides,
+ * per event, whether the current config does; this is the list it is asked
+ * about when the whole Application's email is being switched off.
+ */
+const ESSENTIAL_EVENTS: readonly EmailEventKey[] = [
+  'password_reset',
+  'magic_link_signin',
+  'email_verification',
+];
+
+/**
+ * Serialise every writer on the email/auth-config coupling for one Application.
+ *
+ * The coupling is checked from both ends by two services: the email switches
+ * refuse to go off while the auth config needs mail, and the auth-config
+ * update refuses an email-dependent method while mail is off. Each reads the
+ * other's state and then writes. Without a shared lock, "email off" and
+ * "password sign-in on" can each pass against the other's old value, and both
+ * commit: password sign-in with no reset path, which neither check allows.
+ *
+ * A row lock on the Application, taken first inside the transaction, and every
+ * check re-read under it. All three writers (master switch, per-event switch,
+ * auth-config update) must take it. A lock only one door takes serialises
+ * nothing.
+ */
+export async function lockEmailCoupling(
+  tx: Prisma.TransactionClient,
+  applicationId: string,
+): Promise<void> {
+  await tx.$queryRaw`SELECT id FROM applications WHERE id = ${applicationId} FOR UPDATE`;
+}
+
+/**
  * Is this send allowed out at all? Cheapest and broadest gate first, so a
  * silenced Application costs one boolean rather than three queries.
  */
@@ -205,12 +238,12 @@ export async function addressSuppression(
  *
  * Returns the transport outcome verbatim so callers can branch on "delivered"
  * vs "no_transport" to decide whether to expose the raw token in their HTTP
- * response — with the one deliberate exception documented at the gate below.
+ * response, with the one deliberate exception documented at the gate below.
  */
 export async function dispatch(input: DispatchInput): Promise<SendOutcome> {
   const suppression = await suppressionFor(input.application, input.eventKey, input.to);
   if (suppression !== null) {
-    // Logged, so the Delivery view can answer "why did they not get it" — the
+    // Logged, so the Delivery view can answer "why did they not get it", the
     // whole point of a switch you can see the effect of.
     await recordSuppressedSend({
       tenantId: input.application.tenantId,
@@ -226,7 +259,7 @@ export async function dispatch(input: DispatchInput): Promise<SendOutcome> {
     // to the caller, so a self-hoster with no email can deliver it themselves
     // (see the reset and magic-link paths). Reporting a suppression that way
     // would quietly turn "we switched email off" into "the API now returns live
-    // password-reset tokens in its responses" — not a trade anybody asked for,
+    // password-reset tokens in its responses", not a trade anybody asked for,
     // and not one they would notice.
     //
     // Every existing caller already treats `error` as "nothing sent, withhold
@@ -258,7 +291,7 @@ export async function dispatch(input: DispatchInput): Promise<SendOutcome> {
 }
 
 /**
- * System-level dispatch — used by Tenant-scoped flows (workspace
+ * System-level dispatch, used by Tenant-scoped flows (workspace
  * invitations, operator MFA notifications) where there's no Application
  * to bind per-tenant template customisation or BYO Resend creds to.
  *
@@ -288,7 +321,7 @@ export async function dispatchSystem(input: {
 }
 
 /**
- * Public service surface — used by both the auth flows (dispatch only)
+ * Public service surface, used by both the auth flows (dispatch only)
  * and the tenant routes (CRUD on templates).
  */
 export const emailService = {
@@ -382,7 +415,7 @@ export const emailService = {
   },
 
   /**
-   * Render a template with the event's sample values — for the panel preview
+   * Render a template with the event's sample values, for the panel preview
    * and the test-send route. Both take `eventKey` from the URL, so an unknown
    * one is a 404, not a 500.
    */
@@ -396,7 +429,7 @@ export const emailService = {
   /**
    * Configure (or rotate) the Application's BYO transport creds + email
    * config. `credentials` is the discriminated provider union (Resend API
-   * key or SMTP host/port/user/pass) — stored encrypted at rest.
+   * key or SMTP host/port/user/pass), stored encrypted at rest.
    */
   async setCredentials(args: {
     applicationId: string;
@@ -428,7 +461,7 @@ export const emailService = {
    *
    * Three of the nine events are load-bearing: turning one off silently removes
    * the only way a user completes a flow the Application still offers. So they
-   * are coupled to the auth config rather than merely warned about — the switch
+   * are coupled to the auth config rather than merely warned about, the switch
    * is refused while the flow that depends on it is live, and the refusal names
    * the setting to change first.
    *
@@ -480,17 +513,24 @@ export const emailService = {
    * `essentialBlocker` refuses to disable an email the live auth config needs.
    * That is only half a guarantee, because the auth config can move too: turn
    * `requireEmailVerification` off, disable the `email_verification` email
-   * (now permitted), turn verification back on — three ordinary steps, and
+   * (now permitted), turn verification back on, three ordinary steps, and
    * every subsequent sign-up is stranded on a screen waiting for a mail that
    * will never be sent, with nothing anywhere reporting a problem.
    *
    * So the auth-config route asks this before it writes. Returns the blockers
    * that the PATCHED config would create, or an empty array.
+   *
+   * The master switch counts as every event being off. `dispatch` checks
+   * `emailsEnabled` before it looks at any per-event row, so an Application
+   * with all email off and password sign-in on has no reset path at all,
+   * whatever the `password_reset` row says. `cause` tells the caller which
+   * switch to name in its fix: the master one, or the event's own.
    */
   async authConfigBlockers(
     applicationId: string,
     next: { methods?: string[] | undefined; requireEmailVerification?: boolean | undefined },
-  ): Promise<Array<{ eventKey: string; message: string }>> {
+    db: Prisma.TransactionClient = prisma,
+  ): Promise<Array<{ eventKey: string; message: string; cause: 'master_switch' | 'event_switch' }>> {
     const wanted: Array<[EmailEventKey, boolean, string]> = [
       [
         'password_reset',
@@ -505,32 +545,32 @@ export const emailService = {
       [
         'email_verification',
         next.requireEmailVerification === true,
-        'Requiring email verification needs the verification email, and that email is switched off for this Application — every new sign-up would be stranded.',
+        'Requiring email verification needs the verification email, and that email is switched off for this Application, every new sign-up would be stranded.',
       ],
     ];
     const needed = wanted.filter(([, want]) => want).map(([key]) => key);
     if (needed.length === 0) return [];
-    const settings = await prisma.emailEventSetting.findMany({
+    // Sequential rather than Promise.all: `db` may be an interactive
+    // transaction, which runs one query at a time on one connection.
+    const application = await db.application.findUniqueOrThrow({
+      where: { id: applicationId },
+      select: { emailsEnabled: true },
+    });
+    const settings = await db.emailEventSetting.findMany({
       where: { applicationId, eventKey: { in: needed }, enabled: false },
       select: { eventKey: true },
     });
+    if (application.emailsEnabled === false) {
+      return wanted
+        .filter(([, want]) => want)
+        .map(([eventKey, , message]) => ({ eventKey, message, cause: 'master_switch' as const }));
+    }
     const off = new Set(settings.map((r) => r.eventKey));
     return wanted
       .filter(([key, want]) => want && off.has(key))
-      .map(([eventKey, , message]) => ({ eventKey, message }));
+      .map(([eventKey, , message]) => ({ eventKey, message, cause: 'event_switch' as const }));
   },
 
-  /**
-   * Events that never pass through `dispatch`.
-   *
-   * `workspace_invitation` (tenant-workspaces.service.ts) and
-   * `billing_unapplied_payment` (unapplied-payments.service.ts) both go out
-   * via `dispatchSystem`, which is deliberately ungated: a workspace
-   * invitation is Rekey talking to a prospective operator, not the
-   * Application talking to its end-users, and an unapplied-payment notice is
-   * Rekey telling the tenant that money arrived it could not match. Neither is
-   * something an Application's own email switch should be able to silence.
-   */
   addressSuppression,
 
   /** Master switch + every event's state, for the settings screen. */
@@ -545,7 +585,7 @@ export const emailService = {
       /**
        * True where the event is only ever sent by `dispatchSystem`, which has
        * no per-Application gate. The switch would render, the operator would
-       * turn it off, and the mail would keep going — so the UI marks these
+       * turn it off, and the mail would keep going, so the UI marks these
        * rather than offering a control that does nothing.
        */
       systemScoped: boolean;
@@ -574,10 +614,46 @@ export const emailService = {
     return { emailsEnabled: application.emailsEnabled, events };
   },
 
+  /**
+   * The master switch is refused under the same rule as a per-event switch.
+   *
+   * `dispatch` tests `emailsEnabled` before any per-event row, so turning it
+   * off silences the password-reset, magic-link and verification emails
+   * whatever their own switches say. Refusing `password_reset` alone while
+   * password sign-in is live, and then letting one boolean switch it off
+   * anyway, would be a lock on the door next to an open window. Same code as
+   * the per-event refusal, so a client that handles one handles both; the
+   * blockers are listed so the fix names every method that has to go first.
+   */
   async setEmailsEnabled(applicationId: string, enabled: boolean): Promise<void> {
-    await prisma.application.update({
-      where: { id: applicationId },
-      data: { emailsEnabled: enabled },
+    await prisma.$transaction(async (tx) => {
+      await lockEmailCoupling(tx, applicationId);
+      if (!enabled) {
+        // Re-read under the lock: the auth config read before it is exactly
+        // the stale value a concurrent auth-config write would invalidate.
+        const application = await tx.application.findUniqueOrThrow({
+          where: { id: applicationId },
+        });
+        const blockers = (
+          await Promise.all(
+            ESSENTIAL_EVENTS.map((key) => this.essentialBlocker(application, key)),
+          )
+        ).filter((b): b is NonNullable<typeof b> => b !== null);
+        if (blockers.length > 0) {
+          throw new RekeyError({
+            statusCode: 409,
+            code: 'EMAIL_EVENT_REQUIRED_BY_AUTH_CONFIG',
+            message: `All email cannot be switched off while the auth config depends on it. ${blockers
+              .map((b) => b.message)
+              .join(' ')}`,
+            fix: blockers.map((b) => b.fix).join(' '),
+          });
+        }
+      }
+      await tx.application.update({
+        where: { id: applicationId },
+        data: { emailsEnabled: enabled },
+      });
     });
   },
 
@@ -590,7 +666,7 @@ export const emailService = {
     // Refuse rather than store a setting nothing reads. These events go out
     // through `dispatchSystem`, which has no per-Application gate, so a stored
     // `enabled: false` here would leave an operator certain they had switched
-    // something off while it kept arriving — the worst kind of switch.
+    // something off while it kept arriving, the worst kind of switch.
     // Only the DISABLE is refused. Re-enabling has to stay possible, or an
     // Application carrying a stale `enabled: false` row from before these two
     // events were recognised as workspace-scoped could never have it cleared.
@@ -602,16 +678,22 @@ export const emailService = {
         fix: 'Workspace notifications are not configurable per Application. Nothing to change here.',
       });
     }
-    if (!enabled) {
-      const blocker = await this.essentialBlocker(application, eventKey);
-      if (blocker) {
-        throw new RekeyError({ statusCode: 409, ...blocker });
+    await prisma.$transaction(async (tx) => {
+      await lockEmailCoupling(tx, application.id);
+      if (!enabled) {
+        // The caller's `application` was read before the lock; decide on the
+        // row as it stands now.
+        const current = await tx.application.findUniqueOrThrow({ where: { id: application.id } });
+        const blocker = await this.essentialBlocker(current, eventKey);
+        if (blocker) {
+          throw new RekeyError({ statusCode: 409, ...blocker });
+        }
       }
-    }
-    await prisma.emailEventSetting.upsert({
-      where: { applicationId_eventKey: { applicationId: application.id, eventKey } },
-      create: { applicationId: application.id, eventKey, enabled },
-      update: { enabled },
+      await tx.emailEventSetting.upsert({
+        where: { applicationId_eventKey: { applicationId: application.id, eventKey } },
+        create: { applicationId: application.id, eventKey, enabled },
+        update: { enabled },
+      });
     });
   },
 
@@ -632,7 +714,7 @@ export const emailService = {
     return { items, total };
   },
 
-  /** Idempotent on (application, address) — re-adding updates the note. */
+  /** Idempotent on (application, address), re-adding updates the note. */
   async addSuppression(args: {
     applicationId: string;
     address: string;
@@ -685,7 +767,7 @@ export const emailService = {
     };
   },
 
-  /** Remove BYO creds — Application falls back to the default Resend pool. */
+  /** Remove BYO creds, Application falls back to the default Resend pool. */
   async removeCredentials(applicationId: string): Promise<void> {
     await prisma.application.update({
       where: { id: applicationId },
@@ -728,8 +810,8 @@ export const emailService = {
   },
 
   /**
-   * Recent send-log rows across a whole Tenant (workspace view). Every send
-   * — per-app and tenant system mail — carries the denormalised `tenantId`,
+   * Recent send-log rows across a whole Tenant (workspace view). Every send,
+   * per-app and tenant system mail, carries the denormalised `tenantId`,
    * so a single indexed query covers both. The owning app (if any) is joined
    * for display.
    */
@@ -739,7 +821,7 @@ export const emailService = {
     offset?: number;
     status?: EmailLogStatus;
     /** When true, only tenant SYSTEM mail (operator magic-link/reset, workspace
-     *  invites) — i.e. sends NOT tied to an Application (applicationId null). */
+     *  invites), i.e. sends NOT tied to an Application (applicationId null). */
     systemOnly?: boolean;
   }): Promise<Array<EmailLogRow & { application: { id: string; name: string; slug: string } | null }>> {
     const rows = await prisma.emailLog.findMany({

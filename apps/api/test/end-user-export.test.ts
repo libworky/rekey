@@ -3,8 +3,8 @@
  *   GET /tenant/applications/:id/end-users/:euid/export
  *
  * Covers: document shape (every section present + populated), the
- * OWNER/ADMIN role gate, cross-tenant + cross-application 404s, and —
- * critically — that no credential material (password hashes, token hashes,
+ * OWNER/ADMIN role gate, cross-tenant + cross-application 404s, and,
+ * critically, that no credential material (password hashes, token hashes,
  * MFA ciphertexts, license key hashes, passkey public keys) ever appears in
  * the serialized output.
  */

@@ -1,8 +1,8 @@
 /**
  * `?endUserId=` returns every event ABOUT a person, whoever performed it.
  *
- * The panel's end-user screen needs one question answered — "what happened to
- * this person?" — and the log stores the answer in two different columns. An
+ * The panel's end-user screen needs one question answered, "what happened to
+ * this person?", and the log stores the answer in two different columns. An
  * end-user's own events name them in `actor_id`. Everything done TO them by
  * somebody else (an operator blocking a device, the billing webhook creating
  * the account) names them in `metadata.endUserId`, with the operator or the
@@ -11,7 +11,7 @@
  * With no filter that could express "either", the panel read the application's
  * latest 200 events three times over, once per actor type, and matched both
  * fields in memory: 600 rows fetched to render twenty, on every view. Worse, it
- * was wrong for a quiet user on a busy application — their events simply were
+ * was wrong for a quiet user on a busy application, their events simply were
  * not in anyone's most recent 200.
  *
  * `recordSecurityEvent` now derives one `subject_end_user_id` at write time, so
@@ -130,7 +130,7 @@ describe('GET /api/v1/tenant/security-events?endUserId=', () => {
       applicationId,
       metadata: { endUserId: mine },
     });
-    // A different person entirely — must not leak into the answer.
+    // A different person entirely, must not leak into the answer.
     await recordSecurityEvent({
       type: 'user.signed_in',
       actorType: 'end_user',
@@ -165,7 +165,7 @@ describe('GET /api/v1/tenant/security-events?endUserId=', () => {
     });
 
     // `b` knows the id and asks for it. Tenant scoping, not the subject
-    // filter, is what refuses — but this is the case that matters, because a
+    // filter, is what refuses, but this is the case that matters, because a
     // filter that widened a read would be a silent cross-tenant leak.
     expect(await typesFor(b.tenantAccess, { endUserId: shared })).toEqual([]);
     expect(await typesFor(a.tenantAccess, { endUserId: shared })).toEqual(['user.signed_in']);

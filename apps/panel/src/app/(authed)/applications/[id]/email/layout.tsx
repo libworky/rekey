@@ -1,8 +1,8 @@
 /**
  * Email shell: one tab strip over four responsibilities.
  *
- * The page this replaces stacked three unrelated things — transport status,
- * BYO credentials, and the template list — into one scroll, put the send log on
+ * The page this replaces stacked three unrelated things, transport status,
+ * BYO credentials, and the template list, into one scroll, put the send log on
  * a separate page reachable only by a link buried in the transport card, and
  * offered no way to stop email going out at all. The question an operator
  * arrives with is usually one of four, and each now has a place:
@@ -32,14 +32,14 @@ export default async function EmailLayout({
 
   return (
     <div className="space-y-5">
-      {/* Email is the THIRD strip on this route — AppNav already spends two on
-          Developer → Email — so it takes the enclosed idiom rather than a
+      {/* Email is the THIRD strip on this route, AppNav already spends two on
+          Developer → Email, so it takes the enclosed idiom rather than a
           third page-spanning underline row. No breadcrumb: the two strips
           above already say Developer › Email, and a trail would be the same
           fact stated a third time. */}
       <RecordHeader
         title="Email"
-        description="Transactional mail this Application sends to its end-users. Workspace mail — operator invitations and the like — is separate and is not affected by anything here."
+        description="Transactional mail this Application sends to its end-users. Workspace mail (operator invitations and the like) is separate and is not affected by anything here."
         segmentsLabel="Email sections"
         // `email/[eventKey]` is a child of Templates living at a sibling
         // path, so without this the strip rendered on the per-event editor

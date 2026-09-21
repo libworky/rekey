@@ -64,7 +64,7 @@ function stubIssuer(parts: {
 }): void {
   vi.stubGlobal(
     'fetch',
-    vi.fn(async (input: RequestInfo | URL) => {
+    vi.fn(async (input: string | URL | Request) => {
       const url = String(input);
       if (url.includes('/.well-known/openid-configuration')) return json(parts.doc ?? discoveryDoc());
       if (url.endsWith('/token')) return json(parts.token ?? {});
@@ -164,7 +164,7 @@ describe('OIDC identity claims', () => {
     const tenant = '11111111-2222-3333-4444-555555555555';
     vi.stubGlobal(
       'fetch',
-      vi.fn(async (input: RequestInfo | URL) => {
+      vi.fn(async (input: string | URL | Request) => {
         const url = String(input);
         if (url.includes('/.well-known/openid-configuration')) {
           return json({

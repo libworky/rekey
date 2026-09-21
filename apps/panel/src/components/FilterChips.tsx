@@ -27,7 +27,7 @@ import * as React from 'react';
  *
  * Teal border with the label at full foreground, over a wash of the brand at
  * 8%. The email version tinted the LABEL teal too, which put brand-coloured
- * text at 12px against the page — the smallest, least legible thing on screen
+ * text at 12px against the page, the smallest, least legible thing on screen
  * carrying the least legible colour. The border and the wash carry "selected"
  * on their own; the text can stay readable.
  *
@@ -37,7 +37,7 @@ import * as React from 'react';
  */
 
 export interface FilterChip {
-  /** `undefined` is the "no filter" chip — conventionally first, labelled All. */
+  /** `undefined` is the "no filter" chip, conventionally first, labelled All. */
   value: string | undefined;
   label: React.ReactNode;
   /** Optional trailing count, e.g. the import preview's per-outcome totals. */

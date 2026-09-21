@@ -6,8 +6,8 @@
  * ## The problem this exists to solve
  *
  * `AppNav` renders two strips: a pill row of groups and an underline row of
- * that group's children. Anything nested below one of those children — an
- * end-user, the email section, a webhook endpoint — used to add a third
+ * that group's children. Anything nested below one of those children, an
+ * end-user, the email section, a webhook endpoint, used to add a third
  * full-width underline strip of its own, plus a back link, plus a second
  * identity header. The end-user page reached six horizontal bands of chrome
  * before a single fact about the user appeared, and two of those bands were
@@ -24,7 +24,7 @@
  *
  * So this is a segmented control: enclosed in a track, sitting INSIDE the
  * record's own header rather than spanning the page. Enclosure is the whole
- * point — it says "these switch what you see about THIS record", where the
+ * point, it says "these switch what you see about THIS record", where the
  * strips above span the page and say "these switch where you are in the
  * application". Same tokens, same type scale, different shape language.
  *
@@ -32,7 +32,7 @@
  *
  * The underline strip above it already spends the brand colour. A teal fill
  * here would compete with its parent for attention, which inverts the
- * hierarchy — the deepest control would shout loudest. A raised surface reads
+ * hierarchy, the deepest control would shout loudest. A raised surface reads
  * as selected without adding a third accent, and it survives both themes:
  * light lifts (#f3ede7 track, #ffffff thumb) and dark recesses (#1c1c1c track,
  * #111111 thumb). The ring carries the edge in both directions, which is why
@@ -40,7 +40,8 @@
  */
 
 import * as React from 'react';
-import Link from 'next/link';
+import Link from '@/components/Link';
+import { LinkPending } from '@/components/LinkPending';
 import { usePathname } from 'next/navigation';
 
 export interface Segment {
@@ -48,7 +49,7 @@ export interface Segment {
   label: React.ReactNode;
   /** Active only on an exact pathname match. Use for the record's landing tab. */
   exact?: boolean;
-  /** Match this prefix instead of `href` — for a tab covering several routes. */
+  /** Match this prefix instead of `href`, for a tab covering several routes. */
   matchPrefix?: string;
 }
 
@@ -66,7 +67,7 @@ export function SegmentedNav({
    *
    * The email section had this exact hole: `email/[eventKey]` is a child of
    * Templates but lives at a sibling path, so the strip rendered on that route
-   * with NOTHING highlighted — four segments all reading as "not here", which
+   * with NOTHING highlighted, four segments all reading as "not here", which
    * looks like a bug and tells the operator nothing about where they are. A
    * dynamic child cannot be enumerated as a prefix, so the parent claims the
    * leftovers instead.
@@ -116,7 +117,7 @@ export function SegmentedNav({
                 : 'text-[var(--color-muted-fg)] hover:text-[var(--color-fg)]'
             }`}
           >
-            {s.label}
+            <LinkPending>{s.label}</LinkPending>
           </Link>
         );
       })}

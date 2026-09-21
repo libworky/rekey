@@ -1,5 +1,5 @@
 /**
- * Licenses — perpetual, timed, or seat-based keys for software products.
+ * Licenses, perpetual, timed, or seat-based keys for software products.
  *
  * Issuance is operator-driven (admin / API key from the customer's billing
  * webhook handler). Verification is end-user-facing: customer's software
@@ -9,7 +9,7 @@
  * Activation tracking:
  *   - PERPETUAL / TIMED:  one row per unique (license, machineFingerprint).
  *     Bounded by the holder's `max_devices` FEATURE entitlement when their
- *     plans grant one (the same cap that bounds their sessions — see
+ *     plans grant one (the same cap that bounds their sessions, see
  *     modules/devices); uncapped otherwise, which is what every deployment
  *     had before the entitlement existed.
  *   - SEATS:              same shape, but verification refuses if
@@ -34,7 +34,7 @@ export type PublicLicense = Omit<License, 'keyHash'>;
 
 export interface RotateKeyResult {
   license: PublicLicense;
-  /** Freshly minted raw key. Show ONCE — only the hash is stored. */
+  /** Freshly minted raw key. Show ONCE, only the hash is stored. */
   rawKey: string;
   /**
    * Activations invalidated by the rotation. Rotating discards the previous
@@ -47,7 +47,6 @@ export interface RotateKeyResult {
 }
 
 function redactLicense(l: License): PublicLicense {
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
   const { keyHash, ...rest } = l;
   return rest;
 }
@@ -61,6 +60,14 @@ export interface IssueInput {
   organizationId?: string | undefined;
   expiresAt?: Date | undefined;
   seatsAllowed?: number | undefined;
+  /**
+   * Which of the plan's LICENSE entitlements this licence is for.
+   *
+   * A plan may carry more than one (`@@unique([planId, kind, key])` permits
+   * `LICENSE:a` and `LICENSE:b`). Part of the licence's pool identity, so two
+   * such rows cannot resolve to one licence and overwrite each other.
+   */
+  entitlementKey?: string | undefined;
   metadata?: Record<string, unknown> | undefined;
 }
 
@@ -97,7 +104,7 @@ export interface DeactivateInput {
 }
 
 export type DeactivateResult =
-  /** The seat was given back (or was already free — idempotent). */
+  /** The seat was given back (or was already free, idempotent). */
   | { ok: true; released: boolean }
   /** Same reasons as verify, minus seat exhaustion: releasing never needs a seat. */
   | { ok: false; reason: 'unknown' | 'wrong_application' | 'revoked' | 'expired' };
@@ -161,6 +168,7 @@ export const licensesService = {
         ...(input.organizationId !== undefined && { organizationId: input.organizationId }),
         ...(input.expiresAt !== undefined && { expiresAt: input.expiresAt }),
         ...(input.seatsAllowed !== undefined && { seatsAllowed: input.seatsAllowed }),
+        ...(input.entitlementKey !== undefined && { entitlementKey: input.entitlementKey }),
         ...(input.metadata !== undefined && { metadata: input.metadata as never }),
       },
     });
@@ -187,11 +195,11 @@ export const licensesService = {
 
   /**
    * Mint a fresh raw key for an existing **org-pooled** license and return it
-   * ONCE — the delivery path for keys auto-issued during provisioning.
+   * ONCE, the delivery path for keys auto-issued during provisioning.
    *
    * Why this exists: an org-beneficiary subscription provisions exactly one
    * license pooled to the org (see entitlements.service `provision`), but the
-   * provisioner stores only the hash and discards the raw key — so the team can
+   * provisioner stores only the hash and discards the raw key, so the team can
    * never obtain a key to call `licenses/verify`. Reading a stored key back is
    * impossible by design (hash-only). Rotation is the safe delivery: it mints a
    * new key, resets the hash, and hands the raw value over once.
@@ -250,7 +258,7 @@ export const licensesService = {
    * Verify a license by raw key + record an activation.
    *
    * Returns `ok: false` (no exception) for the common "invalid license"
-   * cases — the customer's software loops on this and we don't want a
+   * cases, the customer's software loops on this and we don't want a
    * 404 to confuse it. Operators see the failure reason.
    */
   async verify(input: VerifyInput): Promise<VerifyResult> {
@@ -288,18 +296,17 @@ export const licensesService = {
 
     // Atomic seat allocation + activation upsert.
     //
-    // Previously the seat count was read OUTSIDE a transaction, then the
-    // activation row was inserted — two concurrent verify() calls for the
-    // same SEATS license on different machines could both pass the count
-    // check, over-issuing by `concurrency - 1` seats. The fix: take a
-    // row-level lock on the license row for the duration of the
-    // count+upsert, which serialises every concurrent verify against the
-    // same license. Verifications across different licenses are
+    // Reading the seat count outside a transaction before inserting the
+    // activation row let two concurrent verify() calls for the same SEATS
+    // license on different machines both pass the count check, over-issuing
+    // by `concurrency - 1` seats. A row-level lock on the license row for the
+    // duration of the count+upsert serialises every concurrent verify against
+    // the same license. Verifications across different licenses are
     // independent and proceed in parallel.
     //
     // The seat re-check inside the transaction is the authoritative one.
     // It still skips when an activation row already exists for this
-    // machine — repeat verify from a previously-active machine never
+    // machine, repeat verify from a previously-active machine never
     // consumes a new seat.
     const result = await prisma.$transaction(async (tx) => {
       await tx.$queryRaw`SELECT id FROM licenses WHERE id = ${license.id} FOR UPDATE`;
@@ -380,7 +387,7 @@ export const licensesService = {
   },
 
   /**
-   * Give a seat back from the machine that holds it — the customer's software
+   * Give a seat back from the machine that holds it, the customer's software
    * calling "deactivate this install" before a re-image, or on uninstall.
    *
    * Same deterministic-body contract as `verify`: an invalid key is `ok:

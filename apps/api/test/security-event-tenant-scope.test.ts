@@ -18,13 +18,13 @@
  * puts a database read on the audit-write path, which is exactly what the
  * scalar-only, relation-free shape of this table exists to prevent (see the
  * `ApiRequestLog` note in the schema: a logging write must not contend with the
- * request it records). It was not theoretical — it reordered detached webhook
+ * request it records). It was not theoretical, it reordered detached webhook
  * emission in `devices.test.ts` about half the time, by contending for a
  * connection with the `emitDetached` next to it.
  *
  * An event naming an Application already identifies its workspace. The fact was
  * never missing, only unjoined. So these cases assert **visibility**, which is
- * the property that actually matters, rather than the value of a column — and
+ * the property that actually matters, rather than the value of a column, and
  * the last one asserts the thing widening a security-scoped read must never
  * break.
  */
@@ -111,7 +111,7 @@ describe('Security events are reachable from the workspace that owns the Applica
       metadata: { deviceId: 'dev-1', endUserId: 'eu-1' },
     });
 
-    // The column really is null — the row is unchanged, the READ is what moved.
+    // The column really is null, the row is unchanged, the READ is what moved.
     const row = await prisma.securityEvent.findFirstOrThrow({
       where: { applicationId: b.applicationId, type: 'end_user.device_blocked' },
     });
@@ -137,7 +137,7 @@ describe('Security events are reachable from the workspace that owns the Applica
   it('a workspace never sees another workspace\'s events', async () => {
     // The point of the whole exercise. Widening a security-scoped read is only
     // safe if this holds, so it is asserted for both shapes: an event carrying
-    // a foreign tenantId, and one carrying only a foreign applicationId — the
+    // a foreign tenantId, and one carrying only a foreign applicationId, the
     // shape the new OR branch matches on.
     const mine = await bootstrap('mine');
     const theirs = await bootstrap('theirs');

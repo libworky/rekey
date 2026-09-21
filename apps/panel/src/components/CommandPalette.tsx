@@ -1,17 +1,17 @@
 'use client';
 
 /**
- * Command palette (Cmd+K / Ctrl+K) — a client island mounted once in the
+ * Command palette (Cmd+K / Ctrl+K), a client island mounted once in the
  * authed layout.
  *
  * Built on the same native `<dialog>` patterns as Modal.tsx (showModal() for
  * the focus trap + Esc-to-close, backdrop click via `e.target ===
  * e.currentTarget`) but with combobox semantics instead of a form body, so it
- * isn't a Modal reuse — Modal's trigger/title anatomy doesn't fit a palette.
+ * isn't a Modal reuse, Modal's trigger/title anatomy doesn't fit a palette.
  *
  * Sources:
  *  1. Static workspace nav destinations (mirrors Sidebar's NAV).
- *  2. The operator's applications — fetched once per page load when the
+ *  2. The operator's applications, fetched once per page load when the
  *     palette first opens, via the panel's own /api/palette/applications
  *     proxy (the operator JWT lives in httpOnly cookies; see that route).
  *  3. Section jumps for the *current* application when the route is under
@@ -51,7 +51,7 @@ interface PaletteApp {
 }
 
 interface PaletteItem {
-  /** Stable unique id — doubles as the React key + aria option id suffix. */
+  /** Stable unique id, doubles as the React key + aria option id suffix. */
   id: string;
   label: string;
   /** Secondary text rendered after the label (e.g. an app slug). */
@@ -62,7 +62,7 @@ interface PaletteItem {
   keywords?: string;
 }
 
-/** Mirrors Sidebar's NAV — keep in sync when nav entries change. */
+/** Mirrors Sidebar's NAV, keep in sync when nav entries change. */
 const NAV_DESTINATIONS: Array<{ label: string; href: string; keywords?: string }> = [
   { label: 'Applications', href: '/applications', keywords: 'apps' },
   { label: 'Team', href: '/team', keywords: 'members invitations invite' },
@@ -167,7 +167,7 @@ export function CommandPalette(): React.JSX.Element {
       try {
         dialog.showModal();
       } catch {
-        /* already open / detached — ignore (same rationale as Modal.tsx) */
+        /* already open / detached, ignore (same rationale as Modal.tsx) */
       }
       // showModal focuses the dialog; move it into the input.
       inputRef.current?.focus();
@@ -196,9 +196,9 @@ export function CommandPalette(): React.JSX.Element {
     const out: PaletteItem[] = [];
     if (currentAppId) {
       const base = `/applications/${currentAppId}`;
-      const group = currentApp ? `Current app — ${currentApp.name}` : 'Current app';
+      const group = currentApp ? `Current app: ${currentApp.name}` : 'Current app';
       for (const s of APP_SECTIONS) {
-        // Billing sections are server-gated when billing is disabled — don't
+        // Billing sections are server-gated when billing is disabled, don't
         // offer dead links. (When the list hasn't loaded yet we can't know;
         // omit until it has.)
         if (s.billing && !currentApp?.billingEnabled) continue;
@@ -262,7 +262,7 @@ export function CommandPalette(): React.JSX.Element {
       localStorage.setItem(RECENTS_KEY, JSON.stringify(next));
       setRecents(next);
     } catch {
-      /* private mode / quota — recents are optional */
+      /* private mode / quota, recents are optional */
     }
     setOpen(false);
     router.push(item.href);

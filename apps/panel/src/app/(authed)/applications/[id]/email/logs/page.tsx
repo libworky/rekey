@@ -33,12 +33,9 @@ export default async function ApplicationEmailLogsPage({
 
   return (
     <div className="space-y-4">
-      {/* The `← Email settings` link that used to sit here pointed at a sibling
-          one row away in the section's own switcher — the sixth navigation
-          band on the deepest route in the panel, navigating somewhere already
-          on screen. The `<h2>` beneath it restated the layout's own title.
-          Both gone; this is now a section heading inside a shell that has
-          already introduced itself. */}
+      {/* No back-link or page title here: the Email layout shell already
+          provides the section switcher and heading, so this is just the
+          section content. */}
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
           <h3 className="text-sm font-semibold text-[var(--color-fg)]">
@@ -48,7 +45,7 @@ export default async function ApplicationEmailLogsPage({
             </span>
           </h3>
           <p className="mt-1 max-w-2xl text-sm text-[var(--color-muted-fg)]">
-            Every transactional email this application attempted — verification, password reset,
+            Every transactional email this application attempted: verification, password reset,
             magic links, etc. Metadata only (recipient, subject, transport, status); message bodies
             are never stored.
           </p>

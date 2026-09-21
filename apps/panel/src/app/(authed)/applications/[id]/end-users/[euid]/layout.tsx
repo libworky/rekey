@@ -5,7 +5,7 @@
  * ## Why this is a layout and not a page
  *
  * This screen used to be one 900-line page rendering everything it knew about
- * an end-user as a single scroll — profile, auth events, subscriptions,
+ * an end-user as a single scroll, profile, auth events, subscriptions,
  * payments, credits, export, erase, impersonate, passkeys, impersonations. It
  * was a data dump, not a console: the shape answered "what do we store" when
  * the operator's question is "what do I do about this ticket". It also fetched
@@ -52,12 +52,10 @@ export default async function EndUserLayout({
 
   return (
     <div className="space-y-5">
-      {/* ONE band, where there were three: a `← End-users` back link (redundant
-          — the End-users sub-tab is already visible and highlighted one row
-          above it), a `PageHeader`, and a third full-width underline strip
-          stacked directly beneath AppNav's own. `RecordHeader` and
-          `SegmentedNav` carry the reasoning for changing the third level's
-          idiom rather than just tightening its spacing. */}
+      {/* One band: a back link would be redundant since End-users is already
+          highlighted one row above, and a separate underline strip would just
+          duplicate AppNav's own. `RecordHeader` combines crumb, title and tab
+          strip into a single row instead. */}
       <RecordHeader
         crumbs={[
           { label: 'End-users', href: `/applications/${id}/end-users` },

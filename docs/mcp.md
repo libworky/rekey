@@ -19,6 +19,30 @@ Provider** when `authConfig.oidcEnabled` is set — same issuer, same clients,
 same grant, plus a discovery document, `id_token` and `/userinfo`. See
 [docs/oidc-provider.md](oidc-provider.md); the two toggles are independent.
 
+## Which switch wins
+
+Four settings turn MCP access off. Each governs one server, and they never
+reach across: the two operator settings do nothing to the end-user MCP, and
+`authConfig.mcpEnabled` does nothing to the operator MCP.
+
+| Switch | Scope | Governs | What "off" refuses |
+|---|---|---|---|
+| `OPERATOR_MCP_ENABLED` (env, default on) | Deployment | Operator MCP | Everything. The JSON-RPC endpoint, its OAuth server and both well-known forms are never registered, so every `/api/v1/tenant/mcp` path answers `404 ROUTE_NOT_FOUND`, refresh and registration included. |
+| `operatorMcpEnabled` (Workspace settings, default on) | Workspace | Operator MCP for that workspace | Every access token for the workspace, PAT or OAuth, gets `403 OPERATOR_MCP_DISABLED` at the MCP endpoint, and consent (`POST …/oauth/grant`) refuses with the same 403. The token endpoint does not check it: refresh keeps rotating and an already-issued code still exchanges, but the access token they mint is refused at the endpoint. Nothing is revoked. |
+| `OPERATOR_MCP_DYNAMIC_REGISTRATION` (env, default `open`) | Deployment | Operator MCP client registration | Only `POST …/oauth/register`, which answers `403 CLIENT_REGISTRATION_DISABLED`; `registration_endpoint` leaves the metadata. Existing clients, consent, tokens and refresh are untouched. |
+| `authConfig.mcpEnabled` (per Application) | Application | End-user MCP at `/api/v1/mcp/<slug>` | The JSON-RPC endpoint and its protected-resource metadata answer `404 MCP_NOT_FOUND`, and the `mcp:account` scope is no longer offered. The authorization server (register, authorize, token, introspect) stays up while `authConfig.oidcEnabled` is on. |
+
+The deployment switch is decided first, at boot: with it off, no request ever
+reaches the workspace switch or the registration setting. With it on, those two
+are independent of each other; the workspace switch cuts access for one
+workspace without revoking anything, so switching it back on restores every
+connected agent without a new consent, while the registration setting only
+stops new clients from appearing. A non-member, or a token already ended by a
+password change or sign-out everywhere, gets the generic `401` before the
+workspace switch is consulted, so only the workspace's own credentials learn
+it is off. None of the four affects operator PATs on `/api/v1/tenant/operator/*`,
+which is not the MCP server.
+
 ## TL;DR
 
 ```
@@ -282,7 +306,7 @@ Three new tables added in migration `20260531230000_operator_mcp_oauth`:
 
 - `tenant_oauth_clients` — RFC 7591 dynamically-registered clients (id, name, redirect_uris, metadata, created_at).
 - `tenant_oauth_auth_codes` — single-use 60s codes bound to `(clientId, tenantUserId, tenantId, redirectUri, codeChallenge, scope)`.
-- `tenant_mcp_refresh_tokens` — hash-only refresh tokens bound to `(tenantUserId, tenantId, clientId)`; atomically rotated on redeem. Replaying an **already-rotated** token revokes the whole family — every live token for that `(tenantUserId, tenantId, clientId)` triple, not just the replayed one — because on a leak the attacker rotates first and the replay is the legitimate client arriving second. A token that was deliberately revoked (sign-out) is refused without burning anything.
+- `tenant_mcp_refresh_tokens`: hash-only refresh tokens bound to `(tenantUserId, tenantId, clientId)`; atomically rotated on redeem. Replaying an **already-rotated** token revokes the whole family (every live token for that `(tenantUserId, tenantId, clientId)` triple, not just the replayed one), because on a leak the attacker rotates first and the replay is the legitimate client arriving second. A token that was deliberately revoked (sign-out) is refused without burning anything. A password change or reset, sign-out everywhere, or panel refresh-token reuse revokes every one of the operator's MCP refresh tokens, and the MCP endpoint refuses an access token whose `iat` predates `TenantUser.sessionsInvalidBefore`. Revoking a single panel session leaves MCP connections alone.
 
 #### Token shape
 

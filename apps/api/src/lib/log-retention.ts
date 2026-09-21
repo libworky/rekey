@@ -3,7 +3,7 @@
  *
  * Three tables only ever grew: `security_events`, `email_logs` and
  * `webhook_deliveries`. Nothing deleted a row from any of them, so each was a
- * disk that only fills — and, more immediately, a table in the hot path of the
+ * disk that only fills, and, more immediately, a table in the hot path of the
  * operator console's heaviest reads, in every backup and every restore.
  *
  * This sweeps rows older than `LOG_RETENTION_DAYS` on the existing 10-minute
@@ -212,6 +212,9 @@ export async function pruneLogs(options: PruneLogsOptions): Promise<PruneLogsRes
     archivedObjects: 0,
     failures: [],
   };
+  // Zero days would put the cutoff at now and delete every row. Unset retention
+  // means keep forever, so a caller that forgets to map it to null keeps rows.
+  if (!(options.retentionDays > 0)) return result;
 
   for (const table of TABLES) {
     try {

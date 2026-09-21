@@ -3,24 +3,23 @@
  *
  * ## Why this file exists
  *
- * Until now the decision lived in three copies: `ensureAppAccess` and
+ * The decision used to live in three copies: `ensureAppAccess` and
  * `appAccessScope` in `app-access.ts` for REST, and `accessibleApplicationIds`
- * in `tenant-mcp/operator-tools.ts` for MCP — with `loadAppInTenant` in
- * `operator-write-tools.ts` wrapping the third. The copy existed for a stated
- * reason: the REST helper took a `FastifyRequest`, and MCP handlers have no
- * request. Its own docstring said "if the two ever diverge, this is the copy
- * to fix", and they had: the MCP copy modelled `read` and only `read`, and its
- * caller warned in a comment that it would not protect a member write tool.
+ * in `tenant-mcp/operator-tools.ts` for MCP, with `loadAppInTenant` in
+ * `operator-write-tools.ts` wrapping the third. The split existed because the
+ * REST helper took a `FastifyRequest` and MCP handlers have no request. The
+ * copies had already diverged: the MCP copy modelled `read` and only `read`,
+ * and its caller warned that it would not protect a member write tool.
  *
  * The fix is not a fourth copy. It is one decision function that takes a plain
- * context — `{ tenantId, role, membershipId, scopes }` — and two thin adapters
+ * context, `{ tenantId, role, membershipId, scopes }`, and two thin adapters
  * that build that context from a request or from a tool context. The grants
  * query, the legacy-member rule, the OWNER/ADMIN short-circuit and the
  * denied-is-indistinguishable-from-absent 404 have exactly one home.
  *
  * ## Scopes
  *
- * A membership carries scopes (`lib/operator-scopes.ts`) — the person's
+ * A membership carries scopes (`lib/operator-scopes.ts`), the person's
  * ceiling, workspace-wide. The three grant roles are presets over the same
  * vocabulary. For an application request the effective set is the
  * INTERSECTION of the two, so neither can widen the other:
@@ -32,8 +31,8 @@
  * short-circuit here before grants are read.
  *
  * The gate runs AFTER the existing checks, deliberately. A cross-tenant or
- * ungranted application still answers 404 — denied stays indistinguishable
- * from absent — and only an application the caller can see can answer 403
+ * ungranted application still answers 404, denied stays indistinguishable
+ * from absent, and only an application the caller can see can answer 403
  * for a missing scope. There is nothing to enumerate at that point: the
  * caller already knows the application exists.
  *
@@ -45,6 +44,14 @@
 
 import type { FastifyRequest } from 'fastify';
 import type { ApplicationGrantRole, TenantRole } from '@prisma/client';
+import {
+  getCachedAppTenant,
+  getCachedGrants,
+  loadTicket,
+  storeAppTenant,
+  storeGrants,
+  type GrantEntry,
+} from './operator-auth-cache.js';
 import { prisma } from './prisma.js';
 import { RekeyError } from './error.js';
 import {
@@ -61,9 +68,9 @@ export type AppAccessNeed = 'read' | 'write' | 'billing-write';
 export interface AppAccess {
   /**
    * How the access was satisfied:
-   *  - 'workspace-admin' — caller is OWNER/ADMIN (implicit full access)
-   *  - 'legacy-member'   — grandfathered pre-grants membership (read-only)
-   *  - ApplicationGrantRole   — MEMBER via an explicit grant on this Application
+   *  - 'workspace-admin', caller is OWNER/ADMIN (implicit full access)
+   *  - 'legacy-member'  , grandfathered pre-grants membership (read-only)
+   *  - ApplicationGrantRole  , MEMBER via an explicit grant on this Application
    */
   level: 'workspace-admin' | 'legacy-member' | ApplicationGrantRole;
   /** The caller's effective scopes on THIS application. What the panel renders from. */
@@ -83,8 +90,8 @@ export interface AppAccessScope {
  * Everything the decision needs, and nothing tied to a transport.
  *
  * `membershipId` is null when the auth path could not resolve one. Every grant
- * check then fails CLOSED — a member whose grants cannot be read must not be
- * handed the workspace — except `applicationAccess`, which treats it as a
+ * check then fails CLOSED, a member whose grants cannot be read must not be
+ * handed the workspace, except `applicationAccess`, which treats it as a
  * programming error (see `accessContextFromRequest`).
  *
  * `scopes` is the membership's ceiling, already intersected with any token's
@@ -105,7 +112,7 @@ function internal(message: string, fix: string): RekeyError {
 /**
  * Build the context from an operator request. Must run after one of the
  * operator auth middlewares (`requireTenantSession`, `resolveOperatorToken`,
- * the MCP bearer resolver) — all three set `tenantId`, `tenantRole`,
+ * the MCP bearer resolver), all three set `tenantId`, `tenantRole`,
  * `tenantMembershipId` and `tenantScopes`.
  *
  * Async only for the defensive fallback `ensureAppAccess` always had: an auth
@@ -152,7 +159,9 @@ export function accessContextFromTool(ctx: {
     tenantId: ctx.tenantId,
     role: ctx.role,
     membershipId: ctx.tenantMembershipId ?? null,
-    scopes: ctx.scopes ?? UNRESTRICTED,
+    // Fail closed, like the request path above. The route always sets scopes;
+    // a caller that forgets must not inherit every one.
+    scopes: ctx.scopes ?? NO_SCOPES,
   };
 }
 
@@ -162,7 +171,7 @@ export interface GrantSet {
   /**
    * Grandfathered pre-grants membership: workspace-wide READ, no writes.
    * Set ONLY by the 2.0.0-rc.3 backfill. Only meaningful when
-   * `byApplication` is empty — setting a grant clears the flag, and the
+   * `byApplication` is empty, setting a grant clears the flag, and the
    * migration cleared it for any row that already had one, so "grandfathered
    * AND granted" is unreachable. If it ever did occur, grants win, exactly as
    * they always have.
@@ -174,7 +183,7 @@ export interface GrantSet {
  * The one grants query. Every decision below reads through this.
  *
  * A context with no membership id resolves to an empty set with the legacy
- * flag off — the closed default — rather than throwing, so a caller that
+ * flag off, the closed default, rather than throwing, so a caller that
  * wants to fail closed can, and a caller that wants to treat it as a
  * programming error checks before calling.
  */
@@ -182,6 +191,11 @@ export async function resolveGrantSet(ctx: AccessContext): Promise<GrantSet> {
   if (ctx.membershipId === null) {
     return { byApplication: new Map(), legacyWorkspaceRead: false };
   }
+  // Cached per membership (lib/operator-auth-cache.ts). Every grant write and
+  // every role, scope or removal write on the membership invalidates it.
+  const cached = getCachedGrants(ctx.membershipId);
+  if (cached) return toGrantSet(cached);
+  const ticket = loadTicket();
   const [grants, membership] = await Promise.all([
     prisma.applicationGrant.findMany({
       where: { tenantMembershipId: ctx.membershipId },
@@ -192,11 +206,36 @@ export async function resolveGrantSet(ctx: AccessContext): Promise<GrantSet> {
       select: { legacyWorkspaceRead: true },
     }),
   ]);
+  const entry = { grants, legacyWorkspaceRead: membership?.legacyWorkspaceRead === true };
+  // A membership that no longer exists is not cached: nothing to invalidate
+  // it by, and the next read should see whatever replaced it.
+  if (membership) storeGrants(ticket, ctx.membershipId, entry);
+  return toGrantSet(entry);
+}
+
+function toGrantSet(entry: GrantEntry): GrantSet {
   return {
-    byApplication: new Map(grants.map((g) => [g.applicationId, g.role])),
-    // `grants.length === 0` as well as the flag, deliberately — see GrantSet.
-    legacyWorkspaceRead: grants.length === 0 && membership?.legacyWorkspaceRead === true,
+    byApplication: new Map(entry.grants.map((g) => [g.applicationId, g.role])),
+    // `grants.length === 0` as well as the flag, deliberately, see GrantSet.
+    legacyWorkspaceRead: entry.grants.length === 0 && entry.legacyWorkspaceRead,
   };
+}
+
+/**
+ * The workspace an application belongs to, or null when it does not exist.
+ * The mapping never changes once created, so a found one is cached for the
+ * life of the process (lib/operator-auth-cache.ts).
+ */
+async function applicationTenantId(applicationId: string): Promise<string | null> {
+  const cached = getCachedAppTenant(applicationId);
+  if (cached !== null) return cached;
+  const app = await prisma.application.findUnique({
+    where: { id: applicationId },
+    select: { tenantId: true },
+  });
+  if (!app) return null;
+  storeAppTenant(applicationId, app.tenantId);
+  return app.tenantId;
 }
 
 export function isWorkspaceAdmin(role: TenantRole): boolean {
@@ -204,7 +243,7 @@ export function isWorkspaceAdmin(role: TenantRole): boolean {
 }
 
 function notFound(applicationId: string): RekeyError {
-  // Don't disclose existence (in another tenant, or behind a missing grant) —
+  // Don't disclose existence (in another tenant, or behind a missing grant),
   // return the same code as "not found" to avoid being an enumeration oracle.
   return new RekeyError({
     statusCode: 404,
@@ -216,7 +255,7 @@ function notFound(applicationId: string): RekeyError {
 
 function legacyWriteDenied(role: string): RekeyError {
   // Same code/shape requireTenantRole(['OWNER','ADMIN']) used to emit for a
-  // MEMBER hitting these routes — kept for client back-compat.
+  // MEMBER hitting these routes, kept for client back-compat.
   return new RekeyError({
     statusCode: 403,
     code: 'TENANT_ROLE_INSUFFICIENT',
@@ -249,7 +288,7 @@ export function scopeDenied(scope: Scope): RekeyError {
  * The caller's effective scopes on an application, given how access was
  * satisfied. Workspace admins are unrestricted; a legacy member reads
  * everything (the APP_VIEWER preset); a grant holder gets the preset for
- * their role — each intersected with the membership's own ceiling.
+ * their role, each intersected with the membership's own ceiling.
  */
 export function effectiveApplicationScopes(
   ctx: AccessContext,
@@ -264,7 +303,7 @@ export function effectiveApplicationScopes(
  * May this caller perform `need` on this Application? Answers BOTH questions
  * the old helper did: does the Application belong to the workspace (404
  * otherwise, same non-disclosure posture), and is the caller allowed `need`
- * on it — and then, if the route declared a scope, whether the caller's
+ * on it, and then, if the route declared a scope, whether the caller's
  * effective scopes on this application include it.
  *
  *   OWNER / ADMIN   → implicit full access.
@@ -281,11 +320,8 @@ export async function applicationAccess(
   need: AppAccessNeed,
   declared?: RouteAccess | undefined,
 ): Promise<AppAccess> {
-  const app = await prisma.application.findUnique({
-    where: { id: applicationId },
-    select: { tenantId: true },
-  });
-  if (!app || app.tenantId !== ctx.tenantId) throw notFound(applicationId);
+  const tenantId = await applicationTenantId(applicationId);
+  if (tenantId === null || tenantId !== ctx.tenantId) throw notFound(applicationId);
 
   if (isWorkspaceAdmin(ctx.role)) return { level: 'workspace-admin', scopes: UNRESTRICTED };
 
@@ -333,7 +369,7 @@ export async function accessScope(ctx: AccessContext): Promise<AppAccessScope> {
     return { restricted: false, applicationIds: [], roleByApplicationId: new Map() };
   }
   const grants = await resolveGrantSet(ctx);
-  // Grandfathered pre-grants membership — workspace-wide read. Zero grants on
+  // Grandfathered pre-grants membership, workspace-wide read. Zero grants on
   // its own no longer widens the scope: since 2.0.0-rc.3 it narrows it to
   // nothing, which is what a new MEMBER invitation is supposed to produce.
   if (grants.legacyWorkspaceRead) {
@@ -347,11 +383,11 @@ export async function accessScope(ctx: AccessContext): Promise<AppAccessScope> {
 }
 
 /**
- * The Applications this caller may READ, as ids — what the MCP handlers
+ * The Applications this caller may READ, as ids, what the MCP handlers
  * resolve their Application set through.
  *
  * Returns `[]` for a caller with grants that name no Application, which every
- * handler treats as "nothing to show" — the same empty result an operator with
+ * handler treats as "nothing to show", the same empty result an operator with
  * no Applications gets, so a denied Application is indistinguishable from an
  * absent one. A context with no membership id also returns `[]`: fail CLOSED.
  */

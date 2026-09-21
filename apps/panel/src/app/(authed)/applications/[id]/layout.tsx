@@ -1,5 +1,5 @@
 import * as React from 'react';
-import Link from 'next/link';
+import Link from '@/components/Link';
 import { getApplication } from '@/lib/api';
 import { AppNav } from '@/components/AppNav';
 import { Breadcrumb } from '@/components/Breadcrumb';
@@ -22,8 +22,8 @@ export default async function ApplicationDetailLayout({
       {/* This header used to run the name, the environment badge, the slug and a
           36-character public key along ONE baseline-aligned row. The key is by
           a wide margin the longest string on that line, so it took the eye
-          first and the application's own name — the thing that tells you which
-          application you are about to change — read as a prefix to it.
+          first and the application's own name, the thing that tells you which
+          application you are about to change, read as a prefix to it.
 
           Two clusters instead: identity left, the identifiers you copy right.
           Nothing is hidden and nothing is newly truncated; they have simply
@@ -49,7 +49,7 @@ export default async function ApplicationDetailLayout({
             </span>
             {/* --color-muted-fg, not --color-faint-fg: this is a value the
                 operator is meant to read off the screen and copy, and faint put
-                it at 3.72:1 (rgb(107,107,107) on #0a0a0a) at 12px — below AA for
+                it at 3.72:1 (rgb(107,107,107) on #0a0a0a) at 12px, below AA for
                 a string where one wrong character is a silent auth failure.
                 Muted measures 7.85:1 on the same background.
 
@@ -69,8 +69,8 @@ export default async function ApplicationDetailLayout({
       />
 
       {/* In the LAYOUT, not on one page. A disabled application looks entirely
-          normal on every tab — the plans are there, the end-users are there,
-          the keys are there — and an operator debugging "why is sign-in
+          normal on every tab, the plans are there, the end-users are there,
+          the keys are there, and an operator debugging "why is sign-in
           failing" would otherwise have to guess to visit Lifecycle. It renders
           above the tab content on all of them. */}
       {app.disabledAt != null && (

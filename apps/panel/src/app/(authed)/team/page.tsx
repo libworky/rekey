@@ -1,11 +1,14 @@
 import * as React from 'react';
 import { DOMAIN_LABEL, SCOPE_DOMAINS, levelFor } from '@/lib/operator-scopes';
+import { cookies } from 'next/headers';
 import { redirect } from 'next/navigation';
-import { errorQuery, readErrorFlash, api, PanelApiError, type ApplicationRow, type MemberRow, type InvitationRow, getMe } from '@/lib/api';
+import { cookieSecure } from '@/lib/cookie-secure';
+import { errorQuery, readErrorFlash, api, PanelApiError, type ApplicationRow, type MemberRow, type InvitationRow, getMe, unlessBusy } from '@/lib/api';
 import { emptyPage, type Page } from '@/lib/paginate';
 import { CopyButton } from '@/components/CopyButton';
 import { ApiErrorText } from '@/components/api-error';
 import { ConfirmButton } from '@/components/ConfirmButton';
+import { ActionForm } from '@/components/ActionForm';
 import { SubmitButton } from '@/components/SubmitButton';
 import { formatDate } from '@/lib/date';
 import { publicHttpUrl } from '@/lib/public-url';
@@ -16,6 +19,27 @@ import { Table, THead, TBody, TR, TH, TD } from '@/components/Table';
 import { Badge } from '@/components/Badge';
 import { Field, fieldInputCls } from '@/components/Field';
 import { MemberRoleSelect } from '@/components/MemberRoleSelect';
+
+/**
+ * Carries the one-time invitation link from `invite()` to the next render of
+ * this page. Path-scoped to `/team` and ~2 min TTL, like the other reveals; no
+ * clear on read because a Server Component may read cookies but not write
+ * them, so the TTL is what stops a later refresh showing it again.
+ */
+const INVITE_REVEAL_COOKIE = 'rekey_reveal_invite';
+
+function readInviteReveal(raw: string | undefined): { token?: string; emailSent: boolean } {
+  if (!raw) return { emailSent: false };
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (typeof parsed !== 'object' || parsed === null) return { emailSent: false };
+    const { token, emailSent } = parsed as Record<string, unknown>;
+    if (typeof token !== 'string' || token === '') return { emailSent: false };
+    return { token, emailSent: emailSent === true };
+  } catch {
+    return { emailSent: false };
+  }
+}
 
 interface InviteCreateResponse {
   invitation: InvitationRow;
@@ -36,9 +60,25 @@ async function invite(formData: FormData): Promise<void> {
       path: '/api/v1/tenant/workspace/invitations',
       body: { email, role },
     });
-    redirect(
-      `/team?inviteToken=${encodeURIComponent(result.token)}&emailSent=${result.emailSent ? '1' : '0'}&e=member_invited`,
-    );
+    // One-time invitation link via a short-lived httpOnly cookie, not the URL.
+    // The token joins a workspace, so it is a credential: in the query it lands
+    // in browser history, in the `Referer` of the next outbound link, and in
+    // every access log between here and the operator. Same channel the API key,
+    // webhook secret and licence key reveals already use.
+    const jar = await cookies();
+    jar.set(INVITE_REVEAL_COOKIE, JSON.stringify({ token: result.token, emailSent: result.emailSent }), {
+      httpOnly: true,
+      sameSite: 'lax',
+      secure: await cookieSecure(),
+      path: '/team',
+      maxAge: 120,
+    });
+    // Kept for the no-JavaScript path, where the browser posts the form
+    // natively and follows this 303 itself. With JavaScript the client does
+    // not commit it on this page (issue #569), which is why the token above
+    // travels in a cookie and `reloadOnSettle` on the form below is what
+    // actually brings the operator back to a rendered `/team`.
+    redirect('/team?e=member_invited');
   } catch (err) {
     if (err instanceof PanelApiError) {
       redirect(`/team?${await errorQuery(err)}`);
@@ -139,7 +179,7 @@ const ERR: Record<string, string> = {
   TENANT_ROLE_INSUFFICIENT: 'Only owners and admins can invite members.',
   INVITE_TARGET_ALREADY_MEMBER: 'That email is already a member of this workspace.',
   APP_GRANT_MEMBER_ONLY:
-    'Grants only apply to members — owners and admins already have full access to every application.',
+    'Grants only apply to members. Owners and admins already have full access to every application.',
 };
 
 const GRANT_ROLE_LABEL: Record<string, string> = {
@@ -160,16 +200,19 @@ export default async function TeamPage({
   // written by whoever composes the link, and this text renders inside the
   // panel's own error banner.
   const { detail: errorDetail, fix: errorFix } = await readErrorFlash(error);
-  const inviteToken = typeof sp.inviteToken === 'string' ? sp.inviteToken : undefined;
-  const inviteEmailSent = sp.emailSent === '1';
+  // The one-time invitation link, left by `invite()` in a short-lived httpOnly
+  // cookie rather than the query. Unreadable JSON is treated as absent.
+  const { token: inviteToken, emailSent: inviteEmailSent } = readInviteReveal(
+    (await cookies()).get(INVITE_REVEAL_COOKIE)?.value,
+  );
 
   const [me, memberPage, invitationPage] = await Promise.all([
     getMe(),
     api<Page<MemberRow>>({ method: 'GET', path: '/api/v1/tenant/workspace/members' }),
     // OWNER/ADMIN-only, unlike the member list beside it. A GET 403 becomes
     // Next's `forbidden()` and replaces the whole page, so an uncaught one here
-    // meant a MEMBER opening Team — which the sidebar offers them, with no role
-    // floor — lost the roster they ARE allowed to see, and got a bare 403
+    // meant a MEMBER opening Team, which the sidebar offers them, with no role
+    // floor, lost the roster they ARE allowed to see, and got a bare 403
     // instead. Omitted-on-failure, the same shape `applications/page.tsx` uses
     // for this exact endpoint.
     api<Page<InvitationRow>>({
@@ -182,18 +225,18 @@ export default async function TeamPage({
 
   const canManage = me.activeRole === 'OWNER' || me.activeRole === 'ADMIN';
   // Application list for the grants picker. Members may only see a subset
-  // (or fail member-role fetch edge cases) — degrade to an empty picker.
+  // (or fail member-role fetch edge cases), degrade to an empty picker.
   const applications = canManage
     ? (
         await api<Page<ApplicationRow>>({
           method: 'GET',
           path: '/api/v1/tenant/applications/?limit=100&offset=0',
-        }).catch(() => emptyPage<ApplicationRow>(100))
+        }).catch(unlessBusy(() => emptyPage<ApplicationRow>(100)))
       ).items
     : [];
   const memberRows = members.filter((m) => m.role === 'MEMBER');
   // PANEL_URL is server-only and on some deploys is an in-cluster host (e.g.
-  // http://panel:3031) — publicHttpUrl() keeps that out of the client HTML.
+  // http://panel:3031), publicHttpUrl() keeps that out of the client HTML.
   // When it doesn't look public we emit a visible sentinel rather than a
   // relative path: this link is copied into an email, where a relative path is
   // silently useless to the recipient, whereas the sentinel names the variable
@@ -229,7 +272,7 @@ export default async function TeamPage({
           </code>
           <p className="text-xs text-amber-800 dark:text-amber-300">
             {inviteEmailSent
-              ? 'We emailed the invite. The link is here too, in case you need to re-share — it is shown only once.'
+              ? 'We emailed the invite. The link is here too, in case you need to re-share. It is shown only once.'
               : 'Email delivery is not configured on this deployment, so copy the link and send it through your own channel.'}
           </p>
         </div>
@@ -272,13 +315,13 @@ export default async function TeamPage({
                 </TD>
                 <TD align="right">
                   {canManage && m.tenantUserId !== me.user.id && (
-                    <form action={removeMember.bind(null, m.membershipId)}>
+                    <ActionForm action={removeMember.bind(null, m.membershipId)}>
                       <ConfirmButton
                         confirm={`Remove ${m.email} from this workspace? They'll lose all access immediately.`}
                       >
                         Remove
                       </ConfirmButton>
-                    </form>
+                    </ActionForm>
                   )}
                 </TD>
               </TR>
@@ -292,7 +335,7 @@ export default async function TeamPage({
         <SectionHeader title="Application access" />
         <p className="text-sm text-[var(--color-muted-fg)]">
           A member sees only the applications you grant them, at the level you choose. A member with
-          no grants sees <strong>nothing</strong> — which is the state accepting an invitation
+          no grants sees <strong>nothing</strong>, which is the state accepting an invitation
           produces, so grant a new teammate an application before expecting them to find their way
           around. Owners and admins always have full access to everything.
         </p>
@@ -323,7 +366,7 @@ export default async function TeamPage({
                         <span className="ml-1.5 text-xs font-normal text-[var(--color-muted-fg)]">(you)</span>
                       )}
                     </p>
-                    {/* Zero grants is no longer "all apps, read-only" (#326) —
+                    {/* Zero grants is no longer "all apps, read-only" (#326),
                         it is no access at all, unless the API flags this
                         membership as grandfathered by the backfill. Saying
                         "all apps" for a member who can see none of them is the
@@ -359,13 +402,13 @@ export default async function TeamPage({
                           <span className="flex shrink-0 items-center gap-2">
                             <Badge tone={g.role === 'APP_ADMIN' ? 'warning' : 'neutral'}>{g.role}</Badge>
                             {canManage && (
-                              <form action={removeGrant.bind(null, m.membershipId, g.applicationId)}>
+                              <ActionForm action={removeGrant.bind(null, m.membershipId, g.applicationId)}>
                                 <ConfirmButton
-                                  confirm={`Remove ${m.email}'s ${g.role} access to ${g.applicationName}?${(m.grants ?? []).length === 1 ? ' This is their last grant — they will be left with access to no application at all.' : ''}`}
+                                  confirm={`Remove ${m.email}'s ${g.role} access to ${g.applicationName}?${(m.grants ?? []).length === 1 ? ' This is their last grant, and they will be left with access to no application at all.' : ''}`}
                                 >
                                   Remove
                                 </ConfirmButton>
-                              </form>
+                              </ActionForm>
                             )}
                           </span>
                         </li>
@@ -378,7 +421,7 @@ export default async function TeamPage({
                   )}
 
                   {canManage && applications.length > 0 && (
-                    <form
+                    <ActionForm
                       action={setGrant.bind(null, m.membershipId)}
                       className="flex flex-wrap items-end gap-3"
                     >
@@ -408,7 +451,7 @@ export default async function TeamPage({
                       >
                         Grant access
                       </SubmitButton>
-                    </form>
+                    </ActionForm>
                   )}
                 </li>
               );
@@ -417,7 +460,7 @@ export default async function TeamPage({
         )}
       </div>
 
-      {/* Invitations — admin-only data, so absent for a MEMBER rather than empty. */}
+      {/* Invitations, admin-only data, so absent for a MEMBER rather than empty. */}
       {invitations !== null && (
       <div className="space-y-3">
         <SectionHeader title="Invitations" count={`(${invitations.length})`} />
@@ -457,13 +500,13 @@ export default async function TeamPage({
                   </TD>
                   <TD align="right">
                     {canManage && i.status === 'pending' && (
-                      <form action={revokeInvite.bind(null, i.id)}>
+                      <ActionForm action={revokeInvite.bind(null, i.id)}>
                         <ConfirmButton
                           confirm={`Revoke the invitation for ${i.email}? The link will stop working.`}
                         >
                           Revoke
                         </ConfirmButton>
-                      </form>
+                      </ActionForm>
                     )}
                   </TD>
                 </TR>
@@ -478,8 +521,9 @@ export default async function TeamPage({
       {canManage && (
         <div className="space-y-3">
           <SectionHeader title="Invite a teammate" />
-          <form
+          <ActionForm
             action={invite}
+            reloadOnSettle
             className="rounded-xl border border-[var(--color-border)] bg-[var(--color-surface)] p-5 space-y-4"
           >
             {error && error !== 'INVITE_TARGET_ALREADY_MEMBER' && (
@@ -504,7 +548,7 @@ export default async function TeamPage({
               <Field
                 label="Role"
                 hint={
-                  'A member joins with access to no application — grant them one under Application access above. Admins see everything.'
+                  'A member joins with access to no application. Grant them one under Application access above. Admins see everything.'
                 }
               >
                 <select name="role" defaultValue="MEMBER" className={fieldInputCls}>
@@ -524,7 +568,7 @@ export default async function TeamPage({
               Single-use, expires in 7 days. If email is configured on this
               deployment we send it; either way you get a link to share.
             </p>
-          </form>
+          </ActionForm>
         </div>
       )}
     </section>
@@ -534,7 +578,7 @@ export default async function TeamPage({
 
 /**
  * What this member may DO, workspace-wide, on top of which applications their
- * grants let them reach. Unrestricted by default — every existing member is —
+ * grants let them reach. Unrestricted by default, every existing member is,
  * and the switch makes the restriction an explicit act rather than a default
  * somebody forgot to lift.
  */
@@ -547,7 +591,7 @@ function ScopeEditor({
 }): React.JSX.Element {
   const restricted = scopes !== null;
   return (
-    <form
+    <ActionForm
       action={setScopes.bind(null, membershipId)}
       className="space-y-3 rounded-md border border-[var(--color-border)] bg-[color-mix(in_srgb,var(--color-surface-muted)_40%,transparent)] px-3 py-3"
     >
@@ -556,7 +600,7 @@ function ScopeEditor({
           <div className="text-sm font-medium text-[var(--color-fg)]">Scopes</div>
           <p className="max-w-xl text-xs text-[var(--color-muted-fg)]">
             What this member may do inside the applications they are granted. A grant decides{' '}
-            <em>which</em> applications; scopes decide <em>what</em> — the two only ever narrow each
+            <em>which</em> applications; scopes decide <em>what</em>, and the two only ever narrow each
             other.
           </p>
         </div>
@@ -592,7 +636,7 @@ function ScopeEditor({
       </div>
       <p className="text-[11px] text-[var(--color-muted-fg)]">
         With <strong>Restrict</strong> off, every scope applies and the selects are ignored. Grants,
-        roles, invitations, lifecycle, impersonation and erasure are never scopes — they stay with
+        roles, invitations, lifecycle, impersonation and erasure are never scopes. They stay with
         owners and admins.
       </p>
       <SubmitButton
@@ -601,6 +645,6 @@ function ScopeEditor({
       >
         Save scopes
       </SubmitButton>
-    </form>
+    </ActionForm>
   );
 }

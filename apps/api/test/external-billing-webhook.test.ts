@@ -24,6 +24,7 @@ import { billingService } from '../src/modules/billing/billing.service.js';
 import { pickProvider } from '../src/modules/billing/providers/index.js';
 import { creditsService } from '../src/modules/credits/credits.service.js';
 import { webhookService } from '../src/modules/webhooks/webhook.service.js';
+import { applyBillingEvent } from '../src/modules/billing/webhooks/apply.js';
 import { waitForSecurityEvents } from './wait-for-security-events.js';
 
 const SECRET = 'external-billing-signing-secret-for-tests-0123456789';
@@ -575,7 +576,7 @@ describe('External billing provider webhook', () => {
     expect(external.status?.webhookConfigured).toBe(true);
     // The signing secret is the only REQUIRED credential: it is what makes an
     // inbound event verifiable, and the module is useless without it. The two
-    // pull fields are optional additions for the subscription import — an
+    // pull fields are optional additions for the subscription import, an
     // Application that only ever receives events needs neither, and leaving
     // them blank makes the import unavailable rather than broken.
     expect(external.credentialFields.filter((f) => f.optional !== true).map((f) => f.key)).toEqual([
@@ -800,5 +801,151 @@ describe('External billing provider webhook', () => {
     expect(old.statusCode).toBe(401);
     const fresh = await post(event('ping', {}), { secret: 'rotated-secret-that-is-long-enough-0123456789' });
     expect(fresh.statusCode).toBe(200);
+  });
+
+  // ------------------------------------------------------------ trials
+  //
+  // The sender runs the trial; Rekey keeps the ledger. A trial a sender
+  // reports goes through the same one-per-buyer rule hosted checkout applies
+  // (#500), and is written TRIALING rather than ACTIVE for the same reason
+  // `applyCheckoutCompleted` does it (#504): a trialist is not MRR.
+
+  it('a future trialEndsAt is one trial: TRIALING, recorded in the ledger, and a replay takes nothing new', async () => {
+    await proPlan();
+    const trialEnd = daysFromNow(14);
+    const body = activated('sub_trial', 'pro', { email: 't@example.com' }, { trialEndsAt: trialEnd.toISOString() });
+    const first = await post(body);
+    expect(first.json()).toMatchObject({ processed: true });
+
+    let sub = await subscriptionOf('sub_trial');
+    expect(sub.status).toBe('TRIALING');
+    expect(sub.trialEndsAt?.toISOString()).toBe(trialEnd.toISOString());
+    // Entitled all the same: TRIALING is a live status.
+    expect(await creditsService.getBalance(appId, { endUserId: sub.endUserId })).toBe(500);
+
+    const ledger = await prisma.trialRedemption.findMany({ where: { applicationId: appId } });
+    expect(ledger).toHaveLength(1);
+    expect(ledger[0]).toMatchObject({
+      status: 'CONSUMED',
+      subjectKey: `user:${sub.endUserId}`,
+      subscriptionId: sub.id,
+      checkoutSessionId: `external:sub_trial:${body.eventId as string}`,
+    });
+    expect(ledger[0]!.endsAt?.toISOString()).toBe(trialEnd.toISOString());
+
+    // The ingress dedupes on event id, so the receipt never reaches the
+    // applier twice through HTTP. A re-delivery that DOES reach it (the
+    // receipt pruned, the row cancelled in between) is the same attempt.
+    const canceled = await post(event('subscription.canceled', { subscription: { id: 'sub_trial' } }));
+    expect(canceled.json()).toMatchObject({ processed: true });
+    expect((await subscriptionOf('sub_trial')).status).toBe('CANCELED');
+    await applyBillingEvent(
+      {
+        type: 'subscription.granted',
+        providerEventId: body.eventId as string,
+        applicationId: appId,
+        provider: 'external',
+        providerSubscriptionId: 'sub_trial',
+        planSlug: 'pro',
+        subscriber: { email: 't@example.com' },
+        trialEndsAt: trialEnd,
+        raw: body,
+      },
+      { log: app.log, provider: 'external' },
+    );
+    sub = await subscriptionOf('sub_trial');
+    expect(sub.status).toBe('TRIALING');
+    expect(await prisma.trialRedemption.count({ where: { applicationId: appId } })).toBe(1);
+  });
+
+  it('a second trial for the same buyer is granted without the trial, and the refusal is on the row', async () => {
+    await proPlan();
+    await makePlan('basic', { amount: 900 });
+    await post(activated('sub_first', 'pro', { email: 'twice@example.com' }, { trialEndsAt: daysFromNow(14).toISOString() }));
+    expect((await subscriptionOf('sub_first')).status).toBe('TRIALING');
+
+    // A NEW subscription, a new event, a different plan: under the default
+    // once_per_application policy this buyer has had their trial.
+    const again = await post(
+      activated('sub_second', 'basic', { email: 'twice@example.com' }, { trialEndsAt: daysFromNow(30).toISOString() }),
+    );
+    expect(again.json()).toMatchObject({ processed: true });
+    const second = await subscriptionOf('sub_second');
+    expect(second.status).toBe('ACTIVE');
+    expect(second.trialEndsAt).toBeNull();
+    const refused = (second.metadata as { refusedTrials?: Array<{ reason: string; attemptKey: string }> })
+      .refusedTrials;
+    expect(refused).toHaveLength(1);
+    expect(refused![0]!.reason).toBe('already_used');
+    expect(refused![0]!.attemptKey).toContain('external:sub_second:');
+    // Still entitled: the sender sold it, the ledger only refused the trial.
+    expect(await creditsService.getBalance(appId, { endUserId: second.endUserId })).toBe(500);
+    // One slot, one row.
+    expect(await prisma.trialRedemption.count({ where: { applicationId: appId } })).toBe(1);
+
+    // A cancel-and-reactivate with a fresh event id is a new attempt, not a
+    // replay, and is judged the same way.
+    await post(event('subscription.canceled', { subscription: { id: 'sub_first' } }));
+    await post(activated('sub_first', 'pro', { email: 'twice@example.com' }, { trialEndsAt: daysFromNow(60).toISOString() }));
+    const reopened = await subscriptionOf('sub_first');
+    expect(reopened.status).toBe('ACTIVE');
+    expect(reopened.trialEndsAt).toBeNull();
+    expect(await prisma.trialRedemption.count({ where: { applicationId: appId } })).toBe(1);
+
+    // `unlimited` is the operator's explicit choice to go back to this.
+    const policy = await app.inject({
+      method: 'PATCH',
+      url: `/api/v1/tenant/applications/${appId}/billing-config`,
+      headers: auth(),
+      payload: { trialPolicy: 'unlimited' },
+    });
+    expect(policy.statusCode).toBe(200);
+    await post(event('subscription.canceled', { subscription: { id: 'sub_second' } }));
+    await post(activated('sub_second', 'basic', { email: 'twice@example.com' }, { trialEndsAt: daysFromNow(30).toISOString() }));
+    expect((await subscriptionOf('sub_second')).status).toBe('TRIALING');
+    expect(await prisma.trialRedemption.count({ where: { applicationId: appId } })).toBe(2);
+  });
+
+  it('a trial converts when the sender says it ended; a paid row is not put back on one', async () => {
+    await proPlan();
+    await post(activated('sub_conv', 'pro', { email: 'conv@example.com' }, { trialEndsAt: daysFromNow(7).toISOString() }));
+    expect((await subscriptionOf('sub_conv')).status).toBe('TRIALING');
+
+    // The sender re-dates its own running trial: mirrored on the row and in
+    // the ledger, still one trial.
+    const later = daysFromNow(10);
+    await post(activated('sub_conv', 'pro', { email: 'conv@example.com' }, { trialEndsAt: later.toISOString() }));
+    let sub = await subscriptionOf('sub_conv');
+    expect(sub.status).toBe('TRIALING');
+    expect(sub.trialEndsAt?.toISOString()).toBe(later.toISOString());
+    const ledger = await prisma.trialRedemption.findMany({ where: { applicationId: appId } });
+    expect(ledger).toHaveLength(1);
+    expect(ledger[0]!.endsAt?.toISOString()).toBe(later.toISOString());
+
+    // Converted: revenue starts counting, and a consumer hears about it once
+    // more, as it does from a hosted provider's trialing → active.
+    await post(
+      activated('sub_conv', 'pro', { email: 'conv@example.com' }, { trialEndsAt: null, currentPeriodEnd: daysFromNow(30).toISOString() }),
+    );
+    sub = await subscriptionOf('sub_conv');
+    expect(sub.status).toBe('ACTIVE');
+    expect(sub.trialEndsAt).toBeNull();
+    expect(await waitForDeliveries(endpointId, 'subscription.activated', 2)).toHaveLength(2);
+
+    // A future date on the paid row is dropped: the ledger judged this buyer
+    // once, and an ACTIVE row saying "trial ends next month" is a contradiction.
+    await post(activated('sub_conv', 'pro', { email: 'conv@example.com' }, { trialEndsAt: daysFromNow(20).toISOString() }));
+    sub = await subscriptionOf('sub_conv');
+    expect(sub.status).toBe('ACTIVE');
+    expect(sub.trialEndsAt).toBeNull();
+    expect(await prisma.trialRedemption.count({ where: { applicationId: appId } })).toBe(1);
+
+    // A date already in the past is history, not a trial: mirrored, ACTIVE.
+    const past = new Date(Date.now() - 86_400_000);
+    await post(activated('sub_hist', 'pro', { email: 'hist@example.com' }, { trialEndsAt: past.toISOString() }));
+    const hist = await subscriptionOf('sub_hist');
+    expect(hist.status).toBe('ACTIVE');
+    expect(hist.trialEndsAt?.toISOString()).toBe(past.toISOString());
+    expect(await prisma.trialRedemption.count({ where: { applicationId: appId } })).toBe(1);
   });
 });

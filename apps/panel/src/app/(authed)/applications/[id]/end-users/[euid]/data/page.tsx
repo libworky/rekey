@@ -1,5 +1,5 @@
 /**
- * End-user Data & privacy — the DSAR export and the GDPR erasure.
+ * End-user Data & privacy, the DSAR export and the GDPR erasure.
  *
  * These are on their own tab because they are not support actions. Everything
  * else in this console is reversible or additive; this tab is where the account
@@ -16,12 +16,14 @@
  * per-application `write` grant alone, which a MEMBER holding `APP_ADMIN`
  * satisfies. So the path that retains the accounting record was gated harder
  * than the path that destroys it. The panel never offered the plain delete, and
- * still does not — a data-subject request wants the erasure, and an operator
+ * still does not, a data-subject request wants the erasure, and an operator
  * who genuinely wants everything gone can say so through the API.
  */
 
 import * as React from 'react';
+import { errorMessage } from '@/lib/error-message';
 import { getMe } from '@/lib/api';
+import { ActionForm } from '@/components/ActionForm';
 import { Card } from '@/components/Card';
 import { Banner } from '@/components/Banner';
 import { TypedConfirmButton } from '@/components/TypedConfirmButton';
@@ -58,15 +60,15 @@ export default async function EndUserDataPage({
           anonymized.
         </Banner>
       )}
-      {eraseError && <Banner tone="error">{ERASE_ERR[eraseError] ?? eraseError}</Banner>}
+      {eraseError && <Banner tone="error">{errorMessage(ERASE_ERR, eraseError)}</Banner>}
 
       <Card className="space-y-3">
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div>
             <h3 className="text-sm font-semibold text-[var(--color-fg)]">Export data (JSON)</h3>
             <p className="max-w-xl text-xs text-[var(--color-muted-fg)]">
-              OWNER / ADMIN only. Downloads everything Rekey stores about this end-user — profile,
-              identities, session metadata, billing, credits, usage, security events — as a single
+              OWNER / ADMIN only. Downloads everything Rekey stores about this end-user (profile,
+              identities, session metadata, billing, credits, usage, security events) as a single
               JSON document. Use it to answer GDPR / CCPA data-subject access requests (DSARs).
               Credential material (password hashes, token hashes, MFA secrets) is never included.
             </p>
@@ -103,19 +105,19 @@ export default async function EndUserDataPage({
               Already erased
             </span>
           ) : isOwner ? (
-            <form action={eraseUser.bind(null, id, euid)} className="inline">
+            <ActionForm action={eraseUser.bind(null, id, euid)} className="inline">
               <TypedConfirmButton
                 expected={detail.endUser.email}
                 title="Erase this end-user (GDPR)?"
                 description={
-                  "This permanently deletes the user's PII and credentials and tombstones the account — " +
+                  "This permanently deletes the user's PII and credentials and tombstones the account, so " +
                   'they can never sign in again. Financial records are retained but anonymized. This cannot be undone.'
                 }
                 triggerLabel="Erase (GDPR)"
                 confirmLabel="Erase permanently"
                 triggerClassName="inline-flex items-center gap-1.5 whitespace-nowrap rounded-md border border-red-300 px-3 py-1.5 text-sm text-red-700 hover:bg-red-50 dark:border-red-700 dark:text-red-400 dark:hover:bg-red-950"
               />
-            </form>
+            </ActionForm>
           ) : (
             <span className="max-w-[14rem] text-right text-xs text-[var(--color-muted-fg)]">
               Restricted to the workspace owner. Your role is {me.activeRole.toLowerCase()}.

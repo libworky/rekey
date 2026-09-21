@@ -3,12 +3,12 @@
  *
  * The permission model reads `config.access` off the route (see
  * lib/route-access.ts). A route that ships without one is a route the gate
- * cannot reason about — and the failure mode is silent, because an
+ * cannot reason about, and the failure mode is silent, because an
  * unclassified route is not refused, it is simply not governed. So this test
  * fails the build instead.
  *
- * It reads the LIVE route table — what the server actually registered, via the
- * `onRoute` hook — not a source grep. A route added to any file under an
+ * It reads the LIVE route table, what the server actually registered, via the
+ * `onRoute` hook, not a source grep. A route added to any file under an
  * operator prefix lands here the moment it is registered. Same discipline as
  * `cross-tenant-matrix.test.ts`, which reads `app.swagger()` for the same
  * reason.
@@ -60,7 +60,7 @@ describe('route access declarations', () => {
 
   it('the floors are floors: no scope is declared on a route the spec keeps role-gated', () => {
     // These may never carry a scope. A scope here is the escalation path the
-    // spec's §2.3 exists to prevent — `team:write` on a member would let them
+    // spec's §2.3 exists to prevent, `team:write` on a member would let them
     // grant themselves everything and then rewrite their own scopes.
     const mustBeFloor = [
       /\/impersonate(\/end)?$/,

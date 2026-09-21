@@ -1,5 +1,5 @@
 /**
- * Hosted MCP account tools — read-only views of the *authenticated* end-user's
+ * Hosted MCP account tools, read-only views of the *authenticated* end-user's
  * own Rekey data, scoped to (applicationId, endUserId). No secrets are ever
  * returned (no key hashes, password hashes, provider creds).
  *
@@ -18,7 +18,7 @@ export interface ToolContext {
 export interface AccountTool {
   name: string;
   description: string;
-  /** JSON Schema for tool arguments — all tools here are zero-arg. */
+  /** JSON Schema for tool arguments, all tools here are zero-arg. */
   inputSchema: { type: 'object'; properties: Record<string, unknown>; additionalProperties: boolean };
   handler: (ctx: ToolContext) => Promise<unknown>;
 }
@@ -48,6 +48,11 @@ export const accountTools: AccountTool[] = [
         where: {
           applicationId: ctx.applicationId,
           endUserId: ctx.endUserId,
+          // This tool answers for the signed-in user personally. An
+          // org-beneficiary row carries their id too (`endUserId` is required
+          // on every Subscription), and the sort below is newest-first, so
+          // without this an org purchase they made is reported as their plan.
+          beneficiaryOrgId: null,
           status: { in: ['ACTIVE', 'TRIALING', 'PAST_DUE'] },
         },
         orderBy: { createdAt: 'desc' },
@@ -78,7 +83,7 @@ export const accountTools: AccountTool[] = [
   {
     name: 'list_my_devices',
     description:
-      "List the signed-in user's devices — the machines they have signed in from — with status " +
+      "List the signed-in user's devices, the machines they have signed in from, with status " +
       'and last-seen time. No IPs and no operator notes.',
     inputSchema: NO_ARGS,
     handler: async (ctx) => {

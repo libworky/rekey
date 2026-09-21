@@ -1,5 +1,5 @@
 /**
- * Operator MCP tools — read-only views of the *authenticated operator's*
+ * Operator MCP tools, read-only views of the *authenticated operator's*
  * accessible workspace data, scoped to (tenantUserId, tenantId).
  *
  * Distinct from the per-Application end-user MCP server in `modules/mcp/`
@@ -15,7 +15,7 @@
  * pinned by `TenantApiToken.tenantId`, or an OAuth access token, whose workspace
  * comes from the `tid` the operator consented to. Both re-check membership on
  * every request. But tenant isolation itself is each handler filtering on
- * `ctx.tenantId` — a convention every new tool must follow, not a property the
+ * `ctx.tenantId`, a convention every new tool must follow, not a property the
  * type system or the guard can enforce for you.
  *
  * ## Reads are authorized, not merely tenant-scoped
@@ -23,7 +23,7 @@
  * "Authorization is the caller's responsibility" used to be the whole model
  * here, and the write tools were the only ones that had any. Read tools were
  * described as "always available", which in practice meant an `APP_VIEWER`
- * MEMBER — someone granted sight of exactly one Application — could mint
+ * MEMBER, someone granted sight of exactly one Application, could mint
  * themselves an OAuth token and read every OTHER Application's end-users plus
  * the full workspace security log, IPs and user agents included. The REST
  * equivalents answer 404 and 403 for the same caller. Two authorization models
@@ -36,7 +36,7 @@
  *     `securityEventsRoutes` and the workspace invitations list.
  *   - **Per-application grants.** Every tool that reads Application-scoped data
  *     resolves its Application set through `accessibleApplicationIds`, which
- *     mirrors `lib/app-access.ts` exactly — including the legacy rule that a
+ *     mirrors `lib/app-access.ts` exactly, including the legacy rule that a
  *     MEMBER with zero grants anywhere keeps workspace-wide READ.
  *
  * `get_end_user` is the one that needed both, and it is the pattern for any new
@@ -45,7 +45,7 @@
  */
 
 import type { TenantRole } from '@prisma/client';
-import { UNRESTRICTED, type Scope } from '../../lib/operator-scopes.js';
+import { NO_SCOPES, UNRESTRICTED, type Scope } from '../../lib/operator-scopes.js';
 import { isWorkspaceAdmin } from '../../lib/access-context.js';
 import { prisma } from '../../lib/prisma.js';
 import {
@@ -56,13 +56,13 @@ import { tenantWorkspacesService } from '../tenant-workspaces/tenant-workspaces.
 
 /**
  * The scopes a tool call runs under. OWNER and ADMIN hold every scope
- * whatever the membership row says — the REST gate short-circuits on role
+ * whatever the membership row says, the REST gate short-circuits on role
  * before it reads scopes, and this is the MCP twin of that rule. A member
  * promoted while restricted has the row cleared on promotion, but the gate
  * must not depend on that: role is the ceiling, scopes narrow a MEMBER only.
  *
- * A context built without scopes (the direct-dispatch tests do this) is
- * unrestricted here; the route adapter never omits them.
+ * A MEMBER context built without scopes holds none here, the same fail-closed
+ * default as the REST request path; the route adapter never omits them.
  *
  * MCP checks the membership ceiling only. REST intersects that with the
  * grant preset per application; a tool that fans out over every grant
@@ -72,7 +72,7 @@ import { tenantWorkspacesService } from '../tenant-workspaces/tenant-workspaces.
  */
 export function effectiveToolScopes(ctx: Pick<OperatorToolContext, 'role' | 'scopes'>): ReadonlySet<Scope> {
   if (isWorkspaceAdmin(ctx.role)) return UNRESTRICTED;
-  return ctx.scopes ?? UNRESTRICTED;
+  return ctx.scopes ?? NO_SCOPES;
 }
 
 export interface OperatorToolContext {
@@ -81,7 +81,7 @@ export interface OperatorToolContext {
   /** The operator's live role in `tenantId`, re-checked by the auth guard. */
   role: TenantRole;
   /**
-   * The caller's `TenantMembership.id` in `tenantId` — the key
+   * The caller's `TenantMembership.id` in `tenantId`, the key
    * `ApplicationGrant` rows hang off. Set by both auth paths in
    * `bearer-auth.ts`; without it a MEMBER's grants cannot be resolved and
    * `accessibleApplicationIds` refuses rather than guessing.
@@ -89,7 +89,7 @@ export interface OperatorToolContext {
   tenantMembershipId?: string | undefined;
   /** Whether this token carries write scope (`mcp:operator:write` / PAT `applications:write`). */
   canWrite: boolean;
-  /** Whether this token carries admin scope (`mcp:operator:admin`) — destructive/financial ops. */
+  /** Whether this token carries admin scope (`mcp:operator:admin`), destructive/financial ops. */
   canAdmin: boolean;
   /**
    * The caller's effective scopes: membership ceiling ∩ token authority.
@@ -120,7 +120,7 @@ export interface OperatorTool {
   };
   /**
    * A mutating tool. Listed + dispatchable only when the caller's token carries
-   * write scope AND their role is allowed (see `minRole`). Defaults to false —
+   * write scope AND their role is allowed (see `minRole`). Defaults to false,
    * a plain read tool.
    */
   write?: boolean;
@@ -134,8 +134,8 @@ export interface OperatorTool {
    * Minimum tenant role allowed to call this tool.
    *
    * For write/admin tools it defaults to `ADMIN` (so OWNER + ADMIN may call;
-   * MEMBER may not). For READ tools there is no default — most workspace reads
-   * are open to any member, as they are over REST — but setting it here gates
+   * MEMBER may not). For READ tools there is no default, most workspace reads
+   * are open to any member, as they are over REST, but setting it here gates
    * them, and it is honoured. It used to be documented as "ignored for read
    * tools", which is how the workspace security log (IPs, user agents, every
    * sign-in) ended up readable by a MEMBER through MCP while the REST route
@@ -168,7 +168,7 @@ function clampLimit(raw: unknown, def = 25): number {
  * kept separate because "the REST helper takes a `FastifyRequest` and these
  * handlers have no request", with a note that if the two ever diverged this
  * was the copy to fix. They did diverge. The decision now lives in
- * `lib/access-context.ts` over a plain context, and this is the adapter —
+ * `lib/access-context.ts` over a plain context, and this is the adapter,
  * same name, same signature, same `[]`-for-denied behaviour every handler
  * relies on.
  */
@@ -216,7 +216,7 @@ export const operatorTools: OperatorTool[] = [
           take: 10000,
         }),
       ]);
-      // MRR aggregated per currency — workspaces may have multi-currency plans.
+      // MRR aggregated per currency, workspaces may have multi-currency plans.
       const mrrByCurrency = new Map<string, number>();
       for (const s of activeSubsRows) {
         if (!s.plan) continue;
@@ -224,7 +224,7 @@ export const operatorTools: OperatorTool[] = [
         mrrByCurrency.set(s.plan.currency, (mrrByCurrency.get(s.plan.currency) ?? 0) + monthly);
       }
       // For backward-friendly clients, sum all currencies' minor values into a
-      // single number too — only meaningful when the workspace is single-currency.
+      // single number too, only meaningful when the workspace is single-currency.
       const mrrMinor = [...mrrByCurrency.values()].reduce((a, b) => a + b, 0);
       return {
         tenantId: ctx.tenantId,
@@ -233,7 +233,7 @@ export const operatorTools: OperatorTool[] = [
         organizationCount: orgCount,
         activeSubscriptions: activeSubsRows.length,
         // Counts are the overview; MRR is money. `overview:read` gets the
-        // tool, `billing:read` gets the amounts — omitted, never zeroed.
+        // tool, `billing:read` gets the amounts, omitted, never zeroed.
         ...(held.has('billing:read')
           ? {
               mrrMinor,
@@ -246,7 +246,7 @@ export const operatorTools: OperatorTool[] = [
   {
     name: 'list_applications',
     description:
-      "List the Applications the operator can read in their active workspace — " +
+      "List the Applications the operator can read in their active workspace, " +
       'id, slug, name, end-user count, active-subscription count, request volume ' +
       'in last 24h. A MEMBER with per-application grants sees only the granted ones.',
     inputSchema: NO_ARGS,
@@ -330,7 +330,7 @@ export const operatorTools: OperatorTool[] = [
     minRole: 'ADMIN',
     inputSchema: NO_ARGS,
     handler: async (ctx) => {
-      // Bounded like every other MCP list tool — the service now pages, and an
+      // Bounded like every other MCP list tool, the service now pages, and an
       // unbounded call would hand a model the entire invitation history.
       const { items: rows } = await tenantWorkspacesService.listInvitations(ctx.tenantId, {
         take: 100,
@@ -350,7 +350,7 @@ export const operatorTools: OperatorTool[] = [
   {
     name: 'recent_payments',
     description:
-      'Recent Payment rows across the Applications the operator can read — by default ' +
+      'Recent Payment rows across the Applications the operator can read, by default ' +
       'the last 25, max 200. Filter optionally by `status` (SUCCEEDED / FAILED / ' +
       "PENDING / REFUNDED). Each row reports its Application's environment.",
     inputSchema: {
@@ -364,7 +364,7 @@ export const operatorTools: OperatorTool[] = [
     handler: async (ctx, args) => {
       const limit = clampLimit(args.limit);
       const status = typeof args.status === 'string' ? args.status : undefined;
-      // Grant-scoped, not merely tenant-scoped — see `accessibleApplicationIds`.
+      // Grant-scoped, not merely tenant-scoped, see `accessibleApplicationIds`.
       const appIds = await accessibleApplicationIds(ctx);
       if (appIds.length === 0) return { payments: [] };
       const rows = await prisma.payment.findMany({
@@ -393,7 +393,7 @@ export const operatorTools: OperatorTool[] = [
   {
     name: 'recent_subscriptions',
     description:
-      'Recent Subscription rows across the workspace — by default the last 25, max ' +
+      'Recent Subscription rows across the workspace, by default the last 25, max ' +
       '200. Filter optionally by `status` (PENDING / ACTIVE / PAST_DUE / CANCELED / EXPIRED). ' +
       "Each row reports its Application's environment and its id (use the id with " +
       'cancel_subscription).',
@@ -411,7 +411,7 @@ export const operatorTools: OperatorTool[] = [
     handler: async (ctx, args) => {
       const limit = clampLimit(args.limit);
       const status = typeof args.status === 'string' ? args.status : undefined;
-      // Grant-scoped, not merely tenant-scoped — see `accessibleApplicationIds`.
+      // Grant-scoped, not merely tenant-scoped, see `accessibleApplicationIds`.
       const appIds = await accessibleApplicationIds(ctx);
       if (appIds.length === 0) return { subscriptions: [] };
       const rows = await prisma.subscription.findMany({
@@ -450,11 +450,11 @@ export const operatorTools: OperatorTool[] = [
     name: 'recent_security_events',
     description:
       "Most recent rows from the workspace's security audit log. Best for incident " +
-      'response — answers "what did IP X do?" / "who signed in when?". Requires the ' +
+      'response, answers "what did IP X do?" / "who signed in when?". Requires the ' +
       'OWNER or ADMIN workspace role.',
     // Matches GET /api/v1/tenant/security-events, which is OWNER/ADMIN because
     // the log carries IPs and user agents for every operator and end-user in
-    // the workspace. Reachable by any MEMBER here until now.
+    // the workspace.
     minRole: 'ADMIN',
     inputSchema: {
       type: 'object',
@@ -509,7 +509,7 @@ export const operatorTools: OperatorTool[] = [
       const limit = clampLimit(args.limit);
       const provider = typeof args.provider === 'string' ? args.provider : undefined;
       const onlyFailed = args.onlyFailed === true;
-      // Grant-scoped, not merely tenant-scoped — see `accessibleApplicationIds`.
+      // Grant-scoped, not merely tenant-scoped, see `accessibleApplicationIds`.
       const appIds = await accessibleApplicationIds(ctx);
       if (appIds.length === 0) return { events: [] };
       const rows = await prisma.webhookEvent.findMany({
@@ -550,7 +550,7 @@ export const operatorTools: OperatorTool[] = [
     },
     handler: async (ctx, args) => {
       const limit = clampLimit(args.limit);
-      // Grant-scoped, not merely tenant-scoped — see `accessibleApplicationIds`.
+      // Grant-scoped, not merely tenant-scoped, see `accessibleApplicationIds`.
       const appIds = await accessibleApplicationIds(ctx);
       if (appIds.length === 0) return { deliveries: [] };
       const rows = await prisma.webhookDelivery.findMany({
@@ -583,7 +583,7 @@ export const operatorTools: OperatorTool[] = [
     name: 'application_health',
     description:
       "Per-application snapshot of payment success rate (30d) and outbound webhook " +
-      'success rate (24h). Sorted by failure count — the top row is the app to investigate first.',
+      'success rate (24h). Sorted by failure count, the top row is the app to investigate first.',
     inputSchema: NO_ARGS,
     handler: async (ctx) => {
       const since24h = new Date(Date.now() - DAY_MS);
@@ -643,7 +643,7 @@ export const operatorTools: OperatorTool[] = [
       additionalProperties: false,
     },
     handler: async (ctx, args) => {
-      // Scope to the Applications this operator may READ — not merely to the
+      // Scope to the Applications this operator may READ, not merely to the
       // workspace. Tenant scoping alone let an APP_VIEWER MEMBER granted one
       // Application read any other Application's end-users by passing its id,
       // which the REST end-user routes answer 404 for.

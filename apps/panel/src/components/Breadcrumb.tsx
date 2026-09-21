@@ -1,5 +1,5 @@
 import * as React from 'react';
-import Link from 'next/link';
+import Link from '@/components/Link';
 
 /**
  * The trail, replacing the stacked back links.
@@ -8,8 +8,8 @@ import Link from 'next/link';
  *
  * Five files carried a byte-identical `← Something` link class string, and two
  * more carried drifted variants of it. On a record page two of them rendered at
- * once — `← All applications` at the top of the application shell and
- * `← End-users` sixty pixels lower — so the page opened with two different
+ * once, `← All applications` at the top of the application shell and
+ * `← End-users` sixty pixels lower, so the page opened with two different
  * "go back" affordances pointing at two different places, neither of them
  * saying where you actually were.
  *
@@ -24,14 +24,14 @@ import Link from 'next/link';
  * collapses two bands into one line, which is most of the height this
  * redesign wins back.
  *
- * The last crumb is the current page and is deliberately NOT a link — a
+ * The last crumb is the current page and is deliberately NOT a link, a
  * breadcrumb whose tail navigates to itself teaches people the trail is
  * decorative.
  */
 
 export interface Crumb {
   label: React.ReactNode;
-  /** Omit on the final crumb — the page you are already on. */
+  /** Omit on the final crumb, the page you are already on. */
   href?: string;
 }
 

@@ -1,8 +1,8 @@
 /**
- * POST /api/v1/users/import — bring end-users over from another auth system.
+ * POST /api/v1/users/import, bring end-users over from another auth system.
  *
  * A migration is one batch call per few hundred users: email, the password
- * hash the old system already holds (argon2id or bcrypt — verified as-is at
+ * hash the old system already holds (argon2id or bcrypt, verified as-is at
  * sign-in and upgraded to argon2id on first success, see lib/passwords.ts),
  * whether the address was verified, a role, metadata, and the OAuth identities
  * the old system had linked, so a Google or Discord user is not re-prompted.
@@ -11,7 +11,7 @@
  * caller asserts, which is the operator's authority, not a browser's.
  *
  * Idempotent per email: an address that already exists in the Application is
- * reported as `skipped`, never updated — an import must not be a way to
+ * reported as `skipped`, never updated, an import must not be a way to
  * overwrite a live account's password. Each row is validated before any row is
  * written, so a malformed batch is refused whole rather than half-applied.
  * Workspace end-user quota applies exactly as it does to sign-up.
@@ -65,7 +65,7 @@ export async function usersImportRoutes(app: FastifyInstance): Promise<void> {
         tags: ['Public · Auth'],
         summary: 'Import end-users from another auth system (server-side)',
         description:
-          'Up to 500 users per call. Password hashes are stored as given — argon2id or bcrypt — ' +
+          'Up to 500 users per call. Password hashes are stored as given, argon2id or bcrypt, ' +
           'and verified as-is at sign-in; a bcrypt hash is upgraded to argon2id on the first ' +
           'successful sign-in. OAuth identities are linked so social-login users are not ' +
           're-prompted. Existing addresses are skipped, never updated. The whole batch is ' +

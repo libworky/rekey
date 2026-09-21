@@ -6,7 +6,7 @@
  * `${issuerUrl}/.well-known/openid-configuration` for endpoint discovery.
  *
  * Per-Application config supplies the issuerUrl alongside clientId/secret/redirectUri.
- * Discovered endpoints are cached in-memory per (issuerUrl) with a 24h TTL —
+ * Discovered endpoints are cached in-memory per (issuerUrl) with a 24h TTL,
  * endpoint rotations are picked up within a day (or immediately on restart).
  */
 
@@ -29,15 +29,15 @@ interface DiscoveryDoc {
   /**
    * RFC 8414. When the issuer advertises S256 we send PKCE; when it says
    * nothing we do not. Reading the answer off discovery rather than making it
-   * a config flag means an issuer that REQUIRES PKCE — OAuth 2.1 mandates it,
-   * and Rekey's own Applications enforce it — works without anyone knowing to
+   * a config flag means an issuer that REQUIRES PKCE, OAuth 2.1 mandates it,
+   * and Rekey's own Applications enforce it, works without anyone knowing to
    * tick a box, and one that has never heard of it is unaffected.
    */
   code_challenge_methods_supported?: string[];
   /**
    * `['none']` means the issuer authenticates public clients by PKCE alone and
    * has no notion of a client secret. Sending one anyway is at best ignored and
-   * at worst a 401 — and demanding the operator invent one is worse than both.
+   * at worst a 401, and demanding the operator invent one is worse than both.
    */
   token_endpoint_auth_methods_supported?: string[];
 }
@@ -51,7 +51,7 @@ function challengeFor(verifier: string): string {
   return createHash('sha256').update(verifier, 'ascii').digest('base64url');
 }
 
-/** Does this issuer accept — and therefore expect — PKCE with S256? */
+/** Does this issuer accept, and therefore expect, PKCE with S256? */
 function wantsPkce(doc: DiscoveryDoc): boolean {
   return (doc.code_challenge_methods_supported ?? []).includes('S256');
 }
@@ -190,7 +190,7 @@ async function discover(issuerUrl: string): Promise<DiscoveryDoc> {
       throw new Error(`OIDC discovery doc at ${url} missing required fields`);
     }
     // OIDC Discovery §4.3: the document must name the issuer it was fetched
-    // from. Without this the later ID token check is self-referential — it
+    // from. Without this the later ID token check is self-referential, it
     // compares the token against a value the same document supplied, so a
     // document that names someone else validates tokens from someone else.
     if (!issuerAnswersFor(issuerUrl, data.issuer)) {
@@ -209,18 +209,13 @@ async function discover(issuerUrl: string): Promise<DiscoveryDoc> {
 export class OidcProvider implements OAuthProvider {
   readonly name = 'oidc';
 
-  // The auth URL build is async (needs discovery), but the OAuthProvider
-  // interface declares it sync. We satisfy the contract by doing the discovery
-  // *during exchange* and using a small server-side redirect for the auth step:
-  // — actually, since we control the call sites, the interface admits async by
-  // returning a Promise<string>. See type widening in the registry call.
+  // OAuthProvider declares buildAuthUrl sync, but OIDC needs discovery first.
+  // This sync entry point always throws; callers must use buildAuthUrlAsync.
+  // The registry's buildAuthUrl() helper is what dispatches to it.
   buildAuthUrl(input: BuildAuthUrlInput): string {
     if (!input.config.issuerUrl) {
       throw new Error('OIDC provider requires `issuerUrl` in the config.');
     }
-    // Synchronous variant: fetch discovery and throw if it isn't already in
-    // the cache. Callers should warm the cache (or accept the throw and retry
-    // — discovery is fast). We swap to async via the registry helper below.
     throw new Error(
       'OidcProvider.buildAuthUrl is async — use buildAuthUrlAsync instead. ' +
       'The registry caller in oauth.service.ts is the chokepoint.',
@@ -242,7 +237,7 @@ export class OidcProvider implements OAuthProvider {
     // Only when the issuer says it understands S256. An issuer that requires
     // PKCE rejects an authorize request without a challenge outright, and one
     // that has never heard of it must not receive parameters it did not ask
-    // for — so the discovery document decides, not a config flag.
+    // for, so the discovery document decides, not a config flag.
     if (input.codeVerifier && wantsPkce(doc)) {
       params.set('code_challenge', challengeFor(input.codeVerifier));
       params.set('code_challenge_method', 'S256');
@@ -272,7 +267,7 @@ export class OidcProvider implements OAuthProvider {
       tokenBody.set('code_verifier', input.codeVerifier);
     }
     // Discovered endpoints are attacker-influenceable too (a malicious
-    // discovery doc can point them anywhere) — validate before fetching.
+    // discovery doc can point them anywhere), validate before fetching.
     const tokenRes = await fetchJsonWithTimeout(doc.token_endpoint, {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded', Accept: 'application/json' },
@@ -284,13 +279,13 @@ export class OidcProvider implements OAuthProvider {
       // The authorization server says why in the body (RFC 6749 §5.2:
       // `invalid_grant`, `invalid_client`, …). Throwing a bare Error discarded
       // it and surfaced every failure as an opaque 500, which is useless to the
-      // person stuck in the flow AND to the operator reading logs — the two
+      // person stuck in the flow AND to the operator reading logs, the two
       // audiences who need it most.
       //
       // The upstream `error` code is safe to pass on: it is a fixed OAuth
       // vocabulary describing OUR request, not the user's data, and it is what
       // distinguishes "that code was already used" from "this client is
-      // misconfigured". `error_description` is NOT forwarded — it is free text
+      // misconfigured". `error_description` is NOT forwarded, it is free text
       // from an operator-configured issuer.
       const body = (tokenRes.data ?? {}) as { error?: unknown; error_description?: unknown };
       const upstream = typeof body.error === 'string' ? body.error : null;

@@ -6,7 +6,7 @@
  * `revokeAllSessions` and `revokeSession` all redirect to the **Security** tab,
  * and nothing there read `support` or `supportError`. An operator clicking
  * "Clear lockout" on an account that was never locked saw the page re-render
- * unchanged — so they either concluded the button was broken or told the
+ * unchanged, so they either concluded the button was broken or told the
  * customer to try again, which is exactly the outcome the "not locked" wording
  * exists to prevent. The error path was worse: a 410, a 403 and a 429 all
  * produced no banner at all, making a refused action indistinguishable from a
@@ -16,6 +16,7 @@
  */
 
 import * as React from 'react';
+import { errorMessage } from '@/lib/error-message';
 import { Banner } from '@/components/Banner';
 
 /** What each completed support action reports back. */
@@ -24,27 +25,27 @@ export const SUPPORT_DONE: Record<string, { tone: 'success' | 'info'; text: stri
   'not-locked': {
     tone: 'info',
     // Not "unlocked". The operator asked whether the lockout was the problem,
-    // and the honest answer is that it was not — so they keep looking.
-    text: 'Nothing to clear — this account was not locked and had no recent failures. Whatever is stopping them signing in, it is not the lockout.',
+    // and the honest answer is that it was not, so they keep looking.
+    text: 'Nothing to clear: this account was not locked and had no recent failures. Whatever is stopping them signing in, it is not the lockout.',
   },
   'verification-sent': { tone: 'success', text: 'Verification email sent.' },
   'verification-not-sent': {
     tone: 'info',
-    text: 'A fresh verification token was minted, but the email could not be sent — this Application has no working transport. Check Email → Delivery.',
+    text: 'A fresh verification token was minted, but the email could not be sent, because this Application has no working transport. Check Email → Delivery.',
   },
   'reset-sent': { tone: 'success', text: 'Password-reset email sent, and the reason recorded.' },
   'reset-not-sent': {
     tone: 'info',
-    text: 'A reset token was minted, but the email could not be sent — this Application has no working transport. Check Email → Delivery.',
+    text: 'A reset token was minted, but the email could not be sent, because this Application has no working transport. Check Email → Delivery.',
   },
   'session-revoked': { tone: 'success', text: 'Session revoked.' },
 };
 
 export const SUPPORT_ERR: Record<string, string> = {
-  REASON_REQUIRED: 'Say why you are sending a reset — it goes in the audit trail.',
+  REASON_REQUIRED: 'Say why you are sending a reset. It goes in the audit trail.',
   EMAIL_ALREADY_VERIFIED: 'That address is already verified; there is nothing to send.',
   END_USER_HAS_NO_PASSWORD:
-    'This account has no password — they sign in with OAuth, a passkey or a magic link. A reset would strand them on a form they cannot complete.',
+    'This account has no password. They sign in with OAuth, a passkey or a magic link. A reset would strand them on a form they cannot complete.',
   // Reachable whenever the `password` method is turned off on an Application
   // whose end-users still carry a hash: `ensurePasswordMethodEnabled` refuses
   // before the send. Without this line the operator got the raw code.
@@ -79,7 +80,7 @@ export function SupportFeedback({
       {signedOut !== null && !Number.isNaN(signedOut) && (
         <Banner tone="success">
           {signedOut === 0
-            ? 'No sessions were open — nothing to sign out.'
+            ? 'No sessions were open, so nothing to sign out.'
             : `Signed out of ${signedOut} session${
                 signedOut === 1 ? '' : 's'
               }. Access tokens already issued stay valid until they expire.`}
@@ -88,11 +89,11 @@ export function SupportFeedback({
       {impEnded !== null && !Number.isNaN(impEnded) && (
         <Banner tone={impEnded === 0 ? 'info' : 'success'}>
           {impEnded === 0
-            ? 'No impersonation was live — nothing to end.'
+            ? 'No impersonation was live, so nothing to end.'
             : `Ended ${impEnded} live impersonation${impEnded === 1 ? '' : 's'}. The tokens they issued are invalid now.`}
         </Banner>
       )}
-      {error !== undefined && <Banner tone="error">{SUPPORT_ERR[error] ?? error}</Banner>}
+      {error !== undefined && <Banner tone="error">{errorMessage(SUPPORT_ERR, error)}</Banner>}
     </>
   );
 }

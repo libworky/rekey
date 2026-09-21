@@ -6,7 +6,7 @@
  * Every route under an operator prefix carries `config.access`, one of:
  *
  *   { scope: 'billing:read' }   gated by one scope (plus whatever role floor
- *                               the route's own preHandler already imposes —
+ *                               the route's own preHandler already imposes,
  *                               the two compose as AND, floor first)
  *   { floor: true }             role-gated only. No scope unlocks it, ever.
  *                               Lifecycle, impersonation, DSAR, erase, team.
@@ -18,7 +18,7 @@
  * ## Why declared on the route and not in a separate table
  *
  * A table in its own file is a second thing that has to be kept true. The
- * route already says what it is — its path, its preHandler, its schema — and
+ * route already says what it is, its path, its preHandler, its schema, and
  * the classification belongs beside those, where the person editing the route
  * will see it. `collectRouteAccess` then builds the table FROM the
  * declarations at registration time, so there is exactly one source and the
@@ -56,7 +56,7 @@ export interface RouteAccessEntry {
  * session or PAT can reach and that touches workspace or application data.
  *
  * Not listed, deliberately: `/api/v1/tenant/auth`, `/mfa`, `/operator`, `/mcp`
- * and `/invitations` — operator-self, token-gated, or public surfaces that
+ * and `/invitations`, operator-self, token-gated, or public surfaces that
  * carry no application data and are gated by their own means. They are the
  * `operator-self` group in the spec's route survey.
  */

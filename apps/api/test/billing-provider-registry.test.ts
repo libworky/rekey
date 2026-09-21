@@ -73,7 +73,7 @@ describe('billing provider-module registry', () => {
   });
 
   it('every module declares at most one webhookRole field', () => {
-    // The pipeline's 503 gate checks a single field by design — a module
+    // The pipeline's 503 gate checks a single field by design, a module
     // declaring two would silently leave the second unchecked.
     for (const name of registryNames) {
       const fields = getModule(name)!.credentialSchema.filter((f) => f.webhookRole);
@@ -143,7 +143,7 @@ describe('billing provider-module registry', () => {
     const rules = credentialRulesSchema(externalModule);
     expect(rules.safeParse({ webhookSecret: 'short' }).success).toBe(false);
     expect(rules.safeParse({ webhookSecret: 'x'.repeat(32) }).success).toBe(true);
-    // And the optional pair really is optional — the secret alone still validates.
+    // And the optional pair really is optional, the secret alone still validates.
     expect(
       rules.safeParse({ webhookSecret: 'x'.repeat(32), subscriptionsUrl: 'http://insecure.example' })
         .success,
@@ -183,7 +183,7 @@ describe('billing provider-module registry', () => {
 
   it('every in-tree module states its discount support explicitly', () => {
     // `capabilities.discounts` is optional in the type so a module written
-    // before it keeps compiling, and absent resolves to "cannot" — but an
+    // before it keeps compiling, and absent resolves to "cannot", but an
     // in-tree module has no excuse for staying silent. Forgetting it here
     // would silently stop every coupon on that provider.
     for (const name of registryNames) {
@@ -192,7 +192,7 @@ describe('billing provider-module registry', () => {
   });
 
   it('only stripe can discount a recurring subscription', () => {
-    // Not a preference — PayPal Subscriptions v1 and Razorpay Subscriptions
+    // Not a preference, PayPal Subscriptions v1 and Razorpay Subscriptions
     // have no per-checkout discount surface at all, so checkout refuses the
     // coupon there rather than billing full price. See the module descriptors.
     expect(stripeModule.capabilities.discounts).toEqual({ oneTime: true, recurring: true });
@@ -202,7 +202,7 @@ describe('billing provider-module registry', () => {
 });
 
 describe('credentialSchema-driven validation (P3)', () => {
-  // Known-good fixture creds per provider — the same shapes the webhook and
+  // Known-good fixture creds per provider, the same shapes the webhook and
   // phase4 test suites store via the credential routes.
   const goodCreds: Record<string, Record<string, string>> = {
     stripe: { apiKey: 'sk_test_abc123', webhookSecret: 'whsec_abc123' },
@@ -304,7 +304,7 @@ describe('credentialSchema-driven validation (P3)', () => {
     // The load-bearing half: an unrecognised shape is null, NOT 'test'.
     // Returning 'test' here would record an unknown-but-live credential as
     // sandbox, which is what the panel badge, the revenue stats and dunning
-    // all read — a wrong answer about real money, dressed as a safe default.
+    // all read, a wrong answer about real money, dressed as a safe default.
     expect(stripeModule.detectMode?.({ apiKey: 'rk_live_restricted', webhookSecret: '' })).toBeNull();
     expect(stripeModule.detectMode?.({ apiKey: '', webhookSecret: '' })).toBeNull();
     expect(razorpayModule.detectMode?.({ keyId: 'something_else' })).toBeNull();

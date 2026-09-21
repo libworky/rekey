@@ -4,15 +4,15 @@
  * credentials and threading them into the provider class.
  *
  * Multi-provider model (phase 6+): an Application can configure any subset
- * of {stripe, paypal, razorpay}. The caller decides which provider to use
- * — either explicitly (user picked at checkout) or via the geo router
+ * of {stripe, paypal, razorpay}. The caller decides which provider to use,
+ * either explicitly (user picked at checkout) or via the geo router
  * (`pickProvider`), then passes that name here.
  *
  * **Every provider returned from here talks to a real payment processor.**
  * There is no fallback. Missing credentials throw
  * `BILLING_CREDENTIALS_NOT_CONFIGURED` in every environment, dev included:
- * the old behaviour — hand back a deterministic stub so the wiring "worked"
- * — meant an operator could run a whole integration, see checkout URLs and
+ * the old behaviour, hand back a deterministic stub so the wiring "worked",
+ * meant an operator could run a whole integration, see checkout URLs and
  * ACTIVE subscriptions, and never learn that no money could ever move. A
  * billing system that succeeds when it is not configured is worse than one
  * that refuses to start. Tests get their fakes from `test/fakes/`.
@@ -69,7 +69,7 @@ export async function getProviderForApplication(
     }
     case 'external': {
       // Every outbound call on this provider refuses with a named error (see
-      // external.ts) — what a row stamped `provider: 'external'` should get
+      // external.ts), what a row stamped `provider: 'external'` should get
       // when a checkout or cancellation path reaches for its processor.
       //
       // The one exception is READING. Credentials are loaded so the
@@ -112,7 +112,7 @@ export async function getProviderForApplication(
  *      `preferred` provider that isn't configured.
  *
  * **There is NO ambient per-provider default.** This function names no provider
- * and consults no country table — it reads only the stored `countries` /
+ * and consults no country table, it reads only the stored `countries` /
  * `priority` on each credential row, which `upsertRaw` defaults to `[]` and
  * `100`. A module's `display.defaultCountries` / `display.priority` are
  * *advertised* through the discovery projection in `registry.ts` so the panel can
@@ -172,7 +172,7 @@ export async function pickProvider(args: {
   if (globals.length > 0) return globals[0]!.provider;
 
   // Last resort: any enabled provider, lowest priority. (This kicks in when
-  // every configured provider has a country list and none match — better to
+  // every configured provider has a country list and none match, better to
   // route to *something* than to fail outright.)
   return enabled.sort((a, b) => a.priority - b.priority)[0]!.provider;
 }

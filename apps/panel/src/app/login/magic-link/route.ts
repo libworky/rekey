@@ -1,7 +1,7 @@
 /**
  * Magic-link verify. The operator's sign-in link points here
  * (/login/magic-link?token=…). The token IS the credential (single-use,
- * 15-min) — possession is the auth factor, so no CSRF cookie is needed (same
+ * 15-min), possession is the auth factor, so no CSRF cookie is needed (same
  * posture as the password-reset link). Exchange it via the API, set the session
  * cookies, and land in the panel.
  *
@@ -18,7 +18,7 @@ type VerifyResult =
 
 
 // Redirect with a RELATIVE Location so the browser resolves it against the
-// public URL it's on (panel.rekey.dev) — NOT `req.url`, which behind a proxy
+// public URL it's on (panel.rekey.dev), NOT `req.url`, which behind a proxy
 // is the internal bind address (e.g. 0.0.0.0:3031). NextResponse.redirect
 // requires an absolute URL, so emit the header directly.
 function seeOther(path: string): NextResponse {

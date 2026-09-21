@@ -1,8 +1,8 @@
 /**
  * Email templates, and whether each event is sent at all.
  *
- * The two questions belong together — "what does this email say" and "does it
- * go out" are the same row — but they are deliberately independent underneath:
+ * The two questions belong together, "what does this email say" and "does it
+ * go out" are the same row, but they are deliberately independent underneath:
  * `EmailEventSetting` is its own table, so switching an event off does not
  * require customising its body first, and deleting a customisation does not
  * quietly re-enable something somebody turned off.
@@ -13,13 +13,15 @@
  */
 
 import * as React from 'react';
-import Link from 'next/link';
+import Link from '@/components/Link';
 import { redirect } from 'next/navigation';
+import { errorMessage } from '@/lib/error-message';
 import { api, apiGet, PanelApiError } from '@/lib/api';
 import { SectionHeader } from '@/components/Card';
 import { Table, TBody, TR, TD } from '@/components/Table';
 import { Badge } from '@/components/Badge';
 import { Banner } from '@/components/Banner';
+import { ActionForm } from '@/components/ActionForm';
 import { SubmitButton } from '@/components/SubmitButton';
 
 interface EventRow {
@@ -28,7 +30,7 @@ interface EventRow {
   enabled: boolean;
   customised: boolean;
   essentialBlocker: { code: string; message: string; fix: string } | null;
-  /** Sent by Rekey itself, not by this Application — no switch reaches it. */
+  /** Sent by Rekey itself, not by this Application, no switch reaches it. */
   systemScoped?: boolean;
 }
 
@@ -87,7 +89,7 @@ export default async function EmailTemplatesPage({
   if (control === null) {
     return (
       <Banner tone="error">
-        The email settings could not be read — the request failed, or your access to this
+        The email settings could not be read. Either the request failed, or your access to this
         Application does not cover it.
       </Banner>
     );
@@ -99,7 +101,7 @@ export default async function EmailTemplatesPage({
     <div className="space-y-4">
       <SectionHeader
         title="Templates"
-        description="What each email says, and whether it is sent. Where the buttons in these emails point is the application URL on the Authentication tab — with no URL resolvable, the button is left out rather than sent broken."
+        description="What each email says, and whether it is sent. Where the buttons in these emails point is the application URL on the Authentication tab. With no URL resolvable, the button is left out rather than sent broken."
       />
 
       {changed && now && (
@@ -108,7 +110,7 @@ export default async function EmailTemplatesPage({
           {now === 'off' ? '. Attempted sends are still recorded, on the Delivery tab.' : '.'}
         </Banner>
       )}
-      {eventError && <Banner tone="error">{EVENT_ERR[eventError] ?? eventError}</Banner>}
+      {eventError && <Banner tone="error">{errorMessage(EVENT_ERR, eventError)}</Banner>}
 
       {!control.emailsEnabled && (
         <Banner tone="warning">
@@ -168,7 +170,7 @@ export default async function EmailTemplatesPage({
                   {e.systemScoped ? (
                     // No switch, because there is nothing for it to switch.
                     // These go out through `dispatchSystem`, which has no
-                    // per-Application gate — rendering a control here would
+                    // per-Application gate, rendering a control here would
                     // let an operator turn something "off" that keeps arriving.
                     <span
                       className="text-xs text-[var(--color-muted-fg)]"
@@ -186,14 +188,14 @@ export default async function EmailTemplatesPage({
                       required
                     </span>
                   ) : (
-                    <form action={setEventEnabled.bind(null, id, e.key, !e.enabled)}>
+                    <ActionForm action={setEventEnabled.bind(null, id, e.key, !e.enabled)}>
                       <SubmitButton
                         className="text-xs text-[var(--color-muted-fg)] hover:text-[var(--color-fg)] hover:underline"
                         pendingLabel="Saving…"
                       >
                         {e.enabled ? 'Turn off' : 'Turn on'}
                       </SubmitButton>
-                    </form>
+                    </ActionForm>
                   )}
                   <Link
                     href={`/applications/${id}/email/${encodeURIComponent(e.key)}`}

@@ -6,7 +6,7 @@
  *     a slot, and reactivates a released one in place.
  *   - The `max_devices` FEATURE entitlement is the only limit, it comes from
  *     the plan union (default plan supplies the free tier), and it is enforced
- *     under a lock — concurrent first sign-ins from N new machines never
+ *     under a lock, concurrent first sign-ins from N new machines never
  *     over-register.
  *   - A BLOCKED fingerprint is refused, and neither release nor a fresh touch
  *     can un-block it; only `unblock` can, and it comes back RELEASED (no slot).

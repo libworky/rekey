@@ -14,7 +14,7 @@ import { ok, okPage, errs, ref, type JsonSchema } from '../../lib/openapi.js';
 import { PaginationQuery, parsePagination, paged, paginationJsonSchema } from '../../lib/pagination.js';
 
 /**
- * The 401/403 pair every `/api/v1/tenant/workspace/*` route shares —
+ * The 401/403 pair every `/api/v1/tenant/workspace/*` route shares,
  * `requireTenantSession` runs as an `onRequest` hook, so these precede any
  * route-specific failure.
  */
@@ -30,23 +30,22 @@ const OWNER_ADMIN_ROLE_ERROR =
   'TENANT_ROLE_INSUFFICIENT — the operator\'s live role in this workspace is below OWNER/ADMIN.';
 
 // `MemberGrantRow`/`MemberRow`/`InvitationRow` (tenant-workspaces.service.ts) now match the
-// registered `MemberGrant`/`WorkspaceMember`/`WorkspaceInvitation` components field-for-field —
+// registered `MemberGrant`/`WorkspaceMember`/`WorkspaceInvitation` components field-for-field,
 // verified against the service return types. Referenced directly via `ref(...)` below instead of
 // duplicating the shapes here.
 
 /**
  * `acceptInvitation()` returns the raw `TenantMembership` Prisma row (`{id, tenantUserId,
- * tenantId, role, createdAt}`), NOT a `MemberRow` — it is created/read inside the transaction
+ * tenantId, role, createdAt}`), NOT a `MemberRow`, it is created/read inside the transaction
  * before any `email`/`name`/`grants` join happens. This does NOT match `WorkspaceMember`
  * (`membershipId`/`email`/`joinedAt`/`grants` are all absent, and `id`/`createdAt` mean something
- * different here), so it is modelled inline rather than via `ref('WorkspaceMember')` — a prior
- * pass had this wrong. See the report for this handler/component mismatch.
+ * different here), so it is modelled inline rather than via `ref('WorkspaceMember')`.
  */
 const AcceptedMembershipRow: JsonSchema = {
   type: 'object',
   description:
     'The raw membership row created (or reused, if already a member) by accepting this ' +
-    'invitation. Not the enriched `WorkspaceMember` shape — no `email`/`name`/`grants`.',
+    'invitation. Not the enriched `WorkspaceMember` shape, no `email`/`name`/`grants`.',
   properties: {
     id: { type: 'string' },
     tenantUserId: { type: 'string' },
@@ -58,7 +57,7 @@ const AcceptedMembershipRow: JsonSchema = {
 };
 
 /**
- * `getWorkspace()` — a trimmed `Tenant` projection (id, name, createdAt only). This is NOT the
+ * `getWorkspace()`, a trimmed `Tenant` projection (id, name, createdAt only). This is NOT the
  * `Tenant` component: `ownerEmail` and `updatedAt` are both required there but this handler's
  * `prisma.tenant.findUnique({ select: {...} })` never fetches them, so `ref('Tenant')` would
  * over-promise. Modelled inline instead.
@@ -78,7 +77,7 @@ const WorkspaceDetail: JsonSchema = {
 };
 
 /**
- * `createWorkspaceForUser()` / `renameWorkspace()` — id + name only. Also not the `Tenant`
+ * `createWorkspaceForUser()` / `renameWorkspace()`, id + name only. Also not the `Tenant`
  * component for the same reason as `WorkspaceDetail` above (missing required `ownerEmail` /
  * `updatedAt`).
  */
@@ -99,7 +98,7 @@ const WorkspaceSummary: JsonSchema = {
 };
 
 /**
- * A workspace-wide SYSTEM email send-log row (`emailService.listTenantLogs`) — the `EmailLog`
+ * A workspace-wide SYSTEM email send-log row (`emailService.listTenantLogs`), the `EmailLog`
  * component's fields plus the joined `application` summary this endpoint alone includes.
  */
 const WorkspaceEmailLogRow: JsonSchema = {
@@ -111,7 +110,7 @@ const WorkspaceEmailLogRow: JsonSchema = {
         application: {
           type: 'object',
           nullable: true,
-          description: 'Null for system mail — this endpoint only ever returns system mail.',
+          description: 'Null for system mail, this endpoint only ever returns system mail.',
           properties: {
             id: { type: 'string' },
             name: { type: 'string' },
@@ -178,7 +177,7 @@ const AcceptBody = z.object({ token: z.string().min(1).max(512) });
 const PreviewQuery = z.object({ token: z.string().min(1).max(512) });
 
 /**
- * Authenticated workspace routes — invitations + members.
+ * Authenticated workspace routes, invitations + members.
  * Mounted under /api/v1/tenant/workspace.
  */
 export async function tenantWorkspacesRoutes(app: FastifyInstance): Promise<void> {
@@ -195,7 +194,7 @@ export async function tenantWorkspacesRoutes(app: FastifyInstance): Promise<void
         description:
           'UX hint, exactly like `GET /tenant/auth/signup-mode`: it lets the panel hide the ' +
           '"New workspace" affordance on a deployment where `POST /tenant/workspace` would ' +
-          'refuse. Not a secret and not the enforcement — `assertWorkspaceCreationAllowed()` ' +
+          'refuse. Not a secret and not the enforcement, `assertWorkspaceCreationAllowed()` ' +
           'gates the creation path server-side regardless of what this reports.',
         response: {
           200: ok(
@@ -224,7 +223,7 @@ export async function tenantWorkspacesRoutes(app: FastifyInstance): Promise<void
         description:
           'UX hint, exactly like `GET /tenant/workspace/creation-mode` above: it lets the panel ' +
           'hide the "Grant subscription" affordance on a deployment where the grant route would ' +
-          'answer 404. Not a secret and not the enforcement — the grant and cancel routes refuse ' +
+          'answer 404. Not a secret and not the enforcement, the grant and cancel routes refuse ' +
           'with `TENANT_SUBSCRIPTION_GRANTS_DISABLED` regardless of what this reports.\n\n' +
           'Deployment-level rather than per-Application, which is why it lives here rather than ' +
           'under one Application: `TENANT_SUBSCRIPTION_GRANTS` is a single switch for the whole ' +
@@ -255,7 +254,7 @@ export async function tenantWorkspacesRoutes(app: FastifyInstance): Promise<void
         security: [{ tenantSession: [] }],
         summary: "Read the active workspace's resource ceilings and current usage",
         description:
-          'Requires the **OWNER or ADMIN** workspace role. Read-only even then — only a ' +
+          'Requires the **OWNER or ADMIN** workspace role. Read-only even then, only a ' +
           'deployment super-admin can change these, via ' +
           '`PUT /api/v1/admin/tenants/:id/limits`.\n\n' +
           'An **absent** key under `limits` means that resource is unlimited, which is the ' +
@@ -265,13 +264,13 @@ export async function tenantWorkspacesRoutes(app: FastifyInstance): Promise<void
           'refused, rather than after. It is a UX hint and nothing more: every quota is ' +
           'enforced server-side on the acting endpoint regardless of what this reports, so ' +
           'a client that skips the check gets a 403, not a bypass.\n\n' +
-          '`usage.productionApps` counts production applications that are **running** — ' +
+          '`usage.productionApps` counts production applications that are **running**, ' +
           '`environment: PRODUCTION` and not disabled. A disabled production application ' +
           'holds no slot, which is why disabling one frees capacity and re-enabling one can ' +
           'be refused.\n\n' +
           'MEMBERs are excluded deliberately. Both usage figures are workspace-wide, and the ' +
           'application list is grant-scoped precisely so a MEMBER with access to three ' +
-          'applications is not told the workspace has forty — that is an existence oracle. This ' +
+          'applications is not told the workspace has forty, that is an existence oracle. This ' +
           'endpoint would hand them the same count plus a workspace-wide end-user headcount. ' +
           'Nothing is lost by excluding them: every action these ceilings gate (creating, ' +
           'promoting, disabling and re-enabling an application) already requires OWNER or ADMIN.',
@@ -481,7 +480,7 @@ export async function tenantWorkspacesRoutes(app: FastifyInstance): Promise<void
         tenantWorkspacesService.listMembers(req.tenantId!, { take, skip }),
         tenantWorkspacesService.countMembers(req.tenantId!),
       ]);
-      // The roster is for everyone — the panel shows teammates to any member.
+      // The roster is for everyone, the panel shows teammates to any member.
       // Each member's GRANTS and SCOPES are not: this route was session-only
       // and returned every member's grant matrix, so a MEMBER learned their
       // own permissions by listing their colleagues'. Under scopes that would
@@ -608,7 +607,7 @@ export async function tenantWorkspacesRoutes(app: FastifyInstance): Promise<void
   // (members see their own access via GET /members, which includes grants).
   // Semantics live in prisma `ApplicationGrant` + lib/app-access.ts: grants
   // are authoritative for a MEMBER, including when there are none (since
-  // 2.0.0-rc.3 — a member with no grants reaches no Application). The single
+  // 2.0.0-rc.3, a member with no grants reaches no Application). The single
   // exception is a membership carrying `legacyWorkspaceRead`, set only by the
   // 2.0.0-rc.3 backfill for memberships that predate that default.
 
@@ -662,7 +661,7 @@ export async function tenantWorkspacesRoutes(app: FastifyInstance): Promise<void
           'Requires the **OWNER or ADMIN** workspace role.\n\n' +
           'Upserts the (member, application) grant: APP_ADMIN (full app read/write), ' +
           'APP_BILLING (read + billing/plans/coupons writes only), or APP_VIEWER ' +
-          '(read-only). Only valid on MEMBER memberships — OWNER/ADMIN already have ' +
+          '(read-only). Only valid on MEMBER memberships, OWNER/ADMIN already have ' +
           'full access.\n\n' +
           'Grants are how a MEMBER gets access at all: a member with none reaches no ' +
           'Application. Setting a grant also permanently clears `legacyWorkspaceRead` ' +
@@ -725,7 +724,7 @@ export async function tenantWorkspacesRoutes(app: FastifyInstance): Promise<void
         description:
           'Requires the **OWNER or ADMIN** workspace role.\n\n' +
           'Removing the LAST grant leaves the member with access to no Application. ' +
-          'Before 2.0.0-rc.3 it instead returned them to workspace-wide read — a ' +
+          'Before 2.0.0-rc.3 it instead returned them to workspace-wide read, a ' +
           'de-scoping call that widened access. Re-grant to restore.',
         params: {
           type: 'object',
@@ -777,8 +776,8 @@ export async function tenantWorkspacesRoutes(app: FastifyInstance): Promise<void
       config: { access: { floor: true } },
       // OWNER/ADMIN, matching the POST directly below. The two halves of one
       // resource disagreed: creating an invitation was ADMIN-gated while
-      // reading the list of them — pending invitee addresses and the workspace
-      // role each was offered — was open to any MEMBER. A role floor that only
+      // reading the list of them, pending invitee addresses and the workspace
+      // role each was offered, was open to any MEMBER. A role floor that only
       // covers the write half is not a role floor.
       preHandler: requireTenantRole(['OWNER', 'ADMIN']),
       schema: {
@@ -836,7 +835,7 @@ export async function tenantWorkspacesRoutes(app: FastifyInstance): Promise<void
                 invitation: ref('WorkspaceInvitation'),
                 token: {
                   type: 'string',
-                  description: 'Raw invitation token. Shown exactly once — store it now.',
+                  description: 'Raw invitation token. Shown exactly once, store it now.',
                 },
                 emailSent: { type: 'boolean' },
                 warning: { type: 'string' },
@@ -894,7 +893,7 @@ export async function tenantWorkspacesRoutes(app: FastifyInstance): Promise<void
           'Requires the **OWNER or ADMIN** workspace role.',
         params: { type: 'object', properties: { id: { type: 'string' } }, required: ['id'] },
         response: {
-          200: ok(ref('WorkspaceInvitation'), 'The revoked invitation (idempotent — same row if already revoked).'),
+          200: ok(ref('WorkspaceInvitation'), 'The revoked invitation (idempotent, same row if already revoked).'),
           ...errs({
             ...TENANT_SESSION_ERRORS,
             403:
@@ -938,7 +937,7 @@ export async function tenantWorkspacesRoutes(app: FastifyInstance): Promise<void
         summary: 'List recent SYSTEM email send-logs for the workspace (operator/invite mail, not per-app)',
         description:
           'Requires the **OWNER or ADMIN** workspace role, same as the workspace security-event log.\n\n' +
-          'System mail only — operator magic-link/password-reset + workspace invitations (sends not ' +
+          'System mail only, operator magic-link/password-reset + workspace invitations (sends not ' +
           'tied to an Application). Per-application email logs live under the Application itself.',
         querystring: {
           type: 'object',
@@ -956,7 +955,7 @@ export async function tenantWorkspacesRoutes(app: FastifyInstance): Promise<void
     },
     async (req) => {
       const q = WorkspaceLogQuery.parse(req.query);
-      // The service defaults to 100 when no limit is sent — mirror it so
+      // The service defaults to 100 when no limit is sent, mirror it so
       // `page.limit` describes the window that was served.
       const limit = q.limit ?? 100;
       const offset = q.offset ?? 0;
@@ -990,7 +989,7 @@ export async function tenantWorkspacesRoutes(app: FastifyInstance): Promise<void
 /**
  * Endpoints for accepting / previewing an invitation token.
  *
- * - GET /preview is unauthenticated — the recipient can see the workspace
+ * - GET /preview is unauthenticated, the recipient can see the workspace
  *   name + role *before* they sign up, so they know what they're agreeing to.
  * - POST /accept requires a valid tenant session (the invitee must already
  *   have an account). The panel flow is: visit the invite URL → if not

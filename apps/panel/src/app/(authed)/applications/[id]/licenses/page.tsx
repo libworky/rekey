@@ -6,6 +6,7 @@ import { BillingDisabledState } from '@/components/BillingDisabledState';
 import { ApiErrorText } from '@/components/api-error';
 import { Modal } from '@/components/Modal';
 import { ConfirmButton } from '@/components/ConfirmButton';
+import { ActionForm } from '@/components/ActionForm';
 import { SubmitButton } from '@/components/SubmitButton';
 import { formatDate } from '@/lib/date';
 import { CopyButton } from '@/components/CopyButton';
@@ -129,7 +130,7 @@ interface ActivationRow {
 }
 
 /**
- * Give a seat back on the holder's behalf — a re-imaged laptop, a departed
+ * Give a seat back on the holder's behalf, a re-imaged laptop, a departed
  * employee. The route has existed since the device series and nothing rendered
  * it, so the only way to free a seat held by a machine that no longer exists
  * was to rotate the key, which breaks every other machine using it.
@@ -204,14 +205,14 @@ export default async function LicensesPage({
 
   const [licensePage, endUserPage] = await Promise.all([
     api<Page<LicenseRow>>({ method: 'GET', path: `/api/v1/tenant/applications/${encodeURIComponent(id)}/licenses?limit=${PAGE_SIZE}&offset=${offset}` }),
-    // End-user picker for the issue-license modal — one window, never paged.
+    // End-user picker for the issue-license modal, one window, never paged.
     api<Page<EndUserRow>>({ method: 'GET', path: `/api/v1/tenant/applications/${encodeURIComponent(id)}/end-users?limit=100` }),
   ]);
   const { items: licenses, page } = licensePage;
   const endUsers = endUserPage.items;
 
   // Only for the expanded licence, and only when it is on the page in front of
-  // us — an id from the querystring is user input, and the API would 404 a
+  // us, an id from the querystring is user input, and the API would 404 a
   // foreign one anyway, but there is no reason to ask.
   const expanded = openActivations ? licenses.find((l) => l.id === openActivations) : undefined;
   const activations = expanded
@@ -227,7 +228,7 @@ export default async function LicensesPage({
         <div className="rounded-lg border-2 border-amber-300 dark:border-amber-500 bg-amber-50 dark:bg-amber-950 p-4 space-y-2">
           <div className="flex items-center justify-between gap-3">
             <p className="text-sm font-medium text-amber-900 dark:text-amber-200">
-              New license key (shown once — copy now)
+              New license key (shown once, copy now)
             </p>
             <CopyButton value={reveal} label="Copy key" />
           </div>
@@ -262,10 +263,10 @@ export default async function LicensesPage({
           >
             {endUsers.length === 0 ? (
               <p className="text-sm text-[var(--color-muted-fg)]">
-                No end-users yet — sign one up via your application's sign-up flow first.
+                No end-users yet. Sign one up via your application's sign-up flow first.
               </p>
             ) : (
-              <form action={issueLicense.bind(null, id)} className="space-y-3">
+              <ActionForm action={issueLicense.bind(null, id)} className="space-y-3">
                 {error && (
                   <Banner tone="error">
                     <ApiErrorText code={error} detail={errorDetail} fix={errorFix} map={ERR} fallback={error} />
@@ -317,7 +318,7 @@ export default async function LicensesPage({
                 </Field>
               </div>
                 <SubmitButton pendingLabel="Issuing license…">Issue license</SubmitButton>
-              </form>
+              </ActionForm>
             )}
           </Modal>
         }
@@ -375,13 +376,13 @@ export default async function LicensesPage({
                         {openActivations === l.id ? 'Hide activations' : 'Activations'}
                       </a>
                       {l.status === 'ACTIVE' && (
-                        <form action={revokeLicense.bind(null, id, l.id)}>
+                        <ActionForm action={revokeLicense.bind(null, id, l.id)}>
                           <ConfirmButton
                             confirm={`Revoke license ${l.keyPrefix}…? Activations using this key will fail immediately.`}
                           >
                             Revoke
                           </ConfirmButton>
-                        </form>
+                        </ActionForm>
                       )}
                     </div>
                   </TD>
@@ -473,7 +474,7 @@ export default async function LicensesPage({
                     </TD>
                     <TD align="right">
                       {a.releasedAt === null && (
-                        <form action={releaseActivation.bind(null, id, expanded.id, a.id)}>
+                        <ActionForm action={releaseActivation.bind(null, id, expanded.id, a.id)}>
                           <ConfirmButton
                             variant="subtle"
                             title="Release this seat?"
@@ -482,7 +483,7 @@ export default async function LicensesPage({
                           >
                             Release
                           </ConfirmButton>
-                        </form>
+                        </ActionForm>
                       )}
                     </TD>
                   </TR>
