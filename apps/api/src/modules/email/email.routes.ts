@@ -21,7 +21,7 @@
  *
  *   PUT    /api/v1/tenant/applications/:id/email-templates/:eventKey
  *     Upsert a custom template. `bodyHtml` is the compiled HTML the
- *     panel produced from the Unlayer designJson — we don't recompile
+ *     panel produced from the Unlayer designJson, we don't recompile
  *     server-side.
  *
  *   DELETE /api/v1/tenant/applications/:id/email-templates/:eventKey
@@ -37,7 +37,7 @@
  *
  * All routes require the operator's tenant session AND the Application
  * must belong to the operator's active workspace (re-uses
- * `ensureAppAccess` helper — which also enforces per-application grants).
+ * `ensureAppAccess` helper, which also enforces per-application grants).
  */
 
 import type { FastifyInstance } from 'fastify';
@@ -100,7 +100,7 @@ const LogQuery = z.object({
 const UpsertTemplateBody = z.object({
   subject: z.string().min(1).max(998),
   designJson: z.unknown(),
-  bodyHtml: z.string().min(1).max(1024 * 200), // 200 KB cap — enough for a complex template, blocks pathological abuse.
+  bodyHtml: z.string().min(1).max(1024 * 200), // 200 KB cap, enough for a complex template, blocks pathological abuse.
   bodyText: z.string().max(1024 * 50).nullable().optional(),
 });
 
@@ -170,7 +170,7 @@ export async function tenantEmailRoutes(app: FastifyInstance): Promise<void> {
   //
   // Until these existed `dispatch` had no gate at all: an Application with a
   // transport configured sent everything it was asked to send, and there was no
-  // way to stop it — not globally, not per event, not for one address. A
+  // way to stop it, not globally, not per event, not for one address. A
   // product whose own backend already sends transactional mail therefore
   // delivered two of everything, with no lever.
 
@@ -184,8 +184,8 @@ export async function tenantEmailRoutes(app: FastifyInstance): Promise<void> {
         summary: 'Get the master switch and every email event with its state',
         description:
           'Requires **read** access to this Application.\n\n' +
-          'Each event reports whether it is enabled, whether its template has been customised, and ' +
-          '— when it cannot currently be switched off — why, as `essentialBlocker`. Three of the ' +
+          'Each event reports whether it is enabled, whether its template has been customised, and, ' +
+          'when it cannot currently be switched off, why, as `essentialBlocker`. Three of the ' +
           'nine are load-bearing: disabling one silently removes the only way a user completes a ' +
           'flow the Application still offers, so they are refused while that flow is live rather ' +
           'than merely warned about.',
@@ -266,14 +266,17 @@ export async function tenantEmailRoutes(app: FastifyInstance): Promise<void> {
         description:
           'Requires **write** access to this Application.\n\n' +
           '`false` stops every Application-scoped email: verification, reset, magic link, welcome, ' +
-          'dunning — all of it. Each attempted send is still RECORDED, with `status: "suppressed"`, ' +
+          'dunning, all of it. Each attempted send is still RECORDED, with `status: "suppressed"`, ' +
           'so the Delivery view can answer "why did they not get it".\n\n' +
           'Workspace and operator mail (invitations, operator MFA) is deliberately unaffected: an ' +
           'Application-level switch must not be able to lock operators out of their own workspace.\n\n' +
           '**This does not hand you the tokens instead.** A suppressed send reports as a failed ' +
           'send, so a reset or magic-link token is withheld rather than returned to the caller. If ' +
           'your own backend needs to deliver those, leave email on and remove the transport ' +
-          'credentials — that is the documented no-transport contract.',
+          'credentials, that is the documented no-transport contract.\n\n' +
+          'Refused with 409 while the live auth config depends on any email this would silence: ' +
+          'password sign-in needs the reset email, magic-link sign-in IS its email, and required ' +
+          'verification needs the verification email. Turn those methods off first.',
         body: {
           type: 'object',
           required: ['emailsEnabled'],
@@ -288,7 +291,10 @@ export async function tenantEmailRoutes(app: FastifyInstance): Promise<void> {
             },
             'The new state of the master switch.',
           ),
-          ...errs(APP_WRITE_ERRORS),
+          ...errs({
+            ...APP_WRITE_ERRORS,
+            409: 'EMAIL_EVENT_REQUIRED_BY_AUTH_CONFIG: a live auth method depends on an email this switch would silence.',
+          }),
         },
       },
     },
@@ -314,7 +320,7 @@ export async function tenantEmailRoutes(app: FastifyInstance): Promise<void> {
           'Independent of whether the template is customised: turning an event off must not require ' +
           'rewriting its body first, and deleting a customisation must not re-enable something ' +
           'somebody switched off.\n\n' +
-          'Refused with 409 while the live auth config depends on the event — the password-reset ' +
+          'Refused with 409 while the live auth config depends on the event, the password-reset ' +
           'mail while password sign-in is on, the magic-link mail while magic-link sign-in is on, ' +
           'the verification mail while verification is required. The refusal names the setting to ' +
           'change first.',
@@ -398,7 +404,7 @@ export async function tenantEmailRoutes(app: FastifyInstance): Promise<void> {
           'Outranks every other gate, including a password reset: an address that hard-bounced ' +
           'cannot receive one anyway, and mailing a complainant again is how a sending domain gets ' +
           'blocked.\n\n' +
-          'Idempotent on the address — re-adding updates the reason and note rather than failing.',
+          'Idempotent on the address, re-adding updates the reason and note rather than failing.',
         body: {
           type: 'object',
           required: ['address'],
@@ -483,7 +489,7 @@ export async function tenantEmailRoutes(app: FastifyInstance): Promise<void> {
         summary: 'Send outcomes over a recent window',
         description:
           'Requires **read** access to this Application. Counted from `email_logs`, so ' +
-          '`suppressed` is visible alongside `sent` — a suppression is an outcome, not an absence.',
+          '`suppressed` is visible alongside `sent`, a suppression is an outcome, not an absence.',
         querystring: {
           type: 'object',
           properties: { hours: { type: 'integer', minimum: 1, maximum: 720, default: 24 } },
@@ -527,7 +533,7 @@ export async function tenantEmailRoutes(app: FastifyInstance): Promise<void> {
         security: [{ tenantSession: [] }],
         summary: "Get an Application's email config and effective transport",
         description:
-          'Requires **read** access to this Application — OWNER/ADMIN, or a MEMBER holding ' +
+          'Requires **read** access to this Application, OWNER/ADMIN, or a MEMBER holding ' +
           'any grant on it. A MEMBER with no grant on this Application gets 404.',
         response: {
           200: ok(
@@ -598,7 +604,7 @@ export async function tenantEmailRoutes(app: FastifyInstance): Promise<void> {
         security: [{ tenantSession: [] }],
         summary: "Set or rotate the Application's BYO email transport (Resend or SMTP) + sender",
         description:
-          'Requires **write** access to this Application — OWNER/ADMIN, or a MEMBER with an ' +
+          'Requires **write** access to this Application, OWNER/ADMIN, or a MEMBER with an ' +
           '`APP_ADMIN` grant on it.',
         body: {
           type: 'object',
@@ -677,7 +683,7 @@ export async function tenantEmailRoutes(app: FastifyInstance): Promise<void> {
         security: [{ tenantSession: [] }],
         summary: 'Revert this Application to the default (or no) email transport',
         description:
-          'Requires **write** access to this Application — OWNER/ADMIN, or a MEMBER with an ' +
+          'Requires **write** access to this Application, OWNER/ADMIN, or a MEMBER with an ' +
           '`APP_ADMIN` grant on it.',
         response: {
           200: ok(
@@ -711,7 +717,7 @@ export async function tenantEmailRoutes(app: FastifyInstance): Promise<void> {
         security: [{ tenantSession: [] }],
         summary: 'List recent email send-logs for this Application',
         description:
-          'Requires **read** access to this Application — OWNER/ADMIN, or a MEMBER holding ' +
+          'Requires **read** access to this Application, OWNER/ADMIN, or a MEMBER holding ' +
           'any grant on it. A MEMBER with no grant on this Application gets 404.',
         params: { type: 'object', properties: { id: { type: 'string' } }, required: ['id'] },
         querystring: {
@@ -734,7 +740,7 @@ export async function tenantEmailRoutes(app: FastifyInstance): Promise<void> {
       const { id } = AppParam.parse(req.params);
       await ensureAppAccess(req, id, 'read');
       const q = LogQuery.parse(req.query);
-      // The service defaults to 100 when no limit is sent — mirror it so
+      // The service defaults to 100 when no limit is sent, mirror it so
       // `page.limit` describes the window that was served.
       const limit = q.limit ?? 100;
       const offset = q.offset ?? 0;
@@ -772,7 +778,7 @@ export async function tenantEmailRoutes(app: FastifyInstance): Promise<void> {
     tags: ['Tenant · Email'],
     security: [{ tenantSession: [] }],
     description:
-      'Requires **read** access to this Application — OWNER/ADMIN, or a MEMBER holding ' +
+      'Requires **read** access to this Application, OWNER/ADMIN, or a MEMBER holding ' +
       'any grant on it. A MEMBER with no grant on this Application gets 404.',
   };
 
@@ -784,7 +790,7 @@ export async function tenantEmailRoutes(app: FastifyInstance): Promise<void> {
         ...templateReadSchema,
         summary: 'List customisable email events',
         response: {
-          // Bounded by construction — the fixed EMAIL_EVENTS registry, not
+          // Bounded by construction, the fixed EMAIL_EVENTS registry, not
           // tenant data. A bare array is correct here, not a defect.
           200: okArray(
             {
@@ -870,7 +876,7 @@ export async function tenantEmailRoutes(app: FastifyInstance): Promise<void> {
         security: [{ tenantSession: [] }],
         summary: 'Upsert a customised template for one event',
         description:
-          'Requires **write** access to this Application — OWNER/ADMIN, or a MEMBER with an ' +
+          'Requires **write** access to this Application, OWNER/ADMIN, or a MEMBER with an ' +
           '`APP_ADMIN` grant on it.',
         response: {
           200: ok(
@@ -922,7 +928,7 @@ export async function tenantEmailRoutes(app: FastifyInstance): Promise<void> {
         security: [{ tenantSession: [] }],
         summary: 'Revert one event to the built-in default template',
         description:
-          'Requires **write** access to this Application — OWNER/ADMIN, or a MEMBER with an ' +
+          'Requires **write** access to this Application, OWNER/ADMIN, or a MEMBER with an ' +
           '`APP_ADMIN` grant on it.',
         response: {
           200: ok(
@@ -931,9 +937,9 @@ export async function tenantEmailRoutes(app: FastifyInstance): Promise<void> {
               properties: { reverted: { type: 'boolean', enum: [true] } },
               required: ['reverted'],
             },
-            // An unknown `eventKey` is silently a no-op (see emailService.deleteTemplate) —
+            // An unknown `eventKey` is silently a no-op (see emailService.deleteTemplate),
             // this always answers 200, never EMAIL_EVENT_UNKNOWN.
-            'Reverted (or already at default — this is idempotent and does not 404 on an ' +
+            'Reverted (or already at default, this is idempotent and does not 404 on an ' +
               'unknown eventKey).',
           ),
           ...errs(APP_WRITE_ERRORS),
@@ -989,7 +995,7 @@ export async function tenantEmailRoutes(app: FastifyInstance): Promise<void> {
         security: [{ tenantSession: [] }],
         summary: 'Render the template with sample values and send to a chosen address',
         description:
-          'Requires **write** access to this Application — OWNER/ADMIN, or a MEMBER with an ' +
+          'Requires **write** access to this Application, OWNER/ADMIN, or a MEMBER with an ' +
           '`APP_ADMIN` grant on it.',
         body: {
           type: 'object',
@@ -1001,8 +1007,8 @@ export async function tenantEmailRoutes(app: FastifyInstance): Promise<void> {
             {
               type: 'object',
               description:
-                'The transport outcome. `kind: "sent"` — delivered; `kind: "no_transport"` — no ' +
-                'Resend/SMTP transport configured (BYO or default pool); `kind: "error"` — the ' +
+                'The transport outcome. `kind: "sent"`, delivered; `kind: "no_transport"`, no ' +
+                'Resend/SMTP transport configured (BYO or default pool); `kind: "error"`, the ' +
                 'provider rejected or the send failed.',
               properties: {
                 kind: { type: 'string', enum: ['sent', 'no_transport', 'error'] },
@@ -1018,7 +1024,7 @@ export async function tenantEmailRoutes(app: FastifyInstance): Promise<void> {
                 },
                 message: {
                   type: 'string',
-                  description: 'Present when `kind` is "error" — a tenant-safe failure description.',
+                  description: 'Present when `kind` is "error", a tenant-safe failure description.',
                 },
               },
               required: ['kind'],
@@ -1051,16 +1057,15 @@ export async function tenantEmailRoutes(app: FastifyInstance): Promise<void> {
       //
       // It does NOT ignore the SUPPRESSION LIST. That list holds addresses
       // that hard-bounced or filed a complaint, and mailing a complainant
-      // again is how a sending domain gets blocked — the model's own docblock
-      // says so. "It was only a test" is not a distinction the receiving
-      // mailbox provider makes.
+      // again is how a sending domain gets blocked. "It was only a test" is
+      // not a distinction the receiving mailbox provider makes.
       const suppressed = await emailService.addressSuppression(id, body.to);
       if (suppressed !== null) {
         throw new RekeyError({
           statusCode: 409,
           code: 'EMAIL_ADDRESS_SUPPRESSED',
           message: `${body.to} is on this Application's suppression list (${suppressed.reason}).`,
-          fix: 'Test with a different address. Sending to a hard-bounced or complaining address again is how a sending domain gets blocked — remove it from Email → Suppressions only if you know the bounce is resolved.',
+          fix: 'Test with a different address. Sending to a hard-bounced or complaining address again is how a sending domain gets blocked, remove it from Email → Suppressions only if you know the bounce is resolved.',
         });
       }
       const outcome = await sendEmail(

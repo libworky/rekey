@@ -222,7 +222,7 @@ describe('a subscription binds its buyer to one payment provider', () => {
    * The subject is exclusive per Application (#431): a user-subject app now
    * refuses a checkout that names an organization outright, before any binding
    * guard runs. The tests below are about the SUBJECT-CONFLICT guard, which
-   * survives that change because it defends a state exclusivity cannot undo —
+   * survives that change because it defends a state exclusivity cannot undo,
    * rows that already mix subjects, from before the rule existed or from an
    * app that was toggled while empty. Seeding a personal row here and checking
    * out for an org is exactly that legacy shape.
@@ -451,7 +451,7 @@ describe('a subscription binds its buyer to one payment provider', () => {
     // subject guard protects a LIVE subscription, because that is the one an
     // opened checkout was silently destroying. A PENDING row is a checkout
     // nobody completed, and refusing over it would tell the buyer to cancel
-    // something that does not exist — the exact shape of refusal that had to
+    // something that does not exist, the exact shape of refusal that had to
     // be removed once already for one-off purchases.
     //
     // What it leaves open is narrow and is not new: the earlier subject's

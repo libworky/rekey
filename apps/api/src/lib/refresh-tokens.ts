@@ -7,10 +7,10 @@
  *      token via POST /api/v1/auth/refresh. The presented refresh is
  *      revoked (revokedAt set) and a new {access, refresh} pair is issued.
  *   3. `replacedById` chains the rotation history. A presented-but-revoked
- *      refresh is *replay* — we reject the call.
+ *      refresh is *replay*, we reject the call.
  *
  * Storage: SHA-256 hash of the raw token, hash-only DB (same model as
- * ApiKey). Refresh tokens are 32 bytes of CSPRNG entropy — fast hash is
+ * ApiKey). Refresh tokens are 32 bytes of CSPRNG entropy, fast hash is
  * correct, Argon2 is for user-chosen passwords (see lib/passwords.ts).
  *
  * Lifetime: END_USER_REFRESH_TOKEN_TTL_DAYS (default 30), sliding: each
@@ -45,16 +45,16 @@ export interface IssueRefreshTokenOptions {
   ip?: string | null;
   /** Surface: "session" (default, SDK) or "mcp" (per-app OAuth token endpoint). */
   kind?: 'session' | 'mcp';
-  /** For `kind: 'mcp'` — the OAuth client_id the token is bound to. */
+  /** For `kind: 'mcp'`, the OAuth client_id the token is bound to. */
   clientId?: string | null;
   /**
-   * For `kind: 'mcp'` — the scopes granted at consent (space-separated,
+   * For `kind: 'mcp'`, the scopes granted at consent (space-separated,
    * RFC 6749). The refresh grant re-issues this exact string, so a chain can
    * never widen (or drop) what the end-user approved. Sessions have no scope
    * and leave it null.
    */
   scope?: string | null;
-  /** Active organization for this session — re-emitted as the `oid` claim on refresh. */
+  /** Active organization for this session, re-emitted as the `oid` claim on refresh. */
   activeOrganizationId?: string | null;
   /**
    * Device the session was minted on (`devices.id`), when the client sent a
@@ -69,7 +69,7 @@ export interface IssueRefreshTokenOptions {
  * value is the *only* time the caller can read it.
  *
  * The optional UA/IP are captured so `/me/sessions` can render a device
- * list. They're hints, not security primitives — cookie cloning across
+ * list. They're hints, not security primitives, cookie cloning across
  * devices won't change the stored values, so don't use them for binding.
  */
 export async function issueRefreshToken(
@@ -78,7 +78,7 @@ export async function issueRefreshToken(
   options: IssueRefreshTokenOptions = {},
 ): Promise<IssuedRefreshToken> {
   const raw = generateRawToken();
-  // Truncate UA at 512 chars — some clients send egregious strings (especially
+  // Truncate UA at 512 chars, some clients send egregious strings (especially
   // mobile WebViews). 512 is generous for any real-world UA.
   const ua = options.userAgent ? options.userAgent.slice(0, 512) : null;
   const ip = options.ip ? options.ip.slice(0, 64) : null;
@@ -107,7 +107,7 @@ export type RefreshOutcome =
   | { kind: 'expired'; token: RefreshToken };
 
 /**
- * Look up a presented refresh token by hash. Does **not** mutate state —
+ * Look up a presented refresh token by hash. Does **not** mutate state,
  * the caller (rotateRefreshToken) wraps this in a transaction with the
  * revoke + issue.
  */
@@ -156,12 +156,12 @@ export async function rotateRefreshToken(
         expiresAt,
         // Carry forward the originating device fingerprint so the
         // session list stays stable across rotations. A new device hitting
-        // /refresh with a stolen token wouldn't update this anyway —
+        // /refresh with a stolen token wouldn't update this anyway,
         // the rotation transaction is keyed off `presented.id`.
         userAgent: presented.userAgent,
         ip: presented.ip,
         // Carry the surface + client binding forward across rotations, and the
-        // granted scope with them — a rotation is a re-issue of the SAME grant,
+        // granted scope with them, a rotation is a re-issue of the SAME grant,
         // so it must not be an opportunity to change what it covers.
         kind: presented.kind,
         clientId: presented.clientId,
@@ -173,6 +173,9 @@ export async function rotateRefreshToken(
         // The refresh handler is what refuses a rotation presented from a
         // different fingerprint; here the binding is simply preserved.
         deviceId: presented.deviceId,
+        // Same session: the access token minted from this row carries the
+        // same `sid`, so a later single-session revoke reaches it.
+        sessionId: presented.sessionId,
       },
     });
 
@@ -186,7 +189,7 @@ export async function rotateRefreshToken(
 }
 
 /**
- * Revoke a single refresh token. Idempotent — re-revoking is fine. Used
+ * Revoke a single refresh token. Idempotent, re-revoking is fine. Used
  * by sign-out.
  */
 export async function revokeRefreshToken(raw: string): Promise<void> {
@@ -216,7 +219,7 @@ export async function revokeAllForEndUser(endUserId: string): Promise<number> {
 /**
  * Revoke every active refresh token for an Application. Returns the count revoked.
  *
- * UNUSED — do not reach for this as the session kill-switch. That is
+ * UNUSED, do not reach for this as the session kill-switch. That is
  * `applicationsService.rotateSessions` (route `POST /tenant/applications/:id/
  * rotate-sessions`), which bumps `Application.tokenGeneration` AND revokes the
  * refresh tokens in ONE transaction. Doing the two halves separately is the
@@ -289,12 +292,11 @@ export async function revokeSessionForEndUser(
     where: { id: sessionId, endUserId, revokedAt: null },
     data: { revokedAt: new Date() },
   });
-  // The revoked session's access token must stop now, not at its expiry.
-  // The stamp is per user, so the user's OTHER sessions also lose their
-  // current access token, but they hold live refresh tokens and renew
-  // silently on the next request; only the revoked one cannot.
-  if (result.count === 1) {
-    await prisma.endUser.updateMany({ where: { id: endUserId }, data: { sessionsInvalidBefore: new Date() } });
-  }
+  // No `sessionsInvalidBefore` stamp here. The stamp is per user, so it would
+  // end the access token of every OTHER session too, and our own clients do
+  // not survive that (the panel and portal refresh during an RSC render where
+  // the rotated cookie is lost, and a second tab's replay then trips reuse
+  // detection). The revoked session's access token is refused by its `sid`
+  // instead: this row is the newest of its family, now revoked.
   return result.count === 1;
 }

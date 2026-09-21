@@ -3,11 +3,11 @@
  *
  * Replaces the old per-file `ensureAppInTenant` helper on every
  * /api/v1/tenant/applications/:id/* route. One call answers BOTH questions:
- *   1. Does this Application belong to the active workspace? (404 otherwise —
+ *   1. Does this Application belong to the active workspace? (404 otherwise,
  *      same non-disclosure posture as before)
  *   2. Is the calling operator allowed to do `need` on it?
  *
- * Permission model (roadmap #8, v1 — see prisma `ApplicationGrant`):
+ * Permission model (roadmap #8, v1, see prisma `ApplicationGrant`):
  *
  *   Workspace role  | Effect
  *   ----------------|---------------------------------------------------------
@@ -33,16 +33,16 @@
  * migration accommodation was in fact the live default: inviting a contractor
  * as MEMBER handed them every Application's end-user roster (with emails),
  * API-key metadata, billing-credential status, payments, webhooks, coupons,
- * licences, organizations and email logs — 31 read endpoints on an Application
+ * licences, organizations and email logs, 31 read endpoints on an Application
  * nobody had granted them. The accommodation is now an explicit per-membership
  * flag (`TenantMembership.legacyWorkspaceRead`) that only the backfill sets,
  * and the DEFAULT for every new membership is closed.
  *
  * Route classification ("need"):
- *   'read'          — GET surfaces (lists, stats, configs, logs).
- *   'billing-write' — mutations on the billing catalog: plans, plan
+ *   'read'         , GET surfaces (lists, stats, configs, logs).
+ *   'billing-write', mutations on the billing catalog: plans, plan
  *                     entitlements, coupons, manual credit grants.
- *   'write'         — every other mutation: auth config, API keys, billing
+ *   'write'        , every other mutation: auth config, API keys, billing
  *                     credentials/config, OAuth config, end-users, licenses,
  *                     usage meters, organizations, webhooks, email, access
  *                     controls, session rotation.
@@ -52,7 +52,7 @@
  * end-user DSAR export, impersonation, and the inbound request log.
  *
  * The decision is implemented ONCE, in `./access-context.ts`, over a plain
- * context rather than a request — that is what lets the MCP handlers share it
+ * context rather than a request, that is what lets the MCP handlers share it
  * instead of carrying their own copy. This file keeps the request-shaped
  * adapters every REST route calls.
  */
@@ -68,9 +68,8 @@ import {
 } from './access-context.js';
 import { NO_SCOPES } from './operator-scopes.js';
 
-// The decision itself lives in ./access-context.ts, where the MCP path shares
-// it. These two are the request-shaped adapters the 128 REST call sites use;
-// their names, signatures and every observable behaviour are unchanged.
+// These two are the request-shaped adapters over the decision in
+// ./access-context.ts; names, signatures and observable behaviour unchanged.
 export type { AppAccess, AppAccessNeed, AppAccessScope };
 
 /**
@@ -109,7 +108,7 @@ export async function ensureAppAccess(
 export async function appAccessScope(req: FastifyRequest): Promise<AppAccessScope> {
   // Mirrors the old inline check: an OWNER/ADMIN, or a request with no
   // membership id, is unrestricted. The adapter's fallback lookup is not
-  // wanted here — the old code never did one for the scope question.
+  // wanted here, the old code never did one for the scope question.
   if (req.tenantRole === 'OWNER' || req.tenantRole === 'ADMIN' || !req.tenantMembershipId) {
     return { restricted: false, applicationIds: [], roleByApplicationId: new Map() };
   }
@@ -124,7 +123,7 @@ export async function appAccessScope(req: FastifyRequest): Promise<AppAccessScop
 /**
  * APP_BILLING members manage money, not sign-in: blank out the auth/OAuth
  * configuration on Application payloads served to them ("can see revenue and
- * manage plans but not touch auth" — roadmap #8).
+ * manage plans but not touch auth", roadmap #8).
  */
 export function redactApplicationForBilling<
   T extends { authConfig?: unknown; oauthConfig?: unknown },
@@ -138,7 +137,7 @@ export function redactApplicationForBilling<
  * `Application` carries `oauthCredentialsCiphertext` (OAuth client secrets),
  * `emailCredentialsCiphertext` (SMTP password) and
  * `billingCredentialsCiphertext` (the payment-provider API key and webhook
- * secret) as columns on the row. Routes that returned the row served all of them — an
+ * secret) as columns on the row. Routes that returned the row served all of them, an
  * external audit found the two credential blobs reaching a read-only
  * APP_VIEWER, which is a grant-scoped audience that only became reachable in
  * 2.0.0-rc.3.
@@ -151,7 +150,7 @@ export function redactApplicationForBilling<
  * leak the day `ENCRYPTION_KEY` does. Nothing outside the API can use these
  * values for anything, so there is no reason to send them.
  *
- * Applied to every audience, not just the restricted ones — an OWNER has no
+ * Applied to every audience, not just the restricted ones, an OWNER has no
  * more use for a ciphertext blob than a viewer does.
  */
 export function stripApplicationSecrets<T extends Record<string, unknown>>(application: T): T {
@@ -159,7 +158,7 @@ export function stripApplicationSecrets<T extends Record<string, unknown>>(appli
     oauthCredentialsCiphertext: _oauth,
     emailCredentialsCiphertext: _email,
     // The audit only caught the two above; this one is the same column class
-    // and the most sensitive of the three — the payment-provider API key and
+    // and the most sensitive of the three, the payment-provider API key and
     // webhook secret.
     billingCredentialsCiphertext: _billing,
     ...safe

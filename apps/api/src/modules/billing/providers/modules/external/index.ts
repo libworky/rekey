@@ -72,8 +72,6 @@ const SIGNATURE_TOLERANCE_SECONDS = 300;
 /** Signing secrets shorter than this are guessable; `openssl rand -hex 32` gives 64. */
 const MIN_SECRET_LENGTH = 32;
 
-// ---------- Envelope ----------
-
 const isoDate = z
   .string()
   .datetime({ offset: true })
@@ -186,8 +184,6 @@ function payloadInvalid(error: z.ZodError, eventType?: string): RekeyError {
     fix: 'See docs/external-billing.md for the envelope and the fields each event type carries.',
   });
 }
-
-// ---------- Webhook contract ----------
 
 function resolveApplication(req: RawWebhookReq): AppRef {
   // Slug only. The body is unverified at this point and the slug is what

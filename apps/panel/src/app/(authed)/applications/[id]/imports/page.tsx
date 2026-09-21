@@ -11,8 +11,9 @@
  */
 
 import * as React from 'react';
-import Link from 'next/link';
+import Link from '@/components/Link';
 import { redirect } from 'next/navigation';
+import { errorMessage } from '@/lib/error-message';
 import { api, apiGet, getApplication, PanelApiError } from '@/lib/api';
 import type { Page } from '@/lib/paginate';
 import { formatDateTime } from '@/lib/date';
@@ -23,6 +24,7 @@ import { Banner } from '@/components/Banner';
 import { EmptyState } from '@/components/EmptyState';
 import { Modal } from '@/components/Modal';
 import { Field } from '@/components/Field';
+import { ActionForm } from '@/components/ActionForm';
 import { SubmitButton } from '@/components/SubmitButton';
 
 interface ImportRun {
@@ -34,6 +36,8 @@ interface ImportRun {
   counts: Record<string, number>;
   error: string | null;
   createdAt: string;
+  /** `applying` with no heartbeat for five minutes: the apply was interrupted. */
+  stale: boolean;
 }
 
 const STATUS_TONE: Record<string, BadgeTone> = {
@@ -110,7 +114,7 @@ export default async function ImportsPage({
         action={<StartButton applicationId={id} error={startError} />}
       />
 
-      {startError && <Banner tone="error">{START_ERR[startError] ?? startError}</Banner>}
+      {startError && <Banner tone="error">{errorMessage(START_ERR, startError)}</Banner>}
 
       <Card className="space-y-2">
         <h3 className="text-sm font-semibold text-[var(--color-fg)]">Before you start</h3>
@@ -125,7 +129,7 @@ export default async function ImportsPage({
           </li>
           <li>
             Importing <strong>announces</strong> <code className="font-mono">subscription.activated</code>{' '}
-            to your webhook endpoints for every row — the same as a real sale. If something
+            to your webhook endpoints for every row, the same as a real sale. If something
             downstream provisions on that event, it will run for all of them.
           </li>
           <li>
@@ -170,8 +174,8 @@ export default async function ImportsPage({
                     {r.provider}
                   </TD>
                   <TD>
-                    <Badge tone={STATUS_TONE[r.status] ?? 'neutral'} dot>
-                      {r.status}
+                    <Badge tone={r.stale ? 'warning' : (STATUS_TONE[r.status] ?? 'neutral')} dot>
+                      {r.stale ? 'interrupted' : r.status}
                     </Badge>
                     {r.error && (
                       <div className="mt-0.5 max-w-[18rem] truncate text-[11px] text-[var(--color-muted-fg)]" title={r.error}>
@@ -188,7 +192,7 @@ export default async function ImportsPage({
                       href={`/applications/${id}/imports/${r.id}`}
                       className="text-sm font-medium text-[var(--color-primary)] hover:underline"
                     >
-                      {r.status === 'ready' ? 'Review →' : 'View →'}
+                      {r.status === 'ready' || r.stale ? 'Review →' : 'View →'}
                     </Link>
                   </TD>
                 </TR>
@@ -215,8 +219,8 @@ function StartButton({
       description="This reads your billing system and shows you what it found. Nothing is written until you review the result and apply it."
       trigger="Import subscriptions"
     >
-      <form action={startImport.bind(null, applicationId)} className="space-y-3">
-        {error && <Banner tone="error">{START_ERR[error] ?? error}</Banner>}
+      <ActionForm action={startImport.bind(null, applicationId)} className="space-y-3">
+        {error && <Banner tone="error">{errorMessage(START_ERR, error)}</Banner>}
         <Field
           label="Provider"
           hint="Only a provider that exposes a list API can be read. For your own billing system, that is the external provider's subscriptions endpoint."
@@ -240,10 +244,10 @@ function StartButton({
         </Field>
         <Banner tone="info">
           An unlinked end-user has no password and an unverified address. They get in through the
-          normal recovery paths — magic link, password reset, or OAuth.
+          normal recovery paths: magic link, password reset, or OAuth.
         </Banner>
         <SubmitButton pendingLabel="Reading…">Preview the import</SubmitButton>
-      </form>
+      </ActionForm>
     </Modal>
   );
 }

@@ -9,7 +9,7 @@
  *                   financial rows, anonymized. Was OWNER/ADMIN, checked in the
  *                   handler.
  *   (default)       Plain cascade delete. Removes the end-user AND every
- *                   dependent row the schema cascades into — payments,
+ *                   dependent row the schema cascades into, payments,
  *                   subscriptions, licences, the credit ledger, usage. Was
  *                   `ensureAppAccess(..., 'write')` and nothing else, which a
  *                   MEMBER holding an `APP_ADMIN` grant satisfies.

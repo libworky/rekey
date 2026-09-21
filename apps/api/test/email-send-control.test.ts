@@ -2,7 +2,7 @@
  * Turning email off, and what that must NOT do.
  *
  * `dispatch` had no gate at all before this: an Application with a transport
- * configured sent everything it was asked to send, and nothing could stop it —
+ * configured sent everything it was asked to send, and nothing could stop it,
  * not globally, not per event, not for one address. A product whose own backend
  * already sends transactional mail therefore delivered two of everything.
  *
@@ -103,6 +103,21 @@ describe('email send control', () => {
     return (key.json().data as { rawKey: string }).rawKey;
   }
 
+  /**
+   * Leave no auth method depending on email, so the master switch may be
+   * turned off through the API. A fresh Application offers password sign-in,
+   * which needs the reset email, and the switch refuses while it does.
+   */
+  async function dropEmailDependence(w: World): Promise<void> {
+    const res = await inject({
+      method: 'PATCH',
+      url: `${base(w)}/auth-config`,
+      headers: auth(w),
+      payload: { methods: ['oauth'], requireEmailVerification: false },
+    });
+    expect(res.statusCode).toBe(200);
+  }
+
   async function send(w: World, to: string) {
     const application = await prisma.application.findUniqueOrThrow({
       where: { id: w.applicationId },
@@ -133,6 +148,7 @@ describe('email send control', () => {
 
   it('the master switch suppresses a send, and records it as suppressed', async () => {
     const w = await world();
+    await dropEmailDependence(w);
     const patch = await inject({
       method: 'PATCH',
       url: `${base(w)}/email-send-control`,
@@ -167,7 +183,7 @@ describe('email send control', () => {
     expect((await send(w, 'a@example.com')).kind).toBe('error');
 
     // A different event is untouched. No transport is configured in test, so
-    // the honest outcome for an allowed send is `no_transport` — which is
+    // the honest outcome for an allowed send is `no_transport`, which is
     // exactly what distinguishes "not sent because we cannot" from "not sent
     // because you said not to".
     const application = await prisma.application.findUniqueOrThrow({
@@ -254,11 +270,14 @@ describe('email send control', () => {
     expect(before.statusCode).toBe(200);
     expect(before.json().data.resetToken).toEqual(expect.any(String));
 
-    await inject({
-      method: 'PATCH',
-      url: `${base(w)}/email-send-control`,
-      headers: auth(w),
-      payload: { emailsEnabled: false },
+    // Written straight to the row: the API refuses this state now (password
+    // sign-in is live, so the master switch is blocked), but a row from before
+    // that refusal existed can still carry it, and `dispatch` must keep the
+    // token withheld for such a row rather than trust the route to have
+    // prevented it.
+    await prisma.application.update({
+      where: { id: w.applicationId },
+      data: { emailsEnabled: false },
     });
 
     // And now the point: same caller, same route, email switched off. The token
@@ -349,6 +368,7 @@ describe('email send control', () => {
 
   it('counts a suppressed send as suppressed, not as an error', async () => {
     const w = await world();
+    await dropEmailDependence(w);
     await inject({
       method: 'PATCH',
       url: `${base(w)}/email-send-control`,
@@ -419,7 +439,7 @@ describe('email send control', () => {
     expect(suppressed.kind).toBe('error');
     expect(suppressed.kind === 'error' && suppressed.suppressed).toBe(true);
 
-    // And it is set ONLY for a suppression — a real transport failure must
+    // And it is set ONLY for a suppression, a real transport failure must
     // still raise the alarm, which is the whole point of the distinction.
     const normal = await send(w, 'fine@example.com');
     expect(normal.kind).toBe('no_transport');
@@ -454,6 +474,7 @@ describe('email send control', () => {
 
     // Master switch off: a test send is how an operator proves transport
     // before turning sending back on, so it must still be attempted.
+    await dropEmailDependence(w);
     await inject({
       method: 'PATCH',
       url: `${base(w)}/email-send-control`,
@@ -540,6 +561,229 @@ describe('email send control', () => {
     });
     expect(backOn.statusCode).toBe(409);
     expect(backOn.json().error.code).toBe('EMAIL_EVENT_REQUIRED_BY_AUTH_CONFIG');
+  });
+
+  // ---------- the master switch is held to the same rule ----------
+
+  it('refuses to switch all email off while password sign-in is live', async () => {
+    // `dispatch` checks the master switch before any per-event row, so with
+    // it off the password-reset email is silenced whatever its own switch
+    // says, and a user who forgets their password has no way back in and no
+    // refusal telling the operator why. The per-event switch already refuses
+    // this; the master switch has to, or the lock on one door is beside an
+    // open window.
+    const w = await world();
+    const res = await inject({
+      method: 'PATCH',
+      url: `${base(w)}/email-send-control`,
+      headers: auth(w),
+      payload: { emailsEnabled: false },
+    });
+    expect(res.statusCode).toBe(409);
+    expect(res.json().error.code).toBe('EMAIL_EVENT_REQUIRED_BY_AUTH_CONFIG');
+    expect(res.json().error.fix).toMatch(/password sign-in/i);
+    // Nothing was written: the row still sends.
+    const row = await prisma.application.findUniqueOrThrow({ where: { id: w.applicationId } });
+    expect(row.emailsEnabled).toBe(true);
+
+    // The refusal names every live dependency, not just the first.
+    const verify = await inject({
+      method: 'PATCH',
+      url: `${base(w)}/auth-config`,
+      headers: auth(w),
+      payload: { requireEmailVerification: true },
+    });
+    expect(verify.statusCode).toBe(200);
+    const both = await inject({
+      method: 'PATCH',
+      url: `${base(w)}/email-send-control`,
+      headers: auth(w),
+      payload: { emailsEnabled: false },
+    });
+    expect(both.statusCode).toBe(409);
+    expect(both.json().error.fix).toMatch(/password sign-in/i);
+    expect(both.json().error.fix).toMatch(/require email verification/i);
+  });
+
+  it('switching all email off is allowed once no auth method depends on it, and turning it ON is always allowed', async () => {
+    const w = await world();
+    await dropEmailDependence(w);
+    const off = await inject({
+      method: 'PATCH',
+      url: `${base(w)}/email-send-control`,
+      headers: auth(w),
+      payload: { emailsEnabled: false },
+    });
+    expect(off.statusCode).toBe(200);
+    expect((off.json().data as { emailsEnabled: boolean }).emailsEnabled).toBe(false);
+
+    // Re-enabling can never be blocked: it is the remedy.
+    const on = await inject({
+      method: 'PATCH',
+      url: `${base(w)}/email-send-control`,
+      headers: auth(w),
+      payload: { emailsEnabled: true },
+    });
+    expect(on.statusCode).toBe(200);
+  });
+
+  it('a disabled master switch blocks the auth-config route the way a disabled event does', async () => {
+    // The three-step walk-around, master-switch edition: drop every
+    // email-dependent method, switch all email off, add password sign-in
+    // back. Without the master switch counting as "every event is off", the
+    // third step would succeed with every per-event row still enabled, and
+    // the Application would offer password sign-in with no reset path.
+    const w = await world();
+    await dropEmailDependence(w);
+    const off = await inject({
+      method: 'PATCH',
+      url: `${base(w)}/email-send-control`,
+      headers: auth(w),
+      payload: { emailsEnabled: false },
+    });
+    expect(off.statusCode).toBe(200);
+
+    const backOn = await inject({
+      method: 'PATCH',
+      url: `${base(w)}/auth-config`,
+      headers: auth(w),
+      payload: { methods: ['oauth', 'password'] },
+    });
+    expect(backOn.statusCode).toBe(409);
+    expect(backOn.json().error.code).toBe('EMAIL_EVENT_REQUIRED_BY_AUTH_CONFIG');
+    // The fix points at the switch that is actually off, not at per-event
+    // toggles that are all still on.
+    expect(backOn.json().error.fix).toMatch(/send control/i);
+    expect(backOn.json().error.fix).not.toMatch(/"password_reset"/);
+
+    const verification = await inject({
+      method: 'PATCH',
+      url: `${base(w)}/auth-config`,
+      headers: auth(w),
+      payload: { requireEmailVerification: true },
+    });
+    expect(verification.statusCode).toBe(409);
+    expect(verification.json().error.code).toBe('EMAIL_EVENT_REQUIRED_BY_AUTH_CONFIG');
+
+    // A patch that touches neither coupled field is not held hostage.
+    const unrelated = await inject({
+      method: 'PATCH',
+      url: `${base(w)}/auth-config`,
+      headers: auth(w),
+      payload: { deviceBinding: 'optional' },
+    });
+    expect(unrelated.statusCode).toBe(200);
+
+    // And the service answers the same for the operator MCP tool's path.
+    const blockers = await emailService.authConfigBlockers(w.applicationId, {
+      methods: ['password'],
+      requireEmailVerification: false,
+    });
+    expect(blockers).toEqual([
+      expect.objectContaining({ eventKey: 'password_reset', cause: 'master_switch' }),
+    ]);
+
+    // Email back on, and the same change goes through.
+    await inject({
+      method: 'PATCH',
+      url: `${base(w)}/email-send-control`,
+      headers: auth(w),
+      payload: { emailsEnabled: true },
+    });
+    const allowed = await inject({
+      method: 'PATCH',
+      url: `${base(w)}/auth-config`,
+      headers: auth(w),
+      payload: { methods: ['oauth', 'password'] },
+    });
+    expect(allowed.statusCode).toBe(200);
+  });
+
+  // ---------- the two ends of the coupling cannot race past each other ----------
+
+  // Each end checks the other's state and then writes. Unserialised, "email
+  // off" and "password sign-in on" each pass against the other's old value and
+  // both commit. Two racers under Promise.all do not reliably overlap in
+  // Postgres, so each round fires eight of each, over several rounds.
+  const RACERS = 8;
+  const ROUNDS = 4;
+
+  it('email off and password sign-in on, fired together, never both land', async () => {
+    const w = await world();
+    let bothLanded = 0;
+    for (let round = 0; round < ROUNDS; round++) {
+      await inject({
+        method: 'PATCH',
+        url: `${base(w)}/email-send-control`,
+        headers: auth(w),
+        payload: { emailsEnabled: true },
+      });
+      await dropEmailDependence(w);
+      const results = await Promise.all(
+        Array.from({ length: RACERS * 2 }, (_, i) =>
+          i % 2 === 0
+            ? inject({
+                method: 'PATCH',
+                url: `${base(w)}/email-send-control`,
+                headers: auth(w),
+                payload: { emailsEnabled: false },
+              })
+            : inject({
+                method: 'PATCH',
+                url: `${base(w)}/auth-config`,
+                headers: auth(w),
+                payload: { methods: ['oauth', 'password'] },
+              }),
+        ),
+      );
+      // Every request was decided, not crashed: 200 or the documented 409.
+      for (const r of results) expect([200, 409]).toContain(r.statusCode);
+      const row = await prisma.application.findUniqueOrThrow({ where: { id: w.applicationId } });
+      const methods = ((row.authConfig ?? {}) as { methods?: string[] }).methods ?? [];
+      if (row.emailsEnabled === false && methods.includes('password')) bothLanded++;
+    }
+    expect(bothLanded).toBe(0);
+  });
+
+  it('the per-event switch takes the same lock: password_reset off and password sign-in on never both land', async () => {
+    const w = await world();
+    let bothLanded = 0;
+    for (let round = 0; round < ROUNDS; round++) {
+      await inject({
+        method: 'PATCH',
+        url: `${base(w)}/email-send-control/password_reset`,
+        headers: auth(w),
+        payload: { enabled: true },
+      });
+      await dropEmailDependence(w);
+      const results = await Promise.all(
+        Array.from({ length: RACERS * 2 }, (_, i) =>
+          i % 2 === 0
+            ? inject({
+                method: 'PATCH',
+                url: `${base(w)}/email-send-control/password_reset`,
+                headers: auth(w),
+                payload: { enabled: false },
+              })
+            : inject({
+                method: 'PATCH',
+                url: `${base(w)}/auth-config`,
+                headers: auth(w),
+                payload: { methods: ['oauth', 'password'] },
+              }),
+        ),
+      );
+      for (const r of results) expect([200, 409]).toContain(r.statusCode);
+      const row = await prisma.application.findUniqueOrThrow({ where: { id: w.applicationId } });
+      const methods = ((row.authConfig ?? {}) as { methods?: string[] }).methods ?? [];
+      const setting = await prisma.emailEventSetting.findUnique({
+        where: {
+          applicationId_eventKey: { applicationId: w.applicationId, eventKey: 'password_reset' },
+        },
+      });
+      if (setting?.enabled === false && methods.includes('password')) bothLanded++;
+    }
+    expect(bothLanded).toBe(0);
   });
 
 });

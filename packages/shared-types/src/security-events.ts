@@ -1,5 +1,5 @@
 /**
- * Security-event types and their human labels — the single definition, next to
+ * Security-event types and their human labels, the single definition, next to
  * the package every consumer already depends on.
  *
  * ## Why this is here rather than in the panel
@@ -9,13 +9,13 @@
  * The operator panel therefore carried a hand-written mirror of the map so it
  * could render "End-user signed in" instead of `user.signed_in`. A mirror of a
  * list nobody owns drifts by construction: the panel's first version covered 10
- * of them, so 44 rendered the raw key twice — once as the value and once as its
- * own label — and the Event-type filter could not select any of the 44 either.
+ * of them, so 44 rendered the raw key twice, once as the value and once as its
+ * own label, and the Event-type filter could not select any of the 44 either.
  * Three types a later revision guessed at turned out not to exist API-side.
  *
  * So the map lives with the shared types both sides already import. `EVENT_TYPE`
  * gives the emit sites a constant to reference instead of a literal, and
- * `SecurityEventType` makes the map exhaustive — a new event added to the union
+ * `SecurityEventType` makes the map exhaustive, a new event added to the union
  * without a label is a compile error, which is the whole point.
  *
  * Two pairs differ only by REST-vs-MCP provenance and read like typos. They are
@@ -27,7 +27,7 @@
 /**
  * Every event type the API can emit, grouped as the emitters group them.
  *
- * The values ARE the contract — they are persisted in `security_events.type`
+ * The values ARE the contract, they are persisted in `security_events.type`
  * and appear in `?type=` filters, so renaming one is a breaking change to
  * stored data, not a refactor.
  */
@@ -40,7 +40,7 @@ export const SECURITY_EVENT_LABEL = {
   // Every MCP tool invocation, recorded at the dispatch layer rather than by
   // each tool. Tools that change something ALSO emit their own specific event;
   // this one exists so the record does not depend on an author remembering,
-  // and so read tools — which change nothing but can read a lot — leave a
+  // and so read tools, which change nothing but can read a lot, leave a
   // trail too. An agent acting on an operator's behalf should be as auditable
   // as the operator.
   'operator.mcp_tool_called': 'MCP tool called',
@@ -90,7 +90,7 @@ export const SECURITY_EVENT_LABEL = {
   // because it changes commercial terms for a single customer without touching
   // any plan, so nothing in the plan history records that it happened.
   'app.subscription_entitlements_overridden': 'Subscription entitlements overridden',
-  // A subscription activated with no payment provider behind it — an invoice,
+  // A subscription activated with no payment provider behind it, an invoice,
   // a bank transfer, a comped account. It is the one billing write that
   // CREATES entitlement on somebody's say-so rather than following money the
   // deployment can see, which is exactly why it is in the trail.
@@ -115,13 +115,13 @@ export const SECURITY_EVENT_LABEL = {
   'user.passkey_added': 'End-user added a passkey',
   'user.passkey_removed': 'End-user removed a passkey',
   'user.sessions_revoked': 'End-user revoked their sessions',
-  // App-authorised session handoff — the Application's own server exchanged a
+  // App-authorised session handoff, the Application's own server exchanged a
   // live end-user session for an OIDC authorization code (see
   // POST /api/v1/mcp/:slug/oauth/authorize/grant). The end-user is the actor
   // because it is their session being handed on; the Application that did it
   // is named in `applicationId`, and the client it was handed to is in
   // `metadata.clientId`. This is the audit trail that makes a stolen secret
-  // key investigable rather than invisible — without it, the handoff would be
+  // key investigable rather than invisible, without it, the handoff would be
   // indistinguishable from an ordinary interactive sign-in.
   'user.session_handoff_granted': 'End-user session handed off by the application server',
   // Devices. `registered` covers both a brand-new fingerprint and a released
@@ -150,7 +150,7 @@ export const SECURITY_EVENT_LABEL = {
 
   // ── Operator support actions on one end-user ──
   // An operator acting ON somebody, rather than the person acting for
-  // themselves — hence `end_user.*` with an operator actor and the subject in
+  // themselves, hence `end_user.*` with an operator actor and the subject in
   // `metadata.endUserId`. Two of these put mail in a real person's inbox that
   // they did not ask for, so both carry an audited reason: at the recipient's
   // end, support-initiated mail and an attacker who reached the panel look
@@ -199,7 +199,7 @@ export const SECURITY_EVENT_TYPES = Object.keys(SECURITY_EVENT_LABEL) as Securit
  * Takes `string`, not `SecurityEventType`, on purpose: the value comes back
  * from the database as a bare string, and a row written by a NEWER API than the
  * client reading it is exactly the case that has to degrade well. An unknown
- * key is humanised — `app.plan_archived` → "Plan archived" — rather than
+ * key is humanised, `app.plan_archived` → "Plan archived", rather than
  * printed raw and shown twice.
  */
 export function humanizeSecurityEventType(type: string): string {

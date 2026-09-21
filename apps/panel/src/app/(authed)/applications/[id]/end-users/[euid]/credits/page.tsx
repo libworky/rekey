@@ -1,5 +1,5 @@
 /**
- * End-user Credits — prepaid balance, the manual adjustment, and the ledger.
+ * End-user Credits, prepaid balance, the manual adjustment, and the ledger.
  *
  * Unchanged in behaviour from the single-page version; it simply has its own
  * route now. This was the ONLY write an operator could perform on an end-user
@@ -8,10 +8,12 @@
  */
 
 import * as React from 'react';
+import { errorMessage } from '@/lib/error-message';
 import { Card, SectionHeader } from '@/components/Card';
 import { Table, THead, TBody, TR, TH, TD } from '@/components/Table';
 import { Badge, type BadgeTone } from '@/components/Badge';
 import { Banner } from '@/components/Banner';
+import { ActionForm } from '@/components/ActionForm';
 import { SubmitButton } from '@/components/SubmitButton';
 import { formatDateTime } from '@/lib/date';
 import { grantCredits } from '../actions';
@@ -58,15 +60,15 @@ export default async function EndUserCreditsPage({
       />
 
       {credited && <Banner tone="success">Credits updated.</Banner>}
-      {creditError && <Banner tone="error">{CREDIT_ERR[creditError] ?? creditError}</Banner>}
+      {creditError && <Banner tone="error">{errorMessage(CREDIT_ERR, creditError)}</Banner>}
 
       {/* Not "0 credits". A balance of zero is a fact about the account; a
           failed read is a fact about the request. The adjust form is withheld
-          too — applying a delta to a balance nobody could read is how an
+          too, applying a delta to a balance nobody could read is how an
           account gets overdrawn by an operator trying to help. */}
       {credits === null ? (
         <Banner tone="error">
-          The credit balance could not be read — the request failed, or your grant on this
+          The credit balance could not be read. Either the request failed, or your grant on this
           Application does not cover billing. This is <strong>not</strong> a zero balance, so
           adjustments are withheld until it loads. Reload; if it persists, check the API and your
           access.
@@ -81,7 +83,7 @@ export default async function EndUserCreditsPage({
           <span className="text-xs text-[var(--color-muted-fg)]">credits available</span>
         </div>
 
-        <form
+        <ActionForm
           action={grantCredits.bind(null, id, euid)}
           className="grid items-end gap-2 sm:grid-cols-[6rem_8rem_1fr_auto]"
         >
@@ -115,9 +117,9 @@ export default async function EndUserCreditsPage({
             />
           </label>
           <SubmitButton pendingLabel="Applying…">Apply</SubmitButton>
-        </form>
+        </ActionForm>
         <p className="text-[11px] text-[var(--color-muted-fg)]">
-          Positive adds (Grant / Refund). Negative with Adjust removes — refused if it would
+          Positive adds (Grant / Refund). Negative with Adjust removes, and is refused if it would
           overdraw.
         </p>
       </Card>

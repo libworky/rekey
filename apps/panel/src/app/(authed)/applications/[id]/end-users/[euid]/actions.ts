@@ -6,20 +6,25 @@
  * One file rather than one per tab, because several of them are reachable from
  * more than one place (releasing a device is a row action on Devices and part
  * of "reset devices" on Overview) and because a `'use server'` module may only
- * export async functions — constants shared with the pages live in `shared.ts`.
+ * export async functions, constants shared with the pages live in `shared.ts`.
  *
  * Every action follows the same shape the rest of the panel uses: call the API,
  * turn a `PanelApiError` into a `?<x>Error=CODE` redirect the page renders as a
- * banner, and redirect to a success flag otherwise. Errors are surfaced by code
- * rather than by message so the copy stays the panel's and the API's wording
- * cannot leak an internal detail into the UI.
+ * banner, and redirect to a success flag otherwise. Errors are surfaced by code,
+ * not by the API's message text, so the copy stays the panel's and the API's
+ * wording cannot leak an internal detail into the UI.
  */
 
 import { redirect } from 'next/navigation';
 import { cookies } from 'next/headers';
 import { api, errorQuery, PanelApiError } from '@/lib/api';
 import { cookieSecure } from '@/lib/cookie-secure';
-import { IMPERSONATE_COOKIE, IMPERSONATE_COOKIE_MAX_AGE } from './shared';
+import {
+  IMPERSONATE_COOKIE,
+  IMPERSONATE_COOKIE_MAX_AGE,
+  SUPPORT_FLASH_COOKIE,
+  SUPPORT_FLASH_MAX_AGE,
+} from './shared';
 
 function tabBase(applicationId: string, euid: string): string {
   return `/applications/${applicationId}/end-users/${euid}`;
@@ -28,10 +33,6 @@ function tabBase(applicationId: string, euid: string): string {
 function apiBase(applicationId: string, euid: string): string {
   return `/api/v1/tenant/applications/${encodeURIComponent(applicationId)}/end-users/${encodeURIComponent(euid)}`;
 }
-
-// ---------------------------------------------------------------------------
-// Credits
-// ---------------------------------------------------------------------------
 
 export async function grantCredits(
   applicationId: string,
@@ -60,12 +61,8 @@ export async function grantCredits(
   redirect(`${base}?credited=1`);
 }
 
-// ---------------------------------------------------------------------------
-// Impersonation
-// ---------------------------------------------------------------------------
-
 /**
- * The impersonation token is sensitive — same treatment as the MFA setup
+ * The impersonation token is sensitive, same treatment as the MFA setup
  * secret. It is stashed in a short-lived HttpOnly cookie scoped to this
  * end-user's pages and rendered server-side; it never goes in the URL.
  */
@@ -105,10 +102,6 @@ export async function impersonate(
   redirect(`${base}?impersonated=1`);
 }
 
-// ---------------------------------------------------------------------------
-// Erasure
-// ---------------------------------------------------------------------------
-
 export async function eraseUser(applicationId: string, euid: string): Promise<void> {
   const base = `${tabBase(applicationId, euid)}/data`;
   try {
@@ -125,13 +118,9 @@ export async function eraseUser(applicationId: string, euid: string): Promise<vo
   redirect(`${base}?erased=1`);
 }
 
-// ---------------------------------------------------------------------------
-// Support actions
-// ---------------------------------------------------------------------------
-
 /**
  * The support bar. Each is one API call, and each reports what actually
- * happened rather than that it was attempted — "unlocked" when nothing was
+ * happened rather than that it was attempted, "unlocked" when nothing was
  * locked, or "sent" when no transport is configured, is the kind of reassurance
  * that sends an operator back to the customer with the wrong answer.
  */
@@ -153,11 +142,40 @@ async function supportAction(
     });
   } catch (err) {
     if (err instanceof PanelApiError) {
+      await supportFlash(applicationId, euid, tab, { error: err.code });
       redirect(`${base}?supportError=${encodeURIComponent(err.code)}`);
     }
     throw err;
   }
-  redirect(`${base}?support=${flag(data)}`);
+  const done = flag(data);
+  await supportFlash(applicationId, euid, tab, { done });
+  redirect(`${base}?support=${done}`);
+}
+
+/**
+ * Leave the outcome where the next render of the Overview tab can find it
+ * without the redirect having to arrive. See `SUPPORT_FLASH_COOKIE`.
+ *
+ * Only for the Overview actions (`tab === ''`). The Security and Devices tabs
+ * read their result out of the URL and reach it by a navigation of their own;
+ * writing a flash for them would leave one lying in wait for an operator who
+ * comes back to Overview later.
+ */
+async function supportFlash(
+  applicationId: string,
+  euid: string,
+  tab: string,
+  value: { done?: string; error?: string },
+): Promise<void> {
+  if (tab !== '') return;
+  const jar = await cookies();
+  jar.set(SUPPORT_FLASH_COOKIE, JSON.stringify(value), {
+    httpOnly: true,
+    sameSite: 'lax',
+    secure: await cookieSecure(),
+    path: tabBase(applicationId, euid),
+    maxAge: SUPPORT_FLASH_MAX_AGE,
+  });
 }
 
 export async function unlockAccount(applicationId: string, euid: string): Promise<void> {
@@ -189,6 +207,7 @@ export async function sendPasswordReset(
 ): Promise<void> {
   const reason = String(formData.get('reason') ?? '').trim();
   if (!reason) {
+    await supportFlash(applicationId, euid, '', { error: 'REASON_REQUIRED' });
     redirect(`${tabBase(applicationId, euid)}?supportError=REASON_REQUIRED`);
   }
   await supportAction(applicationId, euid, '/send-password-reset', { reason }, '', (d) =>
@@ -251,12 +270,8 @@ export async function releaseAllDevices(applicationId: string, euid: string): Pr
   );
 }
 
-// ---------------------------------------------------------------------------
-// Subscriptions
-// ---------------------------------------------------------------------------
-
 /**
- * Grant a subscription with no payment provider behind it — an invoiced sale, a
+ * Grant a subscription with no payment provider behind it, an invoiced sale, a
  * comped account, a migration off a previous billing system.
  *
  * The note is optional to the API and required here. A comped subscription with
@@ -276,7 +291,7 @@ export async function grantSubscription(
   // Re-open the modal on the values the operator chose, so a refusal does not
   // cost them the form. The NOTE is deliberately not echoed: it is free text
   // that in practice carries a customer name or an invoice reference, and this
-  // goes in a URL — browser history, the referer header, access logs. Losing a
+  // goes in a URL, browser history, the referer header, access logs. Losing a
   // sentence beats leaking one.
   const keep = (code: string): string => {
     const q = new URLSearchParams({ grantError: code, grant: '1' });
@@ -308,14 +323,14 @@ export async function grantSubscription(
     }
     throw err;
   }
-  // `activated: false` is the idempotent no-op — the subscriber was already
+  // `activated: false` is the idempotent no-op, the subscriber was already
   // entitled on this plan. Saying "granted" there would be a lie the operator
   // acts on, so the two outcomes get different banners.
   redirect(`${base}?granted=${activated ? '1' : 'already'}`);
 }
 
 /**
- * Always asks for cancellation at period end — the panel offers no immediate
+ * Always asks for cancellation at period end, the panel offers no immediate
  * option, because the honest answer to "which will this be" is `cancelEffect`,
  * not a checkbox: a subscription with no paid period left stops on the spot
  * whatever is requested, and one with a period cannot be made to stop sooner
@@ -342,16 +357,12 @@ export async function cancelSubscription(
   }
   // Report what HAPPENED, not what was asked for. `atPeriodEnd: true` is a
   // request; `cancelEffect` decides, and it schedules nothing for a
-  // subscription with no period left — which is every open-ended grant. A
+  // subscription with no period left, which is every open-ended grant. A
   // banner reading "keeps entitling until the end of the period" over an
   // account that just lost access is worse than no banner.
   const scheduled = result.cancelAt !== null && new Date(result.cancelAt) > new Date();
   redirect(`${base}?canceled=${scheduled ? 'period-end' : 'now'}`);
 }
-
-// ---------------------------------------------------------------------------
-// Entitlement overrides
-// ---------------------------------------------------------------------------
 
 /**
  * Turn one form value into what the overrides route expects. Empty, `null` or
@@ -395,7 +406,7 @@ export async function setEntitlementOverrides(
   if (Object.keys(body).length === 0) {
     redirect(`${base}?error=OVERRIDE_EMPTY&sub=${encodeURIComponent(subId)}`);
   }
-  let changed = true;
+  let changed: boolean;
   try {
     const r = await api<{ changed?: boolean }>({
       method: 'PATCH',
@@ -415,10 +426,6 @@ export async function setEntitlementOverrides(
   // resolved entitlements actually moved.
   redirect(`${base}?overrides=${Object.keys(body).length}&changed=${changed ? 1 : 0}`);
 }
-
-// ---------------------------------------------------------------------------
-// Impersonation: end every live session
-// ---------------------------------------------------------------------------
 
 /**
  * Stamps `endedAt` on every open impersonation of this end-user, whoever
@@ -442,10 +449,6 @@ export async function endImpersonations(applicationId: string, euid: string): Pr
   }
   redirect(`${base}?support=impersonations-ended:${ended}`);
 }
-
-// ---------------------------------------------------------------------------
-// Devices
-// ---------------------------------------------------------------------------
 
 /**
  * Release, block and unblock all return the device plus `sessionsRevoked`, and

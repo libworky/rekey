@@ -4,7 +4,7 @@
  * This switch is the reason granting can be opened to OWNER/ADMIN at all.
  * `billing-admin.routes.ts` held it at the super-admin key because on a
  * deployment that SELLS to the workspaces it hosts, a granted subscription can
- * write the granter's own allowance — and said that tenant scoping contains
+ * write the granter's own allowance, and said that tenant scoping contains
  * that only incidentally, which is why it stayed shut. The switch is how such a
  * deployment says so deliberately instead of relying on the accident.
  *
@@ -39,7 +39,7 @@ describe('operator subscription grants, switched off', () => {
    * Built per test, not once in `beforeAll`: `test/setup.ts` truncates every
    * domain table in `beforeEach`, so a fixture created before the suite is gone
    * by the time the first case runs and its access token authenticates as an
-   * operator who no longer exists — a 401 that looks nothing like the thing
+   * operator who no longer exists, a 401 that looks nothing like the thing
    * under test.
    */
   async function world(): Promise<{

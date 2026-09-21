@@ -153,7 +153,7 @@ recovery; Rekey works out which it is.
 | `subscription.id` | Your id for the subscription. Stored as `providerSubId` and used to find the row for every later event. |
 | `subscription.plan` | A plan slug in this Application. An unknown slug fails the event and stays retryable. |
 | `subscription.currentPeriodEnd` | When the paid period ends. Omit or `null` for an open-ended subscription. A later value than the one stored is a renewal; a value already in the past is stale news and the event is ignored. |
-| `subscription.trialEndsAt` | Mirrored for reporting; Rekey does not run the trial. |
+| `subscription.trialEndsAt` | When the trial your system is running ends. A future value is judged by Rekey's trial ledger under the Application's `trialPolicy`, the same one-per-buyer rule hosted checkout applies: honoured, the row is `TRIALING` until you post an activation with `trialEndsAt` null or past, which converts it to `ACTIVE`; refused, the subscription is still activated, `ACTIVE` and without the trial, and the refusal is kept under the row's `metadata.refusedTrials`. Re-delivering an event never spends a second slot. |
 | `subscriber.email` or `subscriber.endUserId` | Exactly one. An email Rekey does not know creates the end-user (no password, the default role); an unknown `endUserId` fails the event. |
 | `subscriber.emailVerified` | Default `true`. Send `false` if your system has not confirmed the address; an OIDC sign-in will then not auto-link to it. |
 | `subscriber.organizationId` | The beneficiary organization, required for Applications that bill per organization. |
@@ -275,9 +275,9 @@ Stripe sale produces. Each subscription reports `provider: "external"`.
   system created. An id that happens to match a subscription Stripe, PayPal
   or Razorpay created is logged and ignored, on activation as well as on
   cancellation and payments.
-- **Receipts are kept for 90 days** by default (`WEBHOOK_EVENT_RETENTION_DAYS`
-  on the API), which covers every retry window and the inbound log; an
-  `eventId` older than that is accepted as new.
+- **Receipts are kept forever** unless `WEBHOOK_EVENT_RETENTION_DAYS` is set
+  on the API. With a window configured (90 days covers every retry schedule
+  and the inbound log), an `eventId` older than that is accepted as new.
 - **Applier failures retry.** A body that fails validation is a `400` and is
   stored nowhere. An event that validates but cannot be applied (unknown plan
   slug, unknown `endUserId`, an erased subscriber, a missing organization) is

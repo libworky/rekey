@@ -1,5 +1,5 @@
 /**
- * Public credits endpoints — the customer's backend reads balances and draws
+ * Public credits endpoints, the customer's backend reads balances and draws
  * credits down (server-to-server, secret key).
  *
  * Subject: pass `endUserId` for a personal balance OR `organizationId` for a
@@ -16,12 +16,12 @@ import { requireApiKey, requireScope } from '../../middleware/api-key-auth.js';
 import { requireBillingEnabled } from '../../middleware/billing-enabled.js';
 import { positiveBoundedInt } from '../../lib/bounded-int.js';
 import { assertMetadataWithinLimit } from '../../lib/metadata-limit.js';
-import { ok, okPage, errs, ref, type JsonSchema } from '../../lib/openapi.js';
+import { ok, okPage, errs, ref } from '../../lib/openapi.js';
 import { paged } from '../../lib/pagination.js';
 
 /**
  * Auth/gate errors shared by every route in this file: `requireApiKey`
- * (secret key only — the publishable key is rejected outright) +
+ * (secret key only, the publishable key is rejected outright) +
  * `requireBillingEnabled`, then the per-route `requireScope`.
  */
 const READ_GATE_ERRORS = {
@@ -45,17 +45,6 @@ const WRITE_GATE_ERRORS = {
 const SUBJECT_NOT_FOUND =
   'ORGANIZATION_NOT_FOUND — `organizationId` does not name an organization in this ' +
   'application; or END_USER_NOT_FOUND — `endUserId` does not name an end-user in this application.';
-
-/*
- * `data` for `GET /balance` is now `ref('CreditBalance')`.
- *
- * This used to be a local schema because `CreditBalanceDtoSchema` disagreed
- * with the handler: it required `endUserId`, which an ORGANIZATION balance
- * cannot have, and an `updatedAt` that does not exist — the balance is summed
- * from the ledger, not stored on a row with a timestamp. The DTO has been
- * corrected to match (both subject fields optional, no `updatedAt`), so the
- * component describes the response and this local copy is dead.
- */
 
 const subjectFields = {
   endUserId: z.string().min(1).optional(),
@@ -168,7 +157,7 @@ export async function creditsPublicRoutes(app: FastifyInstance): Promise<void> {
       onRequest: requireScope('billing:write'),
       // Generic Idempotency-Key HEADER support (scoped to the Application).
       // Distinct from the body-level `idempotencyKey` below, which dedupes at
-      // the credit-ledger level and keeps working unchanged — the header is
+      // the credit-ledger level and keeps working unchanged, the header is
       // the route-agnostic mechanism, the body field the ledger-native one.
       config: { idempotency: true },
       schema: {

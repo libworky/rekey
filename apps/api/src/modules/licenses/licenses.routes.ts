@@ -6,7 +6,7 @@
  * resources in one place.
  *
  * THIS file ships the public verification endpoint
- * (POST /api/v1/licenses/verify) — that's what the customer's software
+ * (POST /api/v1/licenses/verify), that's what the customer's software
  * calls at startup with the raw license key + a machine fingerprint.
  */
 
@@ -32,7 +32,7 @@ const DeactivateBody = z.object({
 export async function licensesPublicRoutes(app: FastifyInstance): Promise<void> {
   // A desktop/client app verifies its own license at startup with no backend,
   // so this accepts the publishable key (or a secret key). The actual
-  // entitlement bearer is the license `key` in the body — the publishable key
+  // entitlement bearer is the license `key` in the body, the publishable key
   // only identifies which Application's licenses to check against.
   app.addHook('onRequest', requirePublishableOrSecretKey);
   app.addHook('onRequest', requireBillingEnabled);
@@ -41,7 +41,7 @@ export async function licensesPublicRoutes(app: FastifyInstance): Promise<void> 
   // requests are pre-authorized by route membership).
   app.addHook('onRequest', requireScope('billing:write'));
 
-  // Per (application, IP) bucket for both licence routes — see
+  // Per (application, IP) bucket for both licence routes, see
   // licenseRateLimitKey. 60/min covers an office launching at nine and bounds
   // a key guesser to one attempt a second per address.
   const LICENSE_RATE_LIMIT = licenseRateLimit(60);
@@ -54,7 +54,7 @@ export async function licensesPublicRoutes(app: FastifyInstance): Promise<void> 
         tags: ['Public · Licenses'],
         summary: 'Verify a license key + record an activation for this machine',
         description:
-          'Returns { ok, license?, reason? }. `ok=false` is intentional for invalid licenses — ' +
+          'Returns { ok, license?, reason? }. `ok=false` is intentional for invalid licenses, ' +
           'the customer\'s software loops on this and we want a deterministic body, not an HTTP error.',
         security: [{ apiKey: [] }, { publishableKey: [] }],
         body: {
@@ -67,10 +67,10 @@ export async function licensesPublicRoutes(app: FastifyInstance): Promise<void> 
           },
         },
         response: {
-          // Always 200 — `verify()` never throws for an invalid/expired/
+          // Always 200, `verify()` never throws for an invalid/expired/
           // revoked/seats-exhausted license; `ok: false` + `reason` IS the
           // deterministic failure body the description promises.
-          200: ok(ref('LicenseVerifyResult'), 'Verification outcome — check `ok` before `license`.'),
+          200: ok(ref('LicenseVerifyResult'), 'Verification outcome, check `ok` before `license`.'),
           ...errs({
             400: 'VALIDATION_ERROR — the body failed schema validation.',
             401:
@@ -108,7 +108,7 @@ export async function licensesPublicRoutes(app: FastifyInstance): Promise<void> 
         summary: 'Give back the seat this machine holds on a license',
         description:
           'The counterpart to /verify: the customer\'s software calls it before a re-image or on ' +
-          'uninstall so the seat is free for the next machine. Same deterministic body — `ok=false` ' +
+          'uninstall so the seat is free for the next machine. Same deterministic body, `ok=false` ' +
           '+ `reason` for an unknown, revoked or expired key, never an HTTP error. Idempotent: ' +
           '`released` is false when the machine held no seat. A later /verify from the same ' +
           'machine reactivates the seat in place if one is free.',
@@ -122,7 +122,7 @@ export async function licensesPublicRoutes(app: FastifyInstance): Promise<void> 
           },
         },
         response: {
-          200: ok(ref('LicenseDeactivateResult'), 'Outcome — check `ok` before `released`.'),
+          200: ok(ref('LicenseDeactivateResult'), 'Outcome, check `ok` before `released`.'),
           ...errs({
             400: 'VALIDATION_ERROR — the body failed schema validation.',
             401:

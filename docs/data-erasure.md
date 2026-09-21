@@ -58,19 +58,73 @@ For an erasure of end-user `E` in application `A`:
 | `Subscription` | **retain + scrub** | Rows kept (FK to tombstone). `metadata` JSON cleared (`{}`). Status/plan/amounts untouched. |
 | `Payment` | **retain + scrub** | Rows kept. `metadata` cleared, `description` → null. Amount/currency/status/provider ref untouched. |
 | `License` | **retain + scrub** | Rows kept. `metadata` cleared. Key hash/prefix/status untouched. |
-| `LicenseActivation` | **retain + scrub** | Rows kept for seat accounting. `machineFingerprint` tombstoned to `erased:<id>`, `label` and `deviceId` cleared. |
+| `LicenseActivation` | **retain + scrub** | Rows kept for seat accounting. `machineFingerprint` tombstoned to `erased:<id>`, `label` and `deviceId` cleared, and the seat released. Scoped to the subject's own activations: every activation on a licence they hold, plus those on an org-pooled licence of an organization they belong to that name one of their devices. Another user's activation that happens to carry the same fingerprint is not touched; devices are unique per user, so a shared fingerprint is not evidence of a shared person. |
 | `Device` | **hard-delete** | A machine fingerprint the person supplied is personal data; sessions and activations that pointed at the device are SET NULL. |
 | `CreditLedger` | **retain + scrub** | Append-only journal kept. `metadata` cleared, `description` → null. Deltas/balances untouched. |
 | `CreditBalance` | **retain** | Numeric balance only — no free-form PII to scrub. Kept via FK. |
 | `UsageRecord` | **retain + scrub** | Kept (scalar `endUserId`, scoped by meter). `metadata` cleared. Quantities/timestamps untouched. |
 | `OrganizationMembership` | **retain** | Not PII about the subject; left intact (team rosters). The tombstone keeps the FK valid. |
-| `SecurityEvent` | **retain, bounded** | Security audit trail (including the erasure event itself) is retained for forensics for `LOG_RETENTION_DAYS` (default 30), then pruned. If `LOG_ARCHIVE_S3_*` is configured, rows are copied to the archive first and **erasure does not reach that copy**: its `ip` and `user_agent` persist for as long as the bucket keeps them. Give the bucket a lifecycle rule that matches your policy, and do not enable Object Lock unless you have decided erasure never applies to the archive. |
+| `SecurityEvent` | **retain, bounded** | Security audit trail (including the erasure event itself) is retained for forensics indefinitely by default, or for `LOG_RETENTION_DAYS` when that is set, then pruned. Erasure does not scrub these rows, so their `ip` and `user_agent` go to the log archive when one is configured. See "The log archive" below. |
+| `EmailLog` | **retain + scrub** | Rows kept: send counts and outcomes are operational data. On every row of A sent to one of E's addresses, `to_address` becomes the tombstone address, `subject` becomes `[erased]` (templates interpolate variables into it, so it can hold a name), and any copy of the address inside `error` is replaced with the tombstone. `event_key`, `via`, `status`, `message_id` and timestamps untouched. |
+| `EmailSuppression` | **delete** | Suppression rows for E's addresses in A are deleted. See "Suppressions" below for why they are not kept as a hash. |
+| `WebhookDelivery` | **retain + scrub** | Rows, status, attempts and response kept. Deliveries are matched by E's **id** at the places Rekey's own events put it (`data.user.id`, `data.userId`, `data.endUserId`, and `endUserId` under `data.device`, `data.subscription`, `data.payment`, `data.dunningCase`, `data.license`), never by searching payloads for text. In a matched payload: `email` becomes the tombstone address, a device `fingerprint` becomes `erased`, `metadata` / `label` / `description` become null, and any other copy of the address is replaced. `updated_at` is not bumped, so the retention clock is unchanged. |
+| `WebhookEvent` | **retain + scrub** | Inbound billing receipts (the provider's own event body). They carry no Rekey end-user id, so they are matched by E's address within A, and only occurrences of that address are replaced with the tombstone; other fields the provider sent (a billing name or postal address) are not interpreted. Set `WEBHOOK_EVENT_RETENTION_DAYS` to bound how long those survive. Nothing replays a stored receipt, so the rewrite changes no billing state. |
 | `ImpersonationAudit` | **retain** | Operator-accountability trail — retained. |
 | `DunningCase` | **retain** | Denormalized `endUserId` (no FK); part of the billing record. |
 | Redis brute-force lock | **delete** | `bf:fail:` / `bf:lock:eu:login:<appId>:<email>` for the erased address. The key embeds the email in plaintext and the super-admin locked-accounts dashboard enumerates those keys, so a surviving lock would keep the address readable for the rest of its 15-minute TTL. Best-effort, outside the transaction (Redis can't join it). |
 
 > Erasure is **idempotent**: erasing an already-tombstoned user is a no-op (the
-> response carries `alreadyErased: true`). All mutations run in one transaction.
+> response carries `alreadyErased: true`). All mutations run in one transaction,
+> with a 60-second timeout: the email and webhook scrubs are proportional to how
+> much the person was ever mailed or announced, and a half-applied erasure is
+> worse than a slow one. Only E's own rows are locked while it runs.
+
+**Which addresses count as E's.** The account's address at the moment of
+erasure, plus any address an outstanding email-verification or magic-link token
+names (an email change mails the new address before the account holds it). An
+address another end-user of A currently holds is excluded. An address E used and
+changed away from before any of those tokens existed is not known to Rekey any
+more, so rows sent to it are not matched. Every match is scoped to A: the same
+address in another Application is a different data subject and is not touched.
+
+## Suppressions
+
+A suppression row exists so an Application never mails an address again. Erasure
+**deletes** E's suppression rows rather than keeping a hashed address to go on
+refusing it.
+
+- A hash of an email address is still personal data. Anyone holding a candidate
+  address can hash it and test for a match, so a kept hash would be pseudonymised
+  data about a person the operator has promised to forget, not erased data.
+- The person the suppression protected no longer exists in A. If the same address
+  signs up again, that is a new account and a new consent, and the operator can
+  suppress it again.
+- A bounce or complaint suppression is the strongest case for keeping one. The
+  transport keeps its own bounce and complaint list (Resend, SES and most SMTP
+  relays suppress hard bounces and complaints on their side), which erasure does
+  not touch, so a returning address that hard-bounced still does not get mail
+  delivered. Rekey's list is an operator-maintained layer on top of that.
+
+If your policy requires that an address which complained is never mailed again
+even after erasure, record that outside Rekey before erasing.
+
+## The log archive
+
+With `LOG_RETENTION_DAYS` and `LOG_ARCHIVE_S3_*` set, `security_events`,
+`email_logs` and `webhook_deliveries` rows are uploaded to the bucket as full rows
+before they are pruned. How that interacts with erasure:
+
+- **Rows archived after an erasure** carry the scrubbed values. Erasure rewrites
+  rows in place in the database, so by the time the retention sweep reads an
+  email log or a delivery of E's, the address is already the tombstone.
+- **Rows archived before an erasure** keep the personal data they had when they
+  were uploaded. Erasure cannot reach the bucket: an email log uploaded last month
+  still holds E's address, and an archived `security_events` row still holds the
+  `ip` and `user_agent` (those are not scrubbed in the database either).
+- So an operator using the archive **must apply their own retention to it**.
+  Give the bucket a lifecycle rule no longer than your erasure deadline, and do
+  not enable Object Lock unless you have decided erasure never applies to the
+  archive.
 
 ## Auth enforcement
 

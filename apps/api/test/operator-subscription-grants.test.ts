@@ -1,11 +1,11 @@
 /**
- * Operator subscription grant and cancel —
+ * Operator subscription grant and cancel,
  * `POST /tenant/applications/:id/end-users/:euid/subscriptions[/:subId/cancel]`.
  *
  * The same service the super-admin route uses, reached by the workspace's own
  * OWNER/ADMIN. `subscription-grant.test.ts` already pins what a grant DOES
  * (entitlements materialised, `subscription.activated` emitted once, the period
- * anchored), and none of that is re-tested here — reusing the service unchanged
+ * anchored), and none of that is re-tested here, reusing the service unchanged
  * is the whole design. What is new, and what this file covers, is the door:
  *
  *   - who may open it (OWNER and ADMIN, and nobody below regardless of grant);
@@ -16,7 +16,7 @@
  *   - and that a deployment can switch the whole thing off.
  *
  * The last one is the safety argument for opening this below the super-admin
- * key at all, so it is tested rather than asserted — see
+ * key at all, so it is tested rather than asserted, see
  * `operator-subscription-grants-disabled.test.ts`.
  */
 
@@ -184,7 +184,7 @@ describe('operator subscription grants', () => {
     const w = await world();
     const res = await grant(w, w.ownerToken, { note: 'paid by bank transfer, INV-4012' });
 
-    // 201 for a grant that activated, 200 for the idempotent no-op — the same
+    // 201 for a grant that activated, 200 for the idempotent no-op, the same
     // split the super-admin grant route uses. Two grant routes disagreeing
     // about which code means which would make both useless to a retrying
     // caller.
@@ -208,7 +208,7 @@ describe('operator subscription grants', () => {
   });
 
   it('a MEMBER cannot, even holding the strongest billing grant on the Application', async () => {
-    // APP_BILLING is enough for every other billing write on this Application —
+    // APP_BILLING is enough for every other billing write on this Application,
     // plans, coupons, manual credit grants. It is deliberately not enough to
     // mint entitlement out of nothing.
     const w = await world();
@@ -267,7 +267,7 @@ describe('operator subscription grants', () => {
   // ---------- cancel ----------
 
   it('cancelling an OPEN-ENDED grant takes effect immediately, whatever was asked for', async () => {
-    // A grant is open-ended unless a term is named — `resolvePeriodEnd` returns
+    // A grant is open-ended unless a term is named, `resolvePeriodEnd` returns
     // null, deliberately, because nothing renews a grant and "comp this
     // account" must not quietly mean "for one month". The consequence is that
     // `cancelEffect` has no period to schedule against, so `atPeriodEnd: true`
@@ -340,8 +340,8 @@ describe('operator subscription grants', () => {
     // The lever and the Erase button are now on the same end-user, one tab
     // apart. `subscriber.service.ts` has refused this since the external
     // provider landed; the grant path did not, so an erasure could be followed
-    // by a grant that writes a fresh, un-scrubbed financial row — carrying the
-    // operator's note, typically a name or an invoice reference — for a subject
+    // by a grant that writes a fresh, un-scrubbed financial row, carrying the
+    // operator's note, typically a name or an invoice reference, for a subject
     // the workspace has legally committed to scrubbing, and announces
     // `subscription.activated` for an id that just announced `user.erased`.
     const w = await world();

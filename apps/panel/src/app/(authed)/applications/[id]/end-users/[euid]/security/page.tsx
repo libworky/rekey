@@ -1,5 +1,5 @@
 /**
- * End-user Security — can they get in, who has been in, and who has acted as
+ * End-user Security, can they get in, who has been in, and who has acted as
  * them.
  *
  * The activity table here is the one that changed most in the split. It used to
@@ -13,6 +13,7 @@
 
 import * as React from 'react';
 import { cookies } from 'next/headers';
+import { errorMessage } from '@/lib/error-message';
 import { humanizeEventType } from '@/lib/security-events';
 import { formatDateTime } from '@/lib/date';
 import { Card, SectionHeader } from '@/components/Card';
@@ -21,8 +22,9 @@ import { Badge } from '@/components/Badge';
 import { Banner } from '@/components/Banner';
 import { EmptyState } from '@/components/EmptyState';
 import { CopyButton } from '@/components/CopyButton';
+import { ActionForm } from '@/components/ActionForm';
 import { SubmitButton } from '@/components/SubmitButton';
-import Link from 'next/link';
+import Link from '@/components/Link';
 import { ConfirmButton } from '@/components/ConfirmButton';
 import { endImpersonations, impersonate, revokeAllSessions, revokeSession, unlockAccount } from '../actions';
 import { SupportFeedback } from '../support-feedback';
@@ -84,7 +86,7 @@ export default async function EndUserSecurityPage({
   const impersonated = sp.impersonated === '1';
   // Three of the six support actions land HERE, not on Overview: clearing a
   // lockout, revoking one session, and signing every session out. Without
-  // these two lines their outcome — success and refusal alike — was never
+  // these two lines their outcome, success and refusal alike, was never
   // rendered anywhere, so a refused action looked exactly like a successful
   // one.
   const supportDone = typeof sp.support === 'string' ? sp.support : undefined;
@@ -123,7 +125,7 @@ export default async function EndUserSecurityPage({
           className="space-y-2 rounded-xl border border-amber-300 bg-amber-50 px-4 py-3 dark:border-amber-700 dark:bg-amber-950"
         >
           <div className="text-sm font-medium text-amber-900 dark:text-amber-200">
-            Impersonation token minted — shown once
+            Impersonation token minted, shown once
           </div>
           <p className="text-xs text-amber-800 dark:text-amber-300">
             Expires {formatDateTime(reveal.accessTokenExpiresAt)}. Use as{' '}
@@ -139,7 +141,7 @@ export default async function EndUserSecurityPage({
           </div>
         </div>
       )}
-      {impError && <Banner tone="error">{IMPERSONATE_ERR[impError] ?? impError}</Banner>}
+      {impError && <Banner tone="error">{errorMessage(IMPERSONATE_ERR, impError)}</Banner>}
 
       <Card className="space-y-3">
         <SectionHeader
@@ -186,14 +188,14 @@ export default async function EndUserSecurityPage({
           </div>
         </dl>
         <div className="flex flex-wrap items-center gap-3">
-          <form action={unlockAccount.bind(null, id, euid)}>
+          <ActionForm action={unlockAccount.bind(null, id, euid)}>
             <SubmitButton
               className="rounded-md border border-[var(--color-border)] px-3 py-1.5 text-sm text-[var(--color-fg)] hover:bg-[var(--color-surface-muted)]"
               pendingLabel="Unlocking…"
             >
               Clear lockout
             </SubmitButton>
-          </form>
+          </ActionForm>
           <span className="text-[11px] text-[var(--color-muted-fg)]">
             {lockedNow
               ? 'The lock also expires on its own; this just ends it now.'
@@ -209,22 +211,22 @@ export default async function EndUserSecurityPage({
           description="Live refresh tokens, newest first. A session is not a device: releasing a device revokes its sessions, but a session can exist with no device when the Application does not use device binding."
           action={
             sessions && sessions.items.length > 0 ? (
-              <form action={revokeAllSessions.bind(null, id, euid)}>
+              <ActionForm action={revokeAllSessions.bind(null, id, euid)}>
                 <ConfirmButton
                   variant="subtle"
                   title="Sign out everywhere?"
-                  confirm="Revokes every live session. Access tokens already issued keep working until they expire — this stops new ones being obtained."
+                  confirm="Revokes every live session. Access tokens already issued keep working until they expire. This stops new ones being obtained."
                   confirmLabel="Sign out everywhere"
                 >
                   Sign out everywhere
                 </ConfirmButton>
-              </form>
+              </ActionForm>
             ) : undefined
           }
         />
         {sessions === null ? (
           <Banner tone="error">
-            Sessions could not be read — the request failed, or your access does not cover it. This
+            Sessions could not be read. Either the request failed, or your access does not cover it. This
             is <strong>not</strong> an empty session list.
           </Banner>
         ) : sessions.items.length === 0 ? (
@@ -271,7 +273,7 @@ export default async function EndUserSecurityPage({
                     )}
                   </TD>
                   <TD align="right">
-                    <form action={revokeSession.bind(null, id, euid, s.id)}>
+                    <ActionForm action={revokeSession.bind(null, id, euid, s.id)}>
                       <ConfirmButton
                         variant="subtle"
                         title="Revoke this session?"
@@ -280,7 +282,7 @@ export default async function EndUserSecurityPage({
                       >
                         Revoke
                       </ConfirmButton>
-                    </form>
+                    </ActionForm>
                   </TD>
                 </TR>
               ))}
@@ -293,14 +295,15 @@ export default async function EndUserSecurityPage({
         <SectionHeader
           title="Activity"
           count={`(${shown.length})`}
-          description={`Last ${AUTH_EVENTS_SHOWN} recorded events for this end-user, newest first — theirs, an operator's on them, and the system's.`}
+          description={`Last ${AUTH_EVENTS_SHOWN} recorded events for this end-user, newest first: theirs, an operator's on them, and the system's.`}
         />
 
         <Banner tone="info">
-          Successful sign-ins, credential changes and operator actions only.{' '}
-          <strong>Failed</strong> sign-ins and lockouts are counted in Redis and never written as
-          events, so they cannot appear here — the counter above is the only signal, and it resets on
-          a successful sign-in.
+          Sign-ins, credential changes and operator actions, including{' '}
+          <strong>failed</strong> sign-ins and lockouts for this end-user. Attempts against an
+          address that was never registered are deliberately not recorded, so credential stuffing
+          shows in the request log rather than here. The counter above is the live lockout state
+          and it resets on a successful sign-in.
         </Banner>
 
         {events === null ? (
@@ -366,7 +369,7 @@ export default async function EndUserSecurityPage({
             against your customer app. Every minting is audit-logged with your operator id.
           </p>
         </div>
-        <form action={impersonate.bind(null, id, euid)} className="flex items-end gap-2">
+        <ActionForm action={impersonate.bind(null, id, euid)} className="flex items-end gap-2">
           <label className="block flex-1 space-y-1.5">
             <span className="text-sm font-medium text-[var(--color-fg)]">
               Reason (optional, audit-logged)
@@ -380,7 +383,7 @@ export default async function EndUserSecurityPage({
             />
           </label>
           <SubmitButton pendingLabel="Minting…">Mint impersonation token</SubmitButton>
-        </form>
+        </ActionForm>
       </Card>
 
       <section className="space-y-3">
@@ -430,7 +433,7 @@ export default async function EndUserSecurityPage({
           count={`(${detail.recentImpersonations.length})`}
           action={
             detail.recentImpersonations.some((r) => r.endedAt === null) ? (
-              <form action={endImpersonations.bind(null, id, euid)}>
+              <ActionForm action={endImpersonations.bind(null, id, euid)}>
                 <ConfirmButton
                   title="End every live impersonation?"
                   confirm="Every open impersonation of this end-user ends now, whoever minted it, and the tokens they issued stop working immediately. The audit rows stay."
@@ -438,7 +441,7 @@ export default async function EndUserSecurityPage({
                 >
                   End live impersonations
                 </ConfirmButton>
-              </form>
+              </ActionForm>
             ) : undefined
           }
         />

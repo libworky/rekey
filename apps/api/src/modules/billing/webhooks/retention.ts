@@ -24,6 +24,9 @@ import { prisma } from '../../../lib/prisma.js';
 const BATCH = 5_000;
 
 export async function pruneWebhookEvents(retentionDays: number): Promise<number> {
+  // Zero days would delete every receipt, including the idempotency rows that
+  // make a provider's retry a no-op. Unset retention means keep forever.
+  if (!(retentionDays > 0)) return 0;
   const cutoff = new Date(Date.now() - retentionDays * 24 * 60 * 60 * 1000);
   const stale = await prisma.webhookEvent.findMany({
     where: { receivedAt: { lt: cutoff } },

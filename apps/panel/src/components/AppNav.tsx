@@ -12,18 +12,18 @@
  * The active group is derived from the current path's first segment under
  * `/applications/{id}`. Clicking a group jumps to its first sub-tab; clicking
  * the already-active group is a no-op (links to the current path). Groups with
- * a single sub-tab (Overview, Users) render no second row — the primary row
+ * a single sub-tab (Overview, Users) render no second row, the primary row
  * carries the bottom border instead.
  *
  * When the application has billing disabled the Billing group keeps its FULL
- * child list but retargets the group pill at the Providers page — the only
+ * child list but retargets the group pill at the Providers page, the only
  * place billing can be turned back on. Only the link target changes; the
  * children stay, which is what makes `/plans`, `/payments`, `/coupons` &c.
  * still resolve to the Billing group while billing is off.
  *
  * That last point is load-bearing. When the group held only `{seg:'billing'}`,
  * a path like `/applications/{id}/plans` matched NO group, so the `?? groups[0]`
- * fallback marked *Overview* active — while `target = pathname` pointed that
+ * fallback marked *Overview* active, while `target = pathname` pointed that
  * "Overview" tab back at /plans. The result was a tab that claimed
  * `aria-current="page"`, linked to the page you were already on, rendered no
  * sub-tab row, and left no way back. It is one click from the default landing
@@ -32,11 +32,12 @@
  *
  * Both rows scroll horizontally. `main` is `overflow-x: hidden`, so a primary
  * row wider than the viewport (457px of pills at a 375px viewport) is not
- * merely clipped — the whole Developer group becomes unreachable on a phone.
+ * merely clipped, the whole Developer group becomes unreachable on a phone.
  */
 
 import * as React from 'react';
-import Link from 'next/link';
+import Link from '@/components/Link';
+import { LinkPending } from '@/components/LinkPending';
 import { usePathname } from 'next/navigation';
 import { hasScope, type Scope } from '@/lib/operator-scopes';
 
@@ -48,7 +49,7 @@ interface SubTab {
 
 /**
  * Which scope a section needs to be worth showing. Mirrors the API's route
- * declarations (`config.access` on each route) — a section whose reads would
+ * declarations (`config.access` on each route), a section whose reads would
  * all 403 is not offered. `null` = always shown: the landing page and
  * Lifecycle, which floor themselves.
  *
@@ -179,11 +180,11 @@ export function AppNav({
           </span>
         </span>
       ),
-      // The child list is IDENTICAL in both states — see the note at the top of
+      // The child list is IDENTICAL in both states, see the note at the top of
       // the file. Only `entrySeg` and `hiddenSegs` differ, so a billing child
       // path always resolves to this group and always gets a way back.
       children: [
-        // Revenue dashboard is the group landing — stat tiles + the
+        // Revenue dashboard is the group landing, stat tiles + the
         // 12-month revenue chart live at /applications/{id}/revenue.
         { seg: 'revenue', label: 'Overview' },
         { seg: 'billing', label: 'Providers' },
@@ -199,7 +200,7 @@ export function AppNav({
       ],
       // Billing off: the pill goes to Providers (where the enable toggle is),
       // and the sub-row shows Providers plus whichever gated page you are
-      // actually on — so the row still renders and still offers a way out.
+      // actually on, so the row still renders and still offers a way out.
       ...(billingEnabled ? {} : { entrySeg: 'billing', hiddenSegs: BILLING_GATED_SEGS }),
     },
     {
@@ -218,7 +219,7 @@ export function AppNav({
 
   const hrefFor = (seg: string): string => (seg === '' ? base : `${base}/${seg}`);
 
-  // WP16: BOTH rows scroll horizontally on narrow screens — make sure the
+  // BOTH rows scroll horizontally on narrow screens, make sure the
   // active item is visible on mount / navigation. No smooth scrolling on
   // first paint (it would animate on every page load).
   //
@@ -256,7 +257,7 @@ export function AppNav({
 
   return (
     <div className="-mx-6">
-      {/* Primary group row — scrolls horizontally; `main` clips overflow, so
+      {/* Primary group row, scrolls horizontally; `main` clips overflow, so
           without `overflow-x-auto` the trailing groups are unreachable below
           ~460px rather than merely off-screen. */}
       <div className="relative">
@@ -285,7 +286,7 @@ export function AppNav({
                     : 'text-[var(--color-muted-fg)] hover:text-[var(--color-fg)] hover:bg-[color-mix(in_srgb,var(--color-surface-muted)_60%,transparent)]'
                 }`}
               >
-                {g.label}
+                <LinkPending>{g.label}</LinkPending>
               </Link>
             );
           })}
@@ -296,7 +297,7 @@ export function AppNav({
         />
       </div>
 
-      {/* Secondary sub-tab row — only for groups with more than one sub-tab. */}
+      {/* Secondary sub-tab row, only for groups with more than one sub-tab. */}
       {hasSubRow && (
         <div className="relative">
           <nav
@@ -316,7 +317,7 @@ export function AppNav({
                       : 'border-transparent text-[var(--color-muted-fg)] hover:text-[var(--color-fg)]'
                   }`}
                 >
-                  {c.label}
+                  <LinkPending>{c.label}</LinkPending>
                 </Link>
               );
             })}

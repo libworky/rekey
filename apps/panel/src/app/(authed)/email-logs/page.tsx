@@ -37,7 +37,7 @@ export default async function WorkspaceEmailLogsPage({
             </span>
           </>
         }
-        description="Workspace SYSTEM mail only — operator magic-link / password-reset and member invitations (sends not tied to an Application). Per-application email lives inside each Application → Email. Metadata only; bodies are never stored."
+        description="Workspace SYSTEM mail only: operator magic-link / password-reset and member invitations (sends not tied to an Application). Per-application email lives inside each Application → Email. Metadata only; bodies are never stored."
         action={<EmailLogStatusFilter basePath="/email-logs" active={status} pageSize={PAGE_SIZE} />}
       />
 

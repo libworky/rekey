@@ -3,7 +3,7 @@
  *
  * These are the routes an AI agent (or any non-interactive automation) calls
  * with an operator personal-access-token (`Authorization: Bearer rp_op_…`)
- * instead of a short-lived session JWT — replacing reliance on the global
+ * instead of a short-lived session JWT, replacing reliance on the global
  * SUPER_ADMIN_KEY.
  *
  * Every route here authenticates via `resolveOperatorToken` (which decorates
@@ -11,7 +11,7 @@
  * default-deny on writes: the mint endpoint additionally requires the PAT to
  * carry the `keys:mint` scope. We deliberately reuse the existing services
  * (`applicationsService`, `apiKeysService`) and only add the PAT auth + scope
- * gate + tenant-ownership check — no duplicated business logic, no weakening of
+ * gate + tenant-ownership check, no duplicated business logic, no weakening of
  * the session-gated `/api/v1/tenant/applications/*` surface.
  *
  * Mounted under /api/v1/tenant/operator.
@@ -55,7 +55,7 @@ async function ensureAppInTenant(
 ): Promise<void> {
   // A PAT's authority was taken entirely from its scopes, and the live role the
   // middleware resolves was read by nothing. So a token minted by an ADMIN kept
-  // full workspace power after that person was demoted to MEMBER — including
+  // full workspace power after that person was demoted to MEMBER, including
   // minting Application secret keys, which are durable credentials that outlive
   // the token. Membership EXISTENCE was re-checked; the role was not.
   //
@@ -171,8 +171,8 @@ export async function operatorTokenRoutes(app: FastifyInstance): Promise<void> {
           // in test/openapi-contract.test.ts because active keys are hard-capped
           // at MAX_KEYS_PER_APP (25) on the write path. This route is NOT on that
           // list and the published document declares `{items, page}` for it, so
-          // it returns the envelope. `page.hasMore` is always false in practice —
-          // the cap sits below any page size — but the shape matches what the
+          // it returns the envelope. `page.hasMore` is always false in practice,
+          // the cap sits below any page size, but the shape matches what the
           // contract says, which is what a generated client compiles against.
           200: okPage(ref('ApiKey'), 'A page of active (non-revoked) API keys for the application.'),
           ...errs({

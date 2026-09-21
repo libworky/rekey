@@ -8,7 +8,7 @@
  *   - a FAILED delivery an operator redelivered yesterday is not stale just
  *     because it was first created last month;
  *   - `usage_records` is a billing ledger whose idempotency keys stop a
- *     replayed usage event charging twice — it must survive any window;
+ *     replayed usage event charging twice, it must survive any window;
  *   - an archive upload that fails must leave the rows where they are.
  */
 
@@ -17,8 +17,10 @@ import { gunzipSync } from 'node:zlib';
 import { createHash } from 'node:crypto';
 import type { FastifyInstance } from 'fastify';
 import { buildApp } from '../src/app.js';
+import { env } from '../src/config/env.js';
 import { prisma } from '../src/lib/prisma.js';
 import { archiveKey, pruneLogs, type LogArchiver } from '../src/lib/log-retention.js';
+import { pruneWebhookEvents } from '../src/modules/billing/webhooks/retention.js';
 import { createS3LogArchiver, resolveLogArchiveConfig } from '../src/lib/log-archive.js';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -35,6 +37,17 @@ describe('pruneLogs', () => {
   beforeAll(async () => {
     app = await buildApp({ logger: false });
     await app.ready();
+  });
+
+  it('retention is opt-in: unset, both windows mean keep forever', () => {
+    // The suite runs with neither variable set, which is exactly the upgraded
+    // deployment that must not start deleting its audit trail. 0 is what
+    // app.ts reads as "skip the sweep"; every prune test below passes its
+    // window explicitly for that reason.
+    expect(process.env.LOG_RETENTION_DAYS).toBeUndefined();
+    expect(process.env.WEBHOOK_EVENT_RETENTION_DAYS).toBeUndefined();
+    expect(env.LOG_RETENTION_DAYS).toBe(0);
+    expect(env.WEBHOOK_EVENT_RETENTION_DAYS).toBe(0);
   });
 
   afterAll(async () => {
@@ -140,6 +153,50 @@ describe('pruneLogs', () => {
 
     // The ledger is never in scope.
     expect(await prisma.usageRecord.count({ where: { id: usage.id } })).toBe(1);
+  });
+
+  it('refuses a window that is not positive rather than deleting everything', async () => {
+    // app.ts maps an unset window to null and skips the sweep. These guards are
+    // for the next caller that forgets: a zero window would put the cutoff at
+    // now and take every row, including the receipts that make retries no-ops.
+    const applicationId = await application('zero');
+
+    const ancientEvent = await prisma.securityEvent.create({
+      data: { type: 'user.signed_in', actorType: 'end_user', actorId: 'eu_zero', applicationId },
+    });
+    await backdate('security_events', 'created_at', ancientEvent.id, daysAgo(400));
+
+    const ancientEmail = await prisma.emailLog.create({
+      data: { applicationId, toAddress: 'zero@example.com', subject: 'Zero', via: 'none', status: 'sent' },
+    });
+    await backdate('email_logs', 'created_at', ancientEmail.id, daysAgo(400));
+
+    const ancientReceipt = await prisma.webhookEvent.create({
+      data: {
+        applicationId,
+        provider: 'stripe',
+        providerEventId: 'evt_zero_retention',
+        eventType: 'invoice.paid',
+        payload: {},
+      },
+    });
+    await backdate('webhook_events', 'received_at', ancientReceipt.id, daysAgo(400));
+
+    for (const days of [0, -1, Number.NaN]) {
+      const result = await pruneLogs({ retentionDays: days });
+      expect(result.deleted).toEqual({ security_events: 0, email_logs: 0, webhook_deliveries: 0 });
+      expect(await pruneWebhookEvents(days)).toBe(0);
+    }
+
+    expect(await prisma.securityEvent.count({ where: { id: ancientEvent.id } })).toBe(1);
+    expect(await prisma.emailLog.count({ where: { id: ancientEmail.id } })).toBe(1);
+    expect(await prisma.webhookEvent.count({ where: { id: ancientReceipt.id } })).toBe(1);
+
+    // These rows survived on purpose; the archive test below counts objects per
+    // day and would archive them too.
+    await prisma.securityEvent.delete({ where: { id: ancientEvent.id } });
+    await prisma.emailLog.delete({ where: { id: ancientEmail.id } });
+    await prisma.webhookEvent.delete({ where: { id: ancientReceipt.id } });
   });
 
   it('writes the archive before deleting, one object per table per day', async () => {

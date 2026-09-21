@@ -1,12 +1,12 @@
 /**
- * Fake BillingProviders — **test fixtures, never shipped**.
+ * Fake BillingProviders, **test fixtures, never shipped**.
  *
  * These used to live in `src/modules/billing/providers/` as `*StubProvider`
  * classes that production code reached for whenever credentials were missing
  * or `NODE_ENV=test`. That made "we have no payment processor configured" a
  * silent success in every environment but production, which is the opposite of
  * what a billing system should do. The shipped factory now throws
- * `BILLING_CREDENTIALS_NOT_CONFIGURED`, and the fakes moved here — the only
+ * `BILLING_CREDENTIALS_NOT_CONFIGURED`, and the fakes moved here, the only
  * place that is allowed to pretend a charge happened.
  *
  * They are installed for every test file by `test/setup.ts`, which mocks
@@ -38,8 +38,8 @@ export class FakeStripeProvider implements BillingProvider {
   readonly name = 'stripe';
   /**
    * The last checkout input this fake was handed. "Did the discount actually
-   * leave Rekey?" is only answerable by looking at what the provider received
-   * — the response DTO reported a `discountAmount` for months while the
+   * leave Rekey?" is only answerable by looking at what the provider received,
+   * the response DTO reported a `discountAmount` for months while the
    * provider was being told nothing at all.
    */
   lastCheckout: CheckoutSessionInput | null = null;
@@ -132,7 +132,7 @@ export class FakePaypalProvider implements BillingProvider {
 }
 
 /**
- * No `registerWebhook` on purpose — Razorpay has no auto-configuration API,
+ * No `registerWebhook` on purpose, Razorpay has no auto-configuration API,
  * and `billing/webhook-registration.ts` is expected to answer
  * `BILLING_WEBHOOK_AUTOCONFIG_UNSUPPORTED` for it.
  */

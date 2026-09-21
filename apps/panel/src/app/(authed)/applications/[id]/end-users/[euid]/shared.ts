@@ -16,12 +16,9 @@
  * memoise nothing.
  */
 
-import { apiGet, type SecurityEventRow } from '@/lib/api';
+import { cookies } from 'next/headers';
+import { apiGet, unlessBusy, type SecurityEventRow } from '@/lib/api';
 import type { Page } from '@/lib/paginate';
-
-// ---------------------------------------------------------------------------
-// DTOs
-// ---------------------------------------------------------------------------
 
 export interface EndUserDetailDto {
   endUser: {
@@ -39,7 +36,7 @@ export interface EndUserDetailDto {
     failedSignInAttempts: number;
     /** Lock expiry, or null when not locked. */
     lockedUntil: string | null;
-    /** GDPR tombstone — set once the user has been erased. */
+    /** GDPR tombstone, set once the user has been erased. */
     erasedAt: string | null;
     erasedBy: string | null;
     createdAt: string;
@@ -127,7 +124,7 @@ export type DeviceStatus = 'ACTIVE' | 'RELEASED' | 'BLOCKED';
 
 /**
  * `DeviceDtoSchema` in `@rekey.dev/shared-types`. The operator shape, which
- * carries `lastSeenIp` and `blockedReason` — the end-user's own view of the
+ * carries `lastSeenIp` and `blockedReason`, the end-user's own view of the
  * same row omits both.
  */
 export interface DeviceRow {
@@ -147,10 +144,6 @@ export interface DeviceRow {
   createdAt: string;
   updatedAt: string;
 }
-
-// ---------------------------------------------------------------------------
-// Fetchers
-// ---------------------------------------------------------------------------
 
 function base(applicationId: string, euid: string): string {
   return `/api/v1/tenant/applications/${encodeURIComponent(applicationId)}/end-users/${encodeURIComponent(euid)}`;
@@ -177,17 +170,21 @@ export function getEndUserDetail(applicationId: string, euid: string): Promise<E
  * about the account. A 500, a timeout, or a missing grant is a claim about the
  * request, and stating the first when the second happened tells an operator
  * something false about a customer while they are on a ticket about it.
+ *
+ * A busy API (429 / 503) is the exception, and is rethrown (`unlessBusy`): it
+ * has a better answer than "could not be read", which is "retry in a few
+ * seconds", and the error boundary gives it that with an automatic retry.
  */
 export function getEndUserCredits(applicationId: string, euid: string): Promise<CreditsDto | null> {
   return apiGet<CreditsDto>(`${base(applicationId, euid)}/credits`, {
     interruptOnAccessError: false,
-  }).catch(() => null);
+  }).catch(unlessBusy(() => null));
 }
 
 export function getEndUserBilling(applicationId: string, euid: string): Promise<BillingDto | null> {
   return apiGet<BillingDto>(`${base(applicationId, euid)}/billing`, {
     interruptOnAccessError: false,
-  }).catch(() => null);
+  }).catch(unlessBusy(() => null));
 }
 
 export function getEndUserDevices(
@@ -202,7 +199,7 @@ export function getEndUserDevices(
   if (opts.status) q.set('status', opts.status);
   return apiGet<Page<DeviceRow>>(`${base(applicationId, euid)}/devices?${q.toString()}`, {
     interruptOnAccessError: false,
-  }).catch(() => null);
+  }).catch(unlessBusy(() => null));
 }
 
 /** One live refresh token, as the operator sessions route returns it. */
@@ -226,13 +223,13 @@ export function getEndUserSessions(
 ): Promise<Page<SessionRow> | null> {
   return apiGet<Page<SessionRow>>(`${base(applicationId, euid)}/sessions?limit=50`, {
     interruptOnAccessError: false,
-  }).catch(() => null);
+  }).catch(unlessBusy(() => null));
 }
 
 /**
  * Just the counts, for the Overview tiles. Asks for one row and reads
  * `page.total`, which is the count matching the filter rather than the count
- * returned — so this stays exact for a user with more devices than a page.
+ * returned, so this stays exact for a user with more devices than a page.
  *
  * Null if any of the three failed: three tiles disagreeing about whether the
  * device list is reachable is worse than one tile saying it is not.
@@ -250,10 +247,6 @@ export async function getEndUserDeviceCounts(
   return { total: all.page.total, active: active.page.total, blocked: blocked.page.total };
 }
 
-// ---------------------------------------------------------------------------
-// Impersonation reveal
-// ---------------------------------------------------------------------------
-
 /**
  * Where the freshly minted impersonation token is parked between the server
  * action that creates it and the render that shows it once. HttpOnly, scoped to
@@ -267,15 +260,53 @@ export const IMPERSONATE_COOKIE = 'rekey_impersonate_reveal';
 /** Slightly outlives the 5-minute token so the page can re-render. */
 export const IMPERSONATE_COOKIE_MAX_AGE = 60 * 6;
 
-// ---------------------------------------------------------------------------
-// Presentation helpers shared by more than one tab
-// ---------------------------------------------------------------------------
+/**
+ * What the last Overview support action did, on the same channel as the
+ * reveals above rather than in the URL.
+ *
+ * "Send password reset" reported nothing at all: the action ran, recorded
+ * `end_user.password_reset_sent` and redirected to `?support=reset-sent`, and
+ * on a production build that navigation is never committed, so the render
+ * that would have shown the banner never happened (rekey issue #569, still
+ * open). The dialog just sat there. Carrying the outcome in a cookie means the
+ * banner does not depend on that navigation: the form reloads the page it was
+ * submitted from and the result is waiting.
+ *
+ * Only the Overview actions write it, because only Overview reads it. An
+ * action that redirects to another tab would otherwise leave a flash here that
+ * the operator meets later, attached to nothing they just did.
+ */
+export const SUPPORT_FLASH_COOKIE = 'rekey_support_flash';
+/**
+ * Long enough to outlive the reload that reads it, short enough that a
+ * refresh a moment later is not told about it again. A Server Component may
+ * read cookies but not write them, so it cannot be cleared on read and the
+ * TTL is the whole mechanism.
+ */
+export const SUPPORT_FLASH_MAX_AGE = 20;
+
+/** The outcome of the last Overview support action, if this render follows one. */
+export async function readSupportFlash(): Promise<{ done?: string; error?: string }> {
+  const raw = (await cookies()).get(SUPPORT_FLASH_COOKIE)?.value;
+  if (!raw) return {};
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (typeof parsed !== 'object' || parsed === null) return {};
+    const { done, error } = parsed as Record<string, unknown>;
+    return {
+      ...(typeof done === 'string' && done !== '' ? { done } : {}),
+      ...(typeof error === 'string' && error !== '' ? { error } : {}),
+    };
+  } catch {
+    return {};
+  }
+}
 
 /**
  * Brute-force policy the API applies to end-user password sign-in
  * (`LOGIN_POLICY` in `apps/api/src/lib/brute-force.ts`): 10 failures in a
  * 15-minute window → a 15-minute lock. Mirrored here purely so the counter has
- * a denominator — "Failed sign-in attempts: 7" is unanswerable without knowing
+ * a denominator, "Failed sign-in attempts: 7" is unanswerable without knowing
  * what trips the lock.
  */
 export const LOGIN_LOCK_THRESHOLD = 10;
@@ -285,7 +316,7 @@ export const LOGIN_LOCK_MINUTES = 15;
  * How many of one end-user's events a page reads.
  *
  * 200 is the API's `limit` ceiling. Since `?endUserId=` these are 200 of THIS
- * user's events, newest first — not 200 of the whole application's, which is
+ * user's events, newest first, not 200 of the whole application's, which is
  * what the three-scan workaround below this used to read.
  */
 export const AUTH_EVENT_SCAN = 200;
@@ -311,9 +342,9 @@ export function shortFingerprint(fingerprint: string): string {
  * derives one `subject_end_user_id` from those at write time and filters on it
  * with `?endUserId=`, so this is one indexed read.
  *
- * It replaces three reads of the application's latest 200 events — one per
+ * It replaces three reads of the application's latest 200 events, one per
  * actor type, because filtering on `actorType=end_user` alone silently dropped
- * every operator action taken on the person — matched in memory. That was 600
+ * every operator action taken on the person, matched in memory. That was 600
  * rows fetched to render twenty on every view of the end-user screen, and it
  * missed a quiet user's history entirely on a busy application.
  *
@@ -336,7 +367,7 @@ export async function getEndUserEvents(
   const page = await apiGet<Page<SecurityEventRow>>(
     `/api/v1/tenant/security-events?${q.toString()}`,
     { interruptOnAccessError: false },
-  ).catch(() => null);
+  ).catch(unlessBusy(() => null));
   // Newest first is the API's default order; nothing to merge or dedupe.
   return page?.items ?? null;
 }
@@ -350,8 +381,8 @@ export async function getEndUserEvents(
  * provider's word, which on screen is indistinguishable from an abandoned
  * sign-up.
  *
- * The row itself carries nothing to read — `endUser.create` there sets no
- * `metadata` — but the creation is recorded as a security event, so that is
+ * The row itself carries nothing to read, `endUser.create` there sets no
+ * `metadata`, but the creation is recorded as a security event, so that is
  * what this reads, out of the timeline that has already been fetched. A hit is
  * a fact; a miss means "not in the scanned window", which is why the caller
  * renders nothing rather than asserting "signed up".

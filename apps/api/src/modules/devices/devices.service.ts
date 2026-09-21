@@ -1,5 +1,5 @@
 /**
- * Devices — the machines an end-user signs in from.
+ * Devices, the machines an end-user signs in from.
  *
  * A device is an (application, end-user, fingerprint) triple. The fingerprint
  * is whatever the customer's client computes and is opaque here, exactly like
@@ -22,11 +22,11 @@
  * The limit itself is not stored here. It is the `max_devices` FEATURE
  * entitlement resolved through the plan union (MAX across subscriptions, the
  * default plan supplying the free tier), so a plan upgrade raises the cap
- * without touching a device row. No entitlement means no cap — an Application
+ * without touching a device row. No entitlement means no cap, an Application
  * that never configured one sees no change from this module existing.
  *
  * Side effects (webhooks, security events) are emitted after the transaction
- * commits and never block the caller — the AGENTS.md rule.
+ * commits and never block the caller, the AGENTS.md rule.
  */
 
 import type { Device, DeviceStatus, Prisma } from '@prisma/client';
@@ -70,11 +70,43 @@ export type TouchDeviceOutcome =
    */
   | { kind: 'limit_reached'; limit: number; devices: DeviceSummary[] };
 
-/**
- * One lock per (application, end-user). `hashtextextended` gives a 64-bit key
- * from the composite string; the `device:` prefix keeps it from colliding with
- * the billing-binding locks that hash their own strings in the same space.
- */
+/** What `preflight` answers: the refusals `touch` can return, or a clean `ok`. */
+export type PreflightDeviceOutcome =
+  | { kind: 'ok' }
+  | { kind: 'blocked'; device: Device }
+  | { kind: 'limit_reached'; limit: number; devices: DeviceSummary[] };
+
+/** The webhook and security event a refused-by-limit attempt produces. */
+function announceLimitReached(
+  input: TouchDeviceInput,
+  outcome: { limit: number; devices: DeviceSummary[] },
+  ip: string | null,
+): void {
+  emitDetached({
+    applicationId: input.applicationId,
+    type: 'device.limit_reached',
+    data: {
+      endUserId: input.endUserId,
+      limit: outcome.limit,
+      fingerprint: input.fingerprint,
+      devices: outcome.devices.map((d) => ({
+        id: d.id,
+        label: d.label,
+        firstSeenAt: d.firstSeenAt.toISOString(),
+        lastSeenAt: d.lastSeenAt.toISOString(),
+      })),
+    },
+  });
+  void recordSecurityEvent({
+    type: 'user.device_limit_reached',
+    actorType: 'end_user',
+    actorId: input.endUserId,
+    applicationId: input.applicationId,
+    ip,
+    metadata: { limit: outcome.limit, via: input.via ?? null },
+  });
+}
+
 function lockKey(applicationId: string, endUserId: string): string {
   return `device:${applicationId}:${endUserId}`;
 }
@@ -92,6 +124,9 @@ async function lockDevices(
   applicationId: string,
   endUserId: string,
 ): Promise<void> {
+  // `hashtextextended` gives a 64-bit key from the composite string; the
+  // `device:` prefix keeps it from colliding with billing-binding locks that
+  // hash their own strings into the same space.
   await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${lockKey(applicationId, endUserId)}, 0))`;
 }
 
@@ -257,31 +292,60 @@ export const devicesService = {
         metadata: { deviceId: outcome.device.id, via: input.via ?? null, reactivated: outcome.reactivated },
       });
     } else if (outcome.kind === 'limit_reached') {
-      emitDetached({
-        applicationId: input.applicationId,
-        type: 'device.limit_reached',
-        data: {
-          endUserId: input.endUserId,
-          limit: outcome.limit,
-          fingerprint: input.fingerprint,
-          devices: outcome.devices.map((d) => ({
-            id: d.id,
-            label: d.label,
-            firstSeenAt: d.firstSeenAt.toISOString(),
-            lastSeenAt: d.lastSeenAt.toISOString(),
-          })),
-        },
-      });
-      void recordSecurityEvent({
-        type: 'user.device_limit_reached',
-        actorType: 'end_user',
-        actorId: input.endUserId,
-        applicationId: input.applicationId,
-        ip,
-        metadata: { limit: outcome.limit, via: input.via ?? null },
-      });
+      announceLimitReached(input, outcome, ip);
     }
 
+    return outcome;
+  },
+
+  /**
+   * Would `touch` with this input be refused, and why? Nothing is written.
+   *
+   * For the refresh flow, which has to make the device DECISION before it
+   * spends the presented token (a refusal must not cost the client its
+   * session) and the device WRITE after (a replayed token must not register
+   * the replayer's machine or announce it). `touch` after a successful
+   * rotation is the write; this is the decision. Same reads, same lock, no
+   * mutation, so a `limit_reached` here is announced exactly as `touch`
+   * would announce it: the refusal is the news, not the write.
+   *
+   * The answer can go stale between the two phases (another device of the
+   * same user admitted in the gap), which is why `touch` re-decides under the
+   * lock rather than trusting this.
+   */
+  async preflight(input: TouchDeviceInput): Promise<PreflightDeviceOutcome> {
+    const limit = await this.maxDevicesFor(input.applicationId, input.endUserId);
+    const ip = input.ip ? input.ip.slice(0, 64) : null;
+
+    const outcome = await prisma.$transaction(async (tx) => {
+      await lockDevices(tx, input.applicationId, input.endUserId);
+      const existing = await tx.device.findUnique({
+        where: {
+          applicationId_endUserId_fingerprint: {
+            applicationId: input.applicationId,
+            endUserId: input.endUserId,
+            fingerprint: input.fingerprint,
+          },
+        },
+      });
+      if (existing?.status === 'BLOCKED') return { kind: 'blocked' as const, device: existing };
+      if (existing?.status === 'ACTIVE') return { kind: 'ok' as const };
+      if (limit !== null) {
+        const active = await tx.device.count({
+          where: { applicationId: input.applicationId, endUserId: input.endUserId, status: 'ACTIVE' },
+        });
+        if (active >= limit) {
+          const devices = await tx.device.findMany({
+            where: { applicationId: input.applicationId, endUserId: input.endUserId, status: 'ACTIVE' },
+            orderBy: { lastSeenAt: 'desc' },
+          });
+          return { kind: 'limit_reached' as const, limit, devices: devices.map(summary) };
+        }
+      }
+      return { kind: 'ok' as const };
+    });
+
+    if (outcome.kind === 'limit_reached') announceLimitReached(input, outcome, ip);
     return outcome;
   },
 
@@ -318,7 +382,7 @@ export const devicesService = {
 
   /**
    * Give the slot back. Every session minted on the device is revoked in the
-   * same transaction — "release my old laptop" that leaves the laptop signed
+   * same transaction, "release my old laptop" that leaves the laptop signed
    * in would not be a release. Idempotent: releasing a RELEASED device is a
    * no-op that still returns the row. A BLOCKED device stays BLOCKED (an
    * operator decision is not undone by the user asking nicely).
@@ -354,14 +418,15 @@ export const devicesService = {
         where: { id: current.id },
         data: { status: 'RELEASED', releasedAt: now },
       });
+      // The access tokens those sessions hold stop too, from now, and only
+      // theirs: the session middleware refuses a token whose `sid` names a
+      // revoked session or whose `dev` names a device that is no longer
+      // ACTIVE. No per-user stamp, which would sign the user out of every
+      // OTHER device as well.
       const revoked = await tx.refreshToken.updateMany({
         where: { deviceId: current.id, revokedAt: null },
         data: { revokedAt: now },
       });
-      // And the access tokens those sessions hold, from now: the session
-      // middleware refuses tokens issued before this stamp. Other devices'
-      // sessions renew silently; this device's cannot, its refresh is gone.
-      await tx.endUser.updateMany({ where: { id: current.endUserId }, data: { sessionsInvalidBefore: now } });
       return { device, sessionsRevoked: revoked.count, changed: true };
     });
     if (!result.changed) return { device: result.device, sessionsRevoked: 0 };
@@ -417,14 +482,12 @@ export const devicesService = {
           blockedReason: args.reason?.slice(0, 500) ?? null,
         },
       });
+      // Same as release: this device's access tokens are refused by `sid` and
+      // `dev`, without a per-user stamp that would end the others.
       const revoked = await tx.refreshToken.updateMany({
         where: { deviceId: current.id, revokedAt: null },
         data: { revokedAt: now },
       });
-      // And the access tokens those sessions hold, from now: the session
-      // middleware refuses tokens issued before this stamp. Other devices'
-      // sessions renew silently; this device's cannot, its refresh is gone.
-      await tx.endUser.updateMany({ where: { id: current.endUserId }, data: { sessionsInvalidBefore: now } });
       return { device, sessionsRevoked: revoked.count, changed: true };
     });
     if (!result.changed) return { device: result.device, sessionsRevoked: 0 };
@@ -452,7 +515,7 @@ export const devicesService = {
 
   /**
    * Lift a block. The device comes back as RELEASED, not ACTIVE: it takes a
-   * slot again only when it next signs in, and only if the limit allows —
+   * slot again only when it next signs in, and only if the limit allows,
    * unblocking must not be a way to exceed `max_devices`.
    */
   async unblock(args: {

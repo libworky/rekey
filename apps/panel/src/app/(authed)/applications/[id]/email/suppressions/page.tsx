@@ -4,12 +4,13 @@
  * The narrowest of the three gates and the only one about a person rather than
  * about configuration: a bounce, a spam complaint, an unsubscribe, or somebody
  * who asked to be left alone. It outranks everything, including a password
- * reset — an address that hard-bounced cannot receive one anyway, and mailing a
+ * reset, an address that hard-bounced cannot receive one anyway, and mailing a
  * complainant again is how a sending domain gets blocked.
  */
 
 import * as React from 'react';
 import { redirect } from 'next/navigation';
+import { errorMessage } from '@/lib/error-message';
 import { api, apiGet, PanelApiError } from '@/lib/api';
 import type { Page } from '@/lib/paginate';
 import { formatDateTime } from '@/lib/date';
@@ -19,6 +20,7 @@ import { Badge, type BadgeTone } from '@/components/Badge';
 import { Banner } from '@/components/Banner';
 import { EmptyState } from '@/components/EmptyState';
 import { ConfirmButton } from '@/components/ConfirmButton';
+import { ActionForm } from '@/components/ActionForm';
 import { SubmitButton } from '@/components/SubmitButton';
 import { Field } from '@/components/Field';
 
@@ -109,10 +111,10 @@ export default async function EmailSuppressionsPage({
 
       {sp.added === '1' && <Banner tone="success">Address suppressed.</Banner>}
       {sp.removed === '1' && <Banner tone="success">Address removed; email resumes to it.</Banner>}
-      {err && <Banner tone="error">{ERR[err] ?? err}</Banner>}
+      {err && <Banner tone="error">{errorMessage(ERR, err)}</Banner>}
 
       <Card className="space-y-3">
-        <form action={addSuppression.bind(null, id)} className="grid items-end gap-2 sm:grid-cols-[1fr_10rem_1fr_auto]">
+        <ActionForm action={addSuppression.bind(null, id)} className="grid items-end gap-2 sm:grid-cols-[1fr_10rem_1fr_auto]">
           <Field label="Address" required>
             <input type="email" name="address" required maxLength={254} className={inputCls} />
           </Field>
@@ -128,9 +130,9 @@ export default async function EmailSuppressionsPage({
             <input type="text" name="note" maxLength={500} className={inputCls} />
           </Field>
           <SubmitButton pendingLabel="Adding…">Suppress</SubmitButton>
-        </form>
+        </ActionForm>
         <p className="text-[11px] text-[var(--color-muted-fg)]">
-          Rekey does not add these itself yet — no provider bounce webhooks are consumed, so every
+          Rekey does not add these itself yet. No provider bounce webhooks are consumed, so every
           row here was added by a person. The reason is carried so that when Rekey does start
           recording bounces, a bounce and a manual entry stay distinguishable.
         </p>
@@ -138,7 +140,7 @@ export default async function EmailSuppressionsPage({
 
       {page === null ? (
         <Banner tone="error">
-          The suppression list could not be read — the request failed, or your access to this
+          The suppression list could not be read. Either the request failed, or your access to this
           Application does not cover it. This is <strong>not</strong> an empty list.
         </Banner>
       ) : page.items.length === 0 ? (
@@ -172,7 +174,7 @@ export default async function EmailSuppressionsPage({
                   {formatDateTime(s.createdAt)}
                 </TD>
                 <TD align="right">
-                  <form action={removeSuppression.bind(null, id, s.address)}>
+                  <ActionForm action={removeSuppression.bind(null, id, s.address)}>
                     <ConfirmButton
                       variant="subtle"
                       title="Start emailing this address again?"
@@ -181,7 +183,7 @@ export default async function EmailSuppressionsPage({
                     >
                       Remove
                     </ConfirmButton>
-                  </form>
+                  </ActionForm>
                 </TD>
               </TR>
             ))}

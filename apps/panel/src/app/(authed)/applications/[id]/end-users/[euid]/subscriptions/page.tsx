@@ -1,11 +1,11 @@
 /**
- * End-user Subscriptions — what they are paying for, what they have paid, and
+ * End-user Subscriptions, what they are paying for, what they have paid, and
  * what has been issued to them.
  *
  * An OWNER or ADMIN can grant a subscription here, and cancel one. Granting was
  * super-admin-only until the tenant routes existed, because it is the one
  * billing write that CREATES entitlement on an assertion rather than following
- * money that demonstrably moved — so two things gate that affordance: the
+ * money that demonstrably moved, so two things gate that affordance: the
  * operator's role, and `TENANT_SUBSCRIPTION_GRANTS`, which a deployment that
  * sells to the workspaces it hosts sets to `disabled`. Both are checked here
  * for the button and again by the API for the action. Cancelling is gated by
@@ -26,7 +26,7 @@
  */
 
 import * as React from 'react';
-import Link from 'next/link';
+import Link from '@/components/Link';
 import {
   apiGet,
   getApplication,
@@ -34,7 +34,9 @@ import {
   getSubscriptionGrantsMode,
   readErrorFlash,
   type PlanRow,
+  unlessBusy,
 } from '@/lib/api';
+import { errorMessage } from '@/lib/error-message';
 import { ApiErrorText } from '@/components/api-error';
 import { cancelEffect } from '@rekey.dev/shared-types';
 import type { Page } from '@/lib/paginate';
@@ -48,6 +50,7 @@ import { EmptyState } from '@/components/EmptyState';
 import { Banner } from '@/components/Banner';
 import { Modal } from '@/components/Modal';
 import { Field } from '@/components/Field';
+import { ActionForm } from '@/components/ActionForm';
 import { SubmitButton } from '@/components/SubmitButton';
 import { ConfirmButton } from '@/components/ConfirmButton';
 import { cancelSubscription, grantSubscription, setEntitlementOverrides } from '../actions';
@@ -64,7 +67,7 @@ const CANCELLABLE = new Set(['ACTIVE', 'PAST_DUE', 'TRIALING', 'PENDING']);
 
 const GRANT_ERR: Record<string, string> = {
   PLAN_REQUIRED: 'Pick a plan.',
-  NOTE_REQUIRED: 'Say why this is being granted — it goes in the audit trail.',
+  NOTE_REQUIRED: 'Say why this is being granted. It goes in the audit trail.',
   PLAN_NOT_FOUND: 'That plan no longer exists in this Application.',
   BILLING_ORGANIZATION_REQUIRED:
     'This Application bills per organization, so a grant has to name one. Granting to an individual is not possible while the billing subject is “org”.',
@@ -159,7 +162,7 @@ export default async function EndUserSubscriptionsPage({
         { interruptOnAccessError: false },
       )
         .then((p) => p.items.filter((pl) => pl.active))
-        .catch(() => [] as PlanRow[])
+        .catch(unlessBusy(() => [] as PlanRow[]))
     : [];
 
   if (billing === null) {
@@ -170,7 +173,7 @@ export default async function EndUserSubscriptionsPage({
       <div className="space-y-4">
         <SectionHeader title="Subscriptions" />
         <Banner tone="error">
-          Billing could not be read for this end-user — the request failed, or your grant on this
+          Billing could not be read for this end-user. Either the request failed, or your grant on this
           Application does not cover billing. This is <strong>not</strong> an empty billing history.
           Reload; if it persists, check the API and your access.
         </Banner>
@@ -213,7 +216,7 @@ export default async function EndUserSubscriptionsPage({
         )}
         {granted === 'already' && (
           <Banner tone="info">
-            Nothing to do — this end-user was already entitled on that plan. Granting again does not
+            Nothing to do: this end-user was already entitled on that plan. Granting again does not
             extend a live period; to move it to a new term, cancel it and grant again.
           </Banner>
         )}
@@ -226,10 +229,10 @@ export default async function EndUserSubscriptionsPage({
         {canceled === 'now' && (
           <Banner tone="success">Subscription cancelled immediately. Entitlements are gone.</Banner>
         )}
-        {/* `grantError` renders inside the modal, which reopens on it — showing
+        {/* `grantError` renders inside the modal, which reopens on it, showing
             it here as well put the same message twice, one copy behind the
             backdrop. */}
-        {cancelError && <Banner tone="error">{CANCEL_ERR[cancelError] ?? cancelError}</Banner>}
+        {cancelError && <Banner tone="error">{errorMessage(CANCEL_ERR, cancelError)}</Banner>}
         {overridesApplied !== null && !Number.isNaN(overridesApplied) && overridesChanged && (
           <Banner tone="success">
             {overridesApplied === 1 ? 'One entitlement' : `${overridesApplied} entitlements`} adjusted for
@@ -248,8 +251,8 @@ export default async function EndUserSubscriptionsPage({
         {hasExternal && (
           <Banner tone="info">
             One or more of these is carried by an inbound-only provider: your billing system owns it
-            and posts events here. Rekey mirrors the status and refuses to cancel it locally —
-            cancel it where it lives.
+            and posts events here. Rekey mirrors the status and refuses to cancel it locally.
+            Cancel it where it lives.
           </Banner>
         )}
 
@@ -450,8 +453,8 @@ export default async function EndUserSubscriptionsPage({
 /**
  * Grant a subscription with nothing behind it but the operator's word.
  *
- * The confirmation copy says what it is NOT — no money is collected, nothing is
- * charged — because "grant subscription" reads to a support agent like
+ * The confirmation copy says what it is NOT, no money is collected, nothing is
+ * charged, because "grant subscription" reads to a support agent like
  * "charge them for a subscription", and the two are opposite mistakes.
  */
 function GrantForm({
@@ -466,7 +469,7 @@ function GrantForm({
   euid: string;
   plans: PlanRow[];
   error?: string | undefined;
-  /** Echoed back on a refusal so the form is not lost. The note is not — see `grantSubscription`. */
+  /** Echoed back on a refusal so the form is not lost. The note is not, see `grantSubscription`. */
   keptPlanSlug?: string | undefined;
   keptPeriodEnd?: string | undefined;
 }): React.JSX.Element {
@@ -487,11 +490,11 @@ function GrantForm({
     <Modal
       modalKey="grant"
       title="Grant a subscription"
-      description="Activates a subscription against a plan with no payment provider behind it — an invoiced sale, a bank transfer, a comped account, a migration off a previous billing system. No money is collected and nothing is charged."
+      description="Activates a subscription against a plan with no payment provider behind it: an invoiced sale, a bank transfer, a comped account, a migration off a previous billing system. No money is collected and nothing is charged."
       trigger="Grant subscription"
     >
-      <form action={grantSubscription.bind(null, applicationId, euid)} className="space-y-3">
-        {error && <Banner tone="error">{GRANT_ERR[error] ?? error}</Banner>}
+      <ActionForm action={grantSubscription.bind(null, applicationId, euid)} className="space-y-3">
+        {error && <Banner tone="error">{errorMessage(GRANT_ERR, error)}</Banner>}
         <Field label="Plan" required hint="Active plans only. Withdrawn plans can still be granted through the API.">
           <select name="planSlug" required defaultValue={keptPlanSlug ?? ""} className={inputCls}>
             <option value="" disabled>
@@ -499,7 +502,7 @@ function GrantForm({
             </option>
             {plans.map((p) => (
               <option key={p.id} value={p.slug}>
-                {p.name} — {formatMoney(p.amount, p.currency)} / {p.interval.toLowerCase()}
+                {p.name} ({formatMoney(p.amount, p.currency)} / {p.interval.toLowerCase()})
               </option>
             ))}
           </select>
@@ -520,7 +523,7 @@ function GrantForm({
         </Field>
         <Field
           label="Period ends"
-          hint="Optional, and open-ended if you leave it blank — a grant does not renew and nothing expires it, so “comp this account” means comped until somebody cancels. Set a date to time-box it. Note that cancelling an open-ended grant takes effect immediately, because there is no paid period left to run out."
+          hint="Optional, and open-ended if you leave it blank. A grant does not renew and nothing expires it, so “comp this account” means comped until somebody cancels. Set a date to time-box it. Note that cancelling an open-ended grant takes effect immediately, because there is no paid period left to run out."
         >
           <input
             type="date"
@@ -531,7 +534,7 @@ function GrantForm({
           />
         </Field>
         <SubmitButton pendingLabel="Granting…">Grant subscription</SubmitButton>
-      </form>
+      </ActionForm>
     </Modal>
   );
 }
@@ -585,7 +588,7 @@ function OverridesForm({
       description="Deviate from the plan for this one subscription. Each row names an entitlement the plan already defines and the value this customer gets instead; leave the value empty to remove an override. Feature and usage values apply immediately; a credit allowance applies at the next renewal; an issued licence keeps its seat count."
       trigger="Adjust"
     >
-      <form action={setEntitlementOverrides.bind(null, applicationId, euid, subscription.id)} className="space-y-3">
+      <ActionForm action={setEntitlementOverrides.bind(null, applicationId, euid, subscription.id)} className="space-y-3">
         {error && (
           <Banner tone="error">
             <ApiErrorText code={error} detail={detail} fix={fix} map={OVERRIDE_ERR} fallback="The API refused the change." />
@@ -618,7 +621,7 @@ function OverridesForm({
           Values: a number, <code className="font-mono">true</code>/<code className="font-mono">false</code>, or text; the literal words true, false and null cannot be stored as text. Keys may contain colons. Rows with no key are ignored.
         </p>
         <SubmitButton pendingLabel="Applying…">Apply overrides</SubmitButton>
-      </form>
+      </ActionForm>
     </Modal>
   );
 }
@@ -656,7 +659,7 @@ function CancelAction({
   // `cancelEffect` is exported from shared-types for exactly this: one rule,
   // read by the server that applies it and by the UI that has to describe it
   // BEFORE the call is made. Guessing here is how the copy and the behaviour
-  // drift apart — and they would have, immediately: a granted subscription is
+  // drift apart, and they would have, immediately: a granted subscription is
   // open-ended by default, so `currentPeriodEnd` is null and cancelling it
   // stops access on the spot. "Cancels at the end of the paid period" would
   // have been a promise the button breaks the moment it is pressed.
@@ -673,7 +676,7 @@ function CancelAction({
       : `This subscription is carried by ${subscription.provider}, so it is cancelled there too.`;
 
   return (
-    <form action={cancelSubscription.bind(null, applicationId, euid, subscription.id)}>
+    <ActionForm action={cancelSubscription.bind(null, applicationId, euid, subscription.id)}>
       <ConfirmButton
         title={effect === 'period-end' ? 'Cancel at the end of the period?' : 'Cancel immediately?'}
         confirm={`${where} ${timing}`}
@@ -681,7 +684,7 @@ function CancelAction({
       >
         Cancel
       </ConfirmButton>
-    </form>
+    </ActionForm>
   );
 }
 

@@ -136,6 +136,21 @@ never gets a session. The result is a session that knows its machine:
 Clients that send no `device` see no change at all: `deviceId` is `null`,
 there is no claim, and nothing is registered. Browser SDKs never send one.
 
+### Through the framework SDKs
+
+`@rekey.dev/node` takes `device` on `auth.signIn`, `auth.signUp`,
+`auth.mfaVerify` and `auth.refresh(token, { device })`.
+
+`@rekey.dev/nextjs` takes it on `signIn`, `signUp` and `mfaVerify`, and on
+`auth({ device })` / `refreshSession({ device })` so the rotation identifies the
+same machine the sign-in did. `@rekey.dev/astro` takes it in the config that
+`getSession` and `rekeyMiddleware` already accept, which covers its refresh; the
+sign-in there is the Node SDK's call.
+
+Sending a device at sign-in and then refreshing without one is the case to
+avoid. It is not refused, but the chain never proves it is the same machine,
+and a chain that should have become bound never does.
+
 ### Refresh and the stolen-token case
 
 A chain bound at sign-in stays bound. If a refresh **also** carries a
@@ -185,9 +200,11 @@ another Application is indistinguishable from a typo.
 
 **Release** gives the slot back and revokes every session minted on the
 device, in one transaction — including the caller's own refresh chain when it
-is the same device; the access token in hand stays valid until it expires
-(up to the access lifetime for an offline verifier; the API refuses the token on its next use, since a release stamps the user), because `requireUserSession` reads the `dev` claim and
-does not look the device up per request. It is idempotent. A blocked device is
+is the same device. The API refuses that device's access tokens on their next
+use (their `dev` names a device that is no longer ACTIVE, and their `sid` a
+revoked session), and only those: the user's sessions on other devices keep
+working without a refresh. An offline verifier cannot see a release, so a
+locally verified token stays valid until it expires. It is idempotent. A blocked device is
 not its owner's to release. `data.releasedBy` on the webhook and the
 security-events trail say who asked: `end_user`, `operator`, or `server`
 for the secret-key route.

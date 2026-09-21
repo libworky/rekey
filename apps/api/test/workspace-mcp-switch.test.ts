@@ -1,8 +1,8 @@
 /**
  * The per-workspace switch for the operator MCP server.
  *
- * Two kill switches already existed: OPERATOR_MCP_ENABLED (deployment-wide —
- * the server does not mount) and `authConfig.mcpEnabled` (per Application —
+ * Two kill switches already existed: OPERATOR_MCP_ENABLED (deployment-wide,
+ * the server does not mount) and `authConfig.mcpEnabled` (per Application,
  * the END-USER MCP server, a different thing). Neither let one workspace's
  * owner say "no agent acts as any of my operators". This one does.
  *
@@ -11,7 +11,7 @@
  *   - off refuses an already-issued PAT at auth time, with a code that names
  *     the switch and the route that flips it
  *   - off refuses new OAuth consent for the workspace
- *   - on again restores the SAME credential — refused, never revoked
+ *   - on again restores the SAME credential, refused, never revoked
  *   - only OWNER/ADMIN can flip it; a MEMBER gets the role floor
  *   - the workspace read reports the current state
  *   - the OAuth path: an issued access token is refused while off; the

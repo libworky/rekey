@@ -119,9 +119,8 @@ describe('device management routes', () => {
     expect(rel.statusCode).toBe(200);
     expect(rel.json().data.sessionsRevoked).toBe(1);
     expect(rel.json().data.device.status).toBe('RELEASED');
-    // The release stamps the user, so the laptop's pre-release access token
-    // is refused on its next use; its refresh token is live and renews it,
-    // which is what a real client does on that 401.
+    // The release ends only the desktop's session: the laptop's refresh token
+    // is live and still renews.
     const laptopRenewed = await app.inject({
       method: 'POST',
       url: '/api/v1/auth/refresh',

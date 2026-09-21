@@ -1,11 +1,12 @@
 import * as React from 'react';
-import Link from 'next/link';
+import Link from '@/components/Link';
 import { Breadcrumb } from '@/components/Breadcrumb';
 import { redirect } from 'next/navigation';
 import { errorQuery, readErrorFlash, api, PanelApiError } from '@/lib/api';
 import { EmailEditorClient } from '@/components/EmailEditorClient';
 import { ApiErrorText } from '@/components/api-error';
 import { ConfirmButton } from '@/components/ConfirmButton';
+import { ActionForm } from '@/components/ActionForm';
 import { SubmitButton } from '@/components/SubmitButton';
 import { SavedBanner } from '@/components/SavedBanner';
 import { Banner } from '@/components/Banner';
@@ -33,9 +34,9 @@ interface EventListRow {
 
 const ERR: Record<string, string> = {
   missing: 'Subject and body are required.',
-  'bad-design': 'The editor produced invalid design data — reload the page and try again.',
+  'bad-design': 'The editor produced invalid design data. Reload the page and try again.',
   'missing-to': 'Enter an email address to send the test to.',
-  EMAIL_EVENT_UNKNOWN: 'Unknown email event — this template no longer exists.',
+  EMAIL_EVENT_UNKNOWN: 'Unknown email event. This template no longer exists.',
   TENANT_ROLE_INSUFFICIENT: 'Only owners and admins can edit email templates.',
   APPLICATION_NOT_FOUND: 'Application not found.',
 };
@@ -128,7 +129,7 @@ export default async function TemplateEditorPage({
       path: `/api/v1/tenant/applications/${encodeURIComponent(id)}/email-templates/${encodeURIComponent(eventKey)}/preview`,
       body: {},
     }),
-    // For the friendly heading — the per-event endpoint doesn't return the label.
+    // For the friendly heading, the per-event endpoint doesn't return the label.
     api<EventListRow[]>({
       method: 'GET',
       path: `/api/v1/tenant/applications/${encodeURIComponent(id)}/email-templates`,
@@ -159,9 +160,8 @@ export default async function TemplateEditorPage({
     <div className="space-y-5">
       <div className="flex items-baseline justify-between gap-2">
         <div>
-          {/* Was "← Email", pointing at the section shell that is already
-              wrapped around this page. The trail names the actual parent —
-              Templates, which is also now the segment highlighted above. */}
+          {/* Names the actual parent, Templates, not the Email section shell
+              already wrapping this page. */}
           <Breadcrumb
             className="mb-1"
             items={[
@@ -180,11 +180,11 @@ export default async function TemplateEditorPage({
           </p>
         </div>
         {template.customised && (
-          <form action={revertBound}>
+          <ActionForm action={revertBound}>
             <ConfirmButton confirm="Revert this template to the Rekey default? Your custom subject + body will be lost.">
               Revert to default
             </ConfirmButton>
-          </form>
+          </ActionForm>
         )}
       </div>
 
@@ -222,7 +222,7 @@ export default async function TemplateEditorPage({
               <strong>Subject:</strong> {preview.subject}
             </div>
             {/* bg-white is deliberate (no dark: variant): email HTML is
-                authored against a white canvas — rendering it on a dark
+                authored against a white canvas, rendering it on a dark
                 surface would break most templates. */}
             <iframe
               srcDoc={preview.html}
@@ -241,7 +241,7 @@ export default async function TemplateEditorPage({
               Renders with sample values and sends via the Application's configured transport.
             </p>
           </header>
-          <form action={testSendBound} className="flex items-end gap-2">
+          <ActionForm action={testSendBound} className="flex items-end gap-2">
             <label className="block flex-1 space-y-1.5">
               <span className="text-sm font-medium">To</span>
               <input
@@ -253,7 +253,7 @@ export default async function TemplateEditorPage({
               />
             </label>
             <SubmitButton pendingLabel="Sending…">Send test</SubmitButton>
-          </form>
+          </ActionForm>
         </section>
       </div>
     </div>

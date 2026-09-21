@@ -1,5 +1,5 @@
 /**
- * Device management routes — three surfaces over one service.
+ * Device management routes, three surfaces over one service.
  *
  *   devicesUserRoutes      /api/v1/users/me/devices
  *     The end-user's own devices. Publishable key + user JWT, like the rest
@@ -8,12 +8,12 @@
  *
  *   devicesServerRoutes    /api/v1/devices
  *     Secret-key-only. For the customer's OWN backend, which holds a secret
- *     key but not the user's token — a support tool, a licence server, a
+ *     key but not the user's token, a support tool, a licence server, a
  *     migration script. Addresses devices by end-user id.
  *
  *   tenantDevicesRoutes    /api/v1/tenant/applications/:id/end-users/:euid/devices
  *     Operator surface: list, release, block, unblock. Block and unblock live
- *     here ONLY — they are operator decisions, and neither the end-user nor a
+ *     here ONLY, they are operator decisions, and neither the end-user nor a
  *     secret key can make them.
  *
  * Every route resolves the device through `devicesService`, which scopes by
@@ -47,7 +47,6 @@ const STATUS_QUERY_SCHEMA = {
 
 /** What an end-user sees of their own device: no operator notes, no IP. */
 function forEndUser(d: Device): Omit<Device, 'blockedReason' | 'lastSeenIp'> {
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
   const { blockedReason, lastSeenIp, ...rest } = d;
   return rest;
 }
@@ -110,7 +109,7 @@ export async function devicesUserRoutes(app: FastifyInstance): Promise<void> {
         tags: ['Public · Devices'],
         summary: 'Release one of your devices',
         description:
-          'Gives the slot back and revokes every session minted on that device — including the ' +
+          'Gives the slot back and revokes every session minted on that device, including the ' +
           'current one, if it is the same device. Idempotent for an already-released device. A ' +
           'BLOCKED device cannot be released by its owner; an operator has to unblock it first.',
         security: [{ publishableKey: [], userToken: [] }, { apiKey: [], userToken: [] }],
@@ -377,7 +376,7 @@ export async function tenantDevicesRoutes(app: FastifyInstance): Promise<void> {
           'Requires **write** access to this Application. The "I have changed laptop and cannot ' +
           'sign in" button: frees every ACTIVE slot at once and revokes the sessions minted on ' +
           'them, so the next sign-in from any machine is admitted.\n\n' +
-          'BLOCKED devices are deliberately left alone — a block is an operator decision about one ' +
+          'BLOCKED devices are deliberately left alone, a block is an operator decision about one ' +
           'machine, and a bulk convenience must not quietly undo it. Unblock those individually. ' +
           'RELEASED ones are already free and are skipped.\n\n' +
           'Idempotent: an end-user with nothing active answers `released: 0`.',
@@ -419,20 +418,20 @@ export async function tenantDevicesRoutes(app: FastifyInstance): Promise<void> {
       const blocked = await devicesService.listForEndUser(id, euid, { status: 'BLOCKED', take: 1 });
       let released = 0;
       let sessionsRevoked = 0;
-      // Seeded from the devices already blocked when the sweep began, and
-      // added to by any that get blocked while it runs.
+      // Seeded from devices already blocked when the sweep began, and added to
+      // by any that get blocked while it runs.
       let skippedBlocked = blocked.total;
       // Re-query rather than paging with an offset: every release moves a row
       // OUT of this filter, so a second page computed against the first
       // window would skip devices. `release` takes the per-user advisory lock
-      // itself, so these are sequential by construction.
-      // The cap is not there because the loop can spin on its own — every
-      // release moves a row out of the ACTIVE filter, so it terminates. It is
-      // there because `devicesService.touch` puts a RELEASED device back to
-      // ACTIVE, so a client signing in during the sweep adds work: a busy
-      // account could keep this request going far longer than an operator's
-      // patience or a proxy's timeout. 50 passes of 100 is 5000 devices,
-      // which is well past any real end-user.
+      // itself, so these calls are sequential by construction.
+      //
+      // The pass cap is not for loop termination (every release already moves
+      // a row out of the ACTIVE filter). It exists because `devicesService.touch`
+      // puts a RELEASED device back to ACTIVE, so a client signing in mid-sweep
+      // adds work: a busy account could keep this request running past an
+      // operator's patience or a proxy's timeout. 50 passes of 100 is 5000
+      // devices, well past any real end-user.
       let passes = 0;
       let capped = false;
       for (;;) {
@@ -452,7 +451,7 @@ export async function tenantDevicesRoutes(app: FastifyInstance): Promise<void> {
         for (const device of items) {
           // A device somebody BLOCKS mid-sweep makes `release` throw 409.
           // Aborting the request there would discard the count of everything
-          // already released and write no summary event — the operator would
+          // already released and write no summary event, the operator would
           // see an error for a reset that half happened. It belongs in the
           // skipped tally instead, which is what a blocked device is.
           let result;
@@ -504,7 +503,7 @@ export async function tenantDevicesRoutes(app: FastifyInstance): Promise<void> {
         description:
           'Requires **write** access to this Application. Sign-in from this fingerprint is refused ' +
           '(DEVICE_BLOCKED) until unblocked; every session on the device is revoked now. The ' +
-          '`reason` is operator-facing only — the end-user never sees it. Idempotent.',
+          '`reason` is operator-facing only, the end-user never sees it. Idempotent.',
         params: TENANT_DEVICE_PARAMS_SCHEMA,
         body: {
           type: 'object',

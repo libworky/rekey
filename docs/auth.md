@@ -317,13 +317,22 @@ refresh re-checks it. Every sign-in and refresh response carries
 `accessTokenExpiresAt` and `refreshTokenExpiresAt`, so a client never has
 to know the configured values.
 
-A long access lifetime does not extend a session somebody ended. A password
-change, sign-out everywhere, an operator revoking a session, and a device
-release or block all stamp the user, and an access token minted before the
-stamp is refused on its next use with `401 USER_TOKEN_INVALID` and a message
-naming the cause; it is the code SDKs already refresh on, so sessions that
-were not ended renew silently from their refresh token and only the ended
-one, whose refresh is gone, lands on sign-in. A password reset stamps too.
+A long access lifetime does not extend a session somebody ended, and ending
+one session does not end the others. A password change or reset, sign-out
+everywhere and refresh-token reuse detection end every session, so they stamp
+the user: an access token minted before the stamp is refused on its next use.
+Revoking a single session (the user's or an operator's) or releasing or
+blocking a device ends only that session: its access token carries a `sid`
+claim naming the session and a `dev` claim naming the device, and the API
+refuses it once that session is revoked or that device is no longer ACTIVE,
+while the user's other sessions keep working without a refresh. Both refusals
+are `401 USER_TOKEN_INVALID` with a message naming the cause, the code SDKs
+refresh on; the ended session's refresh then answers `REFRESH_TOKEN_REVOKED`.
+Access tokens minted before the `sid` claim existed run to their expiry.
+
+An offline verifier (`verifyAccessToken` in `@rekey.dev/node`, or your own
+JWKS check) sees none of this: a locally verified token stays valid until it
+expires. Call the API when immediate revocation matters.
 
 ### The access JWT
 
@@ -348,7 +357,7 @@ one, whose refresh is gone, lands on sign-in. A password reset stamps too.
 
 ### Sign-out everywhere
 
-`POST /auth/sign-out-everywhere` (requires user JWT) revokes **every** refresh token for the calling user. Use cases: "log out all devices" button, suspected compromise, after a password change, etc.
+`POST /auth/sign-out-everywhere` (requires user JWT) revokes **every** refresh token for the calling user and stamps the user, so every access token they hold, the caller's included, is refused on its next use. That covers MCP and OIDC grants too: their refresh tokens are revoked with the rest, and an MCP access token issued before the stamp is refused by the MCP endpoint, `/oauth/userinfo`, and reported inactive by `/oauth/introspect`. A password change or reset and refresh-token reuse do the same. Revoking a single session does not touch MCP grants. Use cases: "log out all devices" button, suspected compromise, after a password change, etc.
 
 ## Password management
 
@@ -429,7 +438,7 @@ the whole batch is validated before any row is written.
 
 Operators manage end-users from the panel (or the `/api/v1/tenant/applications/:id/end-users*` routes): seed users manually, edit role/metadata/verified flag, grant credits, impersonate (audited, 5-minute token), and delete.
 
-Impersonation is bounded twice over. It is **revocable** — `POST /api/v1/tenant/applications/:id/end-users/:euid/impersonate/end` stamps `endedAt` on every open audit row for that user and invalidates the tokens they issued on the spot (`IMPERSONATION_SESSION_ENDED`), for any operator, not just the one who started it. And it **cannot change credentials**: password change, MFA setup/disable and passkey enrolment/removal answer 403 `IMPERSONATION_ACTION_FORBIDDEN` for an impersonated session, because those survive the five-minute token permanently and the user cannot tell who made them. Everything else the user can do — reads, billing, organizations, profile edits — is unchanged.
+Impersonation is bounded twice over. It is **revocable**: `POST /api/v1/tenant/applications/:id/end-users/:euid/impersonate/end` stamps `endedAt` on every open audit row for that user and invalidates the tokens they issued on the spot (`IMPERSONATION_SESSION_ENDED`), for any operator, not just the one who started it. And it **cannot change credentials or mint a session**: password change, MFA setup/disable, passkey enrolment/removal, linking or unlinking an OAuth provider, the MCP session handoff, and the two routes that re-mint a token pair (`POST /users/me/organizations/:id/switch` and `POST /users/me/organizations/clear-active-organization`) answer 403 `IMPERSONATION_ACTION_FORBIDDEN` for an impersonated session. Each of those would outlive the five-minute token: a re-minted pair is an ordinary 30-day session with no `imp` claim, which would keep working after the impersonation ended. Everything else the user can do (reads, billing, organization membership, profile edits) is unchanged.
 
 ### Data export (DSAR)
 

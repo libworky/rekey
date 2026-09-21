@@ -11,7 +11,7 @@
  * assertion. In a query string it would sit in browser history, in the
  * `Referer` of every subsequent request, and in any proxy log along the way. In
  * a form body it is none of those. rekey.dev renders a self-submitting form
- * rather than issuing a redirect for exactly this reason — the same POST
+ * rather than issuing a redirect for exactly this reason, the same POST
  * binding SAML has used for the same problem for twenty years.
  *
  * The token is single-use and short-lived on the API side, so a replay of a
@@ -30,7 +30,7 @@ type AssertResult =
   | { mfaRequired: false; accessToken: string; refreshToken: string; accessTokenExpiresAt: string; refreshTokenExpiresAt: string };
 
 
-// Relative Location — the browser resolves it against the public URL it is on
+// Relative Location, the browser resolves it against the public URL it is on
 // (panel.rekey.dev), NOT `req.url`, which behind a proxy is the internal bind
 // address. NextResponse.redirect requires an absolute URL, so emit the header
 // directly. Same reasoning as the OAuth callback next door.
@@ -39,7 +39,7 @@ function seeOther(path: string): NextResponse {
 }
 
 export async function POST(req: NextRequest): Promise<NextResponse> {
-  let idToken = '';
+  let idToken: string;
   try {
     const form = await req.formData();
     idToken = String(form.get('id_token') ?? '');

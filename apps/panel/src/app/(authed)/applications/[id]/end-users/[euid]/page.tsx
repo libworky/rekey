@@ -1,5 +1,5 @@
 /**
- * End-user Overview — the triage tab.
+ * End-user Overview, the triage tab.
  *
  * The question this screen answers is "what is going on with this account",
  * asked by someone holding a support ticket. So it is four numbers and a
@@ -13,7 +13,7 @@
  */
 
 import * as React from 'react';
-import Link from 'next/link';
+import Link from '@/components/Link';
 import { getApplication } from '@/lib/api';
 import { humanizeEventType } from '@/lib/security-events';
 import { formatDate, formatDateTime } from '@/lib/date';
@@ -25,6 +25,7 @@ import { Banner } from '@/components/Banner';
 import { SupportFeedback } from './support-feedback';
 import { Modal } from '@/components/Modal';
 import { Field } from '@/components/Field';
+import { ActionForm } from '@/components/ActionForm';
 import { SubmitButton } from '@/components/SubmitButton';
 import { ConfirmButton } from '@/components/ConfirmButton';
 import {
@@ -41,6 +42,7 @@ import {
   getEndUserDeviceCounts,
   getEndUserEvents,
   provenanceFrom,
+  readSupportFlash,
   LOGIN_LOCK_THRESHOLD,
   LOGIN_LOCK_MINUTES,
 } from './shared';
@@ -59,8 +61,12 @@ export default async function EndUserOverviewPage({
 }): Promise<React.JSX.Element> {
   const { id, euid } = await params;
   const sp = await searchParams;
-  const done = typeof sp.support === 'string' ? sp.support : undefined;
-  const supportError = typeof sp.supportError === 'string' ? sp.supportError : undefined;
+  // The URL first, then the cookie the action left behind. The support forms
+  // below reload this page rather than relying on the action's redirect to
+  // commit, and on that reload there is no query to read (rekey issue #569).
+  const flash = await readSupportFlash();
+  const done = typeof sp.support === 'string' ? sp.support : flash.done;
+  const supportError = typeof sp.supportError === 'string' ? sp.supportError : flash.error;
   const [detail, application, billing, credits, devices, events] = await Promise.all([
     getEndUserDetail(id, euid),
     getApplication(id),
@@ -79,7 +85,7 @@ export default async function EndUserOverviewPage({
   const live = billing?.subscriptions.find((s) => LIVE_SUBSCRIPTION.has(s.status));
   /**
    * Free-tier fallback: the plan whose FEATURE entitlements apply to a user
-   * with no subscription. Read-time only — no Subscription row stands behind
+   * with no subscription. Read-time only, no Subscription row stands behind
    * it, which is exactly why an operator looking at an empty subscriptions list
    * needs telling that the user is nonetheless on a plan.
    *
@@ -140,7 +146,7 @@ export default async function EndUserOverviewPage({
                   and cannot read security events at all, or because the
                   creation fell outside the scanned window on a busy
                   application. Asserting "sign-up" there would state the exact
-                  thing this field exists to stop somebody assuming — and would
+                  thing this field exists to stop somebody assuming, and would
                   do it every single time for a MEMBER. */}
               {provenance ? (
                 <span className="inline-flex flex-wrap items-center gap-1.5">
@@ -156,7 +162,7 @@ export default async function EndUserOverviewPage({
                   title={
                     events === null
                       ? 'Listing security events requires the OWNER or ADMIN workspace role, so this cannot be determined for your role.'
-                      : "No creation event for this end-user in the application's most recent events. That is not evidence they signed up — the record may simply be older than the scanned window."
+                      : "No creation event for this end-user in the application's most recent events. That is not evidence they signed up: the record may simply be older than the scanned window."
                   }
                 >
                   {events === null ? 'not visible to your role' : 'not in the scanned window'}
@@ -185,7 +191,7 @@ export default async function EndUserOverviewPage({
 
       <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
         <StatTile title="Plan" value={planValue} footer={planFooter} href={`${base}/subscriptions`} />
-        {/* A tile shows "—" rather than "0" when the read failed. Zero is a
+        {/* A tile shows a dash rather than "0" when the read failed. Zero is a
             statement about the account; the request having failed is not. */}
         <StatTile
           title="Devices"
@@ -277,7 +283,7 @@ function plural(n: number, one: string, many?: string): string {
   return `${n} ${n === 1 ? one : (many ?? `${one}s`)}`;
 }
 
-/** Compact metric tile — same pattern as the Revenue and app Overview tiles. */
+/** Compact metric tile, same pattern as the Revenue and app Overview tiles. */
 function StatTile({
   title,
   value,
@@ -315,7 +321,7 @@ function StatTile({
  *
  * This is the part that was missing entirely. Before it, an operator holding
  * "I cannot sign in" could read a lockout counter and a device list and act on
- * neither — every actual remedy needed a developer with an API client.
+ * neither: every actual remedy needed a developer with an API client.
  *
  * The two that put mail in somebody's inbox are dialogs rather than bare
  * buttons, and the reset asks for a reason, because at the recipient's end an
@@ -353,11 +359,11 @@ function SupportBar({
       <SupportFeedback done={done} error={error} />
 
       <div className="flex flex-wrap items-center gap-2">
-        <form action={unlockAccount.bind(null, applicationId, euid)}>
+        <ActionForm action={unlockAccount.bind(null, applicationId, euid)}>
           <SubmitButton className={supportBtnCls} pendingLabel="Unlocking…">
             Unlock account
           </SubmitButton>
-        </form>
+        </ActionForm>
 
         {!emailVerified && (
           <Modal
@@ -366,7 +372,11 @@ function SupportBar({
             trigger="Resend verification"
             triggerClassName={supportBtnCls}
           >
-            <form action={sendVerification.bind(null, applicationId, euid)} className="space-y-3">
+            <ActionForm
+              action={sendVerification.bind(null, applicationId, euid)}
+              className="space-y-3"
+              reloadOnSettle
+            >
               <Field label="Reason" hint="Optional, recorded in the activity trail.">
                 <input
                   type="text"
@@ -377,7 +387,7 @@ function SupportBar({
                 />
               </Field>
               <SubmitButton pendingLabel="Sending…">Send verification email</SubmitButton>
-            </form>
+            </ActionForm>
           </Modal>
         )}
 
@@ -387,7 +397,15 @@ function SupportBar({
           trigger="Send password reset"
           triggerClassName={supportBtnCls}
         >
-          <form action={sendPasswordReset.bind(null, applicationId, euid)} className="space-y-3">
+          {/* The result is read back off the flash cookie after the reload,
+              because the action's own redirect is not committed here (rekey
+              issue #569). Without this the dialog sat open reporting nothing
+              while the reset had already been sent. */}
+          <ActionForm
+            action={sendPasswordReset.bind(null, applicationId, euid)}
+            className="space-y-3"
+            reloadOnSettle
+          >
             <Banner tone="warning">
               They did not ask for this. At their inbox it is indistinguishable from someone who got
               into your panel, so the reason below is recorded against your operator id.
@@ -403,10 +421,10 @@ function SupportBar({
               />
             </Field>
             <SubmitButton pendingLabel="Sending…">Send reset email</SubmitButton>
-          </form>
+          </ActionForm>
         </Modal>
 
-        <form action={releaseAllDevices.bind(null, applicationId, euid)}>
+        <ActionForm action={releaseAllDevices.bind(null, applicationId, euid)}>
           <ConfirmButton
             variant="subtle"
             title="Release every device?"
@@ -415,18 +433,18 @@ function SupportBar({
           >
             Reset devices
           </ConfirmButton>
-        </form>
+        </ActionForm>
 
-        <form action={revokeAllSessions.bind(null, applicationId, euid)}>
+        <ActionForm action={revokeAllSessions.bind(null, applicationId, euid)}>
           <ConfirmButton
             variant="subtle"
             title="Sign out everywhere?"
-            confirm="Revokes every live session. Access tokens already issued keep working until they expire — this stops new ones being obtained."
+            confirm="Revokes every live session. Access tokens already issued keep working until they expire. This stops new ones being obtained."
             confirmLabel="Sign out everywhere"
           >
             Sign out everywhere
           </ConfirmButton>
-        </form>
+        </ActionForm>
       </div>
     </Card>
   );

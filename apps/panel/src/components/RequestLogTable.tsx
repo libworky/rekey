@@ -4,7 +4,7 @@ import type { ApiRequestLogRow } from '@/lib/api';
 
 /**
  * Read-only table for the per-request access log. Shared by the per-Application
- * Requests tab and the operator's "My requests" account view — both render the
+ * Requests tab and the operator's "My requests" account view, both render the
  * same row shape (api_request_logs), so the markup lives here once.
  */
 

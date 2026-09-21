@@ -41,6 +41,33 @@ An entitlement is a row saying "this subject may have this thing". Resolution un
 
 **Personal quota deliberately excludes organization-beneficiary subscriptions.** Usage metered under an org draws on the org pool; usage metered against a person draws on theirs. Recording team usage with `endUserId` instead of `organizationId` therefore bills the individual, which is a caller mistake worth catching in review.
 
+**The Application's free tier, and exactly how much of a base layer it is.**
+`billingConfig.defaultPlanSlug` names a plan whose FEATURE entitlements and
+included USAGE quota apply on top of what a subject's subscriptions grant. A
+SUBSCRIPTION or USAGE plan suppresses it entirely (`suppressesFreeTier` — buying
+a credit pack or a licence is not "being on a plan").
+
+Where it is **not** suppressed, two different things happen and the difference
+matters:
+
+- **For a key or meter a per-subscription override names**, the free tier is
+  withheld. An override is a deliberate deviation sold to one customer, so it has
+  to be authoritative or it is not an override. This is the only case in which
+  the default loses.
+- **For every other key**, the free tier participates in the merge, but only
+  ever upward: it can raise an INT (`Math.max`) or turn a BOOL true, and it is
+  applied FIRST so a subscription's STRING wins the last-wins tie. Applying it
+  last used to mean a default of `support_tier: "community"` overwrote a paying
+  plan's `"priority"`, which is a base layer beating the thing it sits under.
+
+Its per-unit price always floors the rate charged, even when its quantity is
+withheld: a change about how many units somebody gets must not silently move a
+price. An override whose resolved row grants nothing and prices nothing
+(quantity 0, no price — a shape `validate` refuses to let anyone author, reachable
+only when a later plan edit clears a price) counts as not having landed, and the
+default applies.
+
+
 ### Two ways to meter spend
 
 **Credits** are a pre-paid balance. `POST /credits/consume` is atomic, and idempotent **when the caller supplies a key** — without one, every call counts, which is the right default for a counter and the wrong one for a charge. A spend past zero returns `402` rather than going negative. This is the model for anything an agent burns unpredictably.

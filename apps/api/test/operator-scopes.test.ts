@@ -1,5 +1,5 @@
 /**
- * Scopes on the membership — the gate, the editing, the capabilities.
+ * Scopes on the membership, the gate, the editing, the capabilities.
  *
  * What is pinned here, and why each one matters:
  *
@@ -7,14 +7,14 @@
  *     grant and untouched scopes reaches everything they reached before.
  *   - Restriction is refused with a code that names the scope, on an
  *     application the member CAN see. On one they cannot, the answer stays
- *     404 — a scope refusal must never become an existence oracle.
+ *     404, a scope refusal must never become an existence oracle.
  *   - Unknown scopes are refused, never silently dropped.
  *   - Scopes only apply to MEMBER; an OWNER is untouched and an ADMIN cannot
  *     be restricted.
  *   - `/me` and `GET /:id` report the resolved set the panel renders from,
  *     and `GET /:id` projects sign-in config on the auth-config scope.
  *   - The intersection: a member whose GRANT is APP_VIEWER but whose scopes
- *     include billing:write still cannot write billing — neither axis widens
+ *     include billing:write still cannot write billing, neither axis widens
  *     the other.
  */
 
@@ -46,7 +46,7 @@ describe('operator scopes', () => {
   /**
    * The membership `/me` reports for the ACTIVE workspace. The invitee owns a
    * workspace of their own from sign-up, so `memberships` has two entries and
-   * `[0]` is the wrong one — it is theirs (OWNER, unrestricted), not the one
+   * `[0]` is the wrong one, it is theirs (OWNER, unrestricted), not the one
    * they were invited into.
    */
   const activeMembership = (
@@ -169,7 +169,7 @@ describe('operator scopes', () => {
     // Still reaches what the scope allows.
     expect((await endUsers(w)).statusCode).toBe(200);
 
-    // An application with no grant is ABSENT, not forbidden — the scope
+    // An application with no grant is ABSENT, not forbidden, the scope
     // gate runs after the existence check and cannot leak past it.
     const invisible = await plans(w, w.otherAppId);
     expect(invisible.statusCode).toBe(404);
@@ -201,7 +201,7 @@ describe('operator scopes', () => {
       headers: auth(w.memberToken),
       payload: { slug: 'p', name: 'P', amount: 100, kind: 'SUBSCRIPTION', interval: 'MONTH' },
     });
-    // The GRANT refuses first — APP_VIEWER cannot billing-write — and the
+    // The GRANT refuses first, APP_VIEWER cannot billing-write, and the
     // scope, being an intersection, cannot override that.
     expect(create.statusCode).toBe(403);
     expect(create.json().error.code).toBe('APP_ACCESS_DENIED');
@@ -306,7 +306,7 @@ describe('operator scopes', () => {
     expect(asMember.statusCode).toBe(200);
     const rows = (asMember.json().data as { items: Array<Record<string, unknown>> }).items;
     expect(rows.length).toBe(2);
-    // This route used to hand every member's grant matrix to any session —
+    // This route used to hand every member's grant matrix to any session,
     // a member learned their own permissions by listing their colleagues'.
     for (const r of rows) {
       expect(r).not.toHaveProperty('grants');
@@ -334,7 +334,7 @@ describe('operator scopes', () => {
       url: `/api/v1/tenant/applications/${w.appId}/end-users?subscriptionStatus=ACTIVE`,
       headers: auth(w.memberToken),
     });
-    // 403 naming the scope — the same code every other scope refusal uses.
+    // 403 naming the scope, the same code every other scope refusal uses.
     // Dropping the filter would return an unfiltered list the caller reads
     // as "everyone who is paying".
     expect(filtered.statusCode).toBe(403);
@@ -377,7 +377,7 @@ describe('operator scopes', () => {
       orderBy: { createdAt: 'desc' },
     });
     // With three roles, "who" implied "what they were allowed to do". With
-    // scopes it does not — the set changes — so the log keeps the authority
+    // scopes it does not, the set changes, so the log keeps the authority
     // the write ran under, and it survives the membership being edited later.
     expect(row?.admittedScope).toBe('end-users:write');
     // And it reaches a client: the read schema declares the column, so the

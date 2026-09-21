@@ -1,5 +1,5 @@
 /**
- * The operator scope registry — the one vocabulary of what a workspace member
+ * The operator scope registry, the one vocabulary of what a workspace member
  * may do, and the only place it is defined.
  *
  * ## Why a registry and not a column per domain, or free strings
@@ -25,8 +25,8 @@
  *
  * ## What is NOT in here, on purpose
  *
- * Anything that changes who-may-do-what — grants, roles, invitations, the
- * membership's own scopes — and the destructive floors (lifecycle,
+ * Anything that changes who-may-do-what, grants, roles, invitations, the
+ * membership's own scopes, and the destructive floors (lifecycle,
  * impersonation, DSAR export, erase). Those stay behind `requireTenantRole`
  * and no scope unlocks them. `team:write` on a member would let them grant
  * themselves everything and then rewrite their own scopes; keeping it out of
@@ -55,7 +55,7 @@ export const ALL_SCOPES: readonly Scope[] = SCOPE_DOMAINS.flatMap((d) =>
 
 const SCOPE_SET: ReadonlySet<string> = new Set(ALL_SCOPES);
 
-/** True if `value` is a scope this registry knows. Lineage is NOT applied here — see `expandScopes`. */
+/** True if `value` is a scope this registry knows. Lineage is NOT applied here, see `expandScopes`. */
 export function isScope(value: string): value is Scope {
   return SCOPE_SET.has(value);
 }
@@ -81,7 +81,7 @@ export const SCOPE_LINEAGE: Readonly<Record<string, readonly ScopeDomain[]>> = {
  * anything unknown, and add the implied `read` for every `write`.
  *
  * Unknown values are dropped HERE because this is the read path over data
- * already in the database — a stale row must not break every request. On the
+ * already in the database, a stale row must not break every request. On the
  * WRITE path (`PATCH /members/:id`) unknown values are refused with 400
  * instead; see `assertValidScopes`.
  */
@@ -130,7 +130,7 @@ export function invalidScopes(input: readonly string[]): string[] {
  *
  * `APP_BILLING` excluding `auth-config` is not new behaviour: it is
  * `redactApplicationForBilling` given a name. `APP_BILLING` gaining
- * `billing:write` on provider credentials and refunds IS a change — those
+ * `billing:write` on provider credentials and refunds IS a change, those
  * were `write` today, so the "billing manager" could do neither. It is the
  * change this model exists to make, and it is called out in the release note
  * rather than arriving as a side effect.
@@ -152,7 +152,7 @@ export function presetScopes(role: 'APP_ADMIN' | 'APP_BILLING' | 'APP_VIEWER'): 
   }
 }
 
-/** Intersection — the effective set for an application request. Neither side can widen the other. */
+/** Intersection, the effective set for an application request. Neither side can widen the other. */
 export function intersectScopes(a: ReadonlySet<Scope>, b: ReadonlySet<Scope>): ReadonlySet<Scope> {
   const out = new Set<Scope>();
   for (const s of a) if (b.has(s)) out.add(s);
@@ -163,8 +163,8 @@ export function intersectScopes(a: ReadonlySet<Scope>, b: ReadonlySet<Scope>): R
  * Resolve what a membership row stores into the set the gate reads.
  *
  * Two columns rather than one nullable array, because Prisma list fields
- * cannot be null. `scopesRestricted: false` — every pre-existing row, and the
- * default for every new one — resolves to the whole registry, which is what a
+ * cannot be null. `scopesRestricted: false`, every pre-existing row, and the
+ * default for every new one, resolves to the whole registry, which is what a
  * member has today. `true` with `[]` is a parked member: holds grants, reaches
  * nothing through them.
  */
@@ -183,7 +183,7 @@ export function resolveMembershipScopes(
  *   keys:mint           → developer:write
  *
  * The auth middleware intersects this with the holder's membership scopes, so
- * a token can only ever narrow what its holder may do — the principle
+ * a token can only ever narrow what its holder may do, the principle
  * `operator-tokens.routes.ts` states and that used to be enforced only by
  * re-checking the role.
  */
@@ -207,7 +207,7 @@ export function patTokenScopes(tokenScopes: readonly string[]): ReadonlySet<Scop
 /**
  * An OAuth MCP token's authority in this vocabulary. `mcp:operator:write`
  * maps to every write; without it the token reads only. Admin tools stay
- * role-and-`canAdmin`-gated — they are floors, not scopes.
+ * role-and-`canAdmin`-gated, they are floors, not scopes.
  */
 export function mcpTokenScopes(canWrite: boolean): ReadonlySet<Scope> {
   return canWrite ? UNRESTRICTED : new Set(SCOPE_DOMAINS.map((d) => `${d}:read` as Scope));

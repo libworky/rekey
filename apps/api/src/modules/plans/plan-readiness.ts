@@ -84,9 +84,9 @@ export async function planCheckoutReadiness(
       if (blocker) blockers.push({ provider, ...blocker });
 
       // A trial is only honoured by a provider that declares it can express
-      // one. `resolveCheckoutTrial` refuses the checkout outright otherwise —
+      // one. `resolveCheckoutTrial` refuses the checkout outright otherwise,
       // correctly, since charging today for something advertised as free is the
-      // worse outcome — but that refusal reaches the BUYER, not the operator.
+      // worse outcome, but that refusal reaches the BUYER, not the operator.
       //
       // This matters per provider, not per application: with Stripe global and
       // Razorpay for IN, a plan with a trial sells fine in the US and is

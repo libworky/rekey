@@ -17,15 +17,15 @@ import { operatorWriteTools } from './operator-write-tools.js';
 const PROTOCOL_VERSION = '2025-06-18';
 const SERVER_INFO = { name: 'rekey-operator', version: '1.0.0' };
 
-/** All operator tools — read tools first, then the phase-1 write tools. */
+/** All operator tools, read tools first, then the phase-1 write tools. */
 const allTools: OperatorTool[] = [...operatorTools, ...operatorWriteTools];
 
 /**
- * Which scope each application-scoped tool needs. The REST twin of every tool
+ * Scope each application-scoped tool needs. The REST twin of every tool
  * declares this on its route (`config.access`); tools declare it here, in one
  * table, and `route-access-completeness`'s MCP sibling asserts every tool
- * appears either here or in `WORKSPACE_TOOLS` — so a new tool cannot ship
- * ungoverned. Workspace-level tools are floors (role-gated) and take no scope.
+ * appears either here or in `WORKSPACE_TOOLS`, so a new tool cannot ship
+ * ungoverned. Workspace-level tools are floors (role-gated), no scope needed.
  */
 export const TOOL_SCOPES: Readonly<Record<string, Scope>> = {
   get_workspace_overview: 'overview:read',
@@ -96,17 +96,17 @@ function roleAllows(role: TenantRole, minRole: TenantRole): boolean {
  *
  * That last line is the change. Read tools "are always available" was the rule,
  * and it silently overrode `minRole` on the two read tools whose REST twins are
- * OWNER/ADMIN — so a MEMBER could pull the workspace security log (every IP and
+ * OWNER/ADMIN, so a MEMBER could pull the workspace security log (every IP and
  * user agent in it) and the pending-invitation list out of MCP while the same
  * account got a 403 over HTTP. Per-Application grants are enforced inside the
  * handlers, since they depend on a tool's arguments; see
  * `accessibleApplicationIds` in operator-tools.ts.
  */
 function toolAllowed(ctx: OperatorToolContext, tool: OperatorTool): boolean {
-  // The scope gate, first: a tool the caller's membership does not admit is
-  // neither listed nor callable, whatever the token says. Role is the
-  // ceiling: OWNER/ADMIN pass this unconditionally (see effectiveToolScopes),
-  // so it only ever bites a restricted MEMBER.
+  // Scope gate first: a tool the caller's membership does not admit is
+  // neither listed nor callable, whatever the token says. OWNER/ADMIN pass
+  // unconditionally (see effectiveToolScopes), so this only bites a
+  // restricted MEMBER.
   const held = effectiveToolScopes(ctx);
   const need = TOOL_SCOPES[tool.name];
   if (need !== undefined && !held.has(need)) return false;
@@ -162,7 +162,7 @@ export async function handleOperatorMcpMessage(
       return result(id, {});
 
     case 'tools/list':
-      // Surface only the tools this token+role can actually call — a read-only
+      // Surface only the tools this token+role can actually call, a read-only
       // token never sees the write tools, so the client won't offer them.
       return result(id, {
         tools: allTools
@@ -203,13 +203,13 @@ export async function handleOperatorMcpMessage(
         (msg.params?.arguments as Record<string, unknown> | undefined) ?? {};
       // Log the call before running it, whether or not the handler then
       // succeeds: a failed call is exactly what an operator reviewing an
-      // agent's behaviour wants to see. A call refused above is not logged;
-      // nothing ran, and the refusal is returned to the client.
+      // agent's behaviour wants to see. A call refused above is not logged,
+      // since nothing ran.
       //
-      // Arguments are recorded by KEY only. They routinely carry credentials —
-      // configure_billing_provider takes a provider secret — and an audit trail
-      // that quietly becomes a second copy of every secret is worse than no
-      // trail. Names and shape are enough to answer "what did this agent do".
+      // Arguments are recorded by KEY only. They routinely carry credentials
+      // (configure_billing_provider takes a provider secret), and an audit
+      // trail that becomes a second copy of every secret is worse than none.
+      // Names and shape are enough to answer "what did this agent do".
       void recordSecurityEvent({
         type: 'operator.mcp_tool_called',
         actorType: 'operator',
@@ -221,10 +221,10 @@ export async function handleOperatorMcpMessage(
           write: tool.write === true,
           admin: tool.admin === true,
           // The scope that admitted the call: null for a workspace-floor
-          // tool, and null for OWNER/ADMIN, whom no scope gate checked (the
-          // same rule the request log applies). Durable, unlike the request
-          // log: a membership's scopes change, and the audit trail must
-          // still say what authority a past call ran under.
+          // tool, and null for OWNER/ADMIN since no scope gate checked them.
+          // Durable, unlike the request log: a membership's scopes can
+          // change, and the audit trail must still say what authority a
+          // past call ran under.
           scope: isWorkspaceAdmin(ctx.role) ? null : (TOOL_SCOPES[tool.name] ?? null),
           argKeys: Object.keys(args).sort(),
         },

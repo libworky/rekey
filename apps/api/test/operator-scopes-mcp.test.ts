@@ -9,7 +9,7 @@
  *     and the refusal names the scope
  *   - a tool it does admit still works, through the same token
  *   - the one aggregate that carries money omits the amounts without
- *     billing:read — omitted, never zeroed
+ *     billing:read, omitted, never zeroed
  *   - every tool is either scoped or an explicit workspace floor, so a new
  *     tool cannot ship ungoverned (the MCP twin of route completeness)
  */
@@ -182,7 +182,7 @@ describe('operator scopes over MCP', () => {
     expect(refused.result!.isError).toBe(true);
     expect(called(refused).error).toContain('billing:read');
 
-    // A tool the scopes admit runs — through the same token that was just
+    // A tool the scopes admit runs, through the same token that was just
     // refused above, so the refusal was the membership, not the credential.
     const ok = await rpc(w.pat, 'tools/call', { name: 'list_organization_roles', arguments: { applicationId: w.appId } });
     expect(ok.result!.isError).toBeUndefined();

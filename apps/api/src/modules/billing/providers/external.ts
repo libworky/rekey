@@ -24,6 +24,7 @@
 
 import { createHmac } from 'node:crypto';
 import type { Plan } from '@prisma/client';
+import { readCappedBody } from '../../../lib/capped-body.js';
 import { RekeyError } from '../../../lib/error.js';
 import { assertSafeUrlResolved, pinnedFetchInit } from '../../../lib/ssrf-guard.js';
 import { env } from '../../../config/env.js';
@@ -57,7 +58,7 @@ function inboundOnly(operation: string): RekeyError {
  * ## The signature is deliberately NOT the webhook signature
  *
  * `signWebhook` signs `${t}.${body}` and takes no method or path. A GET has no
- * body, so reusing it verbatim would sign `${t}.` on every request — a constant
+ * body, so reusing it verbatim would sign `${t}.` on every request, a constant
  * per second, replayable against any URL, and proof of nothing.
  *
  * This direction has its own signed string, and it binds the request:
@@ -66,7 +67,7 @@ function inboundOnly(operation: string): RekeyError {
  *
  * Same header shape (`X-Rekey-Signature: t=…,v1=…`) and the same 5-minute
  * tolerance, different payload. `docs/external-billing-pull.md` is the version
- * handed to integrators — keep the two in step, because everyone verifying this
+ * handed to integrators, keep the two in step, because everyone verifying this
  * is writing code against that document alone.
  */
 export interface ExternalPullConfig {
@@ -86,34 +87,11 @@ const PAGE_TIMEOUT_MS = 10_000;
  * Sized against the CONTRACT, not against a typical page: the doc permits 200
  * rows each carrying up to Rekey's 16 KB metadata ceiling, so a legitimate
  * page can reach ~3.2 MB. A tighter cap would truncate that mid-object and the
- * run would die reporting malformed JSON — blaming the sender for obeying the
+ * run would die reporting malformed JSON, blaming the sender for obeying the
  * document. 8 MB leaves room for the envelope and still refuses the unbounded
  * body a bare `res.json()` would read into memory.
  */
 const MAX_PAGE_BYTES = 8 * 1024 * 1024;
-
-/**
- * Read a bounded body with the abort signal still armed.
- *
- * Same shape as the webhook path's reader, and for the same two reasons: an
- * unbounded read lets a third party OOM the process, and doing it before
- * `clearTimeout` means a server that sends headers promptly and then trickles
- * the body still hits the timeout instead of hanging the run forever.
- */
-async function readCapped(res: Response, maxBytes: number): Promise<string> {
-  if (!res.body) return '';
-  const reader = res.body.getReader();
-  const chunks: Buffer[] = [];
-  let total = 0;
-  while (total < maxBytes) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    chunks.push(Buffer.from(value));
-    total += value.byteLength;
-  }
-  void reader.cancel().catch(() => undefined);
-  return Buffer.concat(chunks).toString('utf8').slice(0, maxBytes);
-}
 
 function pullNotConfigured(): RekeyError {
   return new RekeyError({
@@ -135,7 +113,7 @@ export class ExternalBillingProvider implements BillingProvider {
    * Everything here is defensive on purpose: this parses a document written by
    * somebody else's server, and a malformed row must produce a `skip_invalid`
    * item in a preview rather than a 500 in the middle of a run. Shape errors
-   * are therefore left to the importer, which sees the raw row — this only
+   * are therefore left to the importer, which sees the raw row, this only
    * enforces the envelope.
    */
   async listSubscriptions(input: {
@@ -149,8 +127,8 @@ export class ExternalBillingProvider implements BillingProvider {
     if (input.cursor !== undefined) url.searchParams.set('cursor', input.cursor);
 
     // The SAME hardening the webhook delivery path uses, not merely the
-    // registration-time URL check. `isWebhookUrlSafe` never resolves DNS — its
-    // own module header says so — so on its own it misses a public hostname
+    // registration-time URL check. `isWebhookUrlSafe` never resolves DNS, its
+    // own module header says so, so on its own it misses a public hostname
     // with a private A record. An operator who can set this URL is not
     // necessarily trusted with the deployment's network position.
     const t = Math.floor(Date.now() / 1000);
@@ -197,7 +175,7 @@ export class ExternalBillingProvider implements BillingProvider {
       }
       // Inside the try, so the abort signal is still armed: a server that sends
       // headers and then trickles the body must hit the timeout, not hang.
-      bodyText = await readCapped(res, MAX_PAGE_BYTES);
+      bodyText = (await readCappedBody(res, MAX_PAGE_BYTES)).text;
     } catch (e) {
       if (e instanceof RekeyError) throw e;
       throw new RekeyError({
@@ -210,7 +188,7 @@ export class ExternalBillingProvider implements BillingProvider {
       clearTimeout(timer);
     }
 
-    let body: { items?: unknown; nextCursor?: unknown } | null = null;
+    let body: { items?: unknown; nextCursor?: unknown } | null;
     try {
       body = JSON.parse(bodyText) as { items?: unknown; nextCursor?: unknown };
     } catch {

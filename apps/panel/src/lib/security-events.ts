@@ -2,8 +2,8 @@
  * Security-event presentation: labels for the log, and CUID→email resolution.
  *
  * The label map used to live here as a panel-side MIRROR of a list nobody
- * owned — the API emits its event types as bare string literals at ~62 call
- * sites — and this file said so, with "it should live in
+ * owned, the API emits its event types as bare string literals at ~62 call
+ * sites, and this file said so, with "it should live in
  * `@rekey.dev/shared-types` next to the emitters". It now does. The names below
  * are thin re-exports so the pages calling them did not have to change; new
  * code should import from `@rekey.dev/shared-types` directly.
@@ -91,7 +91,7 @@ export function eventDetails(metadata: unknown): EventDetail[] {
 /**
  * Map of `actorId` → email, for the actors on one page of events.
  *
- * The API does not join this. `SecurityEvent` has no relations at all —
+ * The API does not join this. `SecurityEvent` has no relations at all,
  * `actorId` is a bare scalar pointing at `TenantUser.id` or `EndUser.id`
  * depending on `actorType`, and the list endpoint has no `actorId` filter and
  * no email in its serializer. Payments and Dunning show an email because their
@@ -100,7 +100,7 @@ export function eventDetails(metadata: unknown): EventDetail[] {
  *
  * So the panel resolves it. Operators come from one workspace-members read
  * (small, already cached per request). End-users are fetched by id, deduped
- * and in parallel, capped at `MAX_END_USER_LOOKUPS` — a page is 50 rows and
+ * and in parallel, capped at `MAX_END_USER_LOOKUPS`, a page is 50 rows and
  * distinct actors are far fewer, but the cap keeps a pathological page from
  * fanning out unboundedly. Anything unresolved falls back to the CUID, which
  * is strictly no worse than before.
@@ -117,7 +117,7 @@ export async function resolveActorEmails(
   const operatorIds = new Set(
     events.filter((e) => e.actorType === 'operator' && e.actorId).map((e) => e.actorId!),
   );
-  // (applicationId, endUserId) pairs — an end-user id is only meaningful
+  // (applicationId, endUserId) pairs, an end-user id is only meaningful
   // within its application.
   const endUserKeys = new Map<string, { appId: string; euid: string }>();
   for (const e of events) {
@@ -128,10 +128,10 @@ export async function resolveActorEmails(
   const lookups = [...endUserKeys.values()].slice(0, MAX_END_USER_LOOKUPS);
 
   // ONE wave, not two. The members read used to sit in its own `Promise.all`
-  // — a `Promise.all` over a single element, which buys nothing but does cost
-  // a whole serial round-trip: the end-user fan-out could not start until it
-  // resolved. Neither depends on the other, so they go together and the audit
-  // log loses a full API latency from every render.
+  // over a single element, which buys nothing but does cost a whole serial
+  // round-trip: the end-user fan-out could not start until it resolved.
+  // Neither depends on the other, so they go together and the audit log no
+  // longer loses a full API latency on every render.
   const [memberPage, resolved] = await Promise.all([
     operatorIds.size > 0
       ? apiGet<Page<MemberRow>>('/api/v1/tenant/workspace/members').catch(() => null)
