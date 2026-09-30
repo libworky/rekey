@@ -1,6 +1,18 @@
-# Quickstart
+# Self-host quickstart
 
 From a fresh clone to a working API + first Application + first key. Copy-pasteable for both humans and AI agents.
+
+> **Not self-hosting?** The canonical quickstart is
+> [rekey.dev/docs/quickstart](https://rekey.dev/docs/quickstart): a free Rekey
+> Cloud workspace (no card) to a signed-in user in a Next.js app, with the
+> drop-in `<SignIn>` form and two environment variables. Nothing on this page
+> is needed for that.
+>
+> **Self-hosting and building a Next.js app?** Do steps 0 to 3 here to get a
+> running API and a secret key, then follow steps 4 to 7 of the
+> [canonical quickstart](https://rekey.dev/docs/quickstart#step-4) with
+> `REKEY_URL=http://localhost:3030`. Steps 4 onward on this page show the same
+> API from plain Node and `curl`, for any other stack.
 
 ## 0 — Prerequisites
 
@@ -77,8 +89,13 @@ point a container liveness probe at.
 
 ## 3 — Bootstrap: one command
 
-`rekey init` creates the Tenant, the Application, and the Application's first
-API key in a single call. That is the whole bootstrap.
+`rekey init` creates the Tenant, an owner invite for `--owner-email`, the
+Application, and the Application's first API key in a single call. That is the
+whole bootstrap.
+
+The CLI is **self-host only (needs `SUPER_ADMIN_KEY`)**: it calls the
+deployment-wide admin API, and that key exists only on a deployment you run.
+A Rekey Cloud workspace has no such key; there, the panel does this step.
 
 ```bash
 export REKEY_URL=http://localhost:3030
@@ -93,18 +110,40 @@ npx @rekey.dev/cli init \
 
 ```
 ✓ Tenant      cmsa9dd8p0003v5ssca5nrw4k  Acme Co
+✓ Owner       ops@acme.example (invited as OWNER)
 ✓ Application cmsa9dd900005v5sss645n3og  acme-prod
 ✓ Public key  rp_pub_acme-prod_781Wp_9DdfjOCbEt
 ✓ API key     rp_test_BOXc…
 
-SECRET KEY (shown once — save it now):
+SECRET KEY (shown once, save it now):
   rp_test_BOXc99-YIx-TLKird419Xk3NkMCjx5Uo
+
+OWNER INVITE for ops@acme.example (single use, expires 2026-10-05T09:12:44.000Z):
+  http://localhost:3031/accept-invite?token=rp_opinv_Qm9…
+
+Next: Send the link to ops@acme.example. It makes them OWNER of this workspace, once. ...
 ```
 
-Save the secret key now. Only its hash is stored, so it cannot be recovered —
+Save the secret key now. Only its hash is stored, so it cannot be recovered;
 mint a replacement instead. When one leaks, follow
 [docs/api-key-rotation.md](api-key-rotation.md): revoke, mint, deploy, verify
 the old key is dead.
+
+**Then open the owner invite.** The admin routes `init` calls create a
+workspace but no operator: `--owner-email` on its own is only a label, and
+signing up in the panel without the link gives that address a second, empty
+workspace. The link is what makes them the OWNER of this one. Open it as
+`--owner-email` and either create an account (it joins this workspace instead
+of making a new one, in `open` or `invite` sign-up mode) or, if that address
+already has an account, sign in and accept. The invite works once, only for
+that email, and expires after 7 days; mint another with
+`POST /api/v1/admin/operator-invites` and `{"tenantId", "email"}` if it
+lapses. The link uses the API's `PANEL_URL`; when that is unset `init` prints
+the path to put after your panel's address. In `closed` sign-up mode nobody
+new can register, so only an existing account can accept it; `init` reads the
+mode and says so. Against an API older than 2.2.0, which cannot bind the invite
+to the tenant, `init` revokes the key and stops with `CLI_INVITE_UNBOUND`
+before creating the Application.
 
 Add `--json` to any command for a single JSON document on stdout — every
 command in this CLI runs non-interactively when given enough flags, which is
@@ -128,7 +167,7 @@ step 4.
 ### Prefer raw HTTP?
 
 <details>
-<summary>The three <code>curl</code> calls <code>rekey init</code> makes</summary>
+<summary>The four <code>curl</code> calls <code>rekey init</code> makes</summary>
 
 ```bash
 ADMIN=$(grep ^SUPER_ADMIN_KEY .env | cut -d= -f2)
@@ -138,6 +177,13 @@ TENANT=$(curl -sX POST http://localhost:3030/api/v1/admin/tenants \
   -H "Content-Type: application/json" \
   -d '{"name": "Acme Co", "ownerEmail": "ops@acme.example"}' \
   | jq -r .data.id)
+
+# The owner invite: rawToken and inviteUrl are shown once.
+curl -sX POST http://localhost:3030/api/v1/admin/operator-invites \
+  -H "Authorization: Bearer $ADMIN" \
+  -H "Content-Type: application/json" \
+  -d "{\"tenantId\": \"$TENANT\", \"email\": \"ops@acme.example\", \"role\": \"OWNER\"}" \
+  | jq .data
 
 APP=$(curl -sX POST http://localhost:3030/api/v1/admin/applications \
   -H "Authorization: Bearer $ADMIN" \
@@ -223,7 +269,7 @@ covers the drop-in `<SignIn />` / `<SignUp />` / `<UserButton />` family.
 
 ## 6 — Password reset & magic links: branch on `emailSent`
 
-`auth.requestPasswordReset` and `auth.requestMagicLink` (and `auth.sendVerificationEmail`) return **different shapes depending on whether Rekey could send the email itself** (BYO Resend credentials on the Application, or `RESEND_DEFAULT_*` env). They never throw for an unknown email — enumeration-safe by design.
+`auth.requestPasswordReset` and `auth.requestMagicLink` (and `auth.sendVerificationEmail`) return **different shapes depending on whether Rekey could send the email itself** (BYO Resend credentials on the Application, or `RESEND_DEFAULT_*` env). They never throw for an unknown email. A secret-key caller (your server) is told, with `delivered: false` on password reset; a publishable-key browser caller always gets the same body. Keep that difference out of what you render.
 
 | Case | `delivered` | `emailSent` | token field (`resetToken` / `magicLinkToken`) | Your job |
 |---|---|---|---|---|

@@ -10,6 +10,12 @@ Rekey hosts **two MCP surfaces**:
    events). Two auth paths: OAuth 2.1 + PKCE with workspace picker at consent
    (preferred), or PAT-Bearer with an `rp_op_…` token (headless / non-browser).
 
+**On Rekey Cloud, the operator MCP is the one to connect an agent to**
+(`https://api.rekey.dev/api/v1/tenant/mcp`). The separate stdio package
+[`@rekey.dev/mcp`](../packages/mcp/README.md) is a third, local option, and its
+read tools need the deployment-wide `SUPER_ADMIN_KEY`, so it is self-host only.
+The same goes for [`@rekey.dev/cli`](../packages/cli/README.md).
+
 The full operator-facing guide is published at
 [**rekey.dev/docs/mcp**](https://rekey.dev/docs/mcp). This file is the
 repo-level cross-reference for developers working on the API itself.
@@ -83,6 +89,28 @@ For an Application with slug `<slug>`, given `PUBLIC_WEBHOOK_BASE_URL=https://ap
 The MCP endpoint replies `401` + `WWW-Authenticate: Bearer resource_metadata="<protected-resource-url>"`
 on unauthenticated calls, so any RFC-compliant MCP client auto-discovers the rest of the flow.
 
+### Introspection from your own MCP server
+
+If you run your own MCP server against Rekey-issued tokens, it calls
+introspection (`rekey.mcp.introspect(token)` in `@rekey.dev/node`) with the
+Application's **secret** key, typically on every tool call. That call counts
+against the secret key's own budget, the same one every other secret-key call
+spends: 30000 a minute per key by default (`RATE_LIMIT_API_KEY_MAX`, see
+[rate-limits.md](rate-limits.md)). It is not held to a sign-in limit, and one
+backend address serving every user is fine. A call without a valid secret key
+(none, a publishable key, a forged key) is answered `401 invalid_client` and
+counted against the caller's address at 100 a minute (`RATE_LIMIT_MAX`), where
+it also feeds the rejected-credential block.
+
+The answer is never cached on Rekey's side and is sent with
+`Cache-Control: no-store`, so a token Rekey has stopped honouring (the user
+erased, every session revoked, the organization binding no longer valid) reads
+`active: false` on the next call. If your volume is high enough to matter, you may cache an
+`active: true` answer in process for a few seconds (never past its `exp`),
+keyed by a hash of the token. That trades exactly that many seconds of
+revocation latency for fewer calls; do not cache for longer than you would
+accept a revoked token still being honoured.
+
 ## Scopes + grants
 
 | Field | Value |
@@ -141,6 +169,14 @@ personal too, even when the session has an active organization (`oid`):
 binding an organization is always an explicit choice, so a handoff integration
 written before this cannot start acting for a team without asking. It is a `400 INVALID_GRANT_REQUEST` on a grant without
 `mcp:account` or on an Application without organizations.
+
+A hosted authorize page (`authConfig.hostedAuthorizeUrl`) that uses the
+handoff must show a consent screen before it calls `/grant`: MCP clients
+register themselves, so a page that mints on arrival delivers a signed-in
+user's `mcp:account` grant to whichever client a link names.
+`POST /oauth/authorize/preview` returns what that screen needs (client name,
+confirmed redirect URI, granted scopes, signed-in account) and mints nothing.
+See [auth.md](auth.md#acting-as-an-openid-connect-provider-for-another-app).
 
 **Where it lives.** The authorization code (`oauth_auth_codes.organization_id`),
 then the refresh chain (`refresh_tokens.grant_organization_id`, carried across
@@ -241,6 +277,7 @@ Mounted at `/api/v1/tenant/mcp`. JSON-RPC over HTTP POST. Bearer-authed by
 | MCP server (initialize / tools/list / tools/call / ping) | `apps/api/src/modules/tenant-mcp/tenant-mcp-server.ts` |
 | Operator tool definitions | `apps/api/src/modules/tenant-mcp/operator-tools.ts` |
 | Operator tool definitions (writes) | `apps/api/src/modules/tenant-mcp/operator-write-tools.ts` |
+| Operator tool definitions (organization membership) | `apps/api/src/modules/tenant-mcp/operator-organization-tools.ts` |
 | Hybrid bearer guard (PAT **or** OAuth JWT) | `apps/api/src/modules/tenant-mcp/bearer-auth.ts` |
 | PAT resolution (shared with `/api/v1/tenant/operator/*`) | `apps/api/src/middleware/operator-token-auth.ts` |
 | Panel UI — connection guide | `apps/panel/src/app/(authed)/account/mcp/page.tsx` |
@@ -285,9 +322,17 @@ being handed a long-lived secret to paste.
 | `recent_webhook_events` | filter by `provider`, `onlyFailed`, `limit` |
 | `recent_failed_webhook_deliveries` | last-N FAILED outbound deliveries |
 | `application_health` | per-app payment success rate (30d) + outbound webhook success rate (24h), sorted by failure count |
+| `get_user_analytics` | one app's Users overview (`overview:read`): the `GET .../analytics/users` sections and filters, counts only |
 | `get_end_user` | one end-user: verification state, app environment, current subscription |
 | `list_devices` | an end-user's devices, newest activity first, optionally filtered by `status` |
 | `list_organization_roles` | an application's organization-role catalog + each role's `baseRole` tier. Also reports `organizationsEnabled`, and when it is false returns a note naming `update_auth_config`, so an agent asking about roles on an app without organizations gets the next step rather than an empty list |
+| `list_organizations` | an application's organizations, newest first, with member and pending-invitation counts. `query` matches name or slug; `limit` (max 100) and `offset` page, with `total` and `hasMore`. Lives in `operator-organization-tools.ts` and needs `organizations:read` |
+| `list_contact_lists` | an application's lists (waitlists, newsletters, contact forms) with member and submission counts, Public capture and archived state. Needs `audience:read`, and a viewer or billing grant is refused as over REST |
+| `get_contact_list_stats` | one list by `key`: members by status, joined and left in the last 7 and 30 days, how people joined, and submissions. Needs `audience:read` |
+
+The list tools return counts and never an address, and there is deliberately no
+tool that exports or erases contacts: bulk personal data should not flow into an
+agent's context, and erasure has no undo. Use the panel or the CSV export route.
 
 No read tool returns refresh tokens, password hashes, license keys, or provider
 credentials.
@@ -301,7 +346,8 @@ and re-checked on `tools/call`:
 `set_plan_active`, `create_webhook_endpoint`, `update_webhook_endpoint`,
 `invite_member`, `revoke_invitation`, `change_member_role`, `remove_member`,
 `create_organization_role`, `update_organization_role`,
-`delete_organization_role`.
+`delete_organization_role`, `add_organization_member`,
+`set_organization_member_role`.
 
 The three `*_organization_role` tools author an application's **organization**
 role vocabulary: the names a member can hold inside one organization, each
@@ -310,10 +356,38 @@ mapped to an OWNER/ADMIN/MEMBER tier that Rekey enforces on. They refuse with
 off, and the `fix` names `update_auth_config` so the agent can offer to turn
 the feature on rather than dead-ending.
 
+`add_organization_member` and `set_organization_member_role` assign from that
+vocabulary: they put an existing end-user into an organization with a role, or
+change the role of someone already in it. They reuse the operator REST routes'
+service (`POST` / `PATCH /tenant/applications/:id/organizations/:orgId/members`),
+so the rules match the panel's:
+
+- The role must be a name in `list_organization_roles` and not disabled
+  (`ORGANIZATION_ROLE_UNKNOWN`, `ORGANIZATION_ROLE_DISABLED`). Omitting `role`
+  on add uses the catalog's default role.
+- Operator authority skips the organization's own hierarchy, so there is no
+  "only an OWNER may make an OWNER" check and no last-owner guard. Demoting an
+  organization's only OWNER-tier member leaves it without an owner until one is
+  assigned.
+- Both need `organizations:write`, write capability and at least the ADMIN
+  workspace role, and refuse with `ORGANIZATIONS_NOT_ENABLED` while the
+  application has organizations switched off.
+- An Application, organization or end-user outside the caller's workspace
+  reads as not found.
+- Each refusal names the tool that repairs it in `fix` (for example
+  `ORGANIZATION_ALREADY_MEMBER` points at `set_organization_member_role`).
+- Arguments are validated against the advertised bounds before anything runs
+  (`VALIDATION_ERROR`), and the three tools carry MCP annotations:
+  `list_organizations` is `readOnlyHint`, `set_organization_member_role` is
+  `idempotentHint`, neither write is `destructiveHint`.
+- The security events (`app.organization_member_added`,
+  `app.organization_member_role_changed`) are recorded by the service, so the
+  panel and REST routes log the same writes; MCP ones carry `via: operator_mcp`.
+
 Note the axis: `change_member_role` above is a **workspace** (operator) role.
-Assigning an *organization* role to an end-user is not an operator action at
-all. An org OWNER/ADMIN does it from your app with their own end-user session.
-There is deliberately no MCP tool for it.
+The organization tools act on an end-user's role inside one organization. An
+org OWNER/ADMIN can still do the same from your app with their own end-user
+session, without an operator.
 
 Three write tools act on an end-user's devices: `release_device` (gives the
 slot back and revokes the device's sessions), `block_device` (refuses sign-in
@@ -332,6 +406,10 @@ rotation.
 Each goes through the same service the panel uses — no MCP-only write path — and
 emits a security event on success, so an agent's writes are as auditable as a
 human's.
+
+A tool that fails with a Rekey error returns `{ error, code, fix }` in its
+result (`isError: true`), the same code and remediation the REST route sends.
+Other failures return `{ error }` alone.
 
 ### OAuth 2.1 AS (Phase 2 — shipped)
 
@@ -355,7 +433,7 @@ workspace at consent.
 | Authorization (redirects the operator to the panel to sign in + pick a workspace) | `GET …/oauth/authorize` — **GET only**; `POST` here is a 404 |
 | Consent decision (the panel posts the operator's approval back) | `POST …/oauth/grant` — guarded by `requireTenantSession`, i.e. a panel **session** token; a PAT is deliberately not accepted, because consent is a human act |
 | Token (auth-code + refresh) | `POST …/oauth/token` |
-| Introspection (RFC 7662) | `POST …/oauth/introspect` |
+| Introspection (RFC 7662) | `POST …/oauth/introspect`, counted against the PAT's operator (600 a minute, `RATE_LIMIT_AUTHENTICATED_MAX`) |
 
 The consent screen names the **host the authorization code will be delivered to**
 — the registered `redirect_uri`'s origin — and marks it as not vouched for by

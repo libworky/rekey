@@ -6,7 +6,9 @@
  * binding, no flaky network behaviour.
  */
 
-import Fastify, { type FastifyInstance } from "fastify";
+import Fastify, { type FastifyInstance, type FastifyRequest } from "fastify";
+import { verifyMfaChallengeToken } from "./lib/jwt.js";
+import { recordSecurityEvent } from "./lib/security-events.js";
 import cors from "@fastify/cors";
 import helmet from "@fastify/helmet";
 import rateLimit from "@fastify/rate-limit";
@@ -27,6 +29,13 @@ import { rekeyErrorHandler } from "./lib/error.js";
 import { requestIdFor } from "./lib/request-id.js";
 import {
   authCeilingOptions,
+  authClientIpCeilingOptions,
+  wantsAuthClientIpCeiling,
+  wantsUnattributedFailureCap,
+  unattributedFailureKey,
+  unattributedAttemptSubject,
+  unattributedSubjectKey,
+  FAILED_AUTH_ATTEMPT_CODES,
   globalRateLimitKey,
   globalRateLimitAllowList,
   globalRateLimitMaxFor,
@@ -45,11 +54,15 @@ import {
 import { rejectUnsupportedMediaType } from "./middleware/media-type.js";
 import {
   CLIENT_IP_VOUCHED,
+  INTERNAL_CALLER,
+  VISITOR_COUNTRY,
+  DECLARED_CLIENT_IP,
   createClientIpResolver,
   proxySecretWarning,
   type ClientIpPolicy,
 } from "./lib/client-ip.js";
 import { recordApiRequest, flushApiRequestLogs } from "./lib/request-log.js";
+import { apiLoggerOptions } from "./lib/log-redaction.js";
 import {
   idempotencyPreHandler,
   idempotencyOnSend,
@@ -59,6 +72,7 @@ import {
   stopScheduledDeliveries,
 } from "./modules/webhooks/webhook.service.js";
 import { processDueDunningCases } from "./modules/billing/dunning.service.js";
+import { processTrialsEndingSoon } from "./modules/billing/trial-events.js";
 import { runPruneSweep } from "./lib/prune-sweep.js";
 import {
   createS3LogArchiver,
@@ -100,7 +114,11 @@ import {
   tenantInvitationAuthRoutes,
 } from "./modules/tenant-workspaces/index.js";
 import { tenantApplicationsRoutes } from "./modules/tenant-applications/index.js";
-import { oauthRoutes, oauthLinkRoutes } from "./modules/oauth/index.js";
+import {
+  oauthRoutes,
+  oauthLinkRoutes,
+  oauthProviderListRoutes,
+} from "./modules/oauth/index.js";
 import { mfaRoutes } from "./modules/mfa/index.js";
 import { tenantMfaRoutes } from "./modules/tenant-mfa/index.js";
 import {
@@ -119,9 +137,27 @@ import {
   tenantDevicesRoutes,
 } from "./modules/devices/index.js";
 import { portalConfigRoutes } from "./modules/portal/index.js";
+import { tenantEndUserBanRoutes } from "./modules/end-user-bans/index.js";
+import {
+  checkoutProbeRoutes,
+  checkoutSessionRoutes,
+} from "./modules/billing/checkout/checkout-sessions.routes.js";
+import { tenantCheckoutRoutes } from "./modules/billing/checkout/tenant-checkout.routes.js";
 import { usagePublicRoutes, usageSelfRoutes } from "./modules/usage/index.js";
 import { creditsPublicRoutes, creditsSelfRoutes } from "./modules/credits/index.js";
-import { tenantEmailRoutes } from "./modules/email/index.js";
+import {
+  customEmailTemplateRoutes,
+  emailSendRoutes,
+  emailUnsubscribeRoutes,
+  tenantEmailRoutes,
+} from "./modules/email/index.js";
+import {
+  publicListsRoutes,
+  serverListsRoutes,
+  tenantContactsRoutes,
+  tenantListMembersRoutes,
+  tenantListsRoutes,
+} from "./modules/contacts/index.js";
 import {
   tenantWebhookRoutes,
   startWebhookWorker,
@@ -146,6 +182,12 @@ import {
 } from "./middleware/admin-auth.js";
 import { assertDefaultTenantLimitsValid } from "./lib/tenant-limits.js";
 import { shutdownBcryptPool } from "./lib/bcrypt-pool.js";
+import { profileSchemaPublicRoutes, profileSelfRoutes, profileServerRoutes } from "./modules/end-users/profile.routes.js";
+import { profileTenantRoutes } from "./modules/end-users/profile-tenant.routes.js";
+import { insightsTenantRoutes } from "./modules/end-users/insights.routes.js";
+import { applicationSettingsRoutes } from "./modules/analytics/settings.routes.js";
+import { analyticsTenantRoutes } from "./modules/analytics/analytics.routes.js";
+import { ROLLUP_TICK_MS, runAnalyticsRollup } from "./modules/analytics/rollup/job.js";
 
 export interface BuildAppOptions {
   /** Override the default logger config (e.g. silence in tests). */
@@ -158,6 +200,8 @@ export interface BuildAppOptions {
   rateLimitOverrides?: Partial<GlobalRateLimitBudgets>;
   /** Override API_PROXY_SECRET / API_PROXY_HOPS for this instance (tests; env is parsed once). */
   apiProxy?: { secret?: string; hops?: number; callerSecret?: string };
+  /** Overrides TRUST_CF_IPCOUNTRY (tests). */
+  trustCfIpCountry?: boolean;
   /** Replace the client-address resolver (tests: forcing a failure). */
   clientIpResolver?: (raw: import("node:http").IncomingMessage) => boolean;
 }
@@ -243,6 +287,7 @@ export async function buildApp(
     proxyHops: options.apiProxy?.hops ?? env.API_PROXY_HOPS,
     internalCallerSecret:
       options.apiProxy?.callerSecret ?? env.INTERNAL_CALLER_SECRET,
+    trustCfIpCountry: options.trustCfIpCountry ?? env.TRUST_CF_IPCOUNTRY,
     // At most one warning per 10 minutes: it can fire on every request.
     onUnprovenProxy: (peer) => {
       const now = Date.now();
@@ -260,19 +305,7 @@ export async function buildApp(
   const app = Fastify({
     logger:
       options.logger ??
-      ({
-        level: env.NODE_ENV === "production" ? "info" : "debug",
-        redact: {
-          paths: [
-            "headers.authorization",
-            "req.headers.authorization",
-            "body.rawKey",
-            "body.password",
-            "*.rawKey",
-          ],
-          censor: "[REDACTED]",
-        },
-      } as Record<string, unknown>),
+      apiLoggerOptions(env.NODE_ENV === "production" ? "info" : "debug"),
     bodyLimit: 1024 * 1024,
     // Trusting X-Forwarded-For means trusting whoever set it. Keyed off
     // NODE_ENV this was `true` in production for ANY peer, so a client could
@@ -350,10 +383,17 @@ export async function buildApp(
       "client address resolver failed; request treated as unvouched",
     );
   app.decorateRequest("clientIpVouched", false);
+  app.decorateRequest("declaredClientIp", null);
+  app.decorateRequest("visitorCountry", null);
+  app.decorateRequest("internalCaller", false);
   app.addHook("onRequest", async (req) => {
-    req.clientIpVouched =
-      (req.raw as unknown as Record<symbol, boolean>)[CLIENT_IP_VOUCHED] ===
-      true;
+    const raw = req.raw as unknown as Record<symbol, unknown>;
+    req.clientIpVouched = raw[CLIENT_IP_VOUCHED] === true;
+    const declared = raw[DECLARED_CLIENT_IP];
+    req.declaredClientIp = typeof declared === "string" ? declared : null;
+    const country = raw[VISITOR_COUNTRY];
+    req.visitorCountry = typeof country === "string" ? country : null;
+    req.internalCaller = raw[INTERNAL_CALLER] === true;
   });
   const proxyWarning = proxySecretWarning(clientIpPolicy);
   if (proxyWarning && env.NODE_ENV !== "test") app.log.warn(proxyWarning);
@@ -626,8 +666,12 @@ export async function buildApp(
   // identity and bites on `Content-Length` before a byte is read.
   //
   // The key is the Application where one resolved, else the secret key, else
-  // the client IP (`authCeilingKey`). Operator sign-in routes have no
-  // Application, so they key on the IP, and that is only the REAL client when
+  // the client IP (`authCeilingKey`). An Application's bucket gets
+  // RATE_LIMIT_AUTH_CEILING_MAX, sized for a busy Application; a second bucket
+  // holds each end-user address to RATE_LIMIT_MAX of it, so the public
+  // publishable key does not let one address refuse every sign-in to the
+  // Application. Operator sign-in routes have no Application, so they key on
+  // the IP (at RATE_LIMIT_MAX), and that is only the REAL client when
   // lib/client-ip.ts can vouch for it: otherwise every sign-in attempt on the
   // deployment would share one bucket and anyone spraying the login page would
   // lock every operator out, which is why the hook below skips an unvouched
@@ -637,8 +681,51 @@ export async function buildApp(
   // purpose: the hook form sets a per-request "already ran" flag that the
   // route's own limiter shares, so it would silently disable the tight cap.
   const authCeiling = app.createRateLimit(
-    authCeilingOptions(env.RATE_LIMIT_MAX, env.RATE_LIMIT_WINDOW_MS),
+    authCeilingOptions(
+      { perApplication: budgets.authCeiling, perClientIp: budgets.anonymous },
+      env.RATE_LIMIT_WINDOW_MS,
+    ),
   );
+  const authClientIpCeiling = app.createRateLimit(
+    authClientIpCeilingOptions(budgets.anonymous, env.RATE_LIMIT_WINDOW_MS),
+  );
+  // Failed attempts per Application from traffic with no visitor address (a
+  // secret-key backend that does not send X-Rekey-Client-Ip, or a proxy we
+  // cannot identify). Checking must not count, only failures do, hence the
+  // failure limiter rather than a `createRateLimit` bucket.
+  const unattributedFailures = createAuthFailureLimiter({
+    max: budgets.authUnattributedFailures,
+    windowMs: env.RATE_LIMIT_WINDOW_MS,
+    redis: sharedRedis,
+    onStoreError: (err) =>
+      app.log.warn(
+        { err },
+        "unattributed auth-failure limiter store unavailable; failing open",
+      ),
+  });
+  // Which accounts have failed an unattributed attempt this window: one
+  // failure marks the (Application, subject) pair, and past the cap a marked
+  // pair is refused.
+  const unattributedSubjectFailures = createAuthFailureLimiter({
+    max: 1,
+    windowMs: env.RATE_LIMIT_WINDOW_MS,
+    redis: sharedRedis,
+    onStoreError: (err) =>
+      app.log.warn(
+        { err },
+        "unattributed auth-failure limiter store unavailable; failing open",
+      ),
+  });
+  const unattributedSubjectOf = (req: FastifyRequest): string | null =>
+    unattributedAttemptSubject(req, (token) => {
+      if (!req.application) return null;
+      const claims = verifyMfaChallengeToken(
+        token,
+        req.application.id,
+        req.application.tokenGeneration,
+      );
+      return claims?.sub ?? null;
+    });
   // preValidation, not onRequest. The key needs the resolved Application, and
   // `requireApiKey` runs as an onRequest hook on a CHILD instance, parent
   // hooks always run first, so at onRequest time there is nothing to key on
@@ -648,11 +735,65 @@ export async function buildApp(
     // No Application to key on and an address shared by everyone behind an
     // unidentified proxy: this ceiling would lock every operator out.
     if (!req.application && !req.apiKey && !req.clientIpVouched) return;
+    // The address's share first, so one address that has spent its own
+    // budget stops counting against the Application's. For a secret key the
+    // address is the visitor its backend declared in X-Rekey-Client-Ip.
+    if (wantsAuthClientIpCeiling(req)) {
+      const perIp = await authClientIpCeiling(req);
+      if (!perIp.isAllowed && perIp.isExceeded) throw rateLimitedAfter(perIp.ttl, perIp.max);
+    }
+    // No visitor address at all, on sign-in or MFA verification: once the
+    // Application's unattributed traffic has failed too many attempts this
+    // window, an email (or pending MFA user) that has ALREADY failed this
+    // window is refused. Everyone else still gets their attempt, so a spray
+    // costs each account at most one wasted guess and real users are never
+    // shut out wholesale. The per-(Application, email) lockout is unchanged.
+    const attemptSubject = unattributedSubjectOf(req);
+    if (attemptSubject !== null && wantsUnattributedFailureCap(req)) {
+      const overCap = await unattributedFailures.blocked(unattributedFailureKey(req));
+      if (overCap > 0) {
+        const ttl = await unattributedSubjectFailures.blocked(
+          unattributedSubjectKey(req, attemptSubject),
+        );
+        if (ttl > 0) throw rateLimitedAfter(ttl, budgets.authUnattributedFailures);
+      }
+    }
     const result = await authCeiling(req);
     // `isAllowed` is the union discriminant, not redundant with `isExceeded`:
     // narrowing on it is what makes ttl/max visible on the failure branch.
     if (result.isAllowed || !result.isExceeded) return;
     throw rateLimitedAfter(result.ttl, result.max);
+  });
+  // Counts the failed attempts the check above refuses on. Only wrong
+  // passwords and MFA codes (FAILED_AUTH_ATTEMPT_CODES) on the two routes that
+  // produce them, so a busy backend's successful sign-ins never spend it.
+  app.addHook("onError", async (req, _reply, err) => {
+    if (!FAILED_AUTH_ATTEMPT_CODES.has((err as { code?: unknown }).code as string)) return;
+    const subject = unattributedSubjectOf(req);
+    if (subject === null || !wantsUnattributedFailureCap(req)) return;
+    await unattributedSubjectFailures.record(unattributedSubjectKey(req, subject));
+    const count = await unattributedFailures.record(unattributedFailureKey(req));
+    // Exactly once per window per Application: the count passes the cap once.
+    if (count !== budgets.authUnattributedFailures) return;
+    req.log.warn(
+      { applicationId: req.application?.id, failuresInWindow: count },
+      "failed sign-in attempts with no client address reached RATE_LIMIT_AUTH_UNATTRIBUTED_FAILURE_MAX; until the window ends, unattributed sign-in and MFA attempts for accounts that already failed this window are refused. Forward X-Rekey-Client-Ip from the backend to limit per visitor instead",
+    );
+    if (req.application) {
+      await recordSecurityEvent({
+        type: "auth.unattributed_failure_cap_reached",
+        actorType: "system",
+        tenantId: req.application.tenantId,
+        applicationId: req.application.id,
+        ip: req.ip,
+        metadata: {
+          failuresInWindow: count,
+          windowSeconds: env.RATE_LIMIT_WINDOW_MS / 1000,
+          credential: req.apiKey ? "secret-key" : "publishable-key",
+          fix: "Send the visitor's address in X-Rekey-Client-Ip on secret-key sign-in and MFA calls (docs/rate-limits.md), or set API_PROXY_SECRET if browser traffic reaches the API through a proxy.",
+        },
+      });
+    }
   });
 
   // Generic Idempotency-Key support, opt-in per route via
@@ -786,6 +927,22 @@ export async function buildApp(
     }, PRUNE_INTERVAL_MS);
     pruneTimer.unref();
 
+    // Analytics rollup: a five-minute tick that does its work once per UTC
+    // hour, on one replica (lease plus an hour marker, modules/analytics/rollup/job.ts).
+    let rollupRunning = false;
+    const rollupTimer = env.ANALYTICS_ROLLUP_ENABLED
+      ? setInterval(() => {
+          if (rollupRunning) return;
+          rollupRunning = true;
+          void runAnalyticsRollup(getRedis(), { log: app.log })
+            .catch((err) => app.log.warn({ err }, "analytics rollup failed"))
+            .finally(() => {
+              rollupRunning = false;
+            });
+        }, ROLLUP_TICK_MS)
+      : null;
+    rollupTimer?.unref();
+
     // Outbound-webhook retry poller. Primary scheduling is BullMQ when Redis is
     // configured (delayed jobs survive a crash), or in-process setTimeout
     // otherwise (webhook.service.ts). Either way this poller re-attempts PENDING
@@ -812,6 +969,16 @@ export async function buildApp(
     }, DUNNING_POLL_INTERVAL_MS);
     dunningTimer.unref();
 
+    // `subscription.trial_will_end`, a few days before each trial ends. Same
+    // interval as dunning for the same reason: the lead time is days, and the
+    // per-row claim in processTrialsEndingSoon makes replicas safe.
+    const trialTimer = setInterval(() => {
+      void processTrialsEndingSoon(100, app.log).catch((err) =>
+        app.log.warn({ err }, "trial ending sweep failed"),
+      );
+    }, DUNNING_POLL_INTERVAL_MS);
+    trialTimer.unref();
+
     // BullMQ webhook-delivery worker, REQUIRED outside test. Installs the
     // Redis-backed scheduler so delayed retries survive a crash and distribute
     // across replicas (microservice-compatible). startWebhookWorker THROWS if
@@ -824,8 +991,10 @@ export async function buildApp(
     app.addHook("onClose", async () => {
       clearInterval(flushTimer);
       clearInterval(pruneTimer);
+      if (rollupTimer) clearInterval(rollupTimer);
       clearInterval(webhookRetryTimer);
       clearInterval(dunningTimer);
+      clearInterval(trialTimer);
       await stopWebhookWorker();
     });
   }
@@ -846,6 +1015,7 @@ export async function buildApp(
   await app.register(userTokenMeRoutes, { prefix: "/api/v1/auth" });
   await app.register(oauthRoutes, { prefix: "/api/v1/auth/oauth" });
   await app.register(oauthLinkRoutes, { prefix: "/api/v1/auth/oauth" });
+  await app.register(oauthProviderListRoutes, { prefix: "/api/v1/auth/oauth" });
   await app.register(usersMeRoutes, { prefix: "/api/v1/users/me" });
   // The end-user's own devices (docs/devices.md), same credential tier as
   // /users/me: publishable key + user JWT.
@@ -857,6 +1027,9 @@ export async function buildApp(
   // Secret-key end-user lookup by id / exact email (routes/users.ts). Mounted
   // AFTER /users/me so the literal segment wins over the :id parameter.
   await app.register(usersRoutes, { prefix: "/api/v1/users" });
+  await app.register(profileServerRoutes, { prefix: "/api/v1/users" });
+  await app.register(profileSelfRoutes, { prefix: "/api/v1/users/me" });
+  await app.register(profileSchemaPublicRoutes, { prefix: "/api/v1" });
   // Bulk import from another auth system (routes/users-import.ts).
   await app.register(usersImportRoutes, { prefix: "/api/v1/users" });
   // End-user organizations, gated by `authConfig.organizationsEnabled`
@@ -876,12 +1049,22 @@ export async function buildApp(
   await app.register(licensesPublicRoutes, { prefix: "/api/v1/licenses" });
   await app.register(usagePublicRoutes, { prefix: "/api/v1/usage" });
   await app.register(creditsPublicRoutes, { prefix: "/api/v1/credits" });
+  // Custom email templates: the secret-key send, and the public unsubscribe
+  // endpoint its List-Unsubscribe header points at. Separate plugins because
+  // the send route's requireApiKey hook must not reach unsubscribe.
+  await app.register(emailSendRoutes, { prefix: "/api/v1/email" });
+  await app.register(emailUnsubscribeRoutes, { prefix: "/api/v1/email" });
+  await app.register(publicListsRoutes, { prefix: "/api/v1/lists" });
+  await app.register(serverListsRoutes, { prefix: "/api/v1/lists" });
   // The signed-in end-user's own usage and credit reads: same prefixes, a
   // separate plugin each, because the two above are secret-key only as a whole.
   await app.register(usageSelfRoutes, { prefix: "/api/v1/usage" });
   await app.register(creditsSelfRoutes, { prefix: "/api/v1/credits" });
   // Hosted customer portal, public config lookup by slug (Portal V2).
   await app.register(portalConfigRoutes, { prefix: "/api/v1/portal" });
+  // The Rekey-hosted checkout page's reads, and the portal's readiness callback.
+  await app.register(checkoutSessionRoutes, { prefix: "/api/v1/checkout-sessions" });
+  await app.register(checkoutProbeRoutes, { prefix: "/api/v1/checkout" });
   // Per-Application MCP server + OAuth 2.1 AS (gated per-app by authConfig.mcpEnabled).
   await app.register(mcpRoutes, { prefix: "/api/v1/mcp" });
   // Root-level "path-insertion" OAuth metadata discovery (RFC 8414 / 9728). A
@@ -962,13 +1145,43 @@ export async function buildApp(
   await app.register(tenantEmailRoutes, {
     prefix: "/api/v1/tenant/applications",
   });
+  await app.register(customEmailTemplateRoutes, {
+    prefix: "/api/v1/tenant/applications",
+  });
+  await app.register(tenantListsRoutes, {
+    prefix: "/api/v1/tenant/applications",
+  });
+  await app.register(tenantContactsRoutes, {
+    prefix: "/api/v1/tenant/applications",
+  });
+  await app.register(tenantListMembersRoutes, {
+    prefix: "/api/v1/tenant/applications",
+  });
   await app.register(tenantWebhookRoutes, {
     prefix: "/api/v1/tenant/applications",
   });
   await app.register(tenantDevicesRoutes, {
     prefix: "/api/v1/tenant/applications",
   });
+  await app.register(tenantEndUserBanRoutes, {
+    prefix: "/api/v1/tenant/applications",
+  });
+  await app.register(profileTenantRoutes, {
+    prefix: "/api/v1/tenant/applications",
+  });
+  await app.register(insightsTenantRoutes, {
+    prefix: "/api/v1/tenant/applications",
+  });
+  await app.register(applicationSettingsRoutes, {
+    prefix: "/api/v1/tenant/applications",
+  });
+  await app.register(analyticsTenantRoutes, {
+    prefix: "/api/v1/tenant/applications",
+  });
   await app.register(tenantLicenseActivationRoutes, {
+    prefix: "/api/v1/tenant/applications",
+  });
+  await app.register(tenantCheckoutRoutes, {
     prefix: "/api/v1/tenant/applications",
   });
   await app.register(tenantMfaRoutes, { prefix: "/api/v1/tenant/auth/mfa" });

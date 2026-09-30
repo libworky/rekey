@@ -43,6 +43,7 @@
 
 import type { Application, TenantRole } from '@prisma/client';
 import { prisma } from '../../lib/prisma.js';
+import { maskIp, mayReadRawIps } from '../../lib/ip-mask.js';
 import { env } from '../../config/env.js';
 import { RekeyError } from '../../lib/error.js';
 import type { SecurityEventType } from '@rekey.dev/shared-types';
@@ -65,7 +66,7 @@ import {
 import { getModule, registryNames } from '../billing/providers/registry.js';
 import { tenantWorkspacesService } from '../tenant-workspaces/tenant-workspaces.service.js';
 import { organizationRolesService } from '../organization-roles/organization-roles.service.js';
-import { AuthConfigSchema } from '@rekey.dev/shared-types';
+import { API_KEY_SCOPES, AuthConfigSchema, SIGNUP_DOMAIN_LIST_MAX, SignupRestrictionsSchema } from '@rekey.dev/shared-types';
 import { devicesService } from '../devices/devices.service.js';
 import { assertEndUserInApplication } from '../../lib/end-users.js';
 import {
@@ -132,7 +133,7 @@ async function membershipIdInTenant(tenantId: string, tenantUserId: string): Pro
  * The grandfathered `legacyWorkspaceRead` exception survives here deliberately,
  * because it survives over REST too, this is parity, not a gap.
  */
-async function loadAppInTenant(
+export async function loadAppInTenant(
   ctx: OperatorToolContext,
   applicationId: string,
 ): Promise<Application> {
@@ -154,6 +155,22 @@ async function loadAppInTenant(
     });
   }
   return app;
+}
+
+const WELCOME_EMAIL_VALUES = ['on_signup', 'on_verified', 'off'] as const;
+
+/** Checked here because this server does not validate tool arguments against their schema. */
+function parseWelcomeEmail(value: unknown): (typeof WELCOME_EMAIL_VALUES)[number] {
+  const match = WELCOME_EMAIL_VALUES.find((v) => v === value);
+  if (match === undefined) {
+    throw new RekeyError({
+      statusCode: 400,
+      code: 'VALIDATION_ERROR',
+      message: `welcomeEmail "${String(value)}" is not one of ${WELCOME_EMAIL_VALUES.join(', ')}.`,
+      fix: 'Pass welcomeEmail as "on_signup", "on_verified" or "off".',
+    });
+  }
+  return match;
 }
 
 function audit(
@@ -183,7 +200,7 @@ function audit(
  * told to enable them (and how) rather than getting a role nobody can hold.
  * Mirrors `requireOrganizationsEnabled` on the REST side.
  */
-function assertOrganizationsEnabled(app: Application): void {
+export function assertOrganizationsEnabled(app: Application): void {
   const config = AuthConfigSchema.parse(app.authConfig);
   if (!config.organizationsEnabled) {
     throw new RekeyError({
@@ -206,7 +223,7 @@ async function loadEndUserInApp(
   return app;
 }
 
-function deviceView(d: {
+function deviceView(ctx: OperatorToolContext, d: {
   id: string;
   fingerprint: string;
   label: string | null;
@@ -225,7 +242,7 @@ function deviceView(d: {
     status: d.status,
     firstSeenAt: d.firstSeenAt.toISOString(),
     lastSeenAt: d.lastSeenAt.toISOString(),
-    lastSeenIp: d.lastSeenIp,
+    lastSeenIp: mayReadRawIps(ctx.role, accessContextFromTool(ctx).scopes) ? d.lastSeenIp : maskIp(d.lastSeenIp),
     releasedAt: d.releasedAt?.toISOString() ?? null,
     blockedAt: d.blockedAt?.toISOString() ?? null,
     blockedReason: d.blockedReason,
@@ -258,7 +275,7 @@ export const operatorWriteTools: OperatorTool[] = [
       const app = await loadEndUserInApp(ctx, String(args.applicationId), String(args.endUserId));
       const status = args.status === undefined ? undefined : (String(args.status) as 'ACTIVE' | 'RELEASED' | 'BLOCKED');
       const { items, total } = await devicesService.listForEndUser(app.id, String(args.endUserId), { status, take: 100 });
-      return { total, devices: items.map(deviceView) };
+      return { total, devices: items.map((d) => deviceView(ctx, d)) };
     },
   },
   {
@@ -281,7 +298,7 @@ export const operatorWriteTools: OperatorTool[] = [
         deviceId: String(args.deviceId),
         actor: { type: 'operator', id: ctx.tenantUserId },
       });
-      return { device: deviceView(r.device), sessionsRevoked: r.sessionsRevoked };
+      return { device: deviceView(ctx, r.device), sessionsRevoked: r.sessionsRevoked };
     },
   },
   {
@@ -305,7 +322,7 @@ export const operatorWriteTools: OperatorTool[] = [
         reason: args.reason === undefined ? undefined : String(args.reason),
         operatorUserId: ctx.tenantUserId,
       });
-      return { device: deviceView(r.device), sessionsRevoked: r.sessionsRevoked };
+      return { device: deviceView(ctx, r.device), sessionsRevoked: r.sessionsRevoked };
     },
   },
   {
@@ -328,7 +345,7 @@ export const operatorWriteTools: OperatorTool[] = [
         deviceId: String(args.deviceId),
         operatorUserId: ctx.tenantUserId,
       });
-      return { device: deviceView(device) };
+      return { device: deviceView(ctx, device) };
     },
   },
   {
@@ -725,7 +742,8 @@ export const operatorWriteTools: OperatorTool[] = [
     description:
       'Mint a server-side API key (rp_live_… / rp_test_…) for an Application. Returns the ' +
       'raw key EXACTLY ONCE, it is hashed at rest and cannot be retrieved again. Scopes ' +
-      'default to full access; pass a narrower list to restrict the key. Optional ' +
+      'default to full access; pass a narrower list to restrict the key. Valid scopes: ' +
+      `${API_KEY_SCOPES.join(', ')}; any other value is refused with API_KEY_SCOPE_UNKNOWN. Optional ` +
       '`expiresAt` is an ISO-8601 datetime in the future.',
     write: true,
     // Admin tier, for the same reason `configure_billing_provider` is: a secret
@@ -778,6 +796,7 @@ export const operatorWriteTools: OperatorTool[] = [
         applicationId: app.id,
         name: String(args.name),
         scopes,
+        revealsEndUserIps: mayReadRawIps(ctx.role, accessContextFromTool(ctx).scopes),
         ...(expiresAt !== undefined && { expiresAt }),
       });
 
@@ -870,10 +889,34 @@ export const operatorWriteTools: OperatorTool[] = [
             'dead end for users who sign in with Google and have no password. Null or "" ' +
             'turns delegation back off. SECURITY: this is a redirect target in a live ' +
             "sign-in flow, so only ever set it to a page the application's own operator " +
-            'controls. The API refuses to delegate to its own authorize endpoint.',
+            'controls. The API refuses to delegate to its own authorize endpoint. That page ' +
+            'must show a consent screen (POST /oauth/authorize/preview) before it calls ' +
+            '/oauth/authorize/grant.',
         },
         organizationsEnabled: { type: 'boolean' },
         signupMode: { type: 'string', enum: ['public', 'secret_only', 'invite_only'] },
+        signupRestrictions: {
+          type: ['object', 'null'],
+          description:
+            'Which email domains may self sign-up. Replaces the stored rules as a whole; null ' +
+            'removes them. `example.com` matches that domain only, `*.example.com` its ' +
+            'subdomains. A blocked domain wins over an allowed one. Operator-created and ' +
+            'imported users are not checked.',
+          properties: {
+            allowedDomains: {
+              type: 'array',
+              maxItems: SIGNUP_DOMAIN_LIST_MAX,
+              items: { type: 'string', maxLength: 260 },
+            },
+            blockedDomains: {
+              type: 'array',
+              maxItems: SIGNUP_DOMAIN_LIST_MAX,
+              items: { type: 'string', maxLength: 260 },
+            },
+            blockDisposable: { type: 'boolean' },
+          },
+          additionalProperties: false,
+        },
         mfa: { type: 'string', enum: ['off', 'optional', 'required'] },
         mcpEnabled: { type: 'boolean' },
         tokenAlg: {
@@ -902,6 +945,12 @@ export const operatorWriteTools: OperatorTool[] = [
           description:
             'Refuse password sign-in until the end-user confirms their address (403 EMAIL_NOT_VERIFIED). Default false; applies to existing unverified accounts immediately.',
         },
+        welcomeEmail: {
+          type: 'string',
+          enum: ['on_signup', 'on_verified', 'off'],
+          description:
+            'When a new account gets the welcome mail. on_signup (default): at creation, but an unverified address waits for verification while requireEmailVerification is on. on_verified: always after verification. off: never.',
+        },
       },
       required: ['applicationId'],
       additionalProperties: false,
@@ -927,6 +976,12 @@ export const operatorWriteTools: OperatorTool[] = [
         ...(args.signupMode !== undefined && {
           signupMode: args.signupMode as 'public' | 'secret_only' | 'invite_only',
         }),
+        ...(args.signupRestrictions !== undefined && {
+          signupRestrictions:
+            args.signupRestrictions === null
+              ? null
+              : SignupRestrictionsSchema.parse(args.signupRestrictions),
+        }),
         ...(args.mfa !== undefined && { mfa: args.mfa as 'off' | 'optional' | 'required' }),
         ...(args.mcpEnabled !== undefined && { mcpEnabled: args.mcpEnabled === true }),
         ...(args.tokenAlg !== undefined && { tokenAlg: args.tokenAlg as 'HS256' | 'RS256' }),
@@ -941,6 +996,9 @@ export const operatorWriteTools: OperatorTool[] = [
         }),
         ...(args.requireEmailVerification !== undefined && {
           requireEmailVerification: args.requireEmailVerification === true,
+        }),
+        ...(args.welcomeEmail !== undefined && {
+          welcomeEmail: parseWelcomeEmail(args.welcomeEmail),
         }),
       };
       const updated = await applicationsService.updateAuthConfig({ applicationId: app.id, patch });

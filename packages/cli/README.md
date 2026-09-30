@@ -4,6 +4,15 @@
 
 `rekey` — command-line interface for **[Rekey](https://rekey.dev)** deployments. Designed for both human developers and AI agents.
 
+> **Self-host only (needs `SUPER_ADMIN_KEY`).** Every command except `version`
+> and `doctor` calls the deployment-wide admin API (`/api/v1/admin/*`) with
+> `SUPER_ADMIN_KEY`, which only whoever runs the deployment holds. A Rekey Cloud
+> workspace has no such key, so on Cloud use the panel (panel.rekey.dev) for
+> what `rekey init` does, and the hosted operator MCP
+> ([rekey.dev/docs/mcp](https://rekey.dev/docs/mcp))
+> to give an agent your workspace. The Cloud quickstart is
+> [rekey.dev/docs/quickstart](https://rekey.dev/docs/quickstart).
+
 > **What is Rekey?** An auth + billing backend for your SaaS: sign-in (password, magic-link, passkeys, OAuth, MFA), subscriptions, usage, credits, licenses, and teams — behind one API, multi-tenant, provider-agnostic. Docs: **[rekey.dev/docs](https://rekey.dev/docs)**. This CLI manages a deployment — tenants, applications, API keys — from your terminal or an agent.
 
 > **For AI agents**: start at [AGENTS.md](../../AGENTS.md).
@@ -47,7 +56,7 @@ All commands talk to the **admin surface** (`/api/v1/admin/*`) and need `REKEY_U
 |---|---|
 | `rekey version` | Print the CLI version. No env needed. `rekey --version` / `-V` print the same thing; the subcommand is the one that honours `--json`. |
 | `rekey doctor` | Config + connectivity diagnosis (`/health` probe, env checks). Run this first. |
-| `rekey init` | One-shot bootstrap: create tenant → application → first API key. With `--json` the document is `{ tenant, application, apiKey }` at the top level — no `success`/`data` envelope on the success path — so the secret is at **`apiKey.rawKey`**, printed exactly once. (The `{ success: false, error }` envelope appears only on failure, on stderr.) |
+| `rekey init` | One-shot bootstrap: create tenant → owner invite → application → first API key. With `--json` the document is `{ tenant, ownerInvite, application, apiKey }` at the top level, with no `success`/`data` envelope on the success path, so the secret is at **`apiKey.rawKey`**, printed exactly once. (The `{ success: false, error }` envelope appears only on failure, on stderr.) `ownerInvite` is `{ email, role, expiresAt, token, url, signupMode, nextStep }`: a single-use link, valid 7 days, that makes `--owner-email` the tenant's OWNER when they sign up or sign in through it. `url` is null when the API has no `PANEL_URL`; open `<panel>/accept-invite?token=<token>` instead. `signupMode` is read from `GET /api/v1/tenant/auth/signup-mode` (null if that fails) and `nextStep` is worded for it: in `closed` mode only an existing account can accept. Without the link the owner has no way into the tenant: signing up normally creates a separate, empty workspace. Against an API too old to bind the invite to the tenant, `init` revokes the key and fails with `CLI_INVITE_UNBOUND` before creating the Application; upgrade the API to 2.2.0 or later. |
 | `rekey apps list \| get <id> \| create` | Application CRUD. `create` takes `--environment PRODUCTION\|STAGING\|DEVELOPMENT`, which fixes the key prefix (`rp_live_` / `rp_test_`) and defaults to DEVELOPMENT. |
 | `rekey plans list \| create \| set-active` | Plan management (`--amount` is the smallest currency unit, an integer). `create` makes **SUBSCRIPTION** plans only, see below. |
 

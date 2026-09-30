@@ -144,7 +144,21 @@ RUN --mount=type=cache,id=pnpm,target=/pnpm/store \
 COPY --from=build /app/packages/shared-types/dist packages/shared-types/dist
 COPY --from=build /app/apps/api/dist apps/api/dist
 
+# The git commit this image was built from, reported by /health/live next to
+# the release version (apps/api/src/lib/build-info.ts). Optional: unset reads
+# as `unknown`. Declared this late so a new commit invalidates only these two
+# lines, not the dependency install above.
+ARG REKEY_COMMIT=
+ENV REKEY_COMMIT=$REKEY_COMMIT
+
 ENV NODE_ENV=production
+# libuv's threadpool runs argon2 hashing AND dns.lookup (every outbound
+# webhook, breached-password check and email resolves its host there). At the
+# default of 4, a burst of sign-ins held every thread and outbound calls
+# queued behind it. apps/api/src/lib/passwords.ts caps hashing at 4 of these
+# 16, so hashing throughput and memory are unchanged and 12 stay free. It must
+# be set before the process starts: libuv reads it once, on first use.
+ENV UV_THREADPOOL_SIZE=16
 EXPOSE 3030
 # Drop root — the runtime only reads node_modules/dist (world-readable) and
 # writes nothing to disk (migrations go to the DB over the network). The `node`
@@ -172,6 +186,11 @@ COPY --from=build --chown=node:node /app/apps/panel/.next/standalone ./
 # Static assets + the server's runtime chunks aren't part of standalone — copy
 # them to the path Next expects. (panel has no public/ dir.)
 COPY --from=build --chown=node:node /app/apps/panel/.next/static apps/panel/.next/static
+
+# The commit this image was built from, shown in the sidebar next to the API's
+# (apps/panel/src/lib/build-info.ts). Unset reads as `unknown`.
+ARG REKEY_COMMIT=
+ENV REKEY_COMMIT=$REKEY_COMMIT
 
 EXPOSE 3031
 # Run as the unprivileged `node` user. --chown above gives it ownership of the

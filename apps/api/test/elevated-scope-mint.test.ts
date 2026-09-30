@@ -156,6 +156,15 @@ describe('minting a key with an elevated scope', () => {
       expect(minted.some((k) => k.scopes.includes('credits:grant'))).toBe(false);
     });
 
+    it('lets the same MEMBER mint email:send, which needs developer authority only', async () => {
+      const w = await world();
+      expect((await restrict(w, NO_BILLING_WRITE)).statusCode).toBe(200);
+      const res = await mint(w, w.memberToken, ['email:send']);
+      expect(res.statusCode, res.body).toBe(201);
+      // Paired with credits:grant, the billing gate still applies.
+      expect((await mint(w, w.memberToken, ['email:send', 'credits:grant'])).statusCode).toBe(403);
+    });
+
     it('allows a MEMBER who holds billing:write, and the owner', async () => {
       const w = await world();
       expect((await mint(w, w.memberToken, ['credits:grant'])).statusCode).toBe(201);
@@ -218,6 +227,17 @@ describe('minting a key with an elevated scope', () => {
       const elevated = await patMint(w, pat, ['credits:grant']);
       expect(elevated.statusCode).toBe(403);
       expect(elevated.json().error.code).toBe('SCOPE_INSUFFICIENT');
+    });
+
+    it('a keys:mint-only PAT cannot mint contacts:read; one with read access to lists can', async () => {
+      const w = await world();
+      const narrow = await mintPat(w, ['keys:mint']);
+      const refused = await patMint(w, narrow, ['contacts:read']);
+      expect(refused.statusCode).toBe(403);
+      expect(refused.json().error.code).toBe('SCOPE_INSUFFICIENT');
+      expect(refused.json().error.message).toContain('audience:read');
+      const reader = await mintPat(w, ['keys:mint', 'read']);
+      expect((await patMint(w, reader, ['contacts:read'])).statusCode).toBe(201);
     });
 
     it('a PAT that also carries applications:write (billing:write) can', async () => {

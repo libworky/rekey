@@ -2,15 +2,25 @@
 
 Self-hostable, multi-tenant auth and billing for the apps you run. User auth and provider-agnostic billing share one tenant model, behind one API, in one `docker compose --profile full up`.
 
-> **Status:** Public beta. [MIT licensed](LICENSE).
+> **Status:** 2.1.0 is the latest stable release. 2.2.0 is in release candidates, with its stable release to follow. [MIT licensed](LICENSE).
 >
-> **ReliPay is now Rekey.** Packages moved to `@rekey.dev/*` (the old `@relipay/*` packages are deprecated), environment variables renamed `RELIPAY_*` → `REKEY_*` (as of 2.0.0 the old names are no longer read — set `REKEY_*`), and relipay.dev (the old domain) will redirect to rekey.dev once the domain migration completes.
+> **ReliPay is now Rekey.** Packages moved to `@rekey.dev/*` (the old `@relipay/*` packages are deprecated), environment variables renamed `RELIPAY_*` → `REKEY_*` (as of 2.0.0 the old names are no longer read, so set `REKEY_*`), and relipay.dev (the old domain) will redirect to rekey.dev once the domain migration completes.
 
 ## For AI agents
 
 If you're an AI coding agent reading this repo, start at [AGENTS.md](AGENTS.md).
 
 ## Quick start
+
+**Building an app on Rekey Cloud?** You need none of the self-host setup below.
+[rekey.dev/docs/quickstart](https://rekey.dev/docs/quickstart) goes from a free
+workspace (no card) to a signed-in user in a Next.js app, with the drop-in
+`<SignIn>` form and two environment variables. Or clone a starter:
+[Next.js](https://github.com/rekey-dev/nextjs-starter),
+[Astro](https://github.com/rekey-dev/astro-starter),
+[digital shop](https://github.com/rekey-dev/nextjs-commerce).
+
+### Self-host
 
 The whole stack boots with one command — the API auto-migrates on start:
 
@@ -47,7 +57,9 @@ a fresh clone needs no separate build step.
 API at `http://localhost:3030`, interactive docs at `/docs`, operator panel at
 `http://localhost:3031`.
 
-Then bootstrap the first Tenant, Application and API key in one command:
+Then bootstrap the first Tenant, Application and API key in one command. The
+CLI is self-host only: it authenticates with `SUPER_ADMIN_KEY`, which a Rekey
+Cloud workspace does not have.
 
 ```bash
 export REKEY_URL=http://localhost:3030
@@ -57,7 +69,7 @@ npx @rekey.dev/cli init --tenant-name "Acme Co" --owner-email ops@acme.example \
                         --app-name "Acme Prod" --app-slug acme-prod
 ```
 
-See [docs/quickstart.md](docs/quickstart.md) for the full walkthrough (boot →
+See [docs/quickstart.md](docs/quickstart.md), the self-host quickstart, for the full walkthrough (boot →
 bootstrap → call from your app → sign up an end-user), and
 [DEPLOY.md](DEPLOY.md) to run it in production (Traefik + TLS).
 
@@ -71,12 +83,12 @@ Apps (each runs on a fixed dev port):
 | `apps/panel` | `@rekey.dev/panel` | 3031 | Next.js admin panel (panel.rekey.dev) |
 | `apps/portal` | `@rekey.dev/portal` | 3050 | Hosted customer portal V2 (portal.rekey.dev) |
 
-`examples/` is currently empty: the previous demo apps were removed in #261
-because they had drifted from the API they demonstrated, and a rebuilt set has
-not landed yet. Until it does, the worked integrations are
+There is no `examples/` directory: the demo apps that lived there were removed
+in #261 because they had drifted from the API they demonstrated. Working
+integrations live in their own repositories instead, the three starters linked
+under [Quick start](#quick-start), alongside
 [docs/quickstart.md](docs/quickstart.md) and
-[docs/react-components.md](docs/react-components.md), both of which are checked
-against a running stack.
+[docs/react-components.md](docs/react-components.md).
 
 Packages:
 
@@ -91,7 +103,7 @@ Docs (`docs/`):
 
 | Doc | What |
 |---|---|
-| [quickstart.md](docs/quickstart.md) | Fresh clone → running API → first Application → first end-user |
+| [quickstart.md](docs/quickstart.md) | Self-host quickstart: fresh clone → running API → first Application → first end-user. The Cloud quickstart is [rekey.dev/docs/quickstart](https://rekey.dev/docs/quickstart) |
 | [api-url.md](docs/api-url.md) | Which URL to point the SDK at — Rekey Cloud vs self-hosted |
 | [concepts.md](docs/concepts.md) | Tenant / Application / EndUser data model |
 | [api-keys.md](docs/api-keys.md) | The three credential types, and environments |
@@ -100,6 +112,7 @@ Docs (`docs/`):
 | [react-components.md](docs/react-components.md) | The drop-in React component library |
 | [billing.md](docs/billing.md) · [billing-providers.md](docs/billing-providers.md) · [coupons.md](docs/coupons.md) | Plans, checkout, providers, discounts |
 | [webhooks.md](docs/webhooks.md) | Outbound events, signature verification, retries |
+| [email-templates.md](docs/email-templates.md) | Custom transactional email: register, publish, preview, send by key from your backend |
 | [devices.md](docs/devices.md) | Device-bound sessions, the `max_devices` entitlement, licence seats |
 | [external-billing.md](docs/external-billing.md) | Bring your own billing: an inbound-only provider fed by your own system's events |
 | [portal.md](docs/portal.md) | Hosted customer self-service billing portal |
@@ -119,6 +132,7 @@ Billing is **off** on a new Application (`billingConfig.enabled` defaults to
 `false`) — every billing endpoint answers `403 BILLING_DISABLED` until an
 operator turns it on in Panel → Application → Billing.
 
+The core modules under `apps/api/src/modules/` (including `auth`, `billing`, `plans`, `api-keys` and `applications`) ship their own `AGENTS.md` describing what the module is for and what an agent should not do there. If a module has none, start from its `*.routes.ts` file.
 
 ## Known dev-only behaviours
 

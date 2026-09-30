@@ -16,9 +16,9 @@
 import type { Application } from '@prisma/client';
 import { prisma } from '../../lib/prisma.js';
 import { RekeyError } from '../../lib/error.js';
-import { AuthConfigSchema } from '@rekey.dev/shared-types';
+import { AuthConfigSchema, createdViaOAuth } from '@rekey.dev/shared-types';
 import { assertSignupAllowed, type AuthKind } from '../../lib/signup-policy.js';
-import { assertDeviceBindingSatisfiable } from '../auth/auth.service.js';
+import { assertDeviceBindingSatisfiable, assertEndUserNotBanned } from '../auth/auth.service.js';
 import { deliverVerificationEmail } from '../auth/auth.service.js';
 import { assertEndUserQuota } from '../../lib/tenant-limits.js';
 import { encryptJson, decryptJson } from '../../lib/secrets.js';
@@ -29,7 +29,8 @@ import {
   type DeviceContext,
   type SignInOutcome,
 } from '../auth/auth.service.js';
-import { emitDetached } from '../webhooks/webhook.service.js';
+import { enqueueEvent, kickDeliveries } from '../webhooks/webhook.service.js';
+import { sendWelcomeEmail, userSnapshot, welcomeTiming } from '../auth/user-lifecycle.js';
 
 export interface OAuthPublicConfigEntry {
   clientId: string;
@@ -55,35 +56,75 @@ function decryptedSecrets(application: Application): Record<string, { clientSecr
   return decryptJson<Record<string, { clientSecret: string }>>(application.oauthCredentialsCiphertext);
 }
 
-function buildProviderConfig(
-  application: Application,
-  providerName: string,
-): OAuthProviderConfig {
+type ProviderResolution =
+  | { ok: true; config: OAuthProviderConfig }
+  | { ok: false; message: string; fix: string };
+
+/**
+ * The one rule for "this Application can start a sign-in with this provider".
+ * `/:provider/start`, the callback, linking, and the public provider list all
+ * go through it, so a provider is listed exactly when starting it would work.
+ */
+function resolveProviderConfig(application: Application, providerName: string): ProviderResolution {
+  const configUrl = `PUT /api/v1/tenant/applications/${application.id}/oauth-config/${providerName}`;
   const pub = publicConfig(application, providerName);
   if (!pub) {
-    throw new RekeyError({
-      statusCode: 400,
-      code: 'OAUTH_PROVIDER_NOT_CONFIGURED',
+    return {
+      ok: false,
       message: `Application "${application.slug}" has no "${providerName}" OAuth config.`,
-      fix: `Configure it via PUT /api/v1/tenant/applications/${application.id}/oauth-config.`,
-    });
+      fix: `Configure it via ${configUrl}.`,
+    };
   }
-  const secrets = decryptedSecrets(application);
-  const providerSecrets = secrets[providerName];
-  if (!providerSecrets) {
-    throw new RekeyError({
-      statusCode: 400,
-      code: 'OAUTH_PROVIDER_NOT_CONFIGURED',
+  const clientSecret = decryptedSecrets(application)[providerName]?.clientSecret;
+  if (!clientSecret) {
+    return {
+      ok: false,
       message: `Application "${application.slug}" has no clientSecret for "${providerName}".`,
-      fix: `Set the secret via PUT /api/v1/tenant/applications/${application.id}/oauth-config.`,
-    });
+      fix: `Set the secret via ${configUrl}.`,
+    };
+  }
+  if (providerName === 'oidc' && !pub.issuerUrl) {
+    return {
+      ok: false,
+      message: `Application "${application.slug}" has an "oidc" OAuth config with no issuerUrl.`,
+      fix: `Set issuerUrl via ${configUrl}.`,
+    };
   }
   return {
-    clientId: pub.clientId,
-    redirectUri: pub.redirectUri,
-    clientSecret: providerSecrets.clientSecret,
-    ...(pub.issuerUrl !== undefined && { issuerUrl: pub.issuerUrl }),
+    ok: true,
+    config: {
+      clientId: pub.clientId,
+      redirectUri: pub.redirectUri,
+      clientSecret,
+      ...(pub.issuerUrl !== undefined && { issuerUrl: pub.issuerUrl }),
+    },
   };
+}
+
+/**
+ * Whether an end-user can sign in with `providerName` on this Application:
+ * the provider is registered and its config is complete.
+ *
+ * @example
+ * ```ts
+ * usableProvider(application, 'google'); // true once client id + secret are set
+ * ```
+ */
+export function usableProvider(application: Application, providerName: string): boolean {
+  return getOAuthProvider(providerName) !== null && resolveProviderConfig(application, providerName).ok;
+}
+
+function buildProviderConfig(application: Application, providerName: string): OAuthProviderConfig {
+  const resolved = resolveProviderConfig(application, providerName);
+  if (!resolved.ok) {
+    throw new RekeyError({
+      statusCode: 400,
+      code: 'OAUTH_PROVIDER_NOT_CONFIGURED',
+      message: resolved.message,
+      fix: resolved.fix,
+    });
+  }
+  return resolved.config;
 }
 
 export const oauthService = {
@@ -170,7 +211,7 @@ export const oauthService = {
           fix: 'Sign in to the Application this account belongs to, or use a different provider account.',
         });
       }
-      return issueSessionOrMfaChallenge(args.application, existing.endUser, args.device);
+      return issueSessionOrMfaChallenge(args.application, existing.endUser, { via: 'oauth' }, args.device);
     }
 
     // 2. Match by email within this Application → link + sign in.
@@ -191,6 +232,9 @@ export const oauthService = {
         },
       });
       if (matchedByEmail) {
+        // Refuse before the link is written, so a banned account does not
+        // gain a provider identity it will keep after the ban is lifted.
+        assertEndUserNotBanned(matchedByEmail);
         await prisma.oAuthIdentity.create({
           data: {
             applicationId: args.application.id,
@@ -200,7 +244,7 @@ export const oauthService = {
             email: identity.email,
           },
         });
-        return issueSessionOrMfaChallenge(args.application, matchedByEmail, args.device);
+        return issueSessionOrMfaChallenge(args.application, matchedByEmail, { via: 'oauth' }, args.device);
       }
     }
 
@@ -236,6 +280,7 @@ export const oauthService = {
     assertSignupAllowed(
       AuthConfigSchema.parse(args.application.authConfig),
       args.authKind,
+      identity.email,
     );
     // Before the row exists, for the same reason sign-up asks first.
     assertDeviceBindingSatisfiable(args.application, args.device);
@@ -251,25 +296,50 @@ export const oauthService = {
     // exactly like password / magic-link creation. Linking a provider to an
     // ALREADY-EXISTING user returned above and is never gated.
     await assertEndUserQuota(args.application.tenantId);
-    const created = await prisma.endUser.create({
-      data: {
+    const email = identity.email;
+    const welcome = welcomeTiming(args.application, identity.emailVerified);
+    // One unit: the user, the identity that signs them in, and the
+    // `user.created` that announces them. Written separately, a failed
+    // identity insert left a user with no way in, and a crash after the
+    // commit lost the event.
+    const { created, deliveryIds } = await prisma.$transaction(async (tx) => {
+      const user = await tx.endUser.create({
+        data: {
+          applicationId: args.application.id,
+          email: email.toLowerCase(),
+          // Reflect the provider's verification claim faithfully, the
+          // EndUser.emailVerified column was previously hardcoded `true`
+          // which silently laundered unverified emails into trusted state.
+          emailVerified: identity.emailVerified,
+          welcomeEmailPending: welcome === 'pending',
+          createdVia: createdViaOAuth(args.providerName),
+        },
+      });
+      await tx.oAuthIdentity.create({
+        data: {
+          applicationId: args.application.id,
+          endUserId: user.id,
+          provider: args.providerName,
+          providerAccountId: identity.providerAccountId,
+          email,
+        },
+      });
+      // Outbound webhook for new-via-OAuth users, mirrors password sign-up.
+      const ids = await enqueueEvent(tx, {
         applicationId: args.application.id,
-        email: identity.email.toLowerCase(),
-        // Reflect the provider's verification claim faithfully, the
-        // EndUser.emailVerified column was previously hardcoded `true`
-        // which silently laundered unverified emails into trusted state.
-        emailVerified: identity.emailVerified,
-      },
+        type: 'user.created',
+        data: {
+          user: userSnapshot(user),
+          via: 'oauth',
+          provider: args.providerName,
+        },
+      });
+      return { created: user, deliveryIds: ids };
     });
-    await prisma.oAuthIdentity.create({
-      data: {
-        applicationId: args.application.id,
-        endUserId: created.id,
-        provider: args.providerName,
-        providerAccountId: identity.providerAccountId,
-        email: identity.email,
-      },
-    });
+    kickDeliveries(deliveryIds);
+    // Only here, where this callback created the user: a returning or
+    // auto-linked user signed in above without one.
+    if (welcome === 'now') sendWelcomeEmail(args.application, created.email);
 
     // The provider would not vouch for this address, so the account exists and
     // cannot sign in: `requireEmailVerification` refuses it, and nothing has
@@ -290,24 +360,12 @@ export const oauthService = {
         endUser: created,
       });
     }
-    // Outbound webhook for new-via-OAuth users, mirrors password sign-up.
-    emitDetached({
-      applicationId: args.application.id,
-      type: 'user.created',
-      data: {
-        user: {
-          id: created.id,
-          email: created.email,
-          emailVerified: created.emailVerified,
-          role: created.role,
-          createdAt: created.createdAt.toISOString(),
-          metadata: created.metadata ?? null,
-        },
-        via: 'oauth',
-        provider: args.providerName,
-      },
-    });
-    return issueSessionOrMfaChallenge(args.application, created, args.device);
+    return issueSessionOrMfaChallenge(
+      args.application,
+      created,
+      { via: 'oauth', isNewUser: true },
+      args.device,
+    );
   },
 
   /**

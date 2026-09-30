@@ -124,6 +124,8 @@ function Profile() {
 }
 ```
 
+`useOAuthProviders()` returns the Application's enabled OAuth providers (`[{ id, name }]`, or `null` until loaded) for a sign-in page you build yourself.
+
 ---
 
 ## Control components
@@ -210,6 +212,15 @@ export async function signInAction(formData: FormData) {
 ```
 
 Not on the App Router? Use `actionUrl="/api/sign-in"` (the form does a plain `POST`) and call `useRekey().refresh()` after.
+
+**OAuth buttons without listing them.** Leave `oauthProviders` out and pass a start target, and the card shows every provider enabled on the Application in the panel (fetched with the publishable key, so set `publishableKey` on `<RekeyProvider>`):
+
+```tsx
+<SignIn action={signInAction} oauthStartAction={startOAuthAction} />       // action gets formData.get('provider')
+<SignIn action={signInAction} oauthStartUrl="/oauth/{provider}/start" />   // {provider} is replaced
+```
+
+The buttons appear just after hydration. The list is fetched once per `<RekeyProvider>` and kept for the life of the page, so a provider enabled in the panel shows up after the next full page load. For the first paint, fetch on your server with `rekey.auth.listOAuthProviders()` from `@rekey.dev/node` and pass `oauthProviders`, which always wins. See [docs/react-components.md](../../docs/react-components.md#oauth-buttons-from-the-panel).
 
 ### `<UserButton>`
 
@@ -365,7 +376,7 @@ It also supports a controlled `value` + `onChange` pair, an optional `label`, an
 
 ### Org-billing (`billingSubject='org'`)
 
-When your Application bills **per team** (Panel → Application → Billing → Subject = `org`), an individual can't hold a subscription — the user must be inside a team first, and the org id must ride along to checkout.
+When your Application bills **per team** (Panel → Application → Billing → Setup → Settings, Who pays = Organizations), an individual can't hold a subscription — the user must be inside a team first, and the org id must ride along to checkout.
 
 - `<OrganizationSwitcher billingSubject="org">` hides the personal option and nudges the user to select/create a team when none is active.
 - `<PricingTable orgGateBlocking={...}>` renders a **"team required"** gate instead of dead upgrade buttons.
@@ -374,6 +385,19 @@ When your Application bills **per team** (Panel → Application → Billing → 
 Resolve `billingSubject` server-side from `rekey.applications.me().billingConfig.billingSubject`.
 
 ---
+
+## List forms
+
+`<NewsletterForm list="waitlist" />` and `<ContactForm list="contact" />` collect
+people into a list (a waitlist, a newsletter, a contact form); `useListSubscribe`
+is the hook under both. From the browser they need Public capture on the list;
+pass `action` (your Server Action) and `form` (from `rekey.lists.get(key)` on your
+server) to post through your server instead. Rekey sends no email to a list. See
+[docs/react-components.md](https://github.com/rekey-dev/rekey/blob/main/docs/react-components.md#list-forms).
+
+```tsx
+<NewsletterForm list="waitlist" title="Join the waitlist" />
+```
 
 ## Theming
 
@@ -434,8 +458,10 @@ Slots: `root`, `card`, `header`, `title`, `subtitle`, `label`, `input`, `button`
 
 Every component's props, defaults and a working example per component:
 [docs/react-components.md](https://github.com/rekey-dev/rekey/blob/main/docs/react-components.md).
-(The `examples/` apps that used to live here were removed pending a rebuilt
-set — the reference is checked against the source instead.)
+For the components in a running app, see the
+[quickstart](https://rekey.dev/docs/quickstart) (`<SignIn>` and `<SignUp>`
+wired to Next.js server actions) and the
+[nextjs-starter](https://github.com/rekey-dev/nextjs-starter) repository.
 
 ## Headless escape hatch
 

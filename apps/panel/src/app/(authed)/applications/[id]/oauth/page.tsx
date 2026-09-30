@@ -193,8 +193,8 @@ export default async function OAuthPage({
     <div className="space-y-6">
       <PageHeader
         level={2}
-        title="OAuth providers"
-        description="Optional: let end-users sign in with their existing accounts. Each provider needs a client ID + secret from the provider's developer console plus a matching redirect URI. Secrets are AES-256-GCM encrypted at rest; never returned in any API response."
+        title="Sign-in providers"
+        description="Optional: let end-users sign in with their existing accounts. Each provider needs a client ID + secret from the provider's developer console plus a matching redirect URI. Secrets are stored encrypted and never shown again, in the panel or by the API."
       />
 
       {saved && <SavedBanner message={`${saved} configuration saved.`} />}
@@ -227,6 +227,24 @@ export default async function OAuthPage({
           </>
         )}
       </div>
+
+      <p className="text-sm text-[var(--color-muted-fg)]">
+        Your sign-in page does not need its own list of these. It can read the
+        providers saved here, names only, from{' '}
+        <code className="font-mono text-xs text-[var(--color-fg)]">GET /api/v1/auth/oauth/providers</code>
+        {' '}with the publishable key, and{' '}
+        <code className="font-mono text-xs">&lt;SignIn&gt;</code> from{' '}
+        <code className="font-mono text-xs">@rekey.dev/react</code> does it for you. A provider appears
+        there once both its client ID and secret are saved.{' '}
+        <a
+          className="underline"
+          href="https://rekey.dev/docs/api"
+          target="_blank"
+          rel="noreferrer"
+        >
+          API reference
+        </a>
+      </p>
 
       {Object.keys(configured).length === 0 && (
         <p className="text-sm text-[var(--color-muted-fg)]">

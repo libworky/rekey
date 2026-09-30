@@ -135,14 +135,28 @@ leaks the correct prefix a byte at a time.
   event.
 - Delivery is fire-and-forget with respect to the API request that caused it. A
   slow receiver of yours never slows down the call your user is waiting on.
-- The request times out after **10 seconds**. Return 2xx immediately and do the
-  work asynchronously — a queue insert, then 200.
+- The request times out after **10 seconds** by default. A self-hosted
+  deployment can change that with `WEBHOOK_TIMEOUT_MS` (1000 to 30000
+  milliseconds), so check with whoever runs yours. Either way, return 2xx
+  immediately and do the work asynchronously: a queue insert, then 200.
+- At most **4 deliveries to one endpoint**, and at most **8 across all of one
+  Application's endpoints** (`WEBHOOK_APP_MAX_IN_FLIGHT` on a self-hosted
+  deployment), are in flight at once. The rest wait their turn; waiting is not
+  a failed attempt and does not use up a retry. A burst of events is therefore
+  spread out over a few seconds rather than arriving all at once.
+- An Application can have up to **100 webhook endpoints**. Creating one more is
+  refused with `WEBHOOK_ENDPOINT_LIMIT_REACHED`.
 - Any 2xx is success. Everything else — 4xx, 5xx, timeout, connection error —
   is retried. Redirects are **not** followed; a 3xx is a failed attempt.
 - **5 attempts total**, backing off 30s → 2m → 10m → 1h. That is roughly 72
   minutes of forgiveness from the first attempt, after which the delivery is
   marked `FAILED` and left for you to inspect and retry by hand from the panel
   or `POST …/deliveries/:deliveryId/retry`.
+- After **5 failed requests in a row** to an endpoint, Rekey stops sending to it
+  for 60 seconds. An attempt that comes due in that window is recorded as failed
+  without a request (its error starts `Not sent:`) and retried on the schedule
+  above, so the 72 minutes still apply. The first successful delivery after the
+  pause resumes normal sending.
 - Up to 4 KB of your response body is stored against the delivery row, so a
   descriptive error body from your handler shows up in the panel. That is a
   debugging aid, not a contract — don't put anything sensitive in it.
@@ -155,7 +169,7 @@ implement, not something you receive.
 
 ## Event catalog
 
-Twenty-seven events. The registry lives in
+Thirty-two events. The registry lives in
 `apps/api/src/modules/webhooks/events.ts`, and `@rekey.dev/node` re-exports it
 as `WEBHOOK_EVENTS` (`{ name, description }` pairs), `KNOWN_WEBHOOK_EVENTS`
 (names only) and `isKnownWebhookEvent` — use those to build an event picker
@@ -165,15 +179,106 @@ rather than hardcoding this table.
 
 | Event | When |
 |---|---|
-| `user.created` | An end-user account was created — password sign-up, first OAuth or magic-link sign-in, an import (`data.via: "import"`), or a billing system reporting a sale for an address Rekey had not met (`data.via: "billing:<provider>"`). |
-| `user.updated` | An end-user's profile changed (email, role, metadata). |
+| `user.created` | An end-user account was created. `data.user` describes it and `data.via` says how (see below). |
+| `user.updated` | An end-user's role, metadata, verified flag or profile answers changed. `data.changed` lists the field names that changed, never their values, and `data.user` is the record after the change. See below. |
+| `user.onboarding_completed` | Onboarding was marked complete, once per user. `data.userId`, `data.completedAt` and `data.via` (`self`, `server` or `operator`). See [profile-fields.md](profile-fields.md). |
+| `user.onboarding_skipped` | The user skipped onboarding, once per user and never after completion. `data.userId`, `data.skippedAt` and `data.via` (`self`, `server` or `operator`). Rekey records the skip and blocks nothing. See [profile-fields.md](profile-fields.md#onboarding). |
 | `user.deleted` | An end-user account was deleted. |
+| `user.banned` | An operator banned an end-user: every session, OAuth/MCP grant and sign-in link was ended, and every sign-in is refused until the ban is lifted. Subscriptions are not touched. `data.user` carries `id` + `bannedAt`; `data.sessionsRevoked` counts the sessions ended. Never carries the operator's reason. A sign-in racing the ban can deliver `session.created` after this event, so order by the event timestamp. |
+| `user.unbanned` | An operator lifted a ban. The person can sign in again; sessions the ban ended stay ended. `data.user` carries `id` + `bannedAt: null`. |
 | `user.erased` | An end-user was erased for GDPR: PII and auth material hard-deleted, financial rows retained anonymized, and they can never authenticate again. **Propagate this to your own copies of their PII.** `data.user` carries `id` + `erasedAt`. See [data-erasure.md](data-erasure.md). |
+| `session.created` | An end-user signed in and a session was minted. See below. |
 | `session.revoked` | A refresh token was revoked — sign-out, per-session revoke, or kill-switch. |
 | `mfa.enabled` | TOTP enrollment confirmed, or a passkey registered. |
 | `mfa.disabled` | The end-user disabled MFA. |
 | `password.changed` | Authenticated change or reset-token flow. All their other sessions are revoked. |
 | `email.verified` | The end-user verified their email address. |
+
+`user.created` carries `data.via`:
+
+| `via` | Created by |
+|---|---|
+| `password` | Password sign-up. |
+| `magic_link` | The first magic-link sign-in for a new address. |
+| `oauth` | The first OAuth sign-in for a new address. `data.provider` names the provider. |
+| `operator` | An operator, from the panel's End-users page or `POST /api/v1/tenant/applications/:id/end-users`. |
+| `import` | `POST /api/v1/users/import`. This payload carries only `data.user.id` and `data.user.email`. |
+| `import:<provider>` | A subscription import from a billing provider. |
+| `billing:<provider>` | A billing provider reporting a sale for an address Rekey had not met. |
+
+`user.updated` carries `data.changed` and `data.via`:
+
+| `via` | Change | Fields |
+|---|---|---|
+| `self` | The end-user's own `PATCH /api/v1/users/me`, or `PATCH /api/v1/users/me/profile`. | `metadata`, or `profile.<key>` per answer |
+| `server` | A secret key's `PATCH /api/v1/users/:id/profile`. | `profile.<key>` per answer |
+| `operator` | An operator's `PATCH /api/v1/tenant/applications/:id/end-users/:euid`, or `.../end-users/:euid/profile`. | any of `role`, `emailVerified`, `metadata`, or `profile.<key>` |
+| `email_verification` | The first successful `POST /api/v1/auth/verify-email`. | `emailVerified` |
+| `magic_link` | A magic-link sign-in that proved an unverified address. | `emailVerified` |
+
+It is written in the same transaction as the change, and only when a value
+actually changed: a PATCH that stores what was already there, or a second
+verification of a verified address, emits nothing. A password change is
+`password.changed`, and session churn is `session.revoked`; neither emits
+`user.updated`.
+
+`session.created` fires once per real sign-in, in the transaction that writes
+the session, so a sign-in whose event cannot be recorded gets no session:
+
+```json
+{
+  "userId": "eu_...",
+  "sessionId": "clx...",
+  "deviceId": null,
+  "via": "password",
+  "firstSignIn": true,
+  "platform": "web",
+  "country": "DE"
+}
+```
+
+`via` is `password` (sign-in and sign-up), `magic_link`, `oauth`, `passkey`, or
+`mfa` when the session was minted by completing a second factor (the password
+step before it mints nothing, so it emits nothing). A refresh, or switching the
+active organization, re-mints a session and never emits it. `sessionId` is the
+id `session.revoked` carries when that session ends. The same sign-ins, and
+only those, move the user's `signInCount` and `lastSignedInAt` (see
+[analytics.md](analytics.md)). `platform` is where the session came from
+(`web`, `ios`, `android`, `macos`, `windows`, `linux`, `server`, `mcp`, `other`)
+and `country` the visitor's country when the deployment trusts Cloudflare's
+(`TRUST_CF_IPCOUNTRY`, see [analytics.md](analytics.md#country)), else null. Erasure nulls `country` in stored deliveries.
+
+`firstSignIn` is true for the first session the user ever gets, exactly once
+even when several first sign-ins race. That is the sign-up session for a
+self-service sign-up, and the first sign-in for an operator-created or imported
+user. Accounts that existed before this event shipped count as already signed
+in. For "this request created the account", read `isNewUser` on the auth result
+instead (see [auth.md](auth.md#routing-new-users-to-onboarding)).
+
+### Organizations
+
+End-user organizations (`authConfig.organizationsEnabled`). Both events are
+written in the transaction that creates or accepts the invitation, and neither
+carries the invitation token.
+
+| Event | When |
+|---|---|
+| `organization.invitation.created` | An invitation was created. `data.invitation`: id, organizationId, email, role, invitedById, expiresAt, createdAt. |
+| `organization.invitation.accepted` | An invitation was accepted, once per invitation however many accepts race. `data.invitation` (id, organizationId, email, role, acceptedAt) and `data.membership` (id, organizationId, endUserId, role). |
+
+### Lists
+
+People joining and leaving a list, and what they typed (see
+[lists.md](lists.md)). Each is written in the transaction that changed the
+membership or stored the submission, and a call that changes nothing emits
+nothing. Erasing a contact scrubs its stored deliveries (see
+[data-erasure.md](data-erasure.md)).
+
+| Event | When |
+|---|---|
+| `contact.subscribed` | Someone joined a list: a first subscribe, or a secret-key subscribe with `consent` that added back a person who had left. `data.contact` (id, email, name), `data.list` (id, key), `data.member` (status, source, consentVersion, consentAt). |
+| `contact.unsubscribed` | Someone left a list: your server called `DELETE /api/v1/lists/:key/members/:email`, or an operator took them off in the panel. Sent once per change. `data.contact` (id, email, name), `data.list` (id, key), `data.member` (status, unsubscribedAt). |
+| `contact.submission.created` | A subscribe carried `fields` and they were stored, for example a contact form message. `data.contact` (id, email), `data.list` (id, key), `data.submission` (id, fields, createdAt). |
 
 ### Devices
 
@@ -197,15 +302,22 @@ actually transitions** — a provider event that changes nothing emits nothing.
 
 | Event | When |
 |---|---|
-| `subscription.activated` | A Subscription became ACTIVE. `data.subscription` carries ids, plan slug/name/kind, amount/currency/interval, the resolved `entitlements` array, and the period end. |
+| `subscription.activated` | A Subscription became ACTIVE. `data.subscription` carries ids, plan slug/name/kind, amount/currency/interval, the resolved `entitlements` array, the period end, and `trialEndsAt`. |
 | `subscription.canceled` | A Subscription became CANCELED (includes `canceledAt`). |
 | `subscription.past_due` | A Subscription became PAST_DUE — payment failed, provider retrying. |
+| `subscription.trial_started` | A Subscription entered TRIALING: a checkout that completed on a trial, a billing system reporting a trial, or a provider moving the subscription onto one. Sent alongside `subscription.activated` when the trial is also the activation. `data.subscription.trialEndsAt` is the trial end. A re-dated trial is not a new start. |
+| `subscription.trial_will_end` | A TRIALING Subscription's trial ends within 3 days. A sweep checks every 10 minutes, and sends it once per subscription and trial end date; a trial re-dated after it was sent is announced again for the new date. Not sent for a trial that already converted or ended. |
 | `payment.succeeded` | A Payment was recorded SUCCEEDED. `data.payment` carries ids, plan slug when subscription-linked, amount/currency/status. |
 | `payment.failed` | A Payment was recorded FAILED. |
 
 Act on `data.subscription.entitlements`, not on the plan slug. Two subscribers
 on the same plan can hold different quantities, and the slug cannot tell you
 so.
+
+The field is **absent** when Rekey could not resolve it while recording the
+event. Absent means unknown, not "grants nothing": leave what you provisioned
+alone and read the current grant from `GET /api/v1/billing/entitlements/for-user` (secret key with `billing:read`) instead. An empty array
+does mean the subscription grants nothing.
 
 ### Dunning
 
@@ -277,7 +389,7 @@ sent with as `api-grant:<key>`, the form the ledger stores it in.
 - **Verify first, parse second.** Read the raw body, check the signature,
   and only then `JSON.parse`.
 - **Dedupe on `eventId` before side effects.** Retries are normal operation.
-- **Return 2xx fast.** Ten seconds is the budget; queue the work.
+- **Return 2xx fast.** Five seconds is the budget; queue the work.
 - **Don't infer order.** Two events emitted close together can arrive in
   either order, and a retried one arrives up to an hour late. Reconcile against
   the current state (`getSubscription`, `getEntitlements`) rather than assuming

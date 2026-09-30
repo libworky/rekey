@@ -112,11 +112,12 @@ Everything hangs off namespaces on the client. `amount` fields are always intege
 | `listSessions(accessToken)` / `revokeSession(...)` | Active-session management. |
 | `mfaStatus` / `mfaSetup` / `confirmMfaSetup` / `mfaChallenge` / `disableMfa` | TOTP enrollment + step-up. |
 | `startPasskeyAuthentication` / `verifyPasskeyAuthentication` / `startPasskeyRegistration` / `verifyPasskeyRegistration` / `listPasskeys` / `deletePasskey` | WebAuthn / passkeys. |
+| `listOAuthProviders` | The OAuth providers a sign-in page should offer, `{ providers: [{ id, name }] }`. Names only, never client ids or secrets. |
 | `startOAuth` / `completeOAuth` / `listOAuthIdentities` / `startOAuthLink` / `completeOAuthLink` / `unlinkOAuth` | Social sign-in + account linking. |
 
 #### Email-sending methods: branch on `emailSent`
 
-`requestPasswordReset` and `requestMagicLink` return a different shape depending on whether the Application has an email transport configured (BYO Resend creds, or `RESEND_DEFAULT_*` on the deployment). They never throw for an unknown email — enumeration-safe by design.
+`requestPasswordReset` and `requestMagicLink` return a different shape depending on whether the Application has an email transport configured (BYO Resend creds, or `RESEND_DEFAULT_*` on the deployment). They never throw for an unknown email. A secret-key caller (your server) is told, with `delivered: false` on password reset; a publishable-key browser caller always gets the same body. Keep that difference out of what you render.
 
 | Case | `delivered` | `emailSent` | token (`resetToken` / `magicLinkToken`) | Your job |
 | --- | --- | --- | --- | --- |
@@ -142,7 +143,7 @@ if (!r.emailSent && r.resetToken) {
 ### `rekey.billing`
 | Method | Description |
 | --- | --- |
-| `getPlans(page?)` | List the Application's active plans (public, for rendering pricing pages). Returns `{items, page}`. Each plan's `checkout.ready` is false when checkout for it would be refused, so you can hide it: `items.filter((p) => p.slug === freeSlug \|\| p.checkout.ready)`. Keep the free tier in: with no provider connected it reads `ready: false` but still applies to every signed-in user. |
+| `getPlans(page?)` | List the Application's active plans (public, for rendering pricing pages). Returns `{items, page}`. Each plan's `checkout.ready` is false when checkout for it would be refused, so you can hide it: `items.filter((p) => p.slug === freeSlug \|\| p.checkout.ready)`. Keep the free tier in. The free tier is the plan named by `billingConfig.defaultPlanSlug`: it applies to every signed-in user without checkout, and `billing.subscribe` activates it with no provider. It must be an active plan that costs nothing (`amount` 0, no per-unit price). Set it with `PATCH /api/v1/tenant/applications/:id/billing-config` (the panel has no control for it yet). Any other plan, a $0 SUBSCRIPTION plan included, still goes through checkout and reads `ready: false` with no provider connected. |
 | `getSubscription(accessToken, { organizationId?, includeEnded? })` | The user's active subscription, or `null`. `includeEnded: true` falls back to their most recent CANCELED/EXPIRED subscription **only when the answer would otherwise be null** — so a billing page can say what a former subscriber was on and when it ended, instead of showing them the same blank state as somebody who never subscribed. It never replaces a live subscription; leave it off for entitlement checks. |
 | `createCheckout(accessToken, { planSlug, successUrl, cancelUrl, couponCode?, organizationId? })` | Start hosted checkout; returns the redirect URL + a PENDING subscription. Activation happens via the provider webhook. |
 | `cancelSubscription(accessToken, { atPeriodEnd?, organizationId? })` | Cancel the user's subscription. Defaults to **at period end** — the row stays ACTIVE with `cancelAt` set until the day arrives, so read `cancelAt`, not `status`. Pass `atPeriodEnd: false` to end it immediately. The default is a *request*: a PAST_DUE subscription, a PENDING checkout, or an ACTIVE row with no known period end is canceled on the spot regardless. Ask `cancelsAtPeriodEnd(sub)` (exported from this package) before showing a confirmation, so you promise the outcome the caller will actually get. |
@@ -201,12 +202,56 @@ if (!result.applied) {
 
 Retry semantics: a repeat with the same key (timeout retry, queue redelivery, double-click) is a no-op that returns the original result with `applied: false` — never a double charge and never an error. Keys never expire (the ledger is append-only for the life of the subject), so derive them from the operation, not from a timestamp or a random UUID minted per attempt — a fresh UUID per retry defeats the whole mechanism.
 
+### `rekey.lists` (waitlists, newsletters, contact forms)
+| Method | Description |
+| --- | --- |
+| `list()` | Every list with member counts. `contacts:write` (in `*`). |
+| `get(key)` | The list's form: `fieldSchema`, and the consent text and version to show. |
+| `subscribe(key, { email, name?, fields?, consent?, sourceUrl?, hp? })` | Add someone. For your own purposes it resolves `{ status, contactId }`, status `subscribed \| already_subscribed \| previously_unsubscribed \| suppressed \| ignored`. Relaying a visitor's form, call it through `rekey.with({ clientIp })` and pass `{ relay: 'browser' }` as the third argument: it then follows the browser rules and always resolves `{ status: 'received' }`. `contacts:write`. |
+| `members(key, { status?, updatedSince?, cursor?, limit? })` | One page, oldest change first. Needs a key minted with the **elevated** `contacts:read`. |
+| `iterateMembers(key, options?)` | Every member, following cursors. |
+| `unsubscribe(key, email)` | Take someone off a list. Idempotent. `contacts:write`. |
+
+Rekey sends no email to a list. See [docs/lists.md](https://github.com/rekey-dev/rekey/blob/main/docs/lists.md).
+
+### `rekey.email` (custom templates)
+| Method | Description |
+| --- | --- |
+| `send({ template, to, variables?, version?, idempotencyKey? })` | Send a custom template registered and published in the panel (Application → Email → Custom templates). Needs a key minted with the **elevated** `email:send` scope, which `*` does not include. Returns `{ id, status: 'sent' \| 'suppressed', template, version, messageId? }`. |
+
+```ts
+import { emailVariableIssues, isEmailSendError } from '@rekey.dev/node';
+
+try {
+  const { status } = await rekey.email.send({
+    template: 'order_shipped',
+    to: order.email,
+    variables: { orderNumber: order.number, trackingUrl: order.trackingUrl },
+    idempotencyKey: `order-shipped:${order.id}`,
+  });
+  // status 'suppressed': nothing was sent. The address is on the suppression list, or it
+  // unsubscribed from notification mail (critical templates and account emails still arrive).
+} catch (err) {
+  if (isEmailSendError(err) && err.code === 'EMAIL_VARIABLES_INVALID') {
+    console.warn(emailVariableIssues(err)); // [{ path: 'variables.trackingUrl', message: 'must use https.' }]
+  }
+  throw err;
+}
+```
+
+- The call carries no subject, HTML or From address. Those come from the published version, and a body with any of them is refused.
+- Mail only goes out through the Application's own Resend or SMTP provider. On the shared pool the call throws `EMAIL_TRANSPORT_NOT_CUSTOM`.
+- Variables are checked against the template: undeclared names are refused, `url` values must be https on the template's link domains.
+- An `idempotencyKey` names one attempt. A repeat returns the first result and sends nothing, including a repeat of a failed send (`EMAIL_DELIVERY_FAILED`); retry a failure with a new key. If the first attempt never recorded an outcome, a repeat after five minutes throws `EMAIL_SEND_OUTCOME_UNKNOWN`: check whether it arrived before sending with a new key.
+- Sends are capped per workspace per day and per recipient per hour (`EMAIL_RATE_LIMITED`, with `retryAfterSeconds`); the workspace limits can set other numbers.
+- `EMAIL_SEND_ERROR_CODES` lists every code this call can add to the generic ones.
+
 ### `rekey.licenses`
 | Method | Description |
 | --- | --- |
 | `verify({ key, machineFingerprint, label? })` | Verify a license key + record an activation. Always 200 — branch on `result.ok`. |
 | `deactivate({ key, machineFingerprint })` | Give a machine's seat back. Same deterministic body as `verify`; idempotent. |
-| `listMine(accessToken, page?)` | The signed-in user's own licences (and the active organization's, in an org-billed Application). No raw keys, just `keyPrefix`. Needs `billing:read`. |
+| `listMine(accessToken, page?, { organizationId? })` | The signed-in user's own licences (and the active organization's, in an org-billed Application). Pass `organizationId` to include that organization's pool instead; member-only, else 403 `ORGANIZATION_NOT_MEMBER`. No raw keys, just `keyPrefix`. Needs `billing:read`. |
 
 ### `rekey.devices` (secret key)
 | Method | Description |
@@ -324,7 +369,7 @@ Prefer a namespace method wherever one exists — those carry the endpoint's rea
 ## Gotchas
 
 - **Entitlements are resolved server-side.** Never gate features from client state — always read `rekey.billing.getEntitlements(...)` on the server.
-- **`billingSubject: 'org'` needs an `organizationId`.** When the Application bills per-team (Panel → Application → Billing → Subject), an individual can't hold a subscription — pass `organizationId` (a team the user owns/admins) to `createCheckout`. Omitting it throws `BILLING_ORGANIZATION_REQUIRED`. Read the live config via `rekey.applications.me()` (`billingConfig.billingSubject`) and drive your UI from it.
+- **`billingSubject: 'org'` needs an `organizationId`.** When the Application bills per-team (Panel → Application → Billing → Setup → Settings), an individual can't hold a subscription — pass `organizationId` (a team the user owns/admins) to `createCheckout`. Omitting it throws `BILLING_ORGANIZATION_REQUIRED`. Read the live config via `rekey.applications.me()` (`billingConfig.billingSubject`) and drive your UI from it.
 - **Checkout is async.** `createCheckout` returns a *PENDING* subscription + a redirect URL; the subscription flips to ACTIVE only when the **provider's webhook to Rekey** lands (Stripe/PayPal → Rekey — configured by the operator in the panel; your code never receives or verifies it). To react to activation, re-fetch `getSubscription` / `getEntitlements` when the user returns to your `successUrl`. `verifyWebhookSignature` is for the *other* direction — webhooks Rekey sends to your app (user-lifecycle events); see [docs/billing.md](https://github.com/rekey-dev/rekey/blob/main/docs/billing.md).
 - **Switching active org returns new tokens.** `organizations.switch` / `clearActive` return a fresh `{ accessToken, refreshToken }` pair — persist both, or later reads use the stale org view.
 - **Pagination is `{ limit, offset }`.** Defaults to 50 everywhere; max is 100 for org lists and 200 for the credit ledger — see the [Pagination](#pagination) table.

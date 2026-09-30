@@ -4,6 +4,1246 @@ Notable changes to Rekey, covering the self-hosted stack as well as the
 `@rekey.dev/*` SDK packages. The packages share one version and release together
 with the API, panel and portal.
 
+## 2.2.0-rc.5
+
+A release candidate on the 2.2.0 line. It adds contact lists (waitlists,
+newsletters and contact forms, with consent proof, erasure and an export for
+your email tool), end-user profile questions with onboarding completion and
+skip, sign-in and activity tracking per end user, a Users overview with
+analytics kept in a daily rollup, and a ban that shuts one person out of an
+Application. End-user IP addresses are masked for callers below OWNER and
+ADMIN. It fixes billing regressions found in
+pre-release testing, makes portal password resets work, and keeps MFA
+challenge tokens out of URLs in the panel and the portal.
+
+**Upgrading an existing deployment:** twenty-one migrations run on boot, all
+additive for existing data; two of them build indexes on `refresh_tokens`
+concurrently. `docker-compose.prod.yml` now refuses to start without
+`INTERNAL_CALLER_SECRET` in `.env`. After the API is live, run the
+analytics rollup backfill soon and the last-sign-in backfill once. See **Upgrade notes** at the end of this section.
+
+### Changed
+
+Every item here changes a behaviour an existing 2.2.0-rc.4 deployment or
+integration can see. Read this list before you upgrade.
+
+- **Breaking for self-hosters on `docker-compose.prod.yml`: it requires
+  `INTERNAL_CALLER_SECRET`.** The compose passes it to the `api` and `portal`
+  services and fails to render without it, with a message naming the key.
+  The panel already read the same `.env` key. The secret is what lets the API
+  believe the visitor's browser and country that the portal forwards on a
+  sign-in; without it every portal sign-in was recorded as `node`. Generate
+  one with `openssl rand -hex 32`. The split Dokploy compose files already
+  required it.
+
+The next seven items are the billing fixes that were written up as the 2.2.0
+release notes. They fix regressions found in pre-release testing: external
+renewals on org-billed Applications, the organization free tier, usage
+idempotency keys, checkout readiness evidence and refund amounts in the
+portal.
+
+- **`billing.subscribe()` can return `subscription: null`** (`@rekey.dev/node`
+  and `@rekey.dev/react`; the SDK types are now `SelfSubscriptionDto | null`).
+  `POST /billing/subscribe` answers `200` with `data: null` when a FEATURE or
+  USAGE-only free plan is asked for an organization while the caller's one
+  subscription to it is billed to another beneficiary. It used to answer with
+  that other beneficiary's subscription. Row answers now carry `activated`.
+- **Organizations get the free tier only when claimed.** On an Application
+  that bills per organization, `POST /billing/subscribe` naming an
+  organization records its claim, and the org view of entitlements then
+  applies the free plan's FEATURE flags and included USAGE quantity to it (not
+  its per-unit USAGE price; a priced row caps at its included quantity).
+  Admins claiming one organization at once are serialised, so it gets one
+  subscription row. Claims survive deletion of the claimed plan. Unclaimed
+  organizations, and organizations on a per-user Application, are unchanged.
+  The credit and licence variant still answers `409
+  BILLING_FREE_TIER_ALREADY_CLAIMED`.
+- **External billing renewals keep their organization.** A same-id
+  `subscription.activated` that omits `subscriber.organizationId` on an
+  org-billed Application applies to the existing subscription instead of
+  failing on every retry. An event naming an unknown organization or end user
+  answers `404`, an erased end user `410`, instead of `500`; a new
+  subscription with no organization still answers a retryable `500`.
+- **A sender `occurredAt` more than 5 minutes ahead** is ignored for dating a
+  cancellation or ordering an activation, and noted on the receipt. A delayed
+  older cancellation can still end a newer renewal, so send `occurredAt` on
+  every event.
+- **`POST /usage/record` refuses a reused `idempotencyKey`** with a different
+  quantity or in another UTC month (`409 IDEMPOTENCY_KEY_REUSED`). A retry in
+  the same month with a regenerated `occurredAt` still replays.
+  `rekey.usage.record()` in `@rekey.dev/node` now accepts `idempotencyKey`.
+- **Checkout readiness** warns when there are no paid plans to sell and when
+  nothing has shown the provider credentials work (a registered plan, a
+  checkout, subscription or payment through the provider, or a verified
+  webhook since its secret or mode last changed). Routing and enablement edits
+  no longer restart the webhook evidence window; a mode change does. Fresh
+  credentials show a provider WARN until one of those happens.
+- **`GET /billing/payments` items carry `refundedAmount`**, and the portal
+  shows how much of a partially refunded payment came back.
+
+Other changes:
+
+- **Unknown API key scopes are refused.** Minting a key with a scope outside
+  the known list answers `400 API_KEY_SCOPE_UNKNOWN`, with the valid scopes in
+  `fix` and the rejected ones in `details.unknown`. It used to return 201 with
+  a scope that matched nothing. This covers the super-admin, tenant, operator
+  token and operator MCP mint paths. Stored keys are untouched.
+- **Operator token mints with an unknown scope** answer
+  `OPERATOR_SCOPE_UNKNOWN` with `details.unknown` and `details.valid`, instead
+  of `BAD_REQUEST`.
+- **Every `*` key gains `contacts:write`,** the new standard scope for list
+  subscribes. It reaches only lists, and no list exists until an operator
+  creates one. `contacts:read` is elevated, so no existing key gains it.
+- **Token-link checks run before the account lookup** on password reset,
+  magic link and verification re-send. A caller that sends a disallowed
+  `resetUrl`, `signInUrl` or `verifyUrl` for an unknown address now gets `400
+  AUTH_URL_NOT_ALLOWED` too, where it used to get the constant 200. A token
+  URL with a username or password in it
+  (`https://attacker.example@app.example.com`) is refused even when its origin
+  is registered.
+- **A spent backup code at end-user MFA sign-in** answers
+  `MFA_BACKUP_CODE_USED`, so the user is told the code was already used. It
+  still counts toward the MFA lockout. Step-up, disable and operator sign-in
+  keep their existing answers.
+- **Custom template previews validate `variables`.** A preview override with
+  a bad value, such as a `javascript:` URL, answers `400
+  EMAIL_VARIABLES_INVALID`, using the send rules minus `required`.
+- **Operator sign-up without a workspace name** answers
+  `WORKSPACE_NAME_REQUIRED` instead of `BAD_REQUEST`. The name is optional
+  when signing up with a workspace-bound invite key.
+- **Portal MFA moves to a cookie.** The code step is `?step=mfa` and reads
+  the challenge from the httpOnly `rekey_portal_mfa` cookie. Old
+  `/<slug>/login?mfa=...` links no longer open the code step, so a user who is
+  on that step during the deploy signs in again.
+- **Panel MFA moves to a cookie.** `/mfa-verify` reads the challenge from
+  `rk_mfa_challenge`; an old bookmarked `?challenge=` URL is ignored. A
+  missing or expired challenge shows "Sign in again" instead of redirecting
+  to `/login`.
+- **The portal's `PORTAL_BASE_URL` and the API's `PUBLIC_PORTAL_URL` must
+  name the same origin.** Portal password resets are refused with
+  `AUTH_URL_NOT_ALLOWED` when they differ, and when the API has no
+  `PUBLIC_PORTAL_URL`.
+- **The API's hosted authorize page** (served when an Application has no
+  `hostedAuthorizeUrl`) uses plainer scope wording, shows the host both
+  buttons send you to, and says what Deny does. An unnamed client is called
+  "An app" instead of "An application".
+- **Session rows record the visitor, not your server.** When a secret-key
+  caller sends `X-Rekey-Client-User-Agent`, that value becomes the session's
+  `userAgent`, so server-side sign-ins stop showing `node` once you upgrade
+  `@rekey.dev/nextjs` or use `visitorClient` in `@rekey.dev/astro`.
+- **`session.created` carries `platform` and `country`,** and `user.updated`
+  has a new `via` value, `server`, for secret-key profile writes.
+- **`@rekey.dev/nextjs`, `@rekey.dev/astro` and `@rekey.dev/react` treat
+  `END_USER_BANNED` and `END_USER_ERASED` as signed out** and clear the
+  session cookies, instead of throwing on every page until the token expires.
+- **Billing `fix` strings name the new panel paths.** They point at Billing,
+  Setup, Providers (`/applications/:id/billing/providers`), Setup, Status and
+  Setup, Settings instead of the old single Billing page. If you match on
+  `fix` text, update it; match on `code` instead.
+- **`PLAN_SLUG_TAKEN` and `PLAN_INACTIVE`** name a failed or unfinished
+  registration correctly. An unregistered plan's `PLAN_INACTIVE` fix names
+  `POST .../register`.
+- **Profile schema writes are versioned.** `GET
+  /tenant/applications/:id/profile-schema` returns `version`; a PUT that sends
+  a stale `version` answers `409 PROFILE_SCHEMA_CHANGED`. Removing a select
+  option that users picked answers `409 PROFILE_OPTION_IN_USE`.
+- **`PUT /admin/tenants/:id/limits`** now records a
+  `workspace.limits_set_by_admin` security event with the previous and new
+  limits.
+- **End-user IP addresses are masked below OWNER and ADMIN.** Only OWNER
+  and ADMIN operators whose credential holds `activity:read` see them in
+  full. Everyone else (grant holders, restricted members, and an OWNER or
+  ADMIN using a PAT or MCP token without `activity:read`) gets the network:
+  IPv4 as `/24`, IPv6 as `/48` in canonical CIDR form. This covers session
+  lists, impersonation audits, the device list and its block, unblock and
+  release responses, and the operator MCP device tools. Secret keys record
+  `revealsEndUserIps` at mint: a key minted by an OWNER or ADMIN holding
+  `activity:read` (or with the super-admin key) reads full addresses on `GET
+  /api/v1/devices` and `POST /api/v1/devices/:id/release`, and a key minted by
+  anyone else reads them masked. Keys minted before this release have no
+  record and keep reading full addresses; to mask one, mint a replacement as
+  a member and revoke the old key.
+- **Overview and Billing Overview numbers are cached.** `GET
+  /tenant/applications/:id/stats` and `.../billing/stats` are served from a
+  stale-while-revalidate cache: fresh for 60 seconds, then served stale for
+  up to 15 minutes while one request refreshes them. Each computation runs
+  read-only under a 4 second statement budget, and at most two dashboard
+  computations run at once per API process. Under a cold burst a request can
+  get `503 ANALYTICS_BUSY` with `Retry-After`, or `503 ANALYTICS_TIMEOUT`,
+  instead of queueing on the database pool.
+- **`get_workspace_overview` MRR is computed in SQL.** It used to load at
+  most 10,000 subscriptions and counted non-recurring plans, so it could
+  disagree with Billing Overview. It now counts only `SUBSCRIPTION` plans,
+  yearly plans as `floor(amount / 12)`, per currency, with no cap, and matches
+  Billing Overview. `activeSubscriptions` is an uncapped count.
+  `list_applications` reads end-user counts and DAU and MAU from the rollup
+  when it has them (`endUserCountAsOf`, `activityDay`, `activityTimezone`).
+- **Panel:** Billing is split into routed Setup tabs (Status, Providers,
+  Checkout page, Events, Settings); old `/billing?edit=` and `?webhook=` links
+  redirect. Team has Members, Application access and Invitations tabs. Lists
+  sit under a new Audience group. Users has an Onboarding tab that replaces
+  Profile fields (`/profile-fields` redirects). "Usage" is labelled Meters,
+  and "Force-logout all end-users" is now Sign out all end-users. Email is its
+  own nav group, and a new Settings tab holds Promote, Sign out all end-users
+  and Disable (`/lifecycle` redirects there). The OpenID Connect provider
+  switch and "Your own sign-in page" moved to OAuth clients; Developer, Access
+  is now "Allowed origins & IPs". The Applications list hides disabled
+  applications until you turn on "Show disabled". Destructive actions share
+  one outlined red button, settings forms save through one sticky bar, and
+  wide tables scroll inside their card on a phone. The sidebar shows the
+  running Rekey version.
+
+### Added
+
+- **Contact lists.** Collect waitlist, newsletter and contact-form sign-ups
+  into lists that belong to an Application, with versioned consent text and
+  consent proof (version, time, network prefix, source page).
+  - Operator routes under `/api/v1/tenant/applications/:id/lists` to create,
+    edit, archive and restore lists, read members and submissions,
+    unsubscribe a member, and export CSV (`export.csv`, workspace OWNER or
+    ADMIN only, audited). A new `audience` operator scope guards them;
+    viewer and billing grants never reach contacts.
+  - `GET /api/v1/lists/:key` returns a list's form, and `POST
+    /api/v1/lists/:key/subscribe` takes sign-ups. A publishable key (only on
+    a list with Public capture on, and only for an Application with allowed
+    origins) always gets `202 { status: "received" }`. A secret key with
+    `contacts:write` gets the real outcome. A browser can never re-subscribe
+    someone who left, and a secret key that names a visitor
+    (`X-Rekey-Client-Ip` or `X-Rekey-Relay: browser`) is treated as the
+    browser it relays. Browser traffic is rate limited per visitor, per list
+    and per workspace day, and fails closed.
+  - `GET /api/v1/lists/:key/members` with the elevated `contacts:read`
+    scope, keyset-paged with `updatedSince` for incremental sync, for your
+    email tool. `GET /api/v1/lists` returns lists with counts.
+    `DELETE /api/v1/lists/:key/members/:email` unsubscribes.
+  - Webhooks `contact.subscribed`, `contact.submission.created` and
+    `contact.unsubscribed`. Rekey sends no email from a list.
+  - Erasure: erasing an end user also erases their contact in that
+    Application, `DELETE /tenant/applications/:id/contacts/:contactId`
+    (workspace OWNER only) erases a contact who never signed up, and an
+    erased address cannot be re-captured from a browser for 30 days. DSAR
+    exports gain `contacts`. Submissions older than a list's
+    `submissionRetentionDays` are pruned.
+  - Workspace limits `maxContacts`, `maxContactLists` and
+    `contactCaptureDailyCap`, reported in both limits views.
+  - SDKs and tools: `rekey.lists` in `@rekey.dev/node` (`list`, `get`,
+    `subscribe`, `members`, `iterateMembers`, `unsubscribe`);
+    `subscribeToList` in `@rekey.dev/nextjs/server`; `<NewsletterForm>`,
+    `<ContactForm>` and `useListSubscribe` in `@rekey.dev/react`, which work
+    through a Server Action with no provider; `rekey lists ls` and `rekey
+    lists export --format csv|jsonl` in `@rekey.dev/cli`; operator MCP read
+    tools `list_contact_lists` and `get_contact_list_stats` (counts only).
+  - Panel: Audience, Lists with Members, Submissions, Settings and Embed
+    tabs. See docs/lists.md.
+- **Profile questions and onboarding.** Define up to 50 profile fields per
+  Application (`text`, `select`, `number`, `boolean`, `url`, `date`), each
+  writable by the user or only by your server.
+  - `GET|PUT /tenant/applications/:id/profile-schema`, `GET
+    /api/v1/profile-schema`, `PATCH /api/v1/users/me/profile`, `PATCH
+    /api/v1/users/:id/profile` and the operator equivalent.
+  - `POST .../onboarding/complete` (refuses with `PROFILE_INCOMPLETE` until
+    every required field is answered) and `POST .../onboarding/skip`, for the
+    user, your server and the operator. Rekey records what happened and never
+    blocks a user; `onboardingStatus` is `pending`, `completed` or
+    `skipped`.
+  - Webhooks `user.onboarding_completed` and `user.onboarding_skipped`.
+  - `rekey.users.updateProfile`, `completeOnboarding` and `skipOnboarding` in
+    `@rekey.dev/node`; `skipOnboarding` and `completeOnboarding` on
+    `RekeyBrowserClient` in `@rekey.dev/react`; `onboardingStatus()` and the
+    profile types in `@rekey.dev/shared-types`. See docs/profile-fields.md.
+- **Sign-in and activity per end user.** `lastSignedInAt`, `lastSignInVia`,
+  `signInCount` (counted from this deploy), `lastActiveOn`, `lastPlatform`,
+  `platformsSeen` and `lastCountry` on the end-user record, plus each
+  session's platform, OS, browser, app version and country. Clients can say
+  what they are with an optional `client: { platform, appVersion }` on
+  sign-up, sign-in, MFA verify, magic-link verify, passkey complete and the
+  OAuth callback. `GET /tenant/applications/:id/stats` gains `activeUsers`
+  (`d1`, `d7`, `d30`) and a 30-day `activitySeries`. `GET
+  .../end-users/:euid/insights` returns one user's sign-ins, active days,
+  platforms, places and profile answers. The operator end-user list sorts by
+  `lastSignedInAt`. `@rekey.dev/node` gains `clientUserAgent`, and
+  `@rekey.dev/astro` gains `visitorClient(Astro)`. See docs/analytics.md.
+- **Ban an end user.** `GET|POST
+  /api/v1/tenant/applications/:id/end-users/:euid/ban` and `POST .../unban`,
+  with a required reason. A ban ends every session and MCP grant, deletes
+  outstanding links and codes, and answers `403 END_USER_BANNED` on every
+  sign-in path, refresh and live access token, after the credential
+  verifies. Licence verify answers `reason: "suspended"`. Webhooks
+  `user.banned` and `user.unbanned`, a `banned` filter on the end-user list,
+  and an Access tab in the panel. Subscriptions keep billing, and apps
+  verifying RS256 tokens offline see the ban only when the access token
+  expires. See docs/auth.md.
+- **`rekey init --owner-email` hands over the workspace.** `POST
+  /api/v1/admin/operator-invites` accepts `tenantId`, `email` and `role`, and
+  returns `inviteUrl`. A bound invite joins its redeemer to that workspace at
+  sign-up (password or OAuth) or through the panel's accept-invite page, and
+  only for the bound email. `rekey init` prints the link and, under
+  `--json`, `ownerInvite`. Against an older API it revokes the unbound key
+  and stops with `CLI_INVITE_UNBOUND`.
+- **`GET /tenant/applications/:id` returns `portalBaseUrl`,** and the panel
+  Portal page warns when the API has no portal base instead of showing a
+  placeholder URL as live.
+- **`GET /api/v1/admin/applications/:id/plans/:slug/entitlements`,** a
+  super-admin read of a plan's rows.
+- **Users overview.** `GET /api/v1/tenant/applications/:id/analytics/users`
+  (`overview:read`) returns counts, rates and dates, never a person, in
+  sections that succeed or fail on their own: `kpis`, `activity`, `mix`,
+  `onboarding`, `retention`, `security`, `billing` and `usage` (the last two
+  need `billing:read`). It takes `range` (7d, 30d, 90d, 12m or custom),
+  `compare` and filters for platform, country, sign-in method, sign-up source,
+  onboarding, verified, MFA, plan, paying, organization and one profile
+  question. Each section is cached like `/stats`. The route allows 120
+  requests a minute per operator per Application, of which at most 30 may
+  compute an uncached section; cache hits do not count, and the operator MCP
+  tool draws on the same allowance (`429 RATE_LIMITED` with `Retry-After`
+  past either). The panel's new Users, Overview tab shows it, with the
+  filters in the URL, and Users, Onboarding shows completed, skipped and
+  pending counts. See docs/analytics.md.
+- **Daily analytics rollup.** Once an hour one API replica rolls each
+  Application's yesterday and today into `application_activity_days` and a
+  daily population snapshot, in the Application's reporting timezone. Once
+  the rollup holds days, the Users overview answers ranges up to 366 days
+  from it (unfiltered, or filtered on one of platform, country or sign-in
+  method); other requests use live data and are capped at 63 days. Set
+  `ANALYTICS_ROLLUP_ENABLED=false` to turn the job off.
+- **Reporting timezone per Application.** `PATCH
+  /api/v1/tenant/applications/:id/settings` with `{ "reportingTimezone":
+  "Asia/Kolkata" }` (write access and `overview:write`) sets the zone the
+  rollup counts days in; the default is `UTC`. A zone the database does not
+  know, such as a legacy alias like `Asia/Calcutta`, answers `400
+  REPORTING_TIMEZONE_UNSUPPORTED`; send the current name. Days already rolled
+  up keep their zone, and a change rolls the Application up at once. `GET
+  /tenant/applications/:id` returns `reportingTimezone`.
+- **How each account was created.** End users carry `createdVia`:
+  `password`, `magic_link`, `oauth:<provider>`, `operator`, `import` or
+  `billing`. Accounts created before this release read `unknown`. It is on
+  the end-user object, the operator list and detail, the insights endpoint
+  and the DSAR export.
+- **End-user list filters.** `GET /tenant/applications/:id/end-users` takes
+  `activeFrom`, `activeTo`, `inactiveForDays`, `minSignIns`, `createdFrom`,
+  `createdTo`, `createdVia`, `platform`, `country`, `lastSignInVia`,
+  `onboarding`, `mfa`, `plan` and `org`, sorts by `lastActiveOn`, and returns
+  `lastActiveOn` and `lastCountry` on each row. `plan` needs `billing:read`
+  and `org` needs `organizations:read` (403 otherwise, never ignored).
+- **Users analytics for agents and scripts.** Operator MCP tool
+  `get_user_analytics` (`overview:read`) and `rekey analytics users --app
+  <id>` in `@rekey.dev/cli`, which takes an operator token through
+  `--operator-token` or `REKEY_OPERATOR_TOKEN`.
+- **Applications list filters.** `GET /api/v1/tenant/applications` takes
+  `status`, `environment`, `q`, `sort` (`created`, `name`, `activity`) and
+  `include=summary` (active API keys and last active day, each left out when
+  the caller cannot read it). With no parameters it behaves as before.
+
+### Fixed
+
+- **Portal password reset works.** The portal's reset link was refused on
+  every portal app because the portal origin was never an allowed token-link
+  destination, and the link carried no `{token}`. The app's own portal pages
+  are now allowed while the portal is on (scoped to the app's slug on a
+  shared host, or a verified custom domain). Nothing is written into
+  `redirectUrls`. An email transport is still needed.
+- **A new `pnpm dev` stack gets a working portal password reset:** the root
+  `.env.example` sets `PUBLIC_PORTAL_URL`.
+- **`rekey init --owner-email` left the new workspace unreachable.** The
+  named owner got a second, empty workspace. See **Added**.
+- **Panel selects show the saved value after a save,** and a second save no
+  longer reverts an earlier select change (auth methods, team roles and
+  scopes, end-user role, organization role, billing provider mode, template
+  category, plan interval, audit log filter).
+- **Panel:** "MFA enabled" and "MFA disabled" banners now appear; the
+  member role select has an accessible name; the Account security summary
+  says when the passkey read failed; the Operator MCP page takes its address
+  from the API instead of showing `<set NEXT_PUBLIC_API_URL>`; the "Mint your
+  first API key" step ticks when any of the three newest applications has a
+  key; a damaged profile answers form reports "Nothing was saved" instead of
+  a false success; list and onboarding snippets are valid, copy-paste ready
+  code; copy that said failed sign-ins are not recorded, and several stale
+  cross-links, are corrected. Success banners no longer vanish a moment
+  after an action, and the Overview pages say "not visible to your role" or
+  "could not be read" instead of showing zeros.
+- **Trial eligibility on an external-only Application** no longer says the
+  provider "cannot host a checkout".
+- **Sign-up email rules explain apex versus subdomain.** `example.com`
+  matches only that domain and `*.example.com` its subdomains; the panel
+  notes an apex listed without its wildcard. Matching is unchanged.
+
+### Security
+
+- **End-user IP addresses are no longer readable in full by every member.**
+  A member with a viewer, billing or admin grant read raw addresses from
+  sessions, devices and the MCP device tools, an APP_ADMIN could mint a
+  secret key to read them, and an OWNER token narrowed below `activity:read`
+  still got them. All three now get the masked network (see **Changed**).
+- **Dashboard reads cannot exhaust the database pool.** Analytics and
+  Overview computations run read-only, under a statement budget, through a
+  small per-process slot pool, and uncached computations are rate limited
+  per operator.
+- **An account-existence oracle on token links is closed.** A publishable
+  key sending a disallowed reset, magic-link or verification URL got 400 for
+  a known address and 200 for an unknown one. Both now get the same refusal.
+- **Portal reset links are scoped to the app's own pages.** Every app shares
+  the portal host, so the allowance is the app's `/<slug>/` path only, with
+  dot segments, encoded separators, backslashes and empty segments refused
+  both raw and parsed.
+- **MFA challenge tokens no longer travel in URLs** in the panel (after
+  password, magic link, OAuth and the Cloud handoff) or the portal. They were
+  visible in access logs and browser history.
+- **Token URLs with userinfo are refused,** so
+  `https://attacker.example@app.example.com` cannot pass as a registered
+  origin.
+- **`X-Rekey-Client-User-Agent` is believed only from a secret key** or a
+  proven internal caller, and a session's country only when
+  `TRUST_CF_IPCOUNTRY` is on and the request came through the proven proxy or
+  the portal (see **Upgrade notes**).
+- **A bound operator invite is single-use, hashed and expiring,** and needs
+  the bound email at sign-up and at accept.
+- **Erasure** now also clears the new fields: profile answers, onboarding
+  skip time, platform and country roll-ups, ban reasons, and `country` in
+  stored `session.created` deliveries.
+
+### Upgrade notes
+
+Migrations, applied on boot or with `pnpm db:migrate:deploy`. All are
+additive for existing data:
+
+- `20260928095906_operator_invite_workspace_binding`: three nullable columns,
+  a foreign key and an index on `operator_invites`.
+- `20260928100124_mfa_used_backup_code_hashes`: a defaulted column on the MFA
+  credential.
+- `20260928102404_org_free_tier_claims` and
+  `20260928114500_org_free_tier_claim_survives_plan_delete`: the
+  `organization_free_tier_claims` table, its `plan_id` nullable with `ON
+  DELETE SET NULL`.
+- `20260928102922_billing_credentials_secrets_updated_at`: a defaulted
+  `billing_credentials.secrets_updated_at`, backfilled from `updated_at`.
+- `20260929022614_end_user_sign_in_counters`: sign-in columns on
+  `end_users`, an index, and `applications.activity_tracked_since`, which is
+  the deploy time for existing Applications.
+- `20260929022615_end_user_last_sign_in_desc_index`: an index on `end_users`
+  for the last-sign-in sort. It is a plain `CREATE INDEX`, so writes to
+  `end_users` wait while it builds; on a very large table, plan for that.
+- `20260929022650_end_user_ban`: three nullable ban columns.
+- `20260929024139_end_user_daily_activity`: `last_active_on`,
+  `activity_bits` and an index.
+- `20260929025448_session_client_platform`: client columns on
+  `refresh_tokens` and roll-up columns on `end_users`.
+- `20260929030658_end_user_profile_fields` and
+  `20260929030659_profile_schema_version`: `applications.profile_schema`
+  (default `[]`), its version, `end_users.profile` (default `{}`) and
+  `onboarding_completed_at`.
+- `20260929041500_contact_lists`: five new tables for lists, consent
+  versions, contacts, members and submissions.
+- `20260929050545_contact_erasure_tombstones`: a new table of hashed,
+  30-day erasure markers.
+- `20260929211359_onboarding_skipped_at`: one nullable column.
+- `20260929222101_end_user_created_via`: one nullable column, no backfill.
+- `20260929223019_application_reporting_timezone`: `reporting_timezone`,
+  default `UTC`.
+- `20260929230642_analytics_rollups`: the `application_activity_days` and
+  `application_population_snapshots` tables.
+- `20260929230643_refresh_tokens_app_live_head_idx` and
+  `20260929234841_refresh_tokens_app_created_at_idx`: two indexes on
+  `refresh_tokens`, each in a migration of its own and built with `CREATE
+  INDEX CONCURRENTLY IF NOT EXISTS`, so sign-ins and refreshes keep writing
+  while they build. An interrupted build leaves an INVALID index that `IF NOT
+  EXISTS` then skips. Check with `SELECT indexrelid::regclass, indisvalid
+  FROM pg_index WHERE NOT indisvalid;`, and recover with `DROP INDEX
+  CONCURRENTLY IF EXISTS "<name>";`, then `prisma migrate resolve
+  --rolled-back <migration>` and another `prisma migrate deploy`. See
+  docs/analytics.md, "Daily rollup".
+- `20260930043535_api_key_reveals_end_user_ips`: one nullable column on
+  `api_keys`; existing keys stay null and keep reading full addresses.
+
+**Breaking, `docker-compose.prod.yml`:** set `INTERNAL_CALLER_SECRET` in
+`.env` before you pull this release (`openssl rand -hex 32`). The same value
+is used by the API, panel and portal. Without it `docker compose up` fails
+on `services.api.environment.INTERNAL_CALLER_SECRET`.
+
+**Soon after the API is live, backfill the analytics rollup:**
+
+```bash
+docker compose exec api node apps/api/dist/scripts/backfill-analytics-rollup.js
+```
+
+Do not put this off. The activity bits it reads hold 63 days, so each day
+you wait loses one more day of per-day history. It writes UTC days only,
+never yesterday or today, and never a day that already has a row, so a
+re-run does nothing. An Application that fails is logged and skipped, and
+the script exits non-zero so a re-run picks it up.
+
+**Known limits of the Users overview.** Requests the rollup cannot answer
+(filters such as verified or onboarding, or several dimensions at once) are
+computed live over the whole population. With about 20 operators forcing
+such computations at once on a large Application, they can take 9 to 12
+seconds, or answer `503 ANALYTICS_BUSY` or a `pending` section. Repeat views
+are served from the cache.
+
+**After the API is live, backfill the last sign-in** once, on each API:
+
+```bash
+docker compose exec api node apps/api/dist/scripts/backfill-last-sign-in.js
+```
+
+It fills `lastSignedInAt` and `lastSignInVia` from each user's newest stored
+`user.signed_in` event, in batches, only where they are empty. It is safe to
+re-run and to stop half way. `signInCount` is not backfilled and counts from
+the deploy.
+
+**`TRUST_CF_IPCOUNTRY` is opt-in and off by default.** With it off, no
+country is ever recorded. Turn it on only when the API sits behind a proxy
+that sends `API_PROXY_SECRET` and that proxy receives nothing but Cloudflare
+traffic (its origin locked to Cloudflare's address ranges, or authenticated
+origin pulls). Anyone who can reach that proxy another way can write
+`CF-IPCountry` themselves. Requests that skip the proxy are ignored either
+way. The hosted portal forwards its visitor's country only when it is proven
+by `INTERNAL_CALLER_SECRET`. See docs/analytics.md.
+
+**Contact-list limits.** Workspaces have three new limit keys in
+`Tenant.limits`: `maxContacts`, `maxContactLists` and
+`contactCaptureDailyCap`. Absent or `null` means unlimited, so nothing
+changes until you set them, with `PUT /api/v1/admin/tenants/:id/limits` or
+`DEFAULT_TENANT_LIMITS` for new workspaces. On Rekey Cloud they come from the
+plan entitlements `max_contacts`, `max_contact_lists` and
+`contact_capture_daily_cap` (FEATURE, INT). Without rows, Free falls back to
+500 contacts and 1 list and Standard to 25,000 contacts with unlimited
+lists. Existing workspaces keep their limits until their next billing
+webhook or `/plan-change`.
+
+New environment variables:
+
+- `TRUST_CF_IPCOUNTRY` (API), default off. See above.
+- `ANALYTICS_ROLLUP_ENABLED` (API), default on. `false` turns the hourly
+  rollup off.
+- `PUBLIC_PORTAL_URL` is not new, but must now be the same origin as the
+  portal's `PORTAL_BASE_URL` for portal password resets to work.
+- `INTERNAL_CALLER_SECRET` is required by `docker-compose.prod.yml`.
+
+New webhook events: `user.banned`, `user.unbanned`,
+`user.onboarding_completed`, `user.onboarding_skipped`,
+`contact.subscribed`, `contact.submission.created` and
+`contact.unsubscribed`. New scopes: `contacts:write` (standard, in `*`),
+`contacts:read` (elevated; minting it needs `audience:read` on the
+Application) and the operator scope `audience`.
+
+New error codes. The API codes are listed in docs/errors.md:
+
+- Lists: `LIST_NOT_FOUND`, `LIST_KEY_TAKEN`, `LIST_CAPTURE_UNPROTECTED`,
+  `LIST_MEMBER_NOT_FOUND`, `CONTACT_LIST_QUOTA_EXCEEDED`,
+  `CONTACT_QUOTA_EXCEEDED`, `CONTACT_NOT_FOUND`, `CONTACT_CURSOR_INVALID`,
+  `CONTACT_CONSENT_REQUIRED`, `CONTACT_CONSENT_STALE`,
+  `CONTACT_FIELDS_INVALID`, `CONTACT_EMAIL_DOMAIN_NOT_ALLOWED`,
+  `CONTACTS_RATE_LIMITED`.
+- Profile: `PROFILE_SCHEMA_INVALID`, `PROFILE_SCHEMA_CHANGED`,
+  `PROFILE_FIELD_KEY_IMMUTABLE`, `PROFILE_OPTION_IN_USE`,
+  `PROFILE_FIELD_UNKNOWN`, `PROFILE_FIELD_READ_ONLY`,
+  `PROFILE_FIELD_INVALID`, `PROFILE_TOO_LARGE`, `PROFILE_INCOMPLETE`.
+- Auth and keys: `END_USER_BANNED`, `BAN_REASON_INVALID`,
+  `MFA_BACKUP_CODE_USED`, `API_KEY_SCOPE_UNKNOWN`,
+  `OPERATOR_INVITE_EMAIL_MISMATCH`, `OPERATOR_INVITE_TENANT_REQUIRED`,
+  `OPERATOR_INVITE_EMAIL_REQUIRED`, `WORKSPACE_NAME_REQUIRED`.
+- Analytics: `ANALYTICS_BUSY`, `ANALYTICS_TIMEOUT`,
+  `ANALYTICS_RANGE_INVALID`, `ANALYTICS_RANGE_TOO_LONG`,
+  `ANALYTICS_FILTER_UNSUPPORTED`, `REPORTING_TIMEZONE_UNSUPPORTED`.
+- Thrown by the SDK and CLI themselves: `CLIENT_IP_MISSING`
+  (`subscribeToList` without a visitor address), `CLI_INVITE_UNBOUND`,
+  `CLI_SECRET_KEY_MISSING`, `CLI_LISTS_FORMAT_INVALID`,
+  `CLI_LISTS_STATUS_INVALID`, `CLI_OPERATOR_TOKEN_MISSING`.
+
+## 2.2.0-rc.4
+
+A release candidate on the 2.2.0 line. It adds a Rekey-hosted checkout page
+(beta, PayPal subscriptions first), custom transactional email templates sent
+by key, lifecycle webhooks for sign-in, invitations and trials, and sign-up
+email domain rules. The default transactional emails are redesigned and carry
+the sending Application's brand. It also makes MFA codes and sign-in challenge
+tokens single-use, tightens how billing webhooks apply to subscriptions and
+payments, and stops `rekey --help` printing the super-admin key.
+
+**Upgrading an existing deployment:** six migrations run on boot, all additive
+(new tables, nullable or defaulted columns, one index, one backfill). Before
+deploying, check your Stripe credential rows for a key whose mode contradicts
+the stored mode, or every Stripe event on that Application answers 409. See
+**Upgrade notes** at the end of this section.
+
+### Changed
+
+Every item here changes a behaviour an existing 2.2.0-rc.3 deployment or
+integration can see. Read this list before you upgrade.
+
+- **MFA codes and sign-in challenge tokens are single-use** (end-user and
+  operator). A TOTP code is accepted once per factor; a code at or below the
+  last accepted time step answers `MFA_CODE_REUSED` (401 at sign-in verify and
+  on step-up, 422 at setup-confirm). A `mfaChallengeToken` that already
+  completed a sign-in answers `401 MFA_CHALLENGE_USED`, so an integration that
+  retries `mfa-verify` after a success must sign in again. Consequences a user
+  will notice: the code that confirms enrolment cannot also complete the
+  first sign-in, and a code used for step-up cannot be used again for another
+  action in the same window. A reused code does not count toward the MFA
+  lockout. Step-up routes that answered `STEP_UP_REQUIRED` or
+  `MFA_CODE_INVALID` for a spent but correct code now answer
+  `MFA_CODE_REUSED`; `/auth/mfa/challenge` keeps its `200 { ok: false }`.
+  Replay state lives in Redis and fails closed with `503
+  DEPENDENCY_UNAVAILABLE`. Challenge tokens issued before the deploy stay
+  valid until they expire (5 minutes at most).
+
+- **Checkout creation is limited for every checkout**, on the provider's page
+  as well as the new Rekey page, for every provider: 10 an hour and 30 a day
+  per end-user, 20 an hour per client IP (`CHECKOUT_LIMIT_PER_IP_HOUR`) and
+  1000 an hour per Application (`CHECKOUT_LIMIT_PER_APP_HOUR`). Over a limit
+  answers `429 CHECKOUT_RATE_LIMITED`. An unvouched client address skips the
+  IP ceiling, so a backend starting checkouts for many buyers from one server
+  IP is held only by the per-end-user and per-Application limits.
+
+- **Checkout return URLs are checked.** A `successUrl` or `cancelUrl` that is
+  not http(s) (`javascript:`, `data:`, `ftp:`) is refused with `400
+  CHECKOUT_RETURN_URL_INVALID` before anything is created. An http(s) URL
+  whose origin is not the Application's App URL, one of its redirect URLs, or
+  (when enabled) its hosted portal still succeeds, and the response carries
+  `warnings: [{ code: "CHECKOUT_RETURN_URL_UNREGISTERED", ... }]` plus an
+  `app.checkout_return_url_unregistered` security event. A later minor release
+  refuses these; register your origins now.
+
+- **A second checkout while the first is being paid is refused.** `POST
+  /billing/checkout` answers `409 CHECKOUT_PAYMENT_IN_PROGRESS` when a session
+  for the same end-user and plan is confirming, or PayPal reports its
+  subscription approved. A failed PayPal read answers `503
+  CHECKOUT_PAYMENT_STATUS_UNAVAILABLE`.
+
+- **Stripe Checkout no longer forces card-only.** Stripe shows Link, wallets
+  and whatever the account enables. A `checkout.session.completed` with
+  `payment_status: "unpaid"` activates nothing, and
+  `checkout.session.async_payment_succeeded` completes it. Endpoints
+  registered before this release do not receive that event, so a buyer paying
+  by a delayed method stays PENDING until the endpoint is re-registered
+  (Auto-configure). Newly registered Stripe endpoints are pinned to the API
+  version the client uses (`2024-11-20.acacia`), and the translator reads the
+  `2025-03-31.basil` shapes for period end and invoice subscription too.
+
+- **Stripe events whose `livemode` contradicts the verifying credential's
+  mode are answered `409 WEBHOOK_MODE_MISMATCH`** and not applied. They stay
+  unprocessed, so Stripe retries, and a retry after the credential is fixed
+  applies. A cross-Application Stripe event now answers the documented `400
+  WEBHOOK_APPLICATION_MISMATCH`, not 500.
+
+- **Billing webhooks and grants refuse a second subject on the same plan.**
+  An operator or super-admin grant for a different organization (or the
+  personal account) on a plan the end-user already holds answers `409
+  BILLING_SUBSCRIPTION_SUBJECT_CONFLICT`, where it answered `200
+  {"activated":false}`. Subscription imports report it as a per-row error. An
+  external `subscription.activated` for a different subscription id and
+  another subject is acknowledged with 200 but not applied, and the reason is
+  on the webhook event receipt. External activations dated (`occurredAt`) at
+  or before a sender-dated cancellation of the same subscription are ignored,
+  and a live row's period moves only when the new `currentPeriodEnd` is at
+  least 24 hours later. Senders should include `occurredAt`.
+
+- **Refunds are accumulated.** `payment.refunded` adds to `refundedAmount` and
+  sets `PARTIALLY_REFUNDED` or `REFUNDED` from the total. A refund past the
+  payment (`BILLING_REFUND_EXCEEDS_PAYMENT`), in another currency, or for an
+  unrecorded payment is refused and noted on the receipt. Stripe
+  `charge.refunded` is now translated and subscribed on newly registered
+  endpoints. Tenant billing stats and super-admin payment volume count
+  `amount - refundedAmount`. The operator payments list gains
+  `refundedAmount`, and its status filters (and the operator MCP
+  `recent_payments`) accept `PARTIALLY_REFUNDED`.
+
+- **The free-tier default plan must cost nothing.** Setting
+  `billingConfig.defaultPlanSlug` to a plan with a nonzero `amount` or any
+  `pricePerUnitCents` answers `409 BILLING_FREE_PLAN_NOT_FREE`, the code
+  `POST /billing/subscribe` already used. An Application
+  that already has a priced default stops granting its entitlements to
+  non-subscribers and records an `app.default_plan_ignored` security event.
+
+- **End-user subscription responses are an allowlist.** `GET
+  /billing/subscription`, cancel, subscribe, checkout's `subscription` and
+  `include=subscription` now return `SelfSubscriptionDto`. `metadata` keeps
+  only `checkoutSessionId` and `oneTime`, and `entitlementOverrides` is
+  dropped. Code that read operator notes or provenance keys through a
+  publishable key or user token must move to the secret-key operator routes.
+  `@rekey.dev/node` and `@rekey.dev/react` return the new type.
+
+- **Coupons.** Creating an `AMOUNT` coupon without `currency` answers `400
+  COUPON_CURRENCY_REQUIRED`, and a currency outside ISO 4217 answers `400
+  COUPON_CURRENCY_INVALID`. An existing `AMOUNT` coupon with no currency is
+  refused at validate and checkout with `COUPON_CURRENCY_REQUIRED`; the panel
+  flags it. A checkout already open with one still records its redemption
+  when paid.
+
+- **Subscription webhooks omit `entitlements` when the grant cannot be
+  resolved**, where they sent `[]`. Absent means unknown, not zero; do not
+  downgrade on it. `subscription.entitlements_updated` is not sent in that
+  case. Every subscription event payload now carries `trialEndsAt`.
+
+- **Billing refusals name the right provider.** On an Application whose only
+  enabled provider is inbound-only (`external`), checkout and
+  `GET /billing/trial-eligibility` answer `BILLING_PROVIDER_INBOUND_ONLY`
+  instead of `BILLING_CREDENTIALS_NOT_CONFIGURED`. A plan create whose
+  provider registration fails now says the plan exists and names the
+  `/register` route, with `details.planId`, `planSlug` and
+  `registrationStatus: "FAILED"`.
+
+- **Cancelling a checkout that was never completed by `subscriptionId`
+  answers `409 SUBSCRIPTION_CHECKOUT_UNFINISHED`.**
+
+- **`user.updated` is emitted**, and operator-created end-users emit
+  `user.created`. `user.updated` fires on the self and operator end-user
+  PATCH, the first email verification and a magic link that proves an
+  unverified address, only when a value changed, with `data.changed` (field
+  names) and `data.via`. Operator-created users emit `user.created` with
+  `via: "operator"`, and password sign-up's `user.created` now carries
+  `via: "password"`. Subscribers to `*` receive both.
+
+- **Welcome email timing.** OAuth-first sign-up now sends the welcome email
+  once. With `requireEmailVerification` on, an unverified sign-up gets the
+  welcome after its first verification instead of at sign-up.
+
+- **Default transactional emails are redesigned and branded.** The nine
+  built-in emails use the Application's portal branding (`displayName`,
+  `logoUrl`, `primaryColor`, support contact) with the Application name as the
+  fallback, get a hand-built plain-text part and dark-mode styles, and
+  subjects name the app ("Reset your Acme password"). The "Sent via Rekey"
+  line is gone. Timestamps gain readable UTC variables (`expiresAt`,
+  `changedAt`, `enabledAt`, `graceEndsAt`, `receivedAt`) beside the existing
+  `*Iso` ones, and the payment-failed reminder gains `portalUrl` and an
+  "Update payment method" button when the hosted portal is on. Customised
+  templates are unchanged.
+
+- **Email sender identity is separate from credentials.** Saving email
+  credentials without `fromName` or `replyTo` now keeps the stored values
+  instead of clearing them. On the shared pool a stored `fromName` shows as
+  `<name> (via <deployment>)` and Reply-To is now sent. A `fromName` with a
+  control character answers `400 EMAIL_FROM_NAME_INVALID` at write time. From
+  display names are quoted per RFC 5322 on every send.
+
+- **`requireEmailVerification` cannot be switched on without a verification
+  URL.** The auth-config PATCH (and the operator MCP `update_auth_config`)
+  answers `409 EMAIL_VERIFICATION_URL_REQUIRED` when the Application has no
+  `appUrl`, no http(s) redirect URL and no `DEFAULT_APP_URL`.
+
+- **`API_KEY_INVALID` and `PUBLISHABLE_KEY_INVALID` name the public API
+  origin**, not an in-cluster host, and the OpenAPI `servers` entry uses it.
+
+- **`@rekey.dev/cli`: usage errors under `--json` are JSON.** Unknown options
+  and commands, and missing arguments, go to stderr as `CLI_USAGE_ERROR`, exit
+  1. `--limit` (1 to 100) and `--offset` (0 or more) are checked before any
+  request (`CLI_LIST_LIMIT_INVALID`, `CLI_LIST_OFFSET_INVALID`).
+
+- **Rekey Cloud Standard includes three production applications per
+  workspace;** Free keeps one.
+
+### Added
+
+- **Rekey checkout page (beta, PayPal subscriptions).** `POST
+  /billing/checkout` can return a Rekey-hosted page on the portal
+  (`/<slug>/checkout/chk_live_...`) with the Application's branding, the order
+  summary, an auto-renewal disclosure and PayPal's own buttons. It is switched
+  on per Application and per payment mode in Panel, Billing, Checkout page,
+  with a failure behaviour of falling back to the provider's page (default)
+  or refusing. The body accepts `mode: "redirect" | "embedded"`, and the
+  response gains `mode` and `checkoutSessionId`. Card data stays in PayPal's
+  windows, and activation stays webhook-only: a PayPal approval only moves the
+  session to confirming after Rekey checks the subscription with PayPal.
+  - Public routes under `/api/v1/checkout-sessions/:token` (view, status,
+    fallback, `paypal/approved`) and `GET /api/v1/checkout/probe/:nonce`.
+  - Tenant routes `GET`/`PATCH /tenant/applications/:id/checkout`,
+    `GET .../checkout/readiness` (eight checks per mode, Test and Live) and
+    `GET .../checkout/status`.
+  - Kill switch `CHECKOUT_EMBEDDED_ENABLED=false` on the API.
+  - Portal branding gains Terms, Privacy and Refund policy URLs, shown in the
+    checkout page footer.
+  - Webhook events record the mode of the credential that verified them
+    (`WebhookEvent.mode`); readiness counts only live events received since
+    the credentials were last saved.
+  - New security events `app.checkout_embedded_fallback`,
+    `app.checkout_embedded_refused`, `app.checkout_mode_mismatch`,
+    `app.checkout_confirmation_refused` and `app.checkout_settings_updated`.
+- **Custom transactional email templates.** Register a template in Panel,
+  Email, Custom templates (draft, preview, test send to yourself, publish as
+  an immutable version), then send it by key with `POST /api/v1/email/send`
+  and a secret key holding the new elevated scope `email:send`. The call
+  carries only `template`, `to`, `variables`, `version` and `idempotencyKey`,
+  never a subject or HTML. Custom templates send only through the
+  Application's own Resend or SMTP, never the shared pool. Variables are typed
+  and validated, an idempotency key names one attempt, and sends are capped
+  per workspace (`EMAIL_SEND_DAILY_CAP`, `EMAIL_SEND_RECIPIENT_HOURLY_CAP`,
+  overridable in `Tenant.limits`). `notification` templates carry RFC 8058
+  one-click unsubscribe, which stops notification mail only; password resets,
+  sign-in links and `critical` templates keep arriving. The suppressions list
+  shows what each entry stops. The preview returns and highlights undeclared
+  variables. See docs/email-templates.md.
+- **`@rekey.dev/node`: `rekey.email.send()`**, with `isEmailSendError()`,
+  `emailVariableIssues()` and `EMAIL_SEND_ERROR_CODES`.
+- **Email sender identity.** `PATCH
+  /api/v1/tenant/applications/:id/email-sender` sets `fromName`, `replyTo` and
+  `supportEmail`, and the panel's Email settings gain a Sender section.
+  `supportEmail` feeds the "Need help?" footer of the default emails and is
+  returned as `ApplicationDto.supportEmail`.
+- **Lifecycle webhooks:** `session.created` (once per real sign-in, with
+  `via` and `firstSignIn`, never on refresh or organization switch),
+  `organization.invitation.created`, `organization.invitation.accepted`,
+  `subscription.trial_started` and `subscription.trial_will_end` (3 days
+  before `trialEndsAt`, once per trial end). Subscribers to `*` receive them.
+- **`isNewUser` on the auth result**, true when the sign-in created the user
+  (password sign-up, magic link, OAuth), and `SignedInSession` from
+  `@rekey.dev/nextjs`'s `signIn`, `signUp` and `mfaVerify`.
+- **`authConfig.welcomeEmail`**: `on_signup` (default, unchanged timing),
+  `on_verified` or `off`, on the panel Auth page, the auth-config PATCH and
+  the operator MCP.
+- **Sign-up email domain rules**, `authConfig.signupRestrictions`:
+  `allowedDomains`, `blockedDomains` (exact or `*.` subdomains) and
+  `blockDisposable` (a vendored list). Self sign-up from a refused domain
+  answers `403 SIGNUP_EMAIL_DOMAIN_NOT_ALLOWED`; operator create and import
+  skip the rules, and existing users keep signing in. Panel: Auth, Sign-up
+  email rules.
+- **`GET /api/v1/auth/oauth/providers`** lists an Application's usable OAuth
+  providers (id and name only) for the publishable key.
+  `rekey.auth.listOAuthProviders()` in `@rekey.dev/node`; in
+  `@rekey.dev/react`, `useOAuthProviders()` and `<SignIn>` / `<SignUp>` fetch
+  them when given `oauthStartUrl` or `oauthStartAction`.
+- **`GET /api/v1/billing/subscriptions`** returns every live subscription of
+  the user or organization, and cancel accepts `subscriptionId`.
+  `listSubscriptions` and the `subscriptionId` option in `@rekey.dev/node` and
+  `@rekey.dev/react`. The portal lists each live subscription with its own
+  Cancel button and never offers a plan the buyer already holds.
+- **Operator MCP:** `list_organizations`, `add_organization_member` and
+  `set_organization_member_role`, with MCP annotations on tools and the
+  `fix` of every `RekeyError` returned. Member adds and role changes from the
+  panel and MCP record `app.organization_member_added` and
+  `app.organization_member_role_changed`.
+- **`licenses.listMine` (`@rekey.dev/node`) and `listMyLicenses`
+  (`@rekey.dev/react`) take `{ organizationId }`.**
+- **"Secured by Rekey" attribution** for workspaces whose `Tenant.limits`
+  sets `emailAttribution: true` (Rekey Cloud Free). Off everywhere else,
+  including every self-hosted install.
+- **Panel:** the email template editor opens uncustomised templates with the
+  default loaded as editable blocks, and the API returns the default's
+  `designJson`.
+
+### Fixed
+
+- **`npx @rekey.dev/cli` and `npx @rekey.dev/mcp` did nothing.** The entry
+  check compared a symlinked bin path with the real file, so both exited 0
+  without running. They now run under npx and `node_modules/.bin`.
+- **Portal sign-in errors say what happened.** A locked-out or throttled
+  customer is told to wait (with the minutes when known), service failures
+  say the account is fine, and forgot-password no longer claims a link is on
+  its way after a failed request. Error pages outside the billing dashboard
+  no longer say nothing was charged.
+- **A fresh clone reaches its API.** The root `.env.example` sets `REKEY_URL`
+  and `PORTAL_BASE_URL`, and the panel says so when `REKEY_URL` is missing.
+- **The panel login shows a message for every error code**, including
+  `DEPENDENCY_UNAVAILABLE`.
+- **The `SIGNUP_DISABLED` fix** names ways in that exist.
+- **A pending checkout's binding window** is measured from when its session
+  was opened, not from the row's last write.
+- **Panel:** form rows stay aligned when a field shows a hint or an error, and
+  the plan Amount hint no longer shows two amounts.
+- **Documentation:** docs/portal.md describes what the portal serves, the
+  forgot-password route states when a secret-key caller learns an address is
+  unknown, and docs/billing.md, the SDK READMEs and CONTRIBUTING.md are
+  corrected against the code.
+
+### Security
+
+- **`rekey --help` printed the super-admin key.** The CLI's global options
+  took `SUPER_ADMIN_KEY` and `REKEY_URL` as commander defaults, which help
+  prints. Anyone with the key exported who ran `--help` put it on screen and in
+  any captured log. Help now reads `(env: SUPER_ADMIN_KEY)`; the values are
+  read from the environment only when the flag is absent. Rotate
+  `SUPER_ADMIN_KEY` if help output may have been captured.
+- **MFA replay.** One TOTP code verified several times, one challenge token
+  plus one code minted two sessions, and 8 concurrent requests could all spend
+  one backup code. All three are closed; see **Changed**.
+- **Passkey sign-in starts are rate limited** to 10 a minute per Application
+  and visitor address, on the end-user and operator routes.
+- **Tokens in query strings stay out of the API's logs.** Values of `code`,
+  `key`, `invite` and names ending in `token`, `secret`, `password`,
+  `signature`, `ticket` or `challenge` are redacted, as are checkout tokens in
+  paths.
+- **PayPal webhook verification uses the raw body**, not a re-serialised one.
+- **SMTP connects to the address it checked**, closing a DNS rebinding gap,
+  with SNI and certificate checks still on the hostname.
+- **`.gitignore` covers every `.env.*`** except the examples.
+
+### Upgrade notes
+
+Migrations, applied on boot or with `pnpm db:migrate:deploy`:
+
+- `20260926120000_custom_email_templates` and
+  `20260926180000_email_unsubscribe_category`: new template tables, new
+  `EmailLog` columns and status `pending`, `EmailSuppression.category`.
+- `20260927000510_hosted_checkout_sessions`: `checkout_sessions` table and
+  checkout columns on `applications` (default: provider's page).
+- `20260927013324_webhook_event_mode`: nullable `webhook_events.mode`.
+- `20260927135137_end_user_welcome_email_pending`: a defaulted boolean.
+- `20260927141304_lifecycle_first_sign_in_and_trial_will_end`: two nullable
+  columns, an index on `subscriptions (status, trial_ends_at)`, and a backfill
+  that marks every existing end-user as already signed in, so none reads as a
+  first sign-in.
+
+New environment variables for the API, all optional:
+
+- `CHECKOUT_EMBEDDED_ENABLED`, unset means on.
+- `CHECKOUT_LIMIT_PER_IP_HOUR`, default `20`, and
+  `CHECKOUT_LIMIT_PER_APP_HOUR`, default `1000`.
+- `EMAIL_SEND_DAILY_CAP`, default `1000`, and
+  `EMAIL_SEND_RECIPIENT_HOURLY_CAP`, default `10`.
+- `EMAIL_UNSUBSCRIBE_SECRET` (32+ characters), `EMAIL_UNSUBSCRIBE_SECRET_ID`
+  (default `k1`) and `EMAIL_UNSUBSCRIBE_PREVIOUS_SECRETS`. Unset, unsubscribe
+  links are signed with a key derived from `JWT_SECRET` and stop working if it
+  changes.
+
+New error codes (each is listed in docs/errors.md):
+
+- Checkout: `CHECKOUT_RATE_LIMITED`, `CHECKOUT_RETURN_URL_INVALID`,
+  `CHECKOUT_PAYMENT_IN_PROGRESS`, `CHECKOUT_PAYMENT_STATUS_UNAVAILABLE`,
+  `CHECKOUT_EMBEDDED_NOT_READY`, `CHECKOUT_READINESS_FAILED`,
+  `CHECKOUT_MODE_MISMATCH`, `CHECKOUT_SESSION_NOT_FOUND`,
+  `CHECKOUT_SESSION_EXPIRED`, `CHECKOUT_SESSION_COMPLETE`,
+  `CHECKOUT_CONFIRMATION_REFUSED`, `CHECKOUT_CONFIRMATION_LIMIT`,
+  `CHECKOUT_FALLBACK_UNAVAILABLE`, `CHECKOUT_EMBEDDED_UNSUPPORTED`; warnings
+  `CHECKOUT_RETURN_URL_UNREGISTERED` and `CHECKOUT_EMBEDDED_FELL_BACK`.
+- Billing: `BILLING_SUBSCRIPTION_SUBJECT_CONFLICT` (409),
+  `BILLING_REFUND_EXCEEDS_PAYMENT`, `SUBSCRIPTION_CHECKOUT_UNFINISHED`,
+  `COUPON_CURRENCY_REQUIRED`, `COUPON_CURRENCY_INVALID`,
+  `WEBHOOK_MODE_MISMATCH`.
+- Auth: `MFA_CODE_REUSED`, `MFA_CHALLENGE_USED`,
+  `SIGNUP_EMAIL_DOMAIN_NOT_ALLOWED`, `EMAIL_VERIFICATION_URL_REQUIRED`.
+- Email: `EMAIL_TEMPLATE_NOT_FOUND`, `EMAIL_TEMPLATE_NOT_PUBLISHED`,
+  `EMAIL_TEMPLATE_INVALID`, `EMAIL_TEMPLATE_KEY_TAKEN`,
+  `EMAIL_TEMPLATE_LIMIT_REACHED`, `EMAIL_VARIABLES_INVALID`,
+  `EMAIL_TRANSPORT_NOT_CUSTOM`, `EMAIL_SENDER_DOMAIN_MISMATCH`,
+  `EMAIL_RECIPIENT_NOT_END_USER`, `EMAIL_IDEMPOTENCY_KEY_REUSED`,
+  `EMAIL_SEND_IN_FLIGHT`, `EMAIL_SEND_OUTCOME_UNKNOWN`, `EMAIL_RATE_LIMITED`,
+  `EMAIL_DELIVERY_FAILED`, `EMAIL_FROM_NAME_INVALID`,
+  `EMAIL_REPLY_TO_INVALID`, `EMAIL_SUPPORT_EMAIL_INVALID`.
+- CLI: `CLI_USAGE_ERROR`, `CLI_LIST_LIMIT_INVALID`, `CLI_LIST_OFFSET_INVALID`.
+
+Also:
+
+- Before deploying, find Stripe credential rows whose key contradicts the
+  stored mode (an `sk_live_` key on a `test` row, or the reverse). Older rows
+  defaulted to `test`. Keys are encrypted, so compare them through
+  `billingCredentialsService.loadDecryptedWithMode`, not SQL.
+- Re-register Stripe webhook endpoints (Auto-configure) to receive
+  `checkout.session.async_payment_succeeded` and `charge.refunded` and to pin
+  the API version.
+- Register every origin your checkout `successUrl` and `cancelUrl` use as the
+  App URL or a redirect URL.
+- A root `.env` for local development needs `REKEY_URL` and
+  `PORTAL_BASE_URL`; copy them from `.env.example`.
+
+## 2.2.0-rc.3
+
+A release candidate on the 2.2.0 line. Most of it is about sessions: the
+operator panel, the hosted portal, rekey.dev, `@rekey.dev/nextjs` and
+`@rekey.dev/astro` could spend a refresh token without storing its
+replacement, and the next request then replayed the spent token, which made
+the API revoke every session the user had on every device. Refresh now happens
+where the new cookies can be stored, the API forgives a replay that is only a
+race, and a refresh that may have spent the token signs the browser out
+instead of replaying it. It also isolates tenants from each other's slow
+webhook receivers, resizes the rate limits for a busy Application, and closes
+several open redirects.
+
+**Upgrading an existing deployment:** one migration adds a nullable column,
+`docker-compose.yml` now requires `JWT_SECRET` and `SUPER_ADMIN_KEY`, and the
+default per-key rate limit goes from 6000 to 30000 a minute. See **Upgrade
+notes** at the end of this section for every new environment variable and its
+default.
+
+### Breaking changes
+
+Every item here changes a behaviour or a configuration that an existing
+2.2.0-rc.2 deployment or integration can see. Read this list before you
+upgrade.
+
+- **Outbound webhook delivery is capped per endpoint and per Application.** At
+  most 4 sends to one endpoint and 8 sends for one Application
+  (`WEBHOOK_APP_MAX_IN_FLIGHT`) are in flight at once, across every replica.
+  A send over a cap waits its turn and does not use up a retry. After 5 failed
+  sends in a row an endpoint's circuit breaker opens for 60 seconds: attempts
+  that come due meanwhile are recorded as failed without a request (the error
+  starts `Not sent:`) and stay on the normal retry schedule. One success closes
+  it. The request timeout is still 10 seconds and is now configurable with
+  `WEBHOOK_TIMEOUT_MS` (1000 to 30000). Each replica runs up to 50 sends at
+  once, where it ran 10. Deliveries to one endpoint can arrive slightly more
+  out of order than before; order was never guaranteed.
+
+- **An Application can register at most 100 webhook endpoints.** Creating
+  another answers `400 WEBHOOK_ENDPOINT_LIMIT_REACHED`.
+
+- **`@rekey.dev/astro`: `getSession` no longer refreshes outside
+  `rekeyMiddleware`** unless you pass `{ refresh: true }`. Called from a
+  component after the response had started, it rotated the token and lost the
+  new cookies. With `rekeyMiddleware` installed nothing changes. Without it,
+  add the middleware, or pass `{ refresh: true }` from an API endpoint or
+  top-level page frontmatter; otherwise a visitor whose access token has
+  expired reads as signed out.
+
+- **`@rekey.dev/nextjs` and `@rekey.dev/astro` sign the browser out when a
+  refresh may have spent the token.** The API rotates the token before the
+  work that can fail, so a 5xx from the API itself (one that carries a Rekey
+  error envelope), a timeout, or a connection dropped mid-request can come
+  after the rotation. Both SDKs now clear the session cookies then;
+  `rekeyRefreshHandler` redirects to `signInUrl?next=…&reason=session_interrupted`,
+  and the Astro middleware continues signed out. The session is kept on a 429
+  or any other 4xx that is not a `REFRESH_TOKEN_*` verdict, on a connection
+  that was never made (DNS failure, connection refused), and on a 502, 503 or
+  504 with no Rekey envelope, which is a proxy answering while the API
+  restarts. The refresh route answers those with `503` and `Retry-After`.
+
+- **A refresh token replayed moments after its rotation answers `401
+  REFRESH_TOKEN_RACED` and revokes nothing.** That is two tabs or two server
+  instances refreshing at once, or a retry after a lost response. It applies
+  within `REFRESH_TOKEN_REUSE_WINDOW_SECONDS` (default 15, 0 turns it off)
+  while the replacement is unused, to end-user and operator sessions. Nothing
+  is issued to the replayer, and the replay is recorded as
+  `user.refresh_token_raced` or `operator.refresh_token_raced`. A later
+  replay, or one after the replacement was used, still answers
+  `REFRESH_TOKEN_REUSED` and revokes every session. A client that gets
+  `RACED` should use the replacement another request stored, or sign in again
+  if it has none, and must never present the spent token again. Both SDKs do
+  this: `rekeyRefreshHandler` redirects back to `next` with the session
+  cookies untouched, and the Astro middleware sends a GET or HEAD back to its
+  own URL. The same token racing a second time is treated as finished.
+
+- **`@rekey.dev/nextjs`: `rekeyMiddleware` changes three answers.** A Server
+  Action whose `Origin` is `null` or otherwise not a URL gets a `403` (Next 15
+  crashed on it with a 500). Only GET and HEAD are redirected to the refresh
+  route; a Server Action or other non-GET with a stale session reaches your
+  code and refreshes in place through `auth()`, where it used to fail with a
+  405. Its redirects carry `Cache-Control: no-store`, and the sign-in bounce
+  keeps the page's query in `next`.
+
+- **Refresh routes answer a cross-site navigation with an interstitial page
+  instead of rotating.** `rekeyRefreshHandler`, the Astro middleware and the
+  panel, portal and rekey.dev refresh routes rotate only when
+  `Sec-Fetch-Site` is `same-origin` or `none`, or absent. Any other request,
+  `same-site` included, gets a small `no-store` page that asks for the same
+  URL again from this origin, with no script, no cookie and no API call.
+
+- **`@rekey.dev/nextjs`: the access cookie's `maxAge` follows the access
+  token's own lifetime**, read from its `exp` and `iat`, instead of a fixed
+  default.
+
+- **Auth and lifecycle webhooks are written in the transaction of the change
+  they announce.** `user.created`, `password.changed`, `email.verified`,
+  `session.revoked`, `mfa.enabled`, `mfa.disabled`, `user.deleted`,
+  `user.erased`, the `device.*` events and `license.deactivated` can no longer
+  be lost to a crash after the change committed. Payloads are unchanged. The
+  trade: if the event cannot be written, the request now fails and the change
+  does not commit, where it used to succeed and log the lost event.
+
+- **A busy connection pool answers `503 DEPENDENCY_UNAVAILABLE`, not 500.**
+  Prisma `P2024` (no pool connection in time) and `P2028` (a transaction that
+  could not start or ran past its timeout) now map to 503 with `Retry-After`,
+  and `details.reason` says `pool_busy` or `transaction_timeout` rather than
+  claiming the database is unreachable.
+
+- **New `503 USAGE_RECORD_BUSY` on `POST /api/v1/usage/record`.** Capped
+  records now queue only behind records for the same end-user or
+  organization, not every subject of the meter, and a record that waits more
+  than 2 seconds for that lock is refused with this code. Nothing was
+  recorded or charged, so retrying after `Retry-After` is safe.
+
+- **Rate limits are resized for one Application at 50,000 DAU.**
+  - The per-secret-key budget (`RATE_LIMIT_API_KEY_MAX`) defaults to 30000 a
+    minute, was 6000. `RATE_LIMIT_USAGE_MAX` follows it.
+  - The per-Application ceiling across sign-in, sign-up, MFA, magic link,
+    reset and verify has its own setting, `RATE_LIMIT_AUTH_CEILING_MAX`
+    (default 3000). It used `RATE_LIMIT_MAX` (100), which let one address
+    using the public publishable key block an Application's sign-in.
+  - One client address is still held to `RATE_LIMIT_MAX` (100 a minute) across
+    an Application's auth routes, now as a per-(Application, client IP)
+    bucket.
+  - A secret-key caller can name the visitor in `X-Rekey-Client-Ip`, and its
+    auth requests are then counted per visitor, like browser traffic. The API
+    believes the header from a secret key only, and only for these limits.
+  - Auth traffic with no visitor address (a secret key that does not send the
+    header, or a publishable key behind a proxy the API cannot identify) gets
+    a new cap, `RATE_LIMIT_AUTH_UNATTRIBUTED_FAILURE_MAX` (default 300 failed
+    sign-in or MFA attempts per Application a minute). Past it, only accounts
+    that already failed in the window are refused; every other account still
+    signs in, and sign-up, reset, magic link, verification and passkeys are
+    never refused by it. The first time an Application reaches it in a
+    window, the API writes an `auth.unattributed_failure_cap_reached`
+    security event.
+
+- **MCP token introspection counts against the secret key's budget.**
+  `POST /api/v1/mcp/:slug/oauth/introspect` (`rekey.mcp.introspect()`) was
+  held to a 30-a-minute sign-in limit per address; it now uses the key's own
+  budget (30000 a minute by default). The operator
+  `POST /api/v1/tenant/mcp/oauth/introspect` counts against the token's
+  operator at the authenticated limit.
+
+- **Hosted authorize pages must ask for consent.** The rekey.dev hosted
+  authorize page now shows Allow and Deny before any authorization code is
+  minted. New `POST /api/v1/mcp/:slug/oauth/authorize/preview` describes an
+  authorization request (client name, confirmed `redirect_uri`, scope and the
+  account's email) without minting a code, for a hosted page to build its
+  consent screen from. `POST /api/v1/mcp/:slug/oauth/authorize/grant` now
+  returns the confirmed `redirect_uri`, and includes it in `details` on
+  refusals made after it was confirmed. See docs/auth.md.
+
+- **`GET /health/live` and `GET /health/ready` report `version` and
+  `commit`.** `version` is the running release; `commit` is the
+  `REKEY_COMMIT` build argument, or `unknown`.
+  `scripts/check-deployed-version.sh` compares it with npm.
+
+- **`docker-compose.yml` refuses to start without `JWT_SECRET` and
+  `SUPER_ADMIN_KEY`**, and names the missing one. Their old
+  `change-me-in-prod` default was too short for the API, so it only ever
+  produced a crash-looping container.
+
+- **An operator's refresh keeps the workspace they switched to** (or joined
+  through an invitation), instead of moving them back to their oldest
+  workspace every time the access token expired. Migration
+  `20260923120000_operator_refresh_active_tenant` adds a nullable column to
+  `tenant_refresh_tokens`.
+
+- **The API image sets `UV_THREADPOOL_SIZE=16` and runs at most 4 argon2
+  hashes at once.** Hashing throughput and memory are unchanged, and outbound
+  DNS lookups (webhooks, breached-password checks, email) no longer queue
+  behind a burst of sign-ins. A deployment that runs the API outside this
+  image should set the variable itself.
+
+### Added
+
+- **`@rekey.dev/nextjs`: `rekeyRefreshHandler()`** on `/server`, the refresh
+  route `rekeyMiddleware` redirects to. `export const GET =
+  rekeyRefreshHandler();` in `app/api/rekey/refresh/route.ts` is the whole
+  route. It follows `next` only to a same-origin path, and requests presenting
+  the same token at the same moment share one exchange with the API.
+- **`@rekey.dev/nextjs`: `rejectMalformedActionOrigin(req)`** on
+  `/middleware`, for hand-written middleware that wants the same 403.
+- **`@rekey.dev/nextjs`: `DEFAULT_REFRESH_PATH`** (`/api/rekey/refresh`) and
+  **`DEFAULT_SIGN_IN_PATH`** (`/sign-in`).
+- **`@rekey.dev/nextjs`: `signIn`, `signUp` and `mfaVerify` forward the
+  visitor's address** as `X-Rekey-Client-Ip`: the
+  `REKEY_TRUSTED_PROXY_HOPS`-th entry from the right of `X-Forwarded-For`
+  (default 1), or `X-Real-IP`. An optional `{ clientIp }` argument overrides
+  it, and `null` sends none. With nothing in front of the app, set
+  `REKEY_TRUSTED_PROXY_HOPS=0`, or a visitor could pick a fresh rate-limit
+  bucket per request.
+- **`@rekey.dev/node`: `clientIp`**, client-wide or per call with
+  `rekey.with({ clientIp })`, sent as `X-Rekey-Client-Ip` only when it is
+  exactly one IPv4 or IPv6 address. `normalizeClientIp` and `CLIENT_IP_HEADER`
+  are exported.
+- **`@rekey.dev/shared-types/transport`**: `neverConnected` and
+  `NEVER_CONNECTED_CODES`, the one list the refresh clients use to tell a
+  connection that was never made from one that failed mid-request.
+- **Sign-in pages explain an interrupted session.** The panel, portal and
+  rekey.dev sign-in pages show one line for `reason=session_interrupted`.
+- **New security events:** `user.refresh_token_raced`,
+  `user.refresh_token_reused`, `operator.refresh_token_raced`,
+  `operator.refresh_token_reused` and `auth.unattributed_failure_cap_reached`.
+
+### Fixed
+
+- **Opening two magic links for a new address at once, or double-clicking
+  Accept on a workspace or organization invitation, no longer answers 500 to
+  the slower request.** It signs in or joins like the first one, and a new
+  user gets one welcome email.
+- **A user created through an OAuth provider is written together with its
+  identity**, so a failed identity insert no longer leaves a user with no way
+  to sign in.
+- **One slow or unresponsive webhook receiver no longer delays other
+  tenants' deliveries.** A receiver that never answered held every delivery
+  slot on a replica for the full timeout. See **Breaking changes** for the
+  caps and the breaker that replace this.
+- **An MCP server that introspects on every tool call is no longer
+  throttled** after 30 calls a minute.
+
+### Security
+
+- **Open redirects in `next` and redirect handling.** A validator that checks
+  its input and then returns the path rebuilt by the URL parser is not enough:
+  the parser collapses dot segments, so `/..//evil.com` and
+  `/%2e%2e//evil.com` come back as `//evil.com`, a URL on another host. Every
+  validator below now refuses control characters, backslashes and encoded
+  separators, and checks the path it returns as well as the one it was given.
+  - `@rekey.dev/astro`'s `safePath` returned those protocol-relative URLs in
+    every published version since 2.0.0-rc.7. The hash of a legitimate path is
+    now kept alongside the query.
+  - The panel's `next` on sign-in, sign-up, MFA, OAuth and passkey sign-in
+    had the same dot-segment flaw.
+  - rekey.dev's sign-in `next` let `/%09/evil.com` through, which a browser
+    follows to another host once it strips the tab.
+  - The refresh route the `@rekey.dev/nextjs` README and the rekey.dev
+    quickstart showed for apps to copy followed `next` off-site. It is
+    replaced by `rekeyRefreshHandler`, which applies the checks above.
+  - The portal refuses a slug that is not one plain path segment, so an
+    encoded slash (`/%2Fevil.com/...`), which Next decodes, can never become a
+    protocol-relative `Location`.
+  - The rekey.dev hosted OAuth authorize page could redirect to a
+    `redirect_uri` the API had not confirmed. It now shows an error on
+    rekey.dev instead, asks for consent before minting a code, and refuses to
+    be framed.
+- **A refresh token spent during a Server Component render revoked every
+  session.** The panel, the portal and rekey.dev refreshed a stale session
+  while a page rendered, where Next cannot write cookies, so the replacement
+  was lost and the next request replayed the spent token. They now refresh in
+  a route handler (`/session/refresh` on the panel and rekey.dev,
+  `/<slug>/session/refresh` on the portal) and return to the page.
+  `@rekey.dev/astro`'s `getSession` had the same failure; see **Breaking
+  changes**.
+- **A malformed `Origin` on a Server Action is refused, not stripped.** The
+  panel, portal, admin and rekey.dev apps removed an `Origin: null` header to
+  stop Next 15 crashing, which made Next skip its CSRF origin check for that
+  action. They now answer 403, as `rekeyMiddleware` does.
+- **Refresh clients never re-issue tokens from a local cache.** The panel,
+  portal, rekey.dev and `@rekey.dev/nextjs` share only an exchange that is
+  still in flight, keyed by a hash of the token (and of the device in the
+  SDK). A request that arrives with a spent refresh cookie after the exchange
+  finished goes to the API, which answers `REFRESH_TOKEN_RACED`, so nobody
+  holding a copy of a spent cookie is handed its successor.
+- **rekey.dev no longer sends URL query strings to Google Analytics**, where
+  email verification and password reset links carried their tokens.
+- **Operator refresh-replay security events are filed under the session's
+  workspace**, not the operator's oldest one, so another workspace's owner no
+  longer sees them.
+
+### Upgrade notes
+
+New environment variables for the API, all optional:
+
+- `REFRESH_TOKEN_REUSE_WINDOW_SECONDS`, default `15` (0 to 60, 0 turns the
+  reuse window off).
+- `RATE_LIMIT_AUTH_CEILING_MAX`, default `3000`, never below
+  `RATE_LIMIT_MAX`.
+- `RATE_LIMIT_AUTH_UNATTRIBUTED_FAILURE_MAX`, default `300`.
+- `WEBHOOK_TIMEOUT_MS`, default `10000` (1000 to 30000).
+- `WEBHOOK_APP_MAX_IN_FLIGHT`, default `8` (1 to 200).
+- `REKEY_COMMIT`, a build argument and environment variable for the API and
+  billing images, reported by the health probes. Unset reads as `unknown`.
+- `UV_THREADPOOL_SIZE`, set to `16` by the API image.
+
+Changed defaults: `RATE_LIMIT_API_KEY_MAX` is `30000` (was `6000`), and
+`RATE_LIMIT_USAGE_MAX` follows it. A deployment that set either explicitly to
+the old `6000` keeps 6000; remove the setting to get the new default.
+
+For `@rekey.dev/nextjs` apps: `REKEY_TRUSTED_PROXY_HOPS`, default `1`, the
+number of proxies in front of the app that append to `X-Forwarded-For`. Set
+`0` when nothing sits in front.
+
+Also:
+
+- `docker-compose.yml` needs `JWT_SECRET` and `SUPER_ADMIN_KEY` in `.env`
+  (`openssl rand -hex 32` each).
+- Run `pnpm db:migrate:deploy` for
+  `20260923120000_operator_refresh_active_tenant`. It adds a nullable column,
+  so rolling back the code does not need a SQL step.
+- A Next.js app using `rekeyMiddleware` needs the refresh route:
+  `export const GET = rekeyRefreshHandler();` in
+  `app/api/rekey/refresh/route.ts`. Replace a hand-written one; the copies the
+  README and quickstart used to show were open redirects.
+- An Astro site calling `getSession` without `rekeyMiddleware` needs the
+  middleware or `{ refresh: true }`.
+- A backend that signs users in with a secret key should send the visitor's
+  address (`clientIp` in `@rekey.dev/node`), or its failed sign-ins count
+  toward the unattributed cap.
+
 ## 2.2.0-rc.2
 
 A minor release, and NOT a patch. It changes what an existing subscriber

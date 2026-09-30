@@ -1,6 +1,7 @@
 import type { FastifyInstance, FastifyRequest } from 'fastify';
 import { z } from 'zod';
-import { DeviceBindingRequestSchema } from '@rekey.dev/shared-types';
+import { ClientHintSchema, CLIENT_PLATFORMS, DeviceBindingRequestSchema, type ClientHint } from '@rekey.dev/shared-types';
+import { requestClient, type ClientContext } from '../../lib/client-platform.js';
 import { authService } from './auth.service.js';
 import {
   requirePublishableOrSecretKey,
@@ -11,7 +12,7 @@ import { requireUserSession } from '../../middleware/user-session.js';
 import { assertStepUp } from '../../lib/step-up.js';
 import { refuseWhileImpersonating } from '../../middleware/impersonation.js';
 import { mfaService } from '../mfa/mfa.service.js';
-import { authRateLimit, signUpRateLimit } from '../../lib/rate-limit.js';
+import { authRateLimit, passkeyStartRateLimit, signUpRateLimit } from '../../lib/rate-limit.js';
 import type { SecurityEventType } from '@rekey.dev/shared-types';
 import { recordSecurityEvent, requestContext } from '../../lib/security-events.js';
 import { ok, okPage, okFlag, errs, ref, type JsonSchema } from '../../lib/openapi.js';
@@ -80,15 +81,35 @@ const WEBAUTHN_OPTIONS: JsonSchema = {
 function deviceContext(
   req: FastifyRequest,
   binding?: { fingerprint: string; label?: string | undefined },
-): { userAgent: string | null; ip: string | null; fingerprint: string | null; label: string | null } {
-  const ua = req.headers['user-agent'];
+  hint?: ClientHint,
+): {
+  userAgent: string | null;
+  ip: string | null;
+  fingerprint: string | null;
+  label: string | null;
+  client: ClientContext;
+} {
+  const client = requestClient(req, hint);
   return {
-    userAgent: typeof ua === 'string' && ua.length > 0 ? ua : null,
+    userAgent: client.userAgent,
     ip: req.ip || null,
     fingerprint: binding?.fingerprint ?? null,
     label: binding?.label ?? null,
+    client,
   };
 }
+
+/** JSON-schema twin of `ClientHintSchema`, for the OpenAPI document. */
+const CLIENT_BODY_SCHEMA = {
+  type: 'object',
+  description:
+    'What the client is, recorded on the session. A native app should send its platform, since its ' +
+    'User-Agent rarely says. See docs/analytics.md.',
+  properties: {
+    platform: { type: 'string', enum: [...CLIENT_PLATFORMS] },
+    appVersion: { type: 'string', pattern: '^[\\w.+-]{1,32}$' },
+  },
+} as const;
 
 /** JSON-schema twin of `DeviceBindingRequestSchema`, for the OpenAPI document. */
 const DEVICE_BODY_SCHEMA = {
@@ -144,12 +165,14 @@ const SignUpBody = z.object({
   password: z.string().min(1).max(256),
   metadata: z.record(z.unknown()).optional(),
   device: DeviceBindingRequestSchema.optional(),
+  client: ClientHintSchema.optional(),
 });
 
 const SignInBody = z.object({
   email: z.string().email().max(254),
   password: z.string().min(1).max(256),
   device: DeviceBindingRequestSchema.optional(),
+  client: ClientHintSchema.optional(),
 });
 
 const RefreshBody = z.object({
@@ -206,6 +229,7 @@ const MagicLinkRequestBody = z.object({
 const MagicLinkVerifyBody = z.object({
   token: z.string().min(1).max(512),
   device: DeviceBindingRequestSchema.optional(),
+  client: ClientHintSchema.optional(),
 });
 
 const PasskeyAuthStartBody = z.object({
@@ -218,6 +242,7 @@ const PasskeyAuthCompleteBody = z.object({
   response: z.record(z.unknown()),
   expectedChallenge: z.string().min(1).max(1024),
   device: DeviceBindingRequestSchema.optional(),
+  client: ClientHintSchema.optional(),
 });
 
 const PasskeyRegisterCompleteBody = z.object({
@@ -240,6 +265,7 @@ const MfaVerifyBody = z.object({
   mfaChallengeToken: z.string().min(1).max(2048),
   code: z.string().min(1).max(64),
   device: DeviceBindingRequestSchema.optional(),
+  client: ClientHintSchema.optional(),
 });
 
 export function shapeAuthResult(result: import('./auth.service.js').AuthResult): {
@@ -250,6 +276,7 @@ export function shapeAuthResult(result: import('./auth.service.js').AuthResult):
   refreshToken: string;
   refreshTokenExpiresAt: string;
   deviceId: string | null;
+  isNewUser: boolean;
 } {
   return {
     mfaRequired: false,
@@ -259,6 +286,7 @@ export function shapeAuthResult(result: import('./auth.service.js').AuthResult):
     refreshToken: result.refreshToken,
     refreshTokenExpiresAt: result.refreshTokenExpiresAt.toISOString(),
     deviceId: result.deviceId,
+    isNewUser: result.isNewUser,
   };
 }
 
@@ -349,6 +377,7 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
               description: 'Free-form per-app metadata (display name, avatar, custom fields).',
             },
             device: DEVICE_BODY_SCHEMA,
+            client: CLIENT_BODY_SCHEMA,
           },
         },
         response: {
@@ -382,7 +411,7 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
         email: body.email,
         password: body.password,
         ...(body.metadata !== undefined && { metadata: body.metadata }),
-        device: deviceContext(req, body.device),
+        device: deviceContext(req, body.device, body.client),
         // Signup policy: a `secret_only` app refuses creation via a pub key.
         ...(req.authKind !== undefined && { authKind: req.authKind }),
       });
@@ -414,6 +443,7 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
             email: { type: 'string', format: 'email', maxLength: 254 },
             password: { type: 'string', minLength: 1, maxLength: 256 },
             device: DEVICE_BODY_SCHEMA,
+            client: CLIENT_BODY_SCHEMA,
           },
         },
         response: {
@@ -451,7 +481,7 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
         application: req.application!,
         email: body.email,
         password: body.password,
-        device: deviceContext(req, body.device),
+        device: deviceContext(req, body.device, body.client),
       });
       if (!outcome.mfaRequired) {
         recordEndUserEvent(req, 'user.signed_in', outcome.endUser.id, { via: 'password' });
@@ -478,6 +508,7 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
             mfaChallengeToken: { type: 'string', minLength: 1, maxLength: 2048 },
             code: { type: 'string', minLength: 1, maxLength: 64 },
             device: DEVICE_BODY_SCHEMA,
+            client: CLIENT_BODY_SCHEMA,
           },
         },
         response: {
@@ -489,7 +520,10 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
               BOOTSTRAP_401 +
               ' Or MFA_CHALLENGE_INVALID — the challenge token is invalid or expired; or ' +
               'MFA_CHALLENGE_WRONG_APPLICATION — issued for a different Application; or ' +
-              'MFA_CODE_INVALID — the TOTP/backup code did not verify.',
+              'MFA_CODE_INVALID: the TOTP/backup code did not verify; or ' +
+              'MFA_CODE_REUSED: the TOTP code was already accepted, wait for the next one; or ' +
+              'MFA_BACKUP_CODE_USED: that backup code was already spent, use another one; or ' +
+              'MFA_CHALLENGE_USED: the challenge token already completed a sign-in, sign in again.',
             403: BOOTSTRAP_403 + DEVICE_ERRORS_403,
           }),
         },
@@ -501,7 +535,7 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
         application: req.application!,
         mfaChallengeToken: body.mfaChallengeToken,
         code: body.code,
-        device: deviceContext(req, body.device),
+        device: deviceContext(req, body.device, body.client),
       });
       recordEndUserEvent(req, 'user.signed_in', result.endUser.id, { via: 'mfa' });
       return { success: true, data: shapeAuthResult(result) };
@@ -517,7 +551,12 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
         summary: 'Exchange a refresh token for a new {access, refresh} pair',
         description:
           'The presented refresh token is revoked atomically with issuing the replacement. ' +
-          'A presented-but-revoked token is treated as a replay and rejected with REFRESH_TOKEN_REUSED.',
+          'A token that was already rotated is refused. Presented again within the reuse window ' +
+          '(REFRESH_TOKEN_REUSE_WINDOW_SECONDS) while its replacement is still unused, it is ' +
+          'REFRESH_TOKEN_RACED and nothing is revoked: another request (a second tab, a retry) ' +
+          'rotated it moments ago. Otherwise it is treated as a replay, REFRESH_TOKEN_REUSED, and ' +
+          'every session for the user is revoked. A token revoked without being rotated (a ' +
+          'sign-out, a revoked session) is REFRESH_TOKEN_REVOKED.',
         security: [{ apiKey: [] }, { publishableKey: [] }],
         body: {
           type: 'object',
@@ -535,7 +574,9 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
               BOOTSTRAP_401 +
               ' Or REFRESH_TOKEN_INVALID — the token is unknown or not a session-kind token; or ' +
               'REFRESH_TOKEN_REUSED — a rotated-out token was replayed (every session for this ' +
-              'user has been revoked as a precaution); or REFRESH_TOKEN_REVOKED — this session ' +
+              'user has been revoked as a precaution); or REFRESH_TOKEN_RACED, the token was ' +
+              'rotated moments ago by another request and its successor is unused (nothing was ' +
+              'revoked; use the successor or sign in again); or REFRESH_TOKEN_REVOKED — this session ' +
               'was revoked, or its device was refused after the token was spent (`details.reason`); ' +
               'or REFRESH_TOKEN_EXPIRED — the token has expired; or ' +
               'REFRESH_TOKEN_WRONG_APPLICATION — the token belongs to a different Application; or ' +
@@ -605,7 +646,9 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
         summary: 'Request a password-reset token for an email',
         description:
           'Always returns 200 with `{ delivered: boolean, emailSent: boolean, resetToken: string|null }`. ' +
-          'Never discloses whether the email exists. When the Application has email transport ' +
+          'A **publishable-key** caller always gets the same body, so it never learns whether the ' +
+          'email exists. A **secret-key** caller is told the truth (`delivered: false` for an unknown ' +
+          'email), because it may need the token and runs on your own server. When the Application has email transport ' +
           'configured (BYO Resend or RESEND_DEFAULT_*), the email is sent and `resetToken` is null. ' +
           'Otherwise the legacy contract applies, caller forwards `resetToken` via their own provider.',
         security: [{ apiKey: [] }, { publishableKey: [] }],
@@ -622,7 +665,8 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
             {
               type: 'object',
               description:
-                'Never discloses whether the email exists. `resetToken` is non-null only when the ' +
+                'Constant for a publishable-key caller, so it never discloses whether the email exists; ' +
+                'a secret-key caller gets `delivered: false` for an unknown email. `resetToken` is non-null only when the ' +
                 'Application has no email transport configured (legacy contract), a publishable ' +
                 'caller never receives it.',
               properties: {
@@ -734,6 +778,7 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
           properties: {
             token: { type: 'string', minLength: 1, maxLength: 512 },
             device: DEVICE_BODY_SCHEMA,
+            client: CLIENT_BODY_SCHEMA,
           },
         },
         response: {
@@ -761,7 +806,7 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
       const outcome = await authService.verifyMagicLink({
         application: req.application!,
         token: body.token,
-        device: deviceContext(req, body.device),
+        device: deviceContext(req, body.device, body.client),
         // Signup policy: refuse creation via a pub key in `secret_only` apps.
         ...(req.authKind !== undefined && { authKind: req.authKind }),
       });
@@ -777,6 +822,7 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
     '/passkey/authenticate/start',
     {
       bodyLimit: CREDENTIAL_BODY_LIMIT,
+      config: { rateLimit: passkeyStartRateLimit(10) },
       schema: {
         tags: ['Public · Auth'],
         summary: 'Begin a passkey authentication ceremony',
@@ -833,6 +879,7 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
             response: { type: 'object' },
             expectedChallenge: { type: 'string', minLength: 1, maxLength: 1024 },
             device: DEVICE_BODY_SCHEMA,
+            client: CLIENT_BODY_SCHEMA,
           },
         },
         response: {
@@ -855,7 +902,7 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
         application: req.application!,
         expectedChallenge: body.expectedChallenge,
         response: body.response as never,
-        device: deviceContext(req, body.device),
+        device: deviceContext(req, body.device, body.client),
       });
       if (!outcome.mfaRequired) {
         recordEndUserEvent(req, 'user.signed_in', outcome.endUser.id, { via: 'passkey' });
@@ -1244,7 +1291,8 @@ export async function authenticatedAuthRoutes(app: FastifyInstance): Promise<voi
               'so there is no second factor to step up with.',
             401:
               USER_SESSION_401 +
-              ' Or STEP_UP_REQUIRED — a publishable caller did not send a valid `password` or `code`.',
+              ' Or STEP_UP_REQUIRED: a publishable caller did not send a valid `password` or `code`.' +
+              ' Or MFA_CODE_REUSED: the authenticator code was already accepted, wait for the next one.',
             403: IMPERSONATION_403,
           }),
         },
@@ -1266,7 +1314,7 @@ export async function authenticatedAuthRoutes(app: FastifyInstance): Promise<voi
             ...(typeof proof.password === 'string' && { password: proof.password }),
             ...(typeof proof.code === 'string' && { code: proof.code }),
           },
-          verifyMfaCode: (a) => mfaService.verify(a),
+          verifyMfaCode: (a) => mfaService.check(a),
         });
       }
       const result = await authService.passkeyRegisterStart({

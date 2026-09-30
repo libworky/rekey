@@ -273,7 +273,7 @@ export const plansService = {
         statusCode: 404,
         code: 'PLAN_NOT_FOUND',
         message: `Plan "${slug}" not found in application "${applicationId}".`,
-        fix: 'List available plans with GET /api/v1/admin/applications/:id/plans, or create one with POST.',
+        fix: `Check the slug against the plans that exist. GET /api/v1/billing/plans lists the ones on sale; the operator sees every plan in Panel → Application → Plans (/applications/${applicationId}/plans) or with GET /api/v1/tenant/applications/${applicationId}/plans, and creates one with POST there.`,
       });
     }
     return plan;
@@ -466,13 +466,15 @@ export const plansService = {
         // NEW plan inherit an OLD one's public identity, silently changing what
         // `pro` means for every existing caller, a worse failure than this
         // refusal. Reported as #30.
-        const archived = existing?.active === false;
+        const archived = !broken && existing?.active === false;
         throw new RekeyError({
           statusCode: 409,
           code: 'PLAN_SLUG_TAKEN',
-          message: archived
-            ? `An ARCHIVED plan with slug "${input.slug}" already exists in this application. Archiving a plan does not release its slug.`
-            : `A plan with slug "${input.slug}" already exists in this application.`,
+          message: broken
+            ? `A plan with slug "${input.slug}" already exists in this application. Its registration with the payment provider ${existing?.registrationStatus === 'FAILED' ? 'failed' : 'did not finish'}, so it is inactive and off the public catalogue.`
+            : archived
+              ? `An ARCHIVED plan with slug "${input.slug}" already exists in this application. Archiving a plan does not release its slug.`
+              : `A plan with slug "${input.slug}" already exists in this application.`,
           fix: broken
             ? `That plan exists but is not registered with the payment provider, so it is off the public catalogue. Fix the provider credentials if they were the problem, then repair it in place: PATCH /api/v1/tenant/applications/${input.applicationId}/plans/${input.slug} to correct name/price, and POST .../plans/${input.slug}/register to retry registration. You do not need a new slug.`
             : archived
@@ -488,7 +490,7 @@ export const plansService = {
     // file header on why the ordering, not a transaction, is what makes this
     // safe.
     if (!registersEagerly) return plan;
-    return registerAndSettle(application, plan);
+    return registerAndSettle(application, plan, { justCreated: true });
   },
 
   /**
@@ -729,7 +731,11 @@ function registrationErrorText(e: unknown): string {
  * that later added Stripe keys, say, and a failed Stripe promotion must not
  * take it off sale.
  */
-async function registerAndSettle(application: Application, plan: Plan): Promise<Plan> {
+async function registerAndSettle(
+  application: Application,
+  plan: Plan,
+  opts: { justCreated?: boolean } = {},
+): Promise<Plan> {
   const blocked = plan.registrationStatus === 'PENDING' || plan.registrationStatus === 'FAILED';
 
   // Back to PENDING before a retry, so a row cannot read FAILED while a
@@ -771,20 +777,37 @@ async function registerAndSettle(application: Application, plan: Plan): Promise<
     // "Invalid API Key provided: sk_test_…", fix:"Check the request shape
     // against the route schema"}`, three disagreeing signals for one bad
     // stored credential. Raw for the record, mapped for the caller.
-    throw providerError({
+    const mapped = providerError({
       provider: 'stripe',
       operation: 'plan registration',
       audience: 'operator',
       error: e,
     });
+    if (!opts.justCreated) throw mapped;
+    // The row is committed, so "retry" meant re-POSTing a slug that now
+    // answers PLAN_SLUG_TAKEN. Point at the repair for the row that exists.
+    throw new RekeyError({
+      statusCode: mapped.statusCode,
+      code: mapped.code,
+      message: mapped.message,
+      fix: `The plan was created (id ${current.id}) but is inactive and not on sale, because registering it with Stripe failed. Do not create it again: the slug is taken. Correct the Stripe credentials in Panel → Application → Billing → Setup → Providers if they are the cause, then retry registration with POST /api/v1/tenant/applications/${application.id}/plans/${current.slug}/register (Panel → Application → Plans → Register; with the super-admin key, the same path under /api/v1/admin/applications). Name and price can be corrected first with PATCH on the same plan.`,
+      details: { planId: current.id, planSlug: current.slug, registrationStatus: 'FAILED' },
+      cause: e,
+    });
   }
 
+  // The mode goes next to the id: a price registered with sandbox keys does
+  // not exist in the live account, and checkout readiness reports that.
+  const credentials = await prisma.billingCredentials.findUnique({
+    where: { applicationId_provider: { applicationId: application.id, provider: 'stripe' } },
+    select: { mode: true },
+  });
   return prisma.plan.update({
     where: { id: current.id },
     data: {
       metadata: {
         ...(current.metadata as object),
-        stripe: { priceId: providerPlanId },
+        stripe: { priceId: providerPlanId, mode: credentials?.mode === 'live' ? 'live' : 'test' },
       } as never,
       registrationStatus: 'REGISTERED',
       registrationError: null,

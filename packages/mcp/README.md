@@ -4,6 +4,8 @@
 
 A [Model Context Protocol](https://modelcontextprotocol.io) server for [Rekey](https://rekey.dev). Lets Claude Desktop, Cursor, and Claude Code introspect a deployment — and mint API keys — directly, without screenshots or copy-paste from the panel.
 
+**This is the small server.** It has 9 tools: 8 reads against the deployment-wide admin API, plus `mint_api_key`. The hosted operator MCP that every deployment runs at `/api/v1/tenant/mcp` is a different, larger server with 44 tools, including organizations, devices, plan entitlements, subscription cancel and billing provider config. This package does not reach that server and is not a client for it. If the hosted one is available to you, it is usually the one to connect.
+
 > **For AI agents connected through this server:** see [AGENTS.md](../../AGENTS.md) for what's safe to call and the write-tool safety model.
 
 ```bash
@@ -12,6 +14,16 @@ npx -y @rekey.dev/mcp
 ```
 
 It's a stdio MCP server — you don't run it by hand. Wire it into your MCP client's config (below) and the client launches it.
+
+> **Self-host only (needs `SUPER_ADMIN_KEY`).** The read tools authenticate
+> with the deployment-wide `SUPER_ADMIN_KEY`, which only whoever runs the
+> deployment holds. On **Rekey Cloud** you have no such key: use the hosted
+> operator MCP at `https://api.rekey.dev/api/v1/tenant/mcp` instead. It signs
+> you in with your panel account over OAuth, scopes the agent to one
+> workspace, and needs nothing installed. Setup:
+> [rekey.dev/docs/mcp](https://rekey.dev/docs/mcp).
+> (`mint_api_key` alone works with a `REKEY_OPERATOR_TOKEN` on either, but the
+> hosted server has the same tool.)
 
 ## Setup
 

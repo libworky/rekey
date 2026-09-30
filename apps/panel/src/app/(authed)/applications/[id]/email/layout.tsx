@@ -9,6 +9,7 @@
  *
  *   Settings       is mail on, who is it from, and which transport carries it
  *   Templates      what each email says, and whether it is sent at all
+ *   Custom         the Application's own templates, sent by key from its backend
  *   Delivery       what actually happened to the last N sends
  *   Suppressions   who we must not email, and why
  *
@@ -32,11 +33,9 @@ export default async function EmailLayout({
 
   return (
     <div className="space-y-5">
-      {/* Email is the THIRD strip on this route, AppNav already spends two on
-          Developer → Email, so it takes the enclosed idiom rather than a
-          third page-spanning underline row. No breadcrumb: the two strips
-          above already say Developer › Email, and a trail would be the same
-          fact stated a third time. */}
+      {/* Email is its own AppNav group with a single tab, so AppNav draws no
+          second row here and this strip carries the sections. It keeps the
+          enclosed idiom so it does not read as a second copy of AppNav. */}
       <RecordHeader
         title="Email"
         description="Transactional mail this Application sends to its end-users. Workspace mail (operator invitations and the like) is separate and is not affected by anything here."
@@ -48,6 +47,7 @@ export default async function EmailLayout({
         segments={[
           { href: base, label: 'Settings', exact: true },
           { href: `${base}/templates`, label: 'Templates' },
+          { href: `${base}/custom`, label: 'Custom templates' },
           { href: `${base}/logs`, label: 'Delivery' },
           { href: `${base}/suppressions`, label: 'Suppressions' },
         ]}

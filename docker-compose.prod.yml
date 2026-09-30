@@ -154,6 +154,9 @@ services:
       END_USER_REFRESH_TOKEN_TTL_DAYS: ${END_USER_REFRESH_TOKEN_TTL_DAYS:-}
       OPERATOR_ACCESS_TOKEN_TTL_SECONDS: ${OPERATOR_ACCESS_TOKEN_TTL_SECONDS:-}
       OPERATOR_REFRESH_TOKEN_TTL_DAYS: ${OPERATOR_REFRESH_TOKEN_TTL_DAYS:-}
+      # Seconds a just-rotated refresh token may be replayed without revoking
+      # every session (answers REFRESH_TOKEN_RACED). Empty = 15; 0 = off.
+      REFRESH_TOKEN_REUSE_WINDOW_SECONDS: ${REFRESH_TOKEN_REUSE_WINDOW_SECONDS:-}
 
       # ── Secrets ──────────────────────────────────────────────────────────
       JWT_SECRET: ${JWT_SECRET}
@@ -177,8 +180,15 @@ services:
       # yours — see the header.
       PUBLIC_WEBHOOK_BASE_URL: ${PUBLIC_WEBHOOK_BASE_URL:-https://${API_HOST}}
       # Hosted customer portal origin — auto-allowed for publishable-key calls
-      # from portal-enabled apps (CORS + per-app origin check).
+      # from portal-enabled apps (CORS + per-app origin check). Must be the
+      # same origin as the portal's PORTAL_BASE_URL.
       PUBLIC_PORTAL_URL: ${PUBLIC_PORTAL_URL:-https://${PORTAL_HOST}}
+      # Kill switch for the Rekey-hosted checkout page: `false` sends every
+      # checkout to the provider's page (or refuses it, per Application).
+      CHECKOUT_EMBEDDED_ENABLED: ${CHECKOUT_EMBEDDED_ENABLED:-}
+      # Checkout creation ceilings per client IP and per Application, per hour.
+      CHECKOUT_LIMIT_PER_IP_HOUR: ${CHECKOUT_LIMIT_PER_IP_HOUR:-}
+      CHECKOUT_LIMIT_PER_APP_HOUR: ${CHECKOUT_LIMIT_PER_APP_HOUR:-}
       # Operator-facing links: the MCP OAuth consent redirect and emailed
       # workspace invites are built from this.
       PANEL_URL: ${PANEL_URL:-https://${PANEL_HOST}}
@@ -217,10 +227,19 @@ services:
       # openssl rand -hex 32
       API_PROXY_SECRET: ${API_PROXY_SECRET:?set API_PROXY_SECRET in .env, e.g. openssl rand -hex 32}
       API_PROXY_HOPS: ${API_PROXY_HOPS:-1}
-      # Not needed in this file: the panel and portal reach the API over
-      # rekey-edge and are trusted by address. Set it (on the API and on both
-      # of them) only if they call the API some other way.
-      INTERNAL_CALLER_SECRET: ${INTERNAL_CALLER_SECRET:-}
+      # Record end users' country from Cloudflare's CF-IPCountry. Only `true`
+      # when the proxy above receives nothing but Cloudflare traffic; see
+      # docs/analytics.md. Unset: no country is recorded.
+      TRUST_CF_IPCOUNTRY: ${TRUST_CF_IPCOUNTRY:-}
+      # The hourly analytics rollup; on unless `false`. See docs/analytics.md.
+      ANALYTICS_ROLLUP_ENABLED: ${ANALYTICS_ROLLUP_ENABLED:-}
+      # The panel and portal reach the API over rekey-edge and are trusted by
+      # address for rate limiting. This secret is what additionally lets the
+      # API believe the visitor's User-Agent and country the portal forwards,
+      # so a portal sign-in records the visitor's browser and platform rather
+      # than the portal's own `node` (docs/analytics.md). Same value on the
+      # API, panel and portal; all three read it from this .env.
+      INTERNAL_CALLER_SECRET: ${INTERNAL_CALLER_SECRET:?set INTERNAL_CALLER_SECRET in .env, e.g. openssl rand -hex 32}
 
       # ── Transactional email (Resend) ─────────────────────────────────────
       # Unset = Rekey sends no mail and returns raw tokens to the caller
@@ -228,6 +247,11 @@ services:
       RESEND_DEFAULT_API_KEY: ${RESEND_DEFAULT_API_KEY:-}
       RESEND_DEFAULT_FROM: ${RESEND_DEFAULT_FROM:-}
       RESEND_DEFAULT_FROM_NAME: ${RESEND_DEFAULT_FROM_NAME:-}
+      EMAIL_SEND_DAILY_CAP: ${EMAIL_SEND_DAILY_CAP:-}
+      EMAIL_SEND_RECIPIENT_HOURLY_CAP: ${EMAIL_SEND_RECIPIENT_HOURLY_CAP:-}
+      EMAIL_UNSUBSCRIBE_SECRET: ${EMAIL_UNSUBSCRIBE_SECRET:-}
+      EMAIL_UNSUBSCRIBE_SECRET_ID: ${EMAIL_UNSUBSCRIBE_SECRET_ID:-}
+      EMAIL_UNSUBSCRIBE_PREVIOUS_SECRETS: ${EMAIL_UNSUBSCRIBE_PREVIOUS_SECRETS:-}
 
       # ── Registration + tenancy policy ────────────────────────────────────
       # Who may create an OPERATOR account: open | invite | closed. Empty =
@@ -291,6 +315,13 @@ services:
       # "true" lets outbound webhooks target private/internal addresses. Leave
       # empty on an internet-facing deployment: it is the SSRF guard.
       WEBHOOK_ALLOW_PRIVATE_TARGETS: ${WEBHOOK_ALLOW_PRIVATE_TARGETS:-}
+      # Outbound webhook request timeout in ms. Empty = 10000; allowed range
+      # 1000-30000. Raise it for receivers that answer slowly from a cold start.
+      WEBHOOK_TIMEOUT_MS: ${WEBHOOK_TIMEOUT_MS:-}
+      # Outbound webhook sends one Application may have in flight at once,
+      # across replicas and endpoints. Empty = 8. Keeps one tenant with many
+      # slow endpoints from holding every delivery slot.
+      WEBHOOK_APP_MAX_IN_FLIGHT: ${WEBHOOK_APP_MAX_IN_FLIGHT:-}
       # How long a processed inbound billing webhook is remembered, which is
       # what makes a provider's redelivery idempotent. Empty = kept forever;
       # set a number of days to turn pruning on.
@@ -311,13 +342,17 @@ services:
       LOG_ARCHIVE_S3_PREFIX: ${LOG_ARCHIVE_S3_PREFIX:-}
       # Rate limits, per RATE_LIMIT_WINDOW_MS (60s). Empty = the defaults:
       # 100 per client IP unauthenticated, 600 per operator or signed-in end
-      # user, 3000 per IP across those, 6000 per secret API key (and for
-      # POST /api/v1/usage/record), 100 rejected credentials per IP, 60
-      # operator refreshes per IP. Sizing: docs/rate-limits.md.
+      # user, 3000 per IP across those, 30000 per secret API key (and for
+      # POST /api/v1/usage/record), 3000 per Application across its sign-in,
+      # sign-up, MFA, magic-link, reset and verify routes (100 of that per
+      # client IP), 100 rejected credentials per IP, 60 operator refreshes per
+      # IP. Sizing: docs/rate-limits.md.
       RATE_LIMIT_MAX: ${RATE_LIMIT_MAX:-}
       RATE_LIMIT_WINDOW_MS: ${RATE_LIMIT_WINDOW_MS:-}
       RATE_LIMIT_AUTHENTICATED_MAX: ${RATE_LIMIT_AUTHENTICATED_MAX:-}
       RATE_LIMIT_API_KEY_MAX: ${RATE_LIMIT_API_KEY_MAX:-}
+      RATE_LIMIT_AUTH_CEILING_MAX: ${RATE_LIMIT_AUTH_CEILING_MAX:-}
+      RATE_LIMIT_AUTH_UNATTRIBUTED_FAILURE_MAX: ${RATE_LIMIT_AUTH_UNATTRIBUTED_FAILURE_MAX:-}
       RATE_LIMIT_AUTHENTICATED_IP_MAX: ${RATE_LIMIT_AUTHENTICATED_IP_MAX:-}
       RATE_LIMIT_AUTH_FAILURE_MAX: ${RATE_LIMIT_AUTH_FAILURE_MAX:-}
       RATE_LIMIT_REFRESH_MAX: ${RATE_LIMIT_REFRESH_MAX:-}
@@ -452,7 +487,12 @@ services:
       # for all of them. Generate with: openssl rand -hex 32
       PORTAL_TRUSTED_PROXY_HOPS: ${PORTAL_TRUSTED_PROXY_HOPS:-1}
       PORTAL_PROXY_SECRET: ${PORTAL_PROXY_SECRET:?set PORTAL_PROXY_SECRET in .env, e.g. openssl rand -hex 32}
-      # Public URL of this portal — checkout success/cancel return links.
+      # Sent to the API as X-Rekey-Caller-Secret, which is what makes the API
+      # believe the visitor's User-Agent and country the portal forwards on a
+      # sign-in. Must equal the api service's value (the same .env key).
+      INTERNAL_CALLER_SECRET: ${INTERNAL_CALLER_SECRET:?set INTERNAL_CALLER_SECRET in .env, e.g. openssl rand -hex 32}
+      # Public URL of this portal: checkout return links and password-reset
+      # links. Must be the same origin as the api's PUBLIC_PORTAL_URL.
       PORTAL_BASE_URL: ${PORTAL_BASE_URL:-https://${PORTAL_HOST}}
       # Leave empty — see the panel service above.
       REKEY_COOKIE_SECURE: ${REKEY_COOKIE_SECURE:-}

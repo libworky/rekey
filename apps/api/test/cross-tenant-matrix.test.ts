@@ -103,18 +103,66 @@ const PROBES: Probe[] = [
     suffix: '/billing-credentials/stripe',
   },
   { subResource: 'billing', method: 'GET', suffix: '/billing/providers' },
+  // The checkout page setting decides where another operator's buyers pay,
+  // and readiness probes their portal: both must refuse a stranger.
+  { subResource: 'checkout', method: 'GET', suffix: '/checkout' },
+  { subResource: 'checkout', method: 'GET', suffix: '/checkout/readiness' },
+  { subResource: 'checkout', method: 'GET', suffix: '/checkout/status' },
+  {
+    subResource: 'checkout',
+    method: 'PATCH',
+    suffix: '/checkout',
+    payload: { paymentMode: 'test', checkoutMode: 'REDIRECT' },
+  },
   { subResource: 'billing', method: 'GET', suffix: '/billing/stats' },
   { subResource: 'coupons', method: 'GET', suffix: '/coupons' },
   { subResource: 'dunning', method: 'GET', suffix: '/dunning' },
   { subResource: 'email-config', method: 'GET', suffix: '/email-config' },
   // The SMTP password.
   { subResource: 'email-credentials', method: 'DELETE', suffix: '/email-credentials' },
+  {
+    subResource: 'email-sender',
+    method: 'PATCH',
+    suffix: '/email-sender',
+    payload: { fromName: 'Probe' },
+  },
   { subResource: 'email-logs', method: 'GET', suffix: '/email-logs' },
   { subResource: 'email-templates', method: 'GET', suffix: '/email-templates' },
+  // Custom templates: the send settings, and the templates themselves. The
+  // test-send writes to a provider on the owner's behalf, the publish makes a
+  // template sendable, and the delete stops a backend's mail.
+  { subResource: 'custom-email-settings', method: 'GET', suffix: '/custom-email-settings' },
+  {
+    subResource: 'custom-email-settings',
+    method: 'PATCH',
+    suffix: '/custom-email-settings',
+    payload: { recipientsMustBeEndUsers: true },
+  },
+  { subResource: 'custom-email-templates', method: 'GET', suffix: '/custom-email-templates' },
+  { subResource: 'custom-email-templates', method: 'GET', suffix: '/custom-email-templates/some_key' },
+  {
+    subResource: 'custom-email-templates',
+    method: 'POST',
+    suffix: '/custom-email-templates/some_key/publish',
+  },
+  {
+    subResource: 'custom-email-templates',
+    method: 'POST',
+    suffix: '/custom-email-templates/some_key/test-send',
+  },
+  { subResource: 'custom-email-templates', method: 'DELETE', suffix: '/custom-email-templates/some_key' },
   // Was `end-user-roles`, which is still served as a hidden alias and so no
   // longer appears in the route table this test reads.
   { subResource: 'application-roles', method: 'GET', suffix: '/application-roles' },
   { subResource: 'end-users', method: 'GET', suffix: '/end-users' },
+  // Profile fields: the schema is application configuration, and the per-user
+  // routes write another workspace's customer's answers.
+  { subResource: 'profile-schema', method: 'GET', suffix: '/profile-schema' },
+  { subResource: 'profile-schema', method: 'PUT', suffix: '/profile-schema', payload: { fields: [] } },
+  { subResource: 'end-users', method: 'PATCH', suffix: '/end-users/some-user/profile', payload: {} },
+  { subResource: 'end-users', method: 'POST', suffix: '/end-users/some-user/onboarding/complete' },
+  { subResource: 'end-users', method: 'POST', suffix: '/end-users/some-user/onboarding/skip' },
+  { subResource: 'end-users', method: 'GET', suffix: '/end-users/some-user/insights' },
   // The email-control and subscription-import surfaces. Both read and write
   // per-Application configuration, and the import one reads a book of business:
   // exactly the shape that must answer 404 to a stranger rather than
@@ -152,6 +200,22 @@ const PROBES: Probe[] = [
     suffix: '/subscription-imports',
     payload: { provider: 'external', matchStrategy: 'email' },
   },
+  // Lists hold the addresses of people who never signed up. The list id is a
+  // cuid, so each id-taking route is probed with one that does not exist: the
+  // workspace check must refuse before anything looks the list up.
+  { subResource: 'lists', method: 'GET', suffix: '/lists' },
+  { subResource: 'lists', method: 'POST', suffix: '/lists', payload: { key: 'probe_list', name: 'Probe' } },
+  { subResource: 'lists', method: 'GET', suffix: '/lists/probe-list' },
+  { subResource: 'lists', method: 'PATCH', suffix: '/lists/probe-list', payload: { name: 'Probe' } },
+  { subResource: 'lists', method: 'POST', suffix: '/lists/probe-list/archive' },
+  { subResource: 'lists', method: 'DELETE', suffix: '/lists/probe-list/archive' },
+  { subResource: 'lists', method: 'GET', suffix: '/lists/probe-list/members' },
+  { subResource: 'lists', method: 'GET', suffix: '/lists/probe-list/submissions' },
+  { subResource: 'lists', method: 'POST', suffix: '/lists/probe-list/members/probe-member/unsubscribe' },
+  { subResource: 'lists', method: 'GET', suffix: '/lists/probe-list/export.csv' },
+  // Erasure cannot be undone, so another workspace reaching it would destroy
+  // data it cannot see.
+  { subResource: 'contacts', method: 'DELETE', suffix: '/contacts/probe-contact' },
   { subResource: 'licenses', method: 'GET', suffix: '/licenses' },
   { subResource: 'oauth-config', method: 'DELETE', suffix: '/oauth-config/google' },
   { subResource: 'organization-roles', method: 'GET', suffix: '/organization-roles' },
@@ -164,6 +228,8 @@ const PROBES: Probe[] = [
   { subResource: 'rotate-public-key', method: 'POST', suffix: '/rotate-public-key', payload: {} },
   { subResource: 'rotate-sessions', method: 'POST', suffix: '/rotate-sessions', payload: {} },
   { subResource: 'stats', method: 'GET', suffix: '/stats' },
+  { subResource: 'settings', method: 'PATCH', suffix: '/settings', payload: { reportingTimezone: 'Europe/Berlin' } },
+  { subResource: 'analytics', method: 'GET', suffix: '/analytics/users' },
   // Value leaves the building through all three POSTs, so each is probed and
   // not just the list. A cross-tenant refund would pay a stranger's buyer back
   // out of this operator's balance; a cross-tenant extend would hand a

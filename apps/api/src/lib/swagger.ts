@@ -24,12 +24,11 @@
  * route's `description`.
  */
 
-import { createRequire } from 'node:module';
 import type { FastifyInstance } from 'fastify';
 import swagger from '@fastify/swagger';
 import swaggerUi from '@fastify/swagger-ui';
-import { env } from '../config/env.js';
 import { registerOpenApiComponents } from './openapi.js';
+import { publicApiOrigin } from './public-api-origin.js';
 
 /**
  * The version the published document announces itself as.
@@ -39,19 +38,12 @@ import { registerOpenApiComponents } from './openapi.js';
  * while we were cutting 2.0.0, which every client generator, registry, and
  * integrator diffing against the previous release would have believed.
  *
- * `@rekey.dev/shared-types` is the right source: the CHANGELOG states the
- * packages share one version and release together with the API, panel, and
- * portal, so its `package.json` IS the release version. (`apps/api`'s own
- * package.json is `0.0.0`, it is private and never published.) `createRequire`
- * rather than an import attribute so this resolves identically from `src/` under
- * tsx and from `dist/` under node, without depending on the build layout.
- *
- * `test/openapi-contract.test.ts` asserts this matches both the package version
- * and the top CHANGELOG heading, so the three cannot drift apart again.
+ * It is the same value `/health/live` reports; build-info.ts explains why
+ * `@rekey.dev/shared-types` is the source. `test/openapi-contract.test.ts`
+ * asserts it matches both the package version and the top CHANGELOG heading,
+ * so the three cannot drift apart again.
  */
-const { version: RELEASE_VERSION } = createRequire(import.meta.url)(
-  '@rekey.dev/shared-types/package.json',
-) as { version: string };
+import { RELEASE_VERSION } from './build-info.js';
 
 export async function registerSwagger(app: FastifyInstance): Promise<void> {
   // Shared response components (`components.schemas`) + the pass-through
@@ -113,9 +105,10 @@ export async function registerSwagger(app: FastifyInstance): Promise<void> {
       // as the `@rekey.dev/astro` fallback removed in this release, on a
       // surface where the credential is typed in by hand.
       //
-      // `API_URL` is this deployment's origin and always has a value, so the
-      // list is correct everywhere without a fallback to anybody's brand.
-      servers: [{ url: env.API_URL, description: 'This deployment' }],
+      // The public origin when one is configured. Otherwise "/", which
+      // OpenAPI resolves against wherever the document was served from, so an
+      // in-cluster host such as http://api:3030 is never offered (#578).
+      servers: [{ url: publicApiOrigin() ?? '/', description: 'This deployment' }],
       components: {
         securitySchemes: {
           superAdminKey: {
@@ -145,7 +138,7 @@ export async function registerSwagger(app: FastifyInstance): Promise<void> {
               'with narrow scopes (`auth:read`, `auth:write`, `billing:read`, ' +
               '`billing:write`, `webhooks:read`); when a route needs a specific scope its ' +
               'description says so. `*`, the default, grants those five and nothing ' +
-              'else: an **elevated** scope (`credits:grant`) is held only by a key minted ' +
+              'else: an **elevated** scope (`credits:grant`, `email:send`) is held only by a key minted ' +
               'with it named, so no existing full-access key gains it. May also be restricted by the ' +
               "Application's IP allowlist.\n\n" +
               '**Never** put this in browser or mobile-client code, use the publishable ' +

@@ -11,9 +11,21 @@
  * route layer. We deliberately don't duplicate service logic.
  */
 
+import { contactsForExport } from '../contacts/contact-erasure.service.js';
+import { personAddresses } from './end-user-erasure.service.js';
+import { isDeepStrictEqual } from 'node:util';
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { applicationsService } from '../applications/applications.service.js';
+import {
+  APPLICATION_LIST_SORTS,
+  APPLICATION_LIST_STATUSES,
+  ApplicationListFilterQuery,
+  applicationSummaries,
+  listApplications,
+  type ApplicationSummary,
+  type RowSet,
+} from '../applications/application-list.js';
 import { apiKeysService } from '../api-keys/api-keys.service.js';
 import { assertMayMintScopes } from '../api-keys/elevated-scopes.js';
 import { serializePlans } from '../plans/plan-dto.js';
@@ -41,14 +53,15 @@ import { prisma } from '../../lib/prisma.js';
 import { PaginationQuery, parsePagination, paged, paginationJsonSchema } from '../../lib/pagination.js';
 import { listApiRequests } from '../../lib/request-log.js';
 import { CouponDiscountType, type LicenseKind } from '@prisma/client';
-import { AppEnvironmentSchema, AuthConfigSchema, BillingConfigSchema, BillingProviderSchema, GrantCreditsRequestSchema } from '@rekey.dev/shared-types';
+import { AppEnvironmentSchema, AuthConfigSchema, BillingConfigSchema, BillingProviderSchema, GrantCreditsRequestSchema, ONBOARDING_STATUSES, SIGNUP_DOMAIN_LIST_MAX, SignupRestrictionsSchema, onboardingStatus } from '@rekey.dev/shared-types';
 import { RekeyError } from '../../lib/error.js';
 import { hashPassword } from '../../lib/passwords.js';
 import { assertMetadataWithinLimit } from '../../lib/metadata-limit.js';
 import { assertEndUserQuota } from '../../lib/tenant-limits.js';
 import { entitlementOverridesService } from '../billing/entitlement-overrides.service.js';
 import { reconcileSeatsForSubscription } from '../billing/seat-reconciler.js';
-import { kickDeliveries } from '../webhooks/webhook.service.js';
+import { enqueueEvent, kickDeliveries } from '../webhooks/webhook.service.js';
+import { enqueueUserUpdated, userSnapshot } from '../auth/user-lifecycle.js';
 import { applicationRolesService } from '../application-roles/application-roles.service.js';
 import { organizationRolesService } from '../organization-roles/organization-roles.service.js';
 import { organizationsService } from '../organizations/organizations.service.js';
@@ -72,12 +85,13 @@ import {
 import { recordSecurityEvent, requestContext, withActorEmails } from '../../lib/security-events.js';
 import { refreshCorsOrigins } from '../../lib/cors-origins.js';
 import { mcpIssuer } from '../mcp/oauth.service.js';
+import { portalBaseOrigin } from '../../lib/portal-origins.js';
 import { eraseEndUser } from './end-user-erasure.service.js';
+import { withoutBanReason } from '../end-user-bans/end-user-bans.service.js';
 import { billingService } from '../billing/billing.service.js';
 import { subscriptionGrantsService } from '../billing/grant.service.js';
 import { isApplyStale, subscriptionImportService } from '../billing/import.service.js';
 import { env } from '../../config/env.js';
-import { emitDetached } from '../webhooks/webhook.service.js';
 import {
   clearFailures,
   euLoginLockScope,
@@ -94,6 +108,9 @@ import { authRateLimit } from '../../lib/rate-limit.js';
 import { moneyAmount, positiveBoundedInt } from '../../lib/bounded-int.js';
 import { ok, okPage, okArray, errs, ref, type JsonSchema } from '../../lib/openapi.js';
 import { CREDENTIAL_BODY_LIMIT } from '../../lib/body-limits.js';
+import { endUserListOrder } from '../end-users/list-order.js';
+import { mayReadRawIps, operatorIpProjection } from '../../lib/ip-mask.js';
+import { END_USER_LIST_FILTER_JSON_SCHEMA, EndUserListFilterQuery, endUserListWhere } from '../end-users/list-filters.js';
 
 const ImportRunBody = z.object({
   provider: z.string().min(1).max(40),
@@ -196,7 +213,11 @@ const END_USER_SESSION: JsonSchema = {
     createdAt: { type: 'string', format: 'date-time' },
     expiresAt: { type: 'string', format: 'date-time' },
     userAgent: { type: 'string', nullable: true },
-    ip: { type: 'string', nullable: true },
+    ip: {
+      type: 'string',
+      nullable: true,
+      description: 'In full only for OWNER or ADMIN holding `activity:read`; otherwise masked to the /24 (IPv4) or /48 (IPv6) network, for example `203.0.113.0/24`.',
+    },
     deviceId: {
       type: 'string',
       nullable: true,
@@ -310,12 +331,50 @@ export const AUTH_CONFIG_PATCH_BODY_JSON_SCHEMA = {
       description:
         'Refuse password sign-in with 403 EMAIL_NOT_VERIFIED until the end-user confirms their address. Default false; turning it on applies to existing unverified accounts immediately.',
     },
+    welcomeEmail: {
+      type: 'string',
+      enum: ['on_signup', 'on_verified', 'off'],
+      description:
+        'When a new account gets the welcome mail. on_signup (default): at creation, except that with requireEmailVerification on an unverified address waits for its first verification. on_verified: always waits for a verified address. off: never.',
+    },
     signupEnabled: { type: 'boolean', description: 'Legacy alias for signupMode (false ⇔ invite_only). Prefer signupMode.' },
     signupMode: {
       type: 'string',
       enum: ['public', 'secret_only', 'invite_only'],
       description:
         'Who may create end-users: public (any key), secret_only (server-side secret key only, publishable key refused with SIGNUP_REQUIRES_SECRET_KEY), or invite_only (no public sign-up).',
+    },
+    signupRestrictions: {
+      type: 'object',
+      nullable: true,
+      description:
+        'Which email domains may self sign-up (password sign-up, a magic link for a new ' +
+        'address, a first OAuth sign-in). Replaces the stored rules as a whole; null removes ' +
+        'them. A refused address gets 403 SIGNUP_EMAIL_DOMAIN_NOT_ALLOWED, and the magic-link ' +
+        'request answers as if it sent. Operator-created and imported users are not checked. ' +
+        'Entries are lowercased and internationalised names stored as punycode.',
+      properties: {
+        allowedDomains: {
+          type: 'array',
+          maxItems: SIGNUP_DOMAIN_LIST_MAX,
+          items: { type: 'string', maxLength: 260 },
+          description:
+            'When non-empty, only these domains may sign up. `example.com` matches that domain ' +
+            'only; `*.example.com` matches its subdomains and not the domain itself.',
+        },
+        blockedDomains: {
+          type: 'array',
+          maxItems: SIGNUP_DOMAIN_LIST_MAX,
+          items: { type: 'string', maxLength: 260 },
+          description: 'Domains that may never sign up, same matching rules. Wins over allowedDomains.',
+        },
+        blockDisposable: {
+          type: 'boolean',
+          description:
+            'Refuse throwaway-inbox domains (and their subdomains) from the list vendored with ' +
+            'this release.',
+        },
+      },
     },
     mfa: { type: 'string', enum: ['off', 'optional', 'required'], description: 'End-user 2FA policy.' },
     mcpEnabled: { type: 'boolean', description: 'Expose a hosted MCP server + OAuth AS for this app.' },
@@ -395,8 +454,10 @@ export const AUTH_CONFIG_PATCH_BODY = z
     passwordBreachCheckEnabled: z.boolean().optional(),
     sendVerificationEmailOnSignUp: z.boolean().optional(),
     requireEmailVerification: z.boolean().optional(),
+    welcomeEmail: z.enum(['on_signup', 'on_verified', 'off']).optional(),
     signupEnabled: z.boolean().optional(),
     signupMode: z.enum(['public', 'secret_only', 'invite_only']).optional(),
+    signupRestrictions: SignupRestrictionsSchema.nullable().optional(),
     mfa: z.enum(['off', 'optional', 'required']).optional(),
     mcpEnabled: z.boolean().optional(),
     oidcEnabled: z.boolean().optional(),
@@ -422,26 +483,42 @@ export const AUTH_CONFIG_PATCH_BODY = z
 /** Every route: the `requireTenantSession` onRequest hook. */
 const TENANT_SESSION_ERRORS = {
   401:
-    'TENANT_SESSION_MISSING — no `Authorization: Bearer` header; or TENANT_SESSION_INVALID — ' +
+    'TENANT_SESSION_MISSING: no `Authorization: Bearer` header; or TENANT_SESSION_INVALID: ' +
     'the token is invalid, expired, or the operator account no longer exists.',
-  403: 'TENANT_MEMBERSHIP_REVOKED — the operator is no longer a member of this workspace.',
+  403: 'TENANT_MEMBERSHIP_REVOKED: the operator is no longer a member of this workspace.',
+} as const;
+
+/** `EndUser.createdVia`, with a row created before it was recorded read as `unknown`. */
+const CREATED_VIA_JSON_SCHEMA = {
+  type: 'string',
+  description:
+    'How the account was created: password, magic_link, oauth:<provider>, passkey, operator, import or billing. ' +
+    '`unknown` for accounts created before this was recorded.',
 } as const;
 
 /** Routes calling `ensureAppAccess(req, id, 'read')`. */
 const APP_READ_ERRORS = {
   ...TENANT_SESSION_ERRORS,
   404:
-    'APPLICATION_NOT_FOUND — no application with that id in this workspace (also returned to a ' +
-    'MEMBER with per-app grants who holds no grant on it — same non-disclosure posture).',
+    'APPLICATION_NOT_FOUND: no application with that id in this workspace (also returned to a ' +
+    'MEMBER with per-app grants who holds no grant on it, so its existence is not disclosed).',
+} as const;
+
+/** Cached dashboard reads: the app-read errors plus the compute budget. */
+const DASHBOARD_READ_ERRORS = {
+  ...APP_READ_ERRORS,
+  503:
+    'ANALYTICS_BUSY: the numbers are being computed for other requests (honour Retry-After); or ' +
+    'ANALYTICS_TIMEOUT: the computation exceeded its statement budget.',
 } as const;
 
 /** Routes calling `ensureAppAccess(req, id, 'write')`. */
 const APP_WRITE_ERRORS = {
   401: TENANT_SESSION_ERRORS[401],
   403:
-    'TENANT_MEMBERSHIP_REVOKED — the operator is no longer a member of this workspace; or ' +
-    'TENANT_ROLE_INSUFFICIENT — a legacy MEMBER (zero application grants) attempted a write; ' +
-    "or APP_ACCESS_DENIED — the operator's grant on this Application (below APP_ADMIN) does " +
+    'TENANT_MEMBERSHIP_REVOKED: the operator is no longer a member of this workspace; or ' +
+    'TENANT_ROLE_INSUFFICIENT: a legacy MEMBER (zero application grants) attempted a write; ' +
+    "or APP_ACCESS_DENIED: the operator's grant on this Application (below APP_ADMIN) does " +
     'not permit this action.',
   404: APP_READ_ERRORS[404],
 } as const;
@@ -450,9 +527,9 @@ const APP_WRITE_ERRORS = {
 const APP_BILLING_WRITE_ERRORS = {
   401: TENANT_SESSION_ERRORS[401],
   403:
-    'TENANT_MEMBERSHIP_REVOKED — the operator is no longer a member of this workspace; or ' +
-    'TENANT_ROLE_INSUFFICIENT — a legacy MEMBER (zero application grants) attempted a billing ' +
-    "write; or APP_ACCESS_DENIED — the operator's grant on this Application (needs APP_BILLING " +
+    'TENANT_MEMBERSHIP_REVOKED: the operator is no longer a member of this workspace; or ' +
+    'TENANT_ROLE_INSUFFICIENT: a legacy MEMBER (zero application grants) attempted a billing ' +
+    "write; or APP_ACCESS_DENIED: the operator's grant on this Application (needs APP_BILLING " +
     'or APP_ADMIN) does not permit this action.',
   404: APP_READ_ERRORS[404],
 } as const;
@@ -472,8 +549,8 @@ const APP_BILLING_WRITE_ERRORS = {
 const OWNER_ONLY_ERRORS = {
   401: TENANT_SESSION_ERRORS[401],
   403:
-    'TENANT_MEMBERSHIP_REVOKED — the operator is no longer a member of this workspace; or ' +
-    'TENANT_ROLE_INSUFFICIENT — the operator is an ADMIN or MEMBER. This route requires the ' +
+    'TENANT_MEMBERSHIP_REVOKED: the operator is no longer a member of this workspace; or ' +
+    'TENANT_ROLE_INSUFFICIENT: the operator is an ADMIN or MEMBER. This route requires the ' +
     'workspace OWNER; no application grant and no admin role unlocks it.',
   404: APP_READ_ERRORS[404],
 } as const;
@@ -482,8 +559,8 @@ const OWNER_ONLY_ERRORS = {
 const OWNER_ADMIN_ONLY_ERRORS = {
   401: TENANT_SESSION_ERRORS[401],
   403:
-    'TENANT_MEMBERSHIP_REVOKED — the operator is no longer a member of this workspace; or ' +
-    'TENANT_ROLE_INSUFFICIENT — the operator is a MEMBER (this route requires OWNER or ADMIN, ' +
+    'TENANT_MEMBERSHIP_REVOKED: the operator is no longer a member of this workspace; or ' +
+    'TENANT_ROLE_INSUFFICIENT: the operator is a MEMBER (this route requires OWNER or ADMIN, ' +
     'no grant unlocks it).',
 } as const;
 
@@ -696,51 +773,108 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
         tags: ['Tenant · Applications'],
         security: [{ tenantSession: [] }],
         summary: 'List Applications in the active workspace',
-        querystring: { type: 'object', properties: { ...paginationJsonSchema } },
+        description:
+          'Every filter is optional and they combine. Without `status` the page holds running and ' +
+          'disabled Applications alike. `include=summary` adds a `summary` object to each row, ' +
+          'computed in one query for the whole page.',
+        querystring: {
+          type: 'object',
+          properties: {
+            ...paginationJsonSchema,
+            status: {
+              type: 'string',
+              enum: [...APPLICATION_LIST_STATUSES],
+              description: '`active` for running Applications, `disabled` for frozen ones.',
+            },
+            environment: { type: 'string', enum: ['PRODUCTION', 'STAGING', 'DEVELOPMENT'] },
+            q: {
+              type: 'string',
+              maxLength: 80,
+              description: 'Case-insensitive match anywhere in the name or the slug.',
+            },
+            sort: {
+              type: 'string',
+              enum: [...APPLICATION_LIST_SORTS],
+              description:
+                '`created` (default) is newest first, `name` is A to Z, `activity` is most recently ' +
+                'active first, never-active last.',
+            },
+            include: {
+              type: 'string',
+              enum: ['summary'],
+              description:
+                '`summary` adds `activeApiKeys` (needs `developer:read` on the row) and ' +
+                '`lastActiveOn`, the last UTC day an end-user was active or a key was used ' +
+                '(needs `overview:read`). A field the caller may not read is left out.',
+            },
+          },
+        },
         response: {
           200: okPage(
             ref('Application'),
-            'A page of Applications in the active workspace, newest first. A MEMBER with ' +
-              'per-app grants sees only granted Applications (APP_BILLING entries redacted).',
+            'A page of Applications in the active workspace. A MEMBER with per-app grants sees ' +
+              'only granted Applications (APP_BILLING entries redacted).',
           ),
           ...errs({
-            400: 'VALIDATION_ERROR — `limit` or `offset` is out of range.',
+            400: 'VALIDATION_ERROR: `limit`, `offset` or a filter is out of range.',
             ...TENANT_SESSION_ERRORS,
           }),
         },
       },
     },
     async (req) => {
-      const { take, skip } = parsePagination(PaginationQuery.parse(req.query));
+      const query = PaginationQuery.merge(ApplicationListFilterQuery).parse(req.query);
+      const { take, skip } = parsePagination(query);
       // MEMBERs with per-app grants only see their granted Applications,
       // this single filter also scopes the panel sidebar + command palette,
-      // which are both fed by this endpoint.
+      // which are both fed by this endpoint. The total is counted through the
+      // same scope: a MEMBER told there are 40 Applications when they may
+      // read 3 has been handed an existence oracle, not a page count.
       const scope = await appAccessScope(req);
-      const scopeIds = scope.restricted ? { ids: scope.applicationIds } : {};
-      const [apps, total] = await Promise.all([
-        applicationsService.list(req.tenantId!, { take, skip, ...scopeIds }),
-        // Counted through the SAME grant scoping, not over the whole
-        // workspace: a MEMBER told there are 40 Applications when they may
-        // read 3 has been handed an existence oracle, not a page count.
-        applicationsService.count(req.tenantId!, scopeIds),
-      ]);
-      // Each row carries the caller's access on it, so the sidebar and the
-      // command palette can offer only what will not 403, the same
-      // `access.scopes` `GET /:id` returns, computed the same way.
       const ctx = await accessContextFromRequest(req);
-      const levelFor = (appId: string): AppAccess['level'] => {
-        if (!scope.restricted) return req.tenantRole === 'MEMBER' ? 'legacy-member' : 'workspace-admin';
-        return scope.roleByApplicationId.get(appId)!;
+      const unrestrictedLevel: AppAccess['level'] = req.tenantRole === 'MEMBER' ? 'legacy-member' : 'workspace-admin';
+      const levelFor = (appId: string): AppAccess['level'] =>
+        scope.restricted ? scope.roleByApplicationId.get(appId)! : unrestrictedLevel;
+      const mayRead = (appId: string, need: 'overview:read' | 'developer:read'): boolean =>
+        effectiveApplicationScopes(ctx, levelFor(appId)).has(need);
+      const ids = scope.restricted ? scope.applicationIds : undefined;
+      const rowsWith = (need: 'overview:read' | 'developer:read'): RowSet =>
+        scope.restricted
+          ? { all: false, ids: scope.applicationIds.filter((id) => mayRead(id, need)) }
+          : effectiveApplicationScopes(ctx, unrestrictedLevel).has(need)
+            ? { all: true }
+            : { all: false, ids: [] };
+      const activity = { overview: rowsWith('overview:read'), developer: rowsWith('developer:read') };
+      const { items: apps, total } = await listApplications({
+        tenantId: req.tenantId!,
+        ids,
+        filter: query,
+        take,
+        skip,
+        activity,
+      });
+      const summaries =
+        query.include === 'summary' ? await applicationSummaries(apps.map((a) => a.id), activity) : null;
+      const summaryFor = (appId: string): ApplicationSummary | undefined => {
+        const s = summaries?.get(appId);
+        if (!s) return undefined;
+        return {
+          ...(mayRead(appId, 'developer:read') && { activeApiKeys: s.activeApiKeys }),
+          ...(mayRead(appId, 'overview:read') && { lastActiveOn: s.lastActiveOn }),
+        };
       };
       return {
         success: true,
         // Secrets stripped for EVERY audience; sign-in config projected on
-        // the auth-config scope on top.
+        // the auth-config scope on top. Each row carries the caller's access
+        // on it, so the sidebar and the command palette offer only what will
+        // not 403.
         data: paged(
           apps.map((a) => {
             const level = levelFor(a.id);
             const scopes = effectiveApplicationScopes(ctx, level);
-            const row = { ...a, access: { level, scopes: [...scopes].sort() } };
+            const summary = summaryFor(a.id);
+            const row = { ...a, access: { level, scopes: [...scopes].sort() }, ...(summary && { summary }) };
             return stripApplicationSecrets(
               scopes.has('auth-config:read') ? row : redactApplicationForBilling(row),
             );
@@ -866,6 +1000,21 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
                   },
                   required: ['mcpUrl'],
                 },
+                {
+                  type: 'object',
+                  properties: {
+                    portalBaseUrl: {
+                      type: 'string',
+                      nullable: true,
+                      description:
+                        "Origin of this deployment's hosted customer portal (the API's " +
+                        'PUBLIC_PORTAL_URL), or null when it runs none. The shared portal URL ' +
+                        'of this Application is this plus `/<slug>`, and only while ' +
+                        '`hostedPortalEnabled` is true.',
+                    },
+                  },
+                  required: ['portalBaseUrl'],
+                },
               ],
             },
             'The application. An operator holding only the APP_BILLING grant gets authConfig ' +
@@ -885,6 +1034,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
       const data = {
         ...application,
         mcpUrl: mcpIssuer(application.slug),
+        portalBaseUrl: portalBaseOrigin(),
         // The capabilities the panel renders from. Computed from what the gate
         // already resolved, so it cannot disagree with what the gate enforces.
         access: { level: access.level, scopes: [...access.scopes].sort() },
@@ -914,7 +1064,8 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
           'Requires **read** access to this Application, OWNER/ADMIN, or a MEMBER holding ' +
           'any grant on it. A MEMBER with no grant on this Application gets 404.\n\n' +
           'End-user totals + 30-day sign-up trend, security-events summary, billing snapshot, ' +
-          'and a usage/credits roll-up. Scoped to the active workspace.',
+          'a usage/credits roll-up, and daily/weekly/monthly active end users with a 30-day series. ' +
+          'Scoped to the active workspace.',
         params: { type: 'object', properties: { id: { type: 'string' } }, required: ['id'] },
         response: {
           200: ok(
@@ -970,12 +1121,36 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
                   },
                   required: ['creditsOutstanding', 'usageLast30d'],
                 },
+                activeUsers: {
+                  type: 'object',
+                  description:
+                    'Distinct end users active today, in the last 7 and in the last 30 UTC days. Active means ' +
+                    'a sign-in or a session refresh that day. See docs/analytics.md.',
+                  properties: {
+                    d1: { type: 'integer' },
+                    d7: { type: 'integer' },
+                    d30: { type: 'integer' },
+                  },
+                  required: ['d1', 'd7', 'd30'],
+                },
+                activitySeries: {
+                  type: 'array',
+                  description: 'Active end users per UTC day for the last 30 days (oldest first), gap-filled.',
+                  items: {
+                    type: 'object',
+                    properties: {
+                      date: { type: 'string', format: 'date' },
+                      count: { type: 'integer' },
+                    },
+                    required: ['date', 'count'],
+                  },
+                },
               },
-              required: ['users', 'security', 'billing', 'usage'],
+              required: ['users', 'security', 'billing', 'usage', 'activeUsers', 'activitySeries'],
             },
             'Overview-tile dashboard stats for one Application.',
           ),
-          ...errs(APP_READ_ERRORS),
+          ...errs(DASHBOARD_READ_ERRORS),
         },
       },
     },
@@ -1248,8 +1423,10 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
           '**Can be refused.** A disabled PRODUCTION Application holds no production slot, ' +
           'so re-enabling one consumes a slot and fails with `TENANT_QUOTA_EXCEEDED` when ' +
           'the workspace is already running its `maxProductionApps` limit. Free a slot by ' +
-          'disabling a different production application, or contact support to raise the ' +
-          'limit, it cannot be raised self-serve. DEVELOPMENT and STAGING Applications ' +
+          'disabling a different production application, or raise the limit: on a ' +
+          'self-hosted deployment a super-admin sets it with ' +
+          '`PUT /api/v1/admin/tenants/:id/limits`; on Rekey Cloud it comes from the ' +
+          "workspace's plan. DEVELOPMENT and STAGING Applications " +
           'hold no slot and always enable.',
         params: { type: 'object', properties: { id: { type: 'string' } }, required: ['id'] },
         response: {
@@ -1470,7 +1647,14 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
             { type: 'object', properties: { authConfig: ref('AuthConfig') }, required: ['authConfig'] },
             'The Application, patched auth configuration.',
           ),
-          ...errs({ 400: 'VALIDATION_ERROR — a field failed schema validation.', ...APP_WRITE_ERRORS }),
+          ...errs({
+            400: 'VALIDATION_ERROR: a field failed schema validation.',
+            ...APP_WRITE_ERRORS,
+            409:
+              'EMAIL_EVENT_REQUIRED_BY_AUTH_CONFIG: the change needs an email that is switched ' +
+              'off; or EMAIL_VERIFICATION_URL_REQUIRED: a verified email would be required with ' +
+              'no Application URL or http(s) redirect URL to build the verification link on.',
+          }),
         },
       },
     },
@@ -1537,7 +1721,8 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
               type: 'string',
               nullable: true,
               description:
-                'Free-tier fallback. Slug of an active plan whose FEATURE flags and included ' +
+                'Free-tier fallback. Slug of an active plan costing nothing (`amount` 0, no ' +
+                '`pricePerUnitCents`) whose FEATURE flags and included ' +
                 'usage quota apply on top of what a subscription grants: withheld for a key a ' +
                 'per-subscription entitlement override names, and otherwise able only to raise ' +
                 'a value, never to replace one. A SUBSCRIPTION or USAGE plan suppresses it ' +
@@ -1555,6 +1740,10 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
               'VALIDATION_ERROR — an unknown key or a field failed schema validation; or ' +
               'DEFAULT_PLAN_NOT_FOUND — `defaultPlanSlug` does not match an active plan on this Application.',
             ...APP_WRITE_ERRORS,
+            409:
+              'BILLING_SUBJECT_CHANGE_BLOCKED: live subscriptions would be stranded by the new ' +
+              '`billingSubject`; or BILLING_FREE_PLAN_NOT_FREE: `defaultPlanSlug` names a plan ' +
+              'with a nonzero `amount` or a `pricePerUnitCents`.',
           }),
         },
       },
@@ -1579,21 +1768,6 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
         })
         .strict()
         .parse(req.body ?? {});
-      // Reject a typo'd free-tier slug so it can't silently disable the tier.
-      if (typeof body.defaultPlanSlug === 'string') {
-        const plan = await prisma.plan.findFirst({
-          where: { applicationId: id, slug: body.defaultPlanSlug, active: true },
-          select: { id: true },
-        });
-        if (!plan) {
-          throw new RekeyError({
-            statusCode: 400,
-            code: 'DEFAULT_PLAN_NOT_FOUND',
-            message: `No active plan "${body.defaultPlanSlug}" in this Application.`,
-            fix: 'Pass the slug of an existing active plan to use as the free tier, or null to clear it.',
-          });
-        }
-      }
       // Changing the billing subject under live subscriptions strands every
       // one of them on the wrong side of the setting (#431).
       //
@@ -1725,6 +1899,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
             400:
               'API_KEY_EXPIRY_IN_PAST — `expiresAt` is not in the future; or ' +
               'API_KEY_LIMIT_REACHED — the Application already has 25 active keys; or ' +
+              'API_KEY_SCOPE_UNKNOWN: `scopes` names a scope no route enforces; or ' +
               'VALIDATION_ERROR — a field failed schema validation.',
             ...APP_WRITE_ERRORS,
           }),
@@ -1735,11 +1910,13 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
       const { id } = AppParam.parse(req.params);
       await ensureAppAccess(req, id, 'write');
       const body = CreateKeyBody.parse(req.body);
-      await assertMayMintScopes(await accessContextFromRequest(req), id, body.scopes);
+      const minter = await accessContextFromRequest(req);
+      await assertMayMintScopes(minter, id, body.scopes);
       const result = await apiKeysService.create({
         applicationId: id,
         name: body.name,
         scopes: body.scopes,
+        revealsEndUserIps: mayReadRawIps(minter.role, minter.scopes),
         ...(body.expiresAt !== undefined && { expiresAt: new Date(body.expiresAt) }),
       });
       void recordSecurityEvent({
@@ -2402,7 +2579,8 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
             400:
               'COUPON_CODE_INVALID — the code is not 1-40 alphanumerics/underscores/hyphens; or ' +
               'COUPON_AMOUNT_INVALID — `amountOff` is negative, or a PERCENT discount exceeds ' +
-              '10000 basis points (100%); or VALIDATION_ERROR — a field failed schema validation.',
+              '10000 basis points (100%); or COUPON_CURRENCY_REQUIRED: an AMOUNT coupon was ' +
+              'sent without `currency`; or COUPON_CURRENCY_INVALID: `currency` is not an ISO 4217 code; or VALIDATION_ERROR — a field failed schema validation.',
             ...APP_BILLING_WRITE_ERRORS,
             409: 'COUPON_CODE_TAKEN — another coupon on this Application already uses that code.',
           }),
@@ -3096,14 +3274,14 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
         params: { type: 'object', properties: { id: { type: 'string' } }, required: ['id'] },
         response: {
           200: ok(ref('BillingStats'), 'Revenue and subscription stats for this Application.'),
-          ...errs(APP_READ_ERRORS),
+          ...errs(DASHBOARD_READ_ERRORS),
         },
       },
     },
     async (req) => {
       const { id } = AppParam.parse(req.params);
       await ensureAppAccess(req, id, 'read');
-      return { success: true, data: await billingStatsService.forApplication(id) };
+      return { success: true, data: await billingStatsService.cached(id) };
     },
   );
 
@@ -3128,7 +3306,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
         querystring: {
           type: 'object',
           properties: {
-            status: { type: 'string', enum: ['PENDING', 'SUCCEEDED', 'FAILED', 'REFUNDED'] },
+            status: { type: 'string', enum: ['PENDING', 'SUCCEEDED', 'FAILED', 'REFUNDED', 'PARTIALLY_REFUNDED'] },
             from: { type: 'string', format: 'date-time' },
             to: { type: 'string', format: 'date-time' },
             sort: { type: 'string', enum: ['createdAt', 'amount', 'status'] },
@@ -3146,7 +3324,11 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
                 subscriptionId: { type: 'string', nullable: true },
                 amount: { type: 'integer' },
                 currency: { type: 'string' },
-                status: { type: 'string', enum: ['PENDING', 'SUCCEEDED', 'FAILED', 'REFUNDED'] },
+                status: { type: 'string', enum: ['PENDING', 'SUCCEEDED', 'FAILED', 'REFUNDED', 'PARTIALLY_REFUNDED'] },
+                refundedAmount: {
+                  type: 'integer',
+                  description: 'Cumulative amount refunded so far, smallest currency unit.',
+                },
                 providerPaymentId: { type: 'string', nullable: true },
                 description: { type: 'string', nullable: true },
                 createdAt: { type: 'string', format: 'date-time' },
@@ -3169,7 +3351,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
       await ensureAppAccess(req, id, 'read');
       const q = z
         .object({
-          status: z.enum(['PENDING', 'SUCCEEDED', 'FAILED', 'REFUNDED']).optional(),
+          status: z.enum(['PENDING', 'SUCCEEDED', 'FAILED', 'REFUNDED', 'PARTIALLY_REFUNDED']).optional(),
           from: z.coerce.date().optional(),
           to: z.coerce.date().optional(),
           sort: z.enum(['createdAt', 'amount', 'status']).optional(),
@@ -3204,6 +3386,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
             subscriptionId: true,
             amount: true,
             currency: true,
+            refundedAmount: true,
             status: true,
             providerPaymentId: true,
             description: true,
@@ -3777,19 +3960,28 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
         description:
           'Requires **read** access to this Application, OWNER/ADMIN, or a MEMBER holding ' +
           'any grant on it. A MEMBER with no grant on this Application gets 404.\n\n' +
-          'Sort with `?sort=createdAt|email&order=asc|desc` (default createdAt desc).',
+          'Sort with `?sort=createdAt|email|lastSignedInAt|lastActiveOn&order=asc|desc` (default createdAt desc). ' +
+          '`lastSignedInAt` and `lastActiveOn` list users with no value last, in either order. ' +
+          '`?banned=true` lists only banned end-users, `false` only the rest. A ban no longer ' +
+          'applies to an erased end-user, so erased rows count as not banned and list `bannedAt: null`.\n\n' +
+          'Filters (all AND-ed): activity (`activeFrom`, `activeTo`, `inactiveForDays`, `minSignIns`), creation ' +
+          '(`createdFrom`, `createdTo`, `createdVia`), latest values (`platform`, `country`, `lastSignInVia`), ' +
+          '`onboarding`, `mfa`, `plan` (needs `billing:read`) and `org` (needs `organizations:read`). A filter the ' +
+          'caller may not use is refused, never ignored.',
         params: { type: 'object', properties: { id: { type: 'string' } }, required: ['id'] },
         querystring: {
           type: 'object',
           properties: {
             search: { type: 'string', maxLength: 254 },
             emailVerified: { type: 'boolean' },
+            banned: { type: 'boolean' },
             subscriptionStatus: {
               type: 'string',
               enum: ['PENDING', 'ACTIVE', 'PAST_DUE', 'CANCELED', 'EXPIRED'],
             },
-            sort: { type: 'string', enum: ['createdAt', 'email'] },
+            sort: { type: 'string', enum: ['createdAt', 'email', 'lastSignedInAt', 'lastActiveOn'] },
             order: { type: 'string', enum: ['asc', 'desc'] },
+            ...END_USER_LIST_FILTER_JSON_SCHEMA,
             ...paginationJsonSchema,
           },
         },
@@ -3803,13 +3995,39 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
                 emailVerified: { type: 'boolean' },
                 role: { type: 'string' },
                 metadata: { type: 'object', nullable: true, additionalProperties: true },
+                bannedAt: { type: 'string', format: 'date-time', nullable: true },
                 createdAt: { type: 'string', format: 'date-time' },
+                lastSignedInAt: { type: 'string', format: 'date-time', nullable: true },
+                lastActiveOn: {
+                  type: 'string',
+                  format: 'date',
+                  nullable: true,
+                  description: 'The last UTC day the user signed in or refreshed a session.',
+                },
+                lastPlatform: { type: 'string', nullable: true },
+                lastCountry: { type: 'string', nullable: true },
+                profile: { type: 'object', additionalProperties: true },
+                onboardingStatus: {
+                  type: 'string',
+                  enum: [...ONBOARDING_STATUSES],
+                  description: 'Recorded only: Rekey gates nothing on it.',
+                },
+                createdVia: CREATED_VIA_JSON_SCHEMA,
               },
-              required: ['id', 'email', 'emailVerified', 'role', 'createdAt'],
+              required: ['id', 'email', 'emailVerified', 'role', 'bannedAt', 'createdAt', 'lastSignedInAt', 'onboardingStatus', 'createdVia'],
             },
             'A page of end-users, sorted per `?sort`/`?order` (default createdAt desc, default page size 25).',
           ),
-          ...errs({ 400: 'VALIDATION_ERROR — `limit`/`offset` out of range, or an invalid `sort`/`order`/`subscriptionStatus`.', ...APP_READ_ERRORS }),
+          ...errs({
+            400: 'VALIDATION_ERROR: `limit`/`offset` out of range, or an invalid `sort`/`order`/`subscriptionStatus` or filter.',
+            ...APP_READ_ERRORS,
+            403:
+              APP_READ_ERRORS[403] +
+              ' Or SCOPE_INSUFFICIENT: `subscriptionStatus` or `plan` without `billing:read`, or `org` without `organizations:read`.',
+            404:
+              APP_READ_ERRORS[404] +
+              ' Or PLAN_NOT_FOUND or ORGANIZATION_NOT_FOUND: the `plan` or `org` filter names one this Application does not have.',
+          }),
         },
       },
     },
@@ -3822,13 +4040,15 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
           // Fastify's Ajv coerces "true"/"false" query strings to booleans
           // via the querystring schema above before zod sees them.
           emailVerified: z.boolean().optional(),
+          banned: z.boolean().optional(),
           subscriptionStatus: z
             .enum(['PENDING', 'ACTIVE', 'PAST_DUE', 'CANCELED', 'EXPIRED'])
             .optional(),
-          sort: z.enum(['createdAt', 'email']).optional(),
+          sort: z.enum(['createdAt', 'email', 'lastSignedInAt', 'lastActiveOn']).optional(),
           order: z.enum(['asc', 'desc']).optional(),
         })
         .merge(PaginationQuery)
+        .merge(EndUserListFilterQuery)
         .parse(req.query);
       // The rows carry no plan, but this filter is a per-user paying/churned
       // oracle: ask for ACTIVE, then CANCELED, and you have the book of business
@@ -3847,24 +4067,36 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
         applicationId: id,
         ...(q.search && { email: { contains: q.search.toLowerCase() } }),
         ...(q.emailVerified !== undefined && { emailVerified: q.emailVerified }),
+        ...(q.banned === true && { bannedAt: { not: null }, erasedAt: null }),
+        ...(q.banned === false && { OR: [{ bannedAt: null }, { erasedAt: { not: null } }] }),
         ...(q.subscriptionStatus && {
           subscriptions: { some: { status: q.subscriptionStatus } },
         }),
+        AND: await endUserListWhere(id, q, access.scopes),
       };
       const [users, total] = await Promise.all([
         prisma.endUser.findMany({
           where,
           // Stable secondary order by id keeps pagination consistent on ties.
-          orderBy: [q.sort === 'email' ? { email: order } : { createdAt: order }, { id: 'desc' }],
+          orderBy: [endUserListOrder(q.sort, order), { id: 'desc' }],
           take,
           skip,
           select: {
-            id: true, email: true, emailVerified: true, role: true, metadata: true, createdAt: true,
+            id: true, email: true, emailVerified: true, role: true, metadata: true, bannedAt: true, erasedAt: true,
+            createdAt: true, lastSignedInAt: true, lastActiveOn: true, lastPlatform: true, lastCountry: true, profile: true,
+            onboardingCompletedAt: true, onboardingSkippedAt: true, createdVia: true,
           },
         }),
         prisma.endUser.count({ where }),
       ]);
-      return { success: true, data: paged(users, total, take, skip) };
+      const rows = users.map(({ erasedAt, bannedAt, onboardingCompletedAt, onboardingSkippedAt, createdVia, lastActiveOn, ...user }) => ({
+        ...user,
+        bannedAt: erasedAt ? null : bannedAt,
+        lastActiveOn: lastActiveOn ? lastActiveOn.toISOString().slice(0, 10) : null,
+        onboardingStatus: onboardingStatus({ onboardingCompletedAt, onboardingSkippedAt }),
+        createdVia: createdVia ?? 'unknown',
+      }));
+      return { success: true, data: paged(rows, total, take, skip) };
     },
   );
 
@@ -3965,20 +4197,37 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
         ? (await applicationRolesService.assertExists(id, body.role), body.role)
         : (await applicationRolesService.getDefault(id)).name;
       try {
-        const created = await prisma.endUser.create({
-          data: {
+        const { created, deliveryIds } = await prisma.$transaction(async (tx) => {
+          const row = await tx.endUser.create({
+            data: {
+              applicationId: id,
+              email: body.email.toLowerCase(),
+              passwordHash,
+              role: roleName,
+              emailVerified: body.emailVerified ?? true,
+              createdVia: 'operator',
+              ...(body.metadata !== undefined && { metadata: body.metadata as never }),
+            },
+          });
+          const ids = await enqueueEvent(tx, {
             applicationId: id,
-            email: body.email.toLowerCase(),
-            passwordHash,
-            role: roleName,
-            emailVerified: body.emailVerified ?? true,
-            ...(body.metadata !== undefined && { metadata: body.metadata as never }),
-          },
-          select: {
-            id: true, email: true, emailVerified: true, role: true, metadata: true, createdAt: true,
+            type: 'user.created',
+            data: { user: userSnapshot(row), via: 'operator' },
+          });
+          return { created: row, deliveryIds: ids };
+        });
+        kickDeliveries(deliveryIds);
+        return reply.status(201).send({
+          success: true,
+          data: {
+            id: created.id,
+            email: created.email,
+            emailVerified: created.emailVerified,
+            role: created.role,
+            metadata: created.metadata,
+            createdAt: created.createdAt,
           },
         });
-        return reply.status(201).send({ success: true, data: created });
       } catch (e) {
         if ((e as { code?: string }).code === 'P2002') {
           // Same reason as the licenses 404 below: hand-building the envelope
@@ -4022,6 +4271,10 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
                     metadata: { type: 'object', nullable: true, additionalProperties: true },
                     erasedAt: { type: 'string', format: 'date-time', nullable: true },
                     erasedBy: { type: 'string', nullable: true },
+                    createdVia: CREATED_VIA_JSON_SCHEMA,
+                    bannedAt: { type: 'string', format: 'date-time', nullable: true },
+                    bannedBy: { type: 'string', nullable: true },
+                    banReason: { type: 'string', nullable: true },
                     createdAt: { type: 'string', format: 'date-time' },
                     updatedAt: { type: 'string', format: 'date-time' },
                     failedSignInAttempts: {
@@ -4031,7 +4284,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
                     lockedUntil: { type: 'string', format: 'date-time', nullable: true },
                   },
                   required: [
-                    'id', 'applicationId', 'email', 'emailVerified', 'role', 'createdAt',
+                    'id', 'applicationId', 'email', 'emailVerified', 'role', 'createdVia', 'createdAt',
                     'updatedAt', 'failedSignInAttempts', 'lockedUntil',
                   ],
                 },
@@ -4068,7 +4321,11 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
                       reason: { type: 'string', nullable: true },
                       startedAt: { type: 'string', format: 'date-time' },
                       endedAt: { type: 'string', format: 'date-time', nullable: true },
-                      ip: { type: 'string', nullable: true },
+                      ip: {
+                        type: 'string',
+                        nullable: true,
+                        description: 'The address the impersonating operator came from. In full only for OWNER or ADMIN holding `activity:read`; otherwise masked to the /24 (IPv4) or /48 (IPv6) network, for example `203.0.113.0/24`.',
+                      },
                     },
                     required: ['id', 'operatorUserId', 'operatorEmail', 'startedAt'],
                   },
@@ -4088,6 +4345,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
     async (req) => {
       const params = z.object({ id: z.string().min(1), euid: z.string().min(1) }).parse(req.params);
       await ensureAppAccess(req, params.id, 'read');
+      const ip = await operatorIpProjection(req);
       const eu = await prisma.endUser.findUnique({
         where: { id: params.euid },
         select: {
@@ -4099,6 +4357,10 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
           metadata: true,
           erasedAt: true,
           erasedBy: true,
+          createdVia: true,
+          bannedAt: true,
+          bannedBy: true,
+          banReason: true,
           createdAt: true,
           updatedAt: true,
         },
@@ -4140,7 +4402,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
           // on this payload, but this select never returned them: the lock badge
           // read `undefined` and rendered "none" for every account, locked or
           // not. They are real now, sourced from the limiter.
-          endUser: { ...eu, ...lockState },
+          endUser: { ...eu, createdVia: eu.createdVia ?? 'unknown', ...lockState },
           passkeys: passkeys.map((p) => ({
             ...p,
             lastUsedAt: p.lastUsedAt?.toISOString() ?? null,
@@ -4153,7 +4415,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
             reason: r.reason,
             startedAt: r.startedAt.toISOString(),
             endedAt: r.endedAt?.toISOString() ?? null,
-            ip: r.ip,
+            ip: ip(r.ip),
           })),
         },
       };
@@ -4225,7 +4487,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
                       id: { type: 'string' },
                       amount: { type: 'integer' },
                       currency: { type: 'string' },
-                      status: { type: 'string', enum: ['PENDING', 'SUCCEEDED', 'FAILED', 'REFUNDED'] },
+                      status: { type: 'string', enum: ['PENDING', 'SUCCEEDED', 'FAILED', 'REFUNDED', 'PARTIALLY_REFUNDED'] },
                       description: { type: 'string', nullable: true },
                       providerPaymentId: { type: 'string', nullable: true },
                       subscriptionId: { type: 'string', nullable: true },
@@ -4441,18 +4703,39 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
       if (body.role !== undefined) {
         await applicationRolesService.assertExists(params.id, body.role);
       }
-      const updated = await prisma.endUser.update({
-        where: { id: params.euid },
-        data: {
-          ...(body.role !== undefined && { role: body.role }),
-          ...(body.emailVerified !== undefined && { emailVerified: body.emailVerified }),
-          ...(body.metadata !== undefined && { metadata: body.metadata as never }),
-        },
-        select: {
-          id: true, email: true, emailVerified: true, role: true, metadata: true, createdAt: true,
-        },
+      const changed = [
+        ...(body.role !== undefined && body.role !== existing.role ? ['role'] : []),
+        ...(body.emailVerified !== undefined && body.emailVerified !== existing.emailVerified
+          ? ['emailVerified']
+          : []),
+        ...(body.metadata !== undefined && !isDeepStrictEqual(body.metadata, existing.metadata)
+          ? ['metadata']
+          : []),
+      ];
+      const { updated, deliveryIds } = await prisma.$transaction(async (tx) => {
+        const row = await tx.endUser.update({
+          where: { id: params.euid },
+          data: {
+            ...(body.role !== undefined && { role: body.role }),
+            ...(body.emailVerified !== undefined && { emailVerified: body.emailVerified }),
+            ...(body.metadata !== undefined && { metadata: body.metadata as never }),
+          },
+        });
+        const ids = await enqueueUserUpdated(tx, { user: row, changed, via: 'operator' });
+        return { updated: row, deliveryIds: ids };
       });
-      return { success: true, data: updated };
+      kickDeliveries(deliveryIds);
+      return {
+        success: true,
+        data: {
+          id: updated.id,
+          email: updated.email,
+          emailVerified: updated.emailVerified,
+          role: updated.role,
+          metadata: updated.metadata,
+          createdAt: updated.createdAt,
+        },
+      };
     },
   );
 
@@ -4692,7 +4975,15 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
         });
       }
 
-      await prisma.endUser.delete({ where: { id: params.euid } });
+      // `user.deleted` commits with the delete (see below).
+      const deliveryIds = await prisma.$transaction(async (tx) => {
+        await tx.endUser.delete({ where: { id: params.euid } });
+        return enqueueEvent(tx, {
+          applicationId: params.id,
+          type: 'user.deleted',
+          data: { user: { id: params.euid } },
+        });
+      });
 
       // Audit the operator mutation (durable: a deletion is a sensitive action).
       void recordSecurityEvent({
@@ -4709,13 +5000,10 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
         },
       });
 
-      // Outbound webhook, `user.deleted` (registered event). Fire-and-forget,
-      // same contract as `user.created` / `user.erased`.
-      emitDetached({
-        applicationId: params.id,
-        type: 'user.deleted',
-        data: { user: { id: params.euid } },
-      });
+      // Outbound webhook, `user.deleted` (registered event), written in the
+      // delete's transaction above, so it cannot outlive a delete that failed
+      // or be lost to a crash after one that committed.
+      kickDeliveries(deliveryIds);
 
       return { success: true, data: { removed: true } };
     },
@@ -5141,10 +5429,10 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
   async function assertEndUser(
     applicationId: string,
     euid: string,
-  ): Promise<{ id: string; email: string; erasedAt: Date | null }> {
+  ): Promise<{ id: string; email: string; erasedAt: Date | null; bannedAt: Date | null }> {
     const endUser = await prisma.endUser.findUnique({
       where: { id: euid },
-      select: { id: true, email: true, applicationId: true, erasedAt: true },
+      select: { id: true, email: true, applicationId: true, erasedAt: true, bannedAt: true },
     });
     if (!endUser || endUser.applicationId !== applicationId) {
       throw new RekeyError({
@@ -5154,7 +5442,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
         fix: 'List end-users to confirm the id.',
       });
     }
-    return { id: endUser.id, email: endUser.email, erasedAt: endUser.erasedAt };
+    return { id: endUser.id, email: endUser.email, erasedAt: endUser.erasedAt, bannedAt: endUser.bannedAt };
   }
 
   /**
@@ -5170,6 +5458,22 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
         code: 'END_USER_ERASED',
         message: 'That end-user was erased; support actions no longer apply to the tombstone.',
         fix: 'An erasure cannot be undone. If this person is a customer again, they create a new account.',
+      });
+    }
+  }
+
+  /**
+   * A banned user cannot use a reset or verification link: the ban refuses
+   * the session it would lead to. Mailing one anyway tells them nothing works
+   * without saying why, so the operator is told to lift the ban first.
+   */
+  function assertNotBanned(endUser: { bannedAt: Date | null }): void {
+    if (endUser.bannedAt !== null) {
+      throw new RekeyError({
+        statusCode: 403,
+        code: 'END_USER_BANNED',
+        message: 'That end-user is banned; sign-in mail and impersonation do not apply to them.',
+        fix: 'Lift the ban first (POST /api/v1/tenant/applications/:id/end-users/:euid/unban).',
       });
     }
   }
@@ -5296,6 +5600,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
             ...APP_WRITE_ERRORS,
             404: 'END_USER_NOT_FOUND — no end-user with that id in this Application.',
             409: 'EMAIL_ALREADY_VERIFIED — nothing to verify.',
+            403: APP_WRITE_ERRORS[403] + ' Or END_USER_BANNED: lift the ban first.',
             410: 'END_USER_ERASED — that end-user is a tombstone.',
             429: 'RATE_LIMITED — too many sends. Honour the `Retry-After` header.',
           }),
@@ -5308,6 +5613,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
       await ensureAppAccess(req, params.id, 'write');
       const endUser = await assertEndUser(params.id, params.euid);
       assertNotErased(endUser);
+      assertNotBanned(endUser);
 
       const full = await prisma.endUser.findUniqueOrThrow({ where: { id: params.euid } });
       if (full.emailVerified) {
@@ -5391,6 +5697,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
             ...APP_WRITE_ERRORS,
             404: 'END_USER_NOT_FOUND — no end-user with that id in this Application.',
             409: 'END_USER_HAS_NO_PASSWORD — the account signs in with OAuth or a passkey; there is no password to reset.',
+            403: APP_WRITE_ERRORS[403] + ' Or END_USER_BANNED: lift the ban first.',
             410: 'END_USER_ERASED — that end-user is a tombstone.',
             429: 'RATE_LIMITED — too many sends. Honour the `Retry-After` header.',
           }),
@@ -5403,6 +5710,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
       await ensureAppAccess(req, params.id, 'write');
       const endUser = await assertEndUser(params.id, params.euid);
       assertNotErased(endUser);
+      assertNotBanned(endUser);
 
       const full = await prisma.endUser.findUniqueOrThrow({ where: { id: params.euid } });
       if (full.passwordHash === null) {
@@ -5472,7 +5780,8 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
       await assertEndUser(params.id, params.euid);
       const { take, skip } = parsePagination(PaginationQuery.parse(req.query));
       const { items, total } = await listActiveSessions(params.euid, { take, skip });
-      return { success: true, data: paged(items, total, take, skip) };
+      const ip = await operatorIpProjection(req);
+      return { success: true, data: paged(items.map((r) => ({ ...r, ip: ip(r.ip) })), total, take, skip) };
     },
   );
 
@@ -5661,8 +5970,9 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
           "path a provider activation takes: the plan's entitlements are materialised onto the " +
           'beneficiary and `subscription.activated` is emitted through the same outbox, so ' +
           'anything already listening for a sale hears this one too.\n\n' +
-          '**Idempotent.** A subscriber already ACTIVE or PAST_DUE on the plan comes back ' +
-          'unchanged with `activated: false`, and `200` rather than `201`, nothing written, ' +
+          '**Idempotent.** A subscriber already ACTIVE or PAST_DUE on the plan, for the same ' +
+          'organization (or none), comes back unchanged with `activated: false`, and `200` ' +
+          'rather than `201`, nothing written, ' +
           'nothing re-provisioned, nothing re-announced, and no second audit entry. It does not ' +
           'extend a live period; to move a grant to a new term, cancel it and grant again.\n\n' +
           'The subscription carries no provider, which is what lets it be cancelled locally.\n\n' +
@@ -5720,6 +6030,10 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
               'PLAN_NOT_FOUND — no plan with that slug; or ORGANIZATION_NOT_FOUND — `organizationId` ' +
               'names no organization in this Application; or TENANT_SUBSCRIPTION_GRANTS_DISABLED — ' +
               'this deployment does not offer operator grants.',
+            409:
+              'BILLING_SUBSCRIPTION_SUBJECT_CONFLICT: the end-user already holds this plan live ' +
+              'for a different billing subject (another organization, or their personal ' +
+              'account). A subscription to one plan is stored once per subscriber.',
             410:
               'END_USER_ERASED — that end-user is a GDPR tombstone. Nothing can be granted to it, ' +
               'and an erasure cannot be undone.',
@@ -5964,6 +6278,18 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
           emailVerified: true,
           role: true,
           metadata: true,
+          lastSignedInAt: true,
+          lastSignInVia: true,
+          signInCount: true,
+          lastActiveOn: true,
+          lastPlatform: true,
+          platformsSeen: true,
+          lastCountry: true,
+          profile: true,
+          onboardingCompletedAt: true,
+          bannedAt: true,
+          onboardingSkippedAt: true,
+          createdVia: true,
           createdAt: true,
           updatedAt: true,
         },
@@ -6014,6 +6340,11 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
             kind: true,
             userAgent: true,
             ip: true,
+            clientPlatform: true,
+            clientOs: true,
+            clientBrowser: true,
+            clientAppVersion: true,
+            country: true,
             activeOrganizationId: true,
             createdAt: true,
             expiresAt: true,
@@ -6192,6 +6523,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
           // shared-types package declares them: a DSAR export losing fields is a
           // breaking change for anyone archiving these documents.
           ...lockState,
+          bannedAt: endUser.bannedAt?.toISOString() ?? null,
           createdAt: endUser.createdAt.toISOString(),
           updatedAt: endUser.updatedAt.toISOString(),
         },
@@ -6261,12 +6593,20 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
           occurredAt: u.occurredAt.toISOString(),
           createdAt: u.createdAt.toISOString(),
         })),
-        securityEvents: securityEvents.map((e) => ({ ...e, createdAt: e.createdAt.toISOString() })),
+        securityEvents: securityEvents.map((e) => ({
+          ...e,
+          metadata: withoutBanReason(e.type, e.metadata),
+          createdAt: e.createdAt.toISOString(),
+        })),
         impersonations: impersonations.map((r) => ({
           ...r,
           startedAt: r.startedAt.toISOString(),
           endedAt: r.endedAt?.toISOString() ?? null,
         })),
+        contacts: await contactsForExport(
+          params.id,
+          await personAddresses(prisma, params.id, endUser.id, endUser.email),
+        ),
       };
 
       void recordSecurityEvent({
@@ -6362,7 +6702,8 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
           ...errs({
             404: 'END_USER_NOT_FOUND — no end-user with that id in this Application.',
             401: APP_READ_ERRORS[401],
-            403: APP_READ_ERRORS[403] + ' Or TENANT_ROLE_INSUFFICIENT — this route requires the OWNER or ADMIN workspace role (no grant unlocks it).',
+            403: APP_READ_ERRORS[403] + ' Or TENANT_ROLE_INSUFFICIENT — this route requires the OWNER or ADMIN workspace role (no grant unlocks it). Or END_USER_BANNED: lift the ban first.',
+            410: 'END_USER_ERASED: that end-user is a tombstone.',
           }),
         },
       },
@@ -6388,6 +6729,10 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
           fix: 'List end-users to confirm the id.',
         });
       }
+      // Refused before the audit row exists: the token would be rejected on
+      // first use anyway, and an exemption here would be a way past the ban.
+      assertNotErased(endUser);
+      assertNotBanned(endUser);
       const { issueImpersonationToken } = await import('../../lib/jwt.js');
       const impApp = await prisma.application.findUniqueOrThrow({
         where: { id: endUser.applicationId },
@@ -8506,6 +8851,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
         organizationId: params.orgId,
         endUserId: body.endUserId,
         ...(body.role !== undefined && { role: body.role }),
+        actor: { tenantUserId: req.tenantUser!.id, tenantId: req.tenantId!, ...requestContext(req) },
       });
       return reply.status(201).send({
         success: true,
@@ -8579,6 +8925,7 @@ export async function tenantApplicationsRoutes(app: FastifyInstance): Promise<vo
         organizationId: params.orgId,
         endUserId: params.euid,
         role: body.role,
+        actor: { tenantUserId: req.tenantUser!.id, tenantId: req.tenantId!, ...requestContext(req) },
       });
       return {
         success: true,

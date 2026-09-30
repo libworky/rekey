@@ -3,8 +3,8 @@
  *
  * Entrypoints:
  *
- *   `@rekey.dev/nextjs/middleware` , rekeyMiddleware() for middleware.ts
- *   `@rekey.dev/nextjs/server`     , auth() / signIn() / signOut() / createSession() server-side (secret key)
+ *   `@rekey.dev/nextjs/middleware` , rekeyMiddleware() and rejectMalformedActionOrigin() for middleware.ts
+ *   `@rekey.dev/nextjs/server`     , auth() / signIn() / signOut() / createSession() / rekeyRefreshHandler() / subscribeToList() server-side (secret key)
  *   `@rekey.dev/nextjs/client`     , rekeyBrowser() for client-component login/register (publishable key)
  *   `@rekey.dev/nextjs/cookies`    , ACCESS_COOKIE / REFRESH_COOKIE names + options, dependency-free
  *
@@ -23,6 +23,7 @@
  */
 
 export { rekeyMiddleware } from './middleware.js';
+export { rejectMalformedActionOrigin, MALFORMED_ACTION_ORIGIN_MESSAGE } from './action-origin.js';
 export {
   auth,
   signIn,
@@ -31,9 +32,14 @@ export {
   signOut,
   createSession,
   refreshSession,
+  rekeyRefreshHandler,
+  subscribeToList,
 } from './server.js';
+export { DEFAULT_REFRESH_PATH, DEFAULT_SIGN_IN_PATH } from './paths.js';
 export type {
+  RefreshHandlerOptions,
   Session,
+  SignedInSession,
   SignInOutcome,
   SessionDeviceOptions,
   DeviceBindingRequest,
@@ -41,6 +47,7 @@ export type {
 export { classifySignInError } from './errors.js';
 export type { SignInFailure, DeviceChoice } from './errors.js';
 export type { MiddlewareConfig } from './middleware.js';
+export type { ActionRequestLike } from './action-origin.js';
 export {
   ACCESS_COOKIE,
   REFRESH_COOKIE,

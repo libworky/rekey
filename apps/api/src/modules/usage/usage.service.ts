@@ -81,10 +81,102 @@ function usedWhere(
 }
 
 /**
+ * How long a capped record waits for another record of the same subject
+ * before giving up. Under the 5s interactive-transaction timeout, so a stuck
+ * holder costs a waiter one pooled connection for 2s and a retryable 503, not
+ * 5s and a 500.
+ */
+const QUOTA_LOCK_TIMEOUT = '2s';
+
+/**
+ * Serialise the capped records whose quota sums could see each other's rows.
+ *
+ * `usedInWindow` sums by id column, so a row counts toward the end-user's sum
+ * when it carries `endUserId` and toward the organisation's when it carries
+ * `organizationId`. A writer therefore locks every subject its row lands in,
+ * which includes the one whose sum it reads. The public route refuses a record
+ * carrying both ids, so in practice this is one lock; the pair is ordered by
+ * lock key so two writers holding both can never deadlock.
+ *
+ * The key is a 64-bit hash, so two subjects can collide. A collision only
+ * makes two unrelated subjects wait for each other; it can never let two
+ * writers of the same subject run at once, because equal strings always hash
+ * equal.
+ *
+ * This replaces `SELECT ... FOR UPDATE` on the meter row, which serialised
+ * every subject of a meter behind one lock while guarding nothing meter-wide:
+ * `record` reads the meter's `active` and price before the transaction, and the
+ * usage row's foreign key already holds the meter against deletion until
+ * commit.
+ */
+async function lockQuotaSubjects(
+  tx: Prisma.TransactionClient,
+  meterId: string,
+  ids: { endUserId?: string | undefined; organizationId?: string | undefined },
+): Promise<void> {
+  const keys = [
+    ...(ids.endUserId ? [`rekey:usage:${meterId}:u:${ids.endUserId}`] : []),
+    ...(ids.organizationId ? [`rekey:usage:${meterId}:o:${ids.organizationId}`] : []),
+  ];
+  // Transaction-local, like SET LOCAL, so the pooled connection gets its
+  // default back on commit or rollback.
+  await tx.$executeRaw`SELECT set_config('lock_timeout', ${QUOTA_LOCK_TIMEOUT}, true)`;
+  await tx.$executeRaw`
+    SELECT pg_advisory_xact_lock(k) FROM (
+      SELECT DISTINCT hashtextextended(key, 0) AS k FROM unnest(${keys}::text[]) AS key ORDER BY k
+    ) AS ordered`;
+}
+
+/** Postgres `lock_not_available`, as Prisma surfaces it from any statement. */
+function isLockTimeout(e: unknown): boolean {
+  const err = e as { meta?: { code?: unknown }; message?: unknown };
+  return (
+    err?.meta?.code === '55P03' ||
+    (typeof err?.message === 'string' && /\b55P03\b|lock timeout/.test(err.message))
+  );
+}
+
+function rethrowLockTimeoutAsBusy(e: unknown): never {
+  if (isLockTimeout(e)) {
+    throw new RekeyError({
+      statusCode: 503,
+      code: 'USAGE_RECORD_BUSY',
+      message: 'Another usage record for this subject held the quota lock for too long, so this one was not recorded.',
+      fix: 'Retry after the Retry-After delay. Nothing was recorded or charged, so a retry cannot double count.',
+      retryAfterSeconds: 1,
+    });
+  }
+  throw e;
+}
+
+/**
  * Every meter a remaining read reports at once. Far above any real catalogue;
  * past it the response says `truncated: true` and a caller reads per meter.
  */
 const MAX_METERS_PER_REMAINING_READ = 200;
+
+/**
+ * The original record for a retried idempotency key, provided the retry asks
+ * for the same thing: the same quantity in the same billing month. A retry
+ * that regenerates its timestamp within the month is the same event; a
+ * different quantity, or a month the original was not counted in, is not, and
+ * answering it with the original record told the caller it was counted.
+ */
+function replayOf(
+  prior: UsageRecord,
+  args: { quantity: number; occurredAt?: Date | undefined; idempotencyKey?: string | undefined },
+): UsageRecord {
+  const sameMonth =
+    args.occurredAt === undefined ||
+    monthWindowUtc(args.occurredAt).start.getTime() === monthWindowUtc(prior.occurredAt).start.getTime();
+  if (prior.quantity === args.quantity && sameMonth) return prior;
+  throw new RekeyError({
+    statusCode: 409,
+    code: 'IDEMPOTENCY_KEY_REUSED',
+    message: `The idempotencyKey "${args.idempotencyKey}" was already used on this meter for this subject with a different quantity, or for a different billing month. The original record stands and nothing new was recorded.`,
+    fix: 'Send a fresh idempotencyKey for a different usage event. Reuse a key only to retry the identical record.',
+  });
+}
 
 export const usageService = {
   async listMeters(
@@ -275,7 +367,7 @@ export const usageService = {
           },
         },
       });
-      if (prior) return prior;
+      if (prior) return replayOf(prior, args);
     }
 
     // Hard cap (BILLING_MODEL §7): when the subject's plan bundles an included
@@ -342,7 +434,7 @@ export const usageService = {
           },
         },
         });
-        if (prior) return prior;
+        if (prior) return replayOf(prior, args);
       }
       throw e;
     };
@@ -381,13 +473,10 @@ export const usageService = {
         // once it has committed.
         let creditDeliveries: string[] = [];
         // Check + insert must be atomic: two concurrent records could both
-        // read a pre-insert SUM and together blow past the hard cap. Take a
-        // row-level lock on the meter (same pattern as licenses.service.ts
-        // verify) so concurrent records against the same meter serialise;
-        // records against other meters proceed in parallel.
+        // read a pre-insert SUM and together blow past the hard cap.
         return prisma
           .$transaction(async (tx) => {
-            await tx.$queryRaw`SELECT id FROM usage_meters WHERE id = ${meter.id} FOR UPDATE`;
+            await lockQuotaSubjects(tx, meter.id, args);
             const used = await usedInWindow(tx, meter.id, subject, window);
             const remainingIncluded = Math.max(0, includedUnits - used);
             const billable = Math.max(0, args.quantity - remainingIncluded);
@@ -471,6 +560,7 @@ export const usageService = {
             kickDeliveries(creditDeliveries);
             return created;
           })
+          .catch(rethrowLockTimeoutAsBusy)
           .catch(onConflictReturnExisting);
       }
     }

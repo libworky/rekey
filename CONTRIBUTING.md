@@ -44,6 +44,11 @@ separate build step. Running an app's own `dev` script directly (`pnpm --filter
 
 - API: `http://localhost:3030` — interactive docs at `/docs`
 - Operator panel: `http://localhost:3031`
+- Customer portal: `http://localhost:3050/<slug>`. The API's `PUBLIC_PORTAL_URL`
+  and the portal's `PORTAL_BASE_URL` must name this same origin; `.env.example`
+  sets both. Leave `PUBLIC_PORTAL_URL` out and the API treats the stack as
+  having no hosted portal, so portal password resets fail with
+  `AUTH_URL_NOT_ALLOWED`.
 
 Redis is required infrastructure, not just a rate-limiter: the outbound-webhook
 delivery queue runs on it and the API refuses to start if Redis is unreachable.
@@ -182,6 +187,17 @@ codebase calls `void recordSecurityEvent(...)` by contract, and a dropped
 autofix removed `as object` from a Prisma write where the assertion was
 load-bearing for `InputJsonValue` assignability, producing ten typecheck errors
 from a single `--fix` run.
+
+## Testing the SDKs in another app
+
+Build the packages, then pack them with **`pnpm pack`**, not `npm pack`:
+
+```bash
+pnpm build
+cd packages/sdk-node && pnpm pack --pack-destination /tmp/rekey-sdk
+```
+
+The SDKs depend on each other through `workspace:^` (for example `@rekey.dev/nextjs` on `@rekey.dev/node`, and both on `@rekey.dev/shared-types`). `pnpm pack` rewrites that to a real version range; `npm pack` leaves `workspace:^` in the tarball, which no package manager outside this repo can install. Pack every workspace package the one you are testing depends on, and install the tarballs together in the other app so the unpublished versions resolve to each other.
 
 ## Pull requests
 

@@ -2,6 +2,7 @@ import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { TenantLimitsSchema, type TenantLimits } from "@rekey.dev/shared-types";
 import { tenantsService } from "./tenants.service.js";
+import { parseTenantLimits } from "../../lib/tenant-limits.js";
 import { requireSuperAdmin } from "../../middleware/admin-auth.js";
 import { RekeyError } from "../../lib/error.js";
 import {
@@ -48,8 +49,17 @@ const TenantLimitsView: JsonSchema = {
           description:
             "Applications in the workspace whose `environment` is `PRODUCTION`.",
         },
+        contacts: {
+          type: "integer",
+          description:
+            "Contacts across every Application, one per address per Application.",
+        },
+        contactLists: {
+          type: "integer",
+          description: "Lists that are not archived, across every Application.",
+        },
       },
-      required: ["activeEndUsers", "productionApps"],
+      required: ["activeEndUsers", "productionApps", "contacts", "contactLists"],
     },
   },
   required: ["limits", "usage"],
@@ -90,9 +100,10 @@ function parseLimitsOrThrow(value: unknown): TenantLimits {
       .map((i) => `${i.path.join(".") || "(root)"} — ${i.message}`)
       .join("; ")}`,
     fix:
-      "Send an object whose keys are `maxActiveEndUsers` and/or `maxProductionApps` " +
-      "(each a non-negative integer, or null for unlimited). Send `{}` to clear every " +
-      "limit.",
+      "Send an object using only these keys: `maxActiveEndUsers` and `maxProductionApps` " +
+      "(a non-negative integer, or null for unlimited), `emailSendDailyCap` and " +
+      "`emailSendRecipientHourlyCap` (a positive integer, or null for the deployment " +
+      "default), and `emailAttribution` (true or false). Send `{}` to clear every limit.",
   });
 }
 
@@ -405,6 +416,14 @@ export async function tenantsRoutes(app: FastifyInstance): Promise<void> {
                 "Staging and development Applications are never counted and never blocked. " +
                 "Null or omitted = unlimited.",
             },
+            emailAttribution: {
+              type: "boolean",
+              nullable: true,
+              description:
+                "When true, the built-in account emails of this workspace's Applications end " +
+                "with a small \"Secured by Rekey\" line. Customised templates never carry it. " +
+                "Null or omitted = off.",
+            },
           },
         },
         response: {
@@ -424,10 +443,19 @@ export async function tenantsRoutes(app: FastifyInstance): Promise<void> {
     },
     async (req) => {
       const { id } = TenantParams.parse(req.params);
-      return {
-        success: true,
-        data: await tenantsService.setLimits(id, parseLimitsOrThrow(req.body)),
-      };
+      const next = parseLimitsOrThrow(req.body);
+      const previous = parseTenantLimits((await tenantsService.get(id)).limits);
+      const view = await tenantsService.setLimits(id, next);
+      const { ip, userAgent } = requestContext(req);
+      void recordSecurityEvent({
+        type: "workspace.limits_set_by_admin",
+        actorType: "system",
+        tenantId: id,
+        ip,
+        userAgent,
+        metadata: { previous, limits: next },
+      });
+      return { success: true, data: view };
     },
   );
 }
