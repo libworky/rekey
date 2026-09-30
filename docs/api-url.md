@@ -72,7 +72,10 @@ curl -s https://api.rekey.dev/health/live
 ```
 
 `/health/live` is the cheap liveness ping and answers `200` from any reachable
-Rekey deployment. Swap in your own origin when self-hosting.
+Rekey deployment. Swap in your own origin when self-hosting. It also names the
+running build, `version` (the release) and `commit` (`unknown` unless the image
+was built with `--build-arg REKEY_COMMIT=<sha>`), so you can confirm an upgrade
+actually landed.
 
 `/health` is the fuller check and reports the datastores:
 
@@ -105,4 +108,4 @@ and cannot resolve it.
 
 You find out you needed it at the point of use rather than at boot: registering
 a webhook against a non-public base answers `BILLING_WEBHOOK_BASE_NOT_PUBLIC`,
-which Panel → Application → Billing surfaces when you click Auto-configure.
+which Panel → Application → Billing → Setup → Providers surfaces when you click Auto-configure.

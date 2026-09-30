@@ -19,6 +19,7 @@ import { prisma } from '../src/lib/prisma.js';
 import { registerOAuthProvider } from '../src/modules/oauth/providers/index.js';
 import { GoogleProvider } from '../src/modules/oauth/providers/google.js';
 import { operatorTokensService } from '../src/modules/tenant-auth/operator-tokens.service.js';
+import { OPERATOR_TOKEN_SCOPES } from '../src/lib/operator-token.js';
 import { configureSandboxStripe } from './fakes/billing-credentials.js';
 
 const ADMIN_KEY = process.env.SUPER_ADMIN_KEY!;
@@ -351,11 +352,83 @@ describe('uncovered error codes', () => {
       expect(res.statusCode).toBe(400);
       expect(res.json().error.code).toBe('COUPON_CURRENCY_MISMATCH');
 
-      // A coupon with no currency restriction is not caught by the same gate.
-      await createCoupon(f, { code: 'ANY5', discountType: 'AMOUNT', amountOff: 500 });
-      const ok = await validate(f, 'ANY5');
+      // The same face value in the plan's own currency applies.
+      await createCoupon(f, { code: 'USD5', discountType: 'AMOUNT', amountOff: 500, currency: 'USD' });
+      const ok = await validate(f, 'USD5');
       expect(ok.statusCode).toBe(200);
       expect((ok.json().data as { discountAmount: number }).discountAmount).toBe(500);
+    });
+
+    it('COUPON_CURRENCY_REQUIRED: an AMOUNT coupon cannot be created without a currency', async () => {
+      // Without one, 500 would come off a plan in any currency: $5, 5 EUR,
+      // or 500 yen, whichever the buyer happened to pick (#290).
+      const f = await couponFixture('ccurreq');
+      const res = await app.inject({
+        method: 'POST',
+        url: `/api/v1/admin/applications/${f.applicationId}/coupons`,
+        headers: { authorization: `Bearer ${ADMIN_KEY}` },
+        payload: { code: 'ANY5', discountType: 'AMOUNT', amountOff: 500 },
+      });
+      expect(res.statusCode).toBe(400);
+      expect(res.json().error.code).toBe('COUPON_CURRENCY_REQUIRED');
+      expect(await prisma.coupon.count({ where: { applicationId: f.applicationId } })).toBe(0);
+
+      // The fix it gives works: the same body with a currency is accepted.
+      await createCoupon(f, { code: 'ANY5', discountType: 'AMOUNT', amountOff: 500, currency: 'USD' });
+
+      // PERCENT is unaffected: a percentage means the same thing in every currency.
+      await createCoupon(f, { code: 'PCT10', discountType: 'PERCENT', amountOff: 1000 });
+    });
+
+    it('COUPON_CURRENCY_INVALID: a currency that is not ISO 4217 is refused at create', async () => {
+      const f = await couponFixture('ccurinvalid');
+      const res = await app.inject({
+        method: 'POST',
+        url: `/api/v1/admin/applications/${f.applicationId}/coupons`,
+        headers: { authorization: `Bearer ${ADMIN_KEY}` },
+        payload: { code: 'BOGUS5', discountType: 'AMOUNT', amountOff: 500, currency: 'ABC' },
+      });
+      expect(res.statusCode).toBe(400);
+      expect(res.json().error.code).toBe('COUPON_CURRENCY_INVALID');
+      expect(await prisma.coupon.count({ where: { applicationId: f.applicationId } })).toBe(0);
+
+      // Case does not matter, matching how the plan comparison treats it.
+      await createCoupon(f, { code: 'LOWER5', discountType: 'AMOUNT', amountOff: 500, currency: 'usd' });
+    });
+
+    it('COUPON_CURRENCY_REQUIRED: a legacy AMOUNT coupon with no currency is refused, not applied at face value', async () => {
+      // Rows created before `currency` was required still exist. The API can
+      // no longer write one, so the row is seeded directly.
+      const f = await couponFixture('ccurlegacy');
+      await prisma.coupon.create({
+        data: {
+          applicationId: f.applicationId,
+          code: 'legacy5',
+          discountType: 'AMOUNT',
+          amountOff: 500,
+          currency: null,
+        },
+      });
+
+      const res = await validate(f, 'LEGACY5');
+      expect(res.statusCode).toBe(400);
+      expect(res.json().error.code).toBe('COUPON_CURRENCY_REQUIRED');
+
+      // Checkout goes through the same gate, so nothing is reserved or minted.
+      const checkout = await app.inject({
+        method: 'POST',
+        url: '/api/v1/billing/checkout',
+        headers: { authorization: `Bearer ${f.liveKey}`, 'x-rekey-user-token': f.userToken },
+        payload: {
+          planSlug: 'pro_monthly',
+          couponCode: 'LEGACY5',
+          successUrl: 'https://example.com/ok',
+          cancelUrl: 'https://example.com/cancel',
+        },
+      });
+      expect(checkout.statusCode).toBe(400);
+      expect(checkout.json().error.code).toBe('COUPON_CURRENCY_REQUIRED');
+      expect(await prisma.couponRedemption.count({ where: { applicationId: f.applicationId } })).toBe(0);
     });
   });
 
@@ -370,14 +443,13 @@ describe('uncovered error codes', () => {
       payload: { name: 'typo', scopes: ['keys:mints'] },
     });
     expect(res.statusCode).toBe(400);
-    // NOTE: this is `BAD_REQUEST`, not `OPERATOR_SCOPE_UNKNOWN`. The route's
-    // JSON schema pins `scopes.items` to the OPERATOR_TOKEN_SCOPES enum, so
-    // Fastify rejects the body before the handler runs and the service-level
-    // code is unreachable over HTTP. It is defence in depth for any non-HTTP
-    // caller of `operatorTokensService.mint`, covered directly below. Pinned
-    // here so nobody "fixes" this to the service code without first removing
-    // the schema enum.
-    expect(res.json().error.code).toBe('BAD_REQUEST');
+    // The named code with the valid scopes, not the schema's generic
+    // BAD_REQUEST, so a typo tells the caller what to send instead.
+    const error = res.json().error as { code: string; message: string; fix: string; details: { unknown: string[]; valid: string[] } };
+    expect(error.code).toBe('OPERATOR_SCOPE_UNKNOWN');
+    expect(error.message).toContain('keys:mints');
+    for (const scope of OPERATOR_TOKEN_SCOPES) expect(error.fix).toContain(scope);
+    expect(error.details).toEqual({ unknown: ['keys:mints'], valid: [...OPERATOR_TOKEN_SCOPES] });
     // Fail CLOSED either way: a typo must not silently mint a token.
     expect(await prisma.tenantApiToken.count({ where: { tenantId: b.tenantId } })).toBe(0);
   });

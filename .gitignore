@@ -5,10 +5,9 @@ dist
 coverage
 
 .env
-.env.local
-.env.*.local
-.env.dokploy
+.env.*
 !.env.example
+!.env.*.example
 
 *.log
 .DS_Store
@@ -33,3 +32,4 @@ dump.rdb
 
 # Local .env backups (pre-flight snapshots). Never committed.
 .env.bak*
+.vitest-reports

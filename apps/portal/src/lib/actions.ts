@@ -8,11 +8,21 @@
 
 import { redirect } from 'next/navigation';
 import { RekeyError } from '@rekey.dev/react';
-import { portalClientFor, setSession, clearSession, getRefreshToken, getAccessToken } from './session';
+import {
+  portalClientFor,
+  setSession,
+  clearSession,
+  getRefreshToken,
+  getAccessToken,
+  setMfaChallenge,
+  getMfaChallenge,
+  clearMfaChallenge,
+} from './session';
 import { getPortalConfig } from './config';
-import { resolveCheckoutProvider } from './provider-capabilities';
+import { checkoutRefusalCode, resolveCheckoutProvider } from './provider-capabilities';
 import { portalBaseUrl, rekeyApiUrl } from './env';
 import { API_TIMEOUT_MS, forwardedClientHeaders } from './client-ip';
+import { isMfaRestartCode, retryQuery } from './auth-error-copy';
 
 export async function signInAction(slug: string, formData: FormData): Promise<void> {
   const email = String(formData.get('email') ?? '').trim();
@@ -22,9 +32,8 @@ export async function signInAction(slug: string, formData: FormData): Promise<vo
   try {
     const out = await client.signIn({ email, password });
     if (out.mfaRequired) {
-      // MFA-enrolled user: hand the single-use, short-lived challenge token to
-      // the code step (same pattern the operator panel uses).
-      redirect(`/${slug}/login?mfa=${encodeURIComponent(out.mfaChallengeToken)}`);
+      await setMfaChallenge(slug, out.mfaChallengeToken);
+      redirect(`/${slug}/login?step=mfa`);
     }
     await setSession(slug, out.accessToken, out.refreshToken, out);
   } catch (err) {
@@ -32,7 +41,7 @@ export async function signInAction(slug: string, formData: FormData): Promise<vo
       // Carry the email back so a mistyped password doesn't cost the customer
       // both fields. Never the password.
       redirect(
-        `/${slug}/login?error=${encodeURIComponent(err.code)}&email=${encodeURIComponent(email)}`,
+        `/${slug}/login?error=${encodeURIComponent(err.code)}${retryQuery(err.retryAfterSeconds)}&email=${encodeURIComponent(email)}`,
       );
     }
     throw err;
@@ -41,19 +50,25 @@ export async function signInAction(slug: string, formData: FormData): Promise<vo
 }
 
 export async function mfaVerifyAction(slug: string, formData: FormData): Promise<void> {
-  const challenge = String(formData.get('challenge') ?? '').trim();
   const code = String(formData.get('code') ?? '').trim();
   const client = await portalClientFor(slug);
   if (!client) redirect(`/${slug}`);
-  if (!challenge || !code) redirect(`/${slug}/login`);
+  const challenge = await getMfaChallenge();
+  if (!challenge) redirect(`/${slug}/login?reason=mfa_expired`);
+  if (!code) redirect(`/${slug}/login?step=mfa`);
   try {
     const out = await client.mfaVerify({ mfaChallengeToken: challenge, code });
+    await clearMfaChallenge(slug);
     await setSession(slug, out.accessToken, out.refreshToken, out);
   } catch (err) {
     if (err instanceof RekeyError) {
+      if (isMfaRestartCode(err.code)) {
+        await clearMfaChallenge(slug);
+        redirect(`/${slug}/login?error=${encodeURIComponent(err.code)}`);
+      }
       // Keep the challenge so a mistyped code doesn't force a fresh sign-in.
       redirect(
-        `/${slug}/login?mfa=${encodeURIComponent(challenge)}&error=${encodeURIComponent(err.code)}`,
+        `/${slug}/login?step=mfa&error=${encodeURIComponent(err.code)}${retryQuery(err.retryAfterSeconds)}`,
       );
     }
     throw err;
@@ -70,34 +85,52 @@ async function publishablePost(
   slug: string,
   path: string,
   body: Record<string, unknown>,
-): Promise<{ ok: boolean; code?: string }> {
+): Promise<{ ok: boolean; code?: string; retryAfterSeconds?: number }> {
   const config = await getPortalConfig(slug);
   if (!config) return { ok: false, code: 'PORTAL_NOT_FOUND' };
-  const res = await fetch(`${rekeyApiUrl()}${path}`, {
-    method: 'POST',
-    headers: {
-      ...(await forwardedClientHeaders()),
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${config.publishableKey}`,
-    },
-    body: JSON.stringify(body),
-    cache: 'no-store',
-    signal: AbortSignal.timeout(API_TIMEOUT_MS),
-  });
+  let res: Response;
+  try {
+    res = await fetch(`${rekeyApiUrl()}${path}`, {
+      method: 'POST',
+      headers: {
+        ...(await forwardedClientHeaders()),
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${config.publishableKey}`,
+      },
+      body: JSON.stringify(body),
+      cache: 'no-store',
+      signal: AbortSignal.timeout(API_TIMEOUT_MS),
+    });
+  } catch {
+    return { ok: false, code: 'NETWORK_ERROR' };
+  }
   if (res.ok) return { ok: true };
-  const json = (await res.json().catch(() => null)) as { error?: { code?: string } } | null;
-  return { ok: false, code: json?.error?.code ?? `HTTP_${res.status}` };
+  const json = (await res.json().catch(() => null)) as
+    | { error?: { code?: string; retryAfterSeconds?: number } }
+    | null;
+  const retryAfterSeconds = json?.error?.retryAfterSeconds;
+  return {
+    ok: false,
+    code: json?.error?.code ?? `HTTP_${res.status}`,
+    ...(typeof retryAfterSeconds === 'number' && { retryAfterSeconds }),
+  };
 }
 
 export async function forgotPasswordAction(slug: string, formData: FormData): Promise<void> {
   const email = String(formData.get('email') ?? '').trim();
   if (!email) redirect(`/${slug}/forgot-password?error=missing`);
-  // Enumeration-safe on the API side, always confirm the same way. resetUrl
-  // points the emailed link back at this portal's reset page.
-  await publishablePost(slug, '/api/v1/auth/forgot-password', {
+  // The API answers the same way whether or not the address has an account, so
+  // a failure here says nothing about the address: it was throttled, or the
+  // request never ran. Only a success may tell the customer a link is coming.
+  const result = await publishablePost(slug, '/api/v1/auth/forgot-password', {
     email,
-    resetUrl: `${portalBaseUrl()}/${slug}/reset-password`,
+    resetUrl: `${portalBaseUrl()}/${slug}/reset-password?token={token}`,
   });
+  if (!result.ok) {
+    redirect(
+      `/${slug}/forgot-password?error=${encodeURIComponent(result.code ?? 'UNKNOWN')}${retryQuery(result.retryAfterSeconds)}`,
+    );
+  }
   redirect(`/${slug}/forgot-password?sent=1`);
 }
 
@@ -111,7 +144,7 @@ export async function resetPasswordAction(slug: string, formData: FormData): Pro
   });
   if (!result.ok) {
     redirect(
-      `/${slug}/reset-password?token=${encodeURIComponent(token)}&error=${encodeURIComponent(result.code ?? 'UNKNOWN')}`,
+      `/${slug}/reset-password?token=${encodeURIComponent(token)}&error=${encodeURIComponent(result.code ?? 'UNKNOWN')}${retryQuery(result.retryAfterSeconds)}`,
     );
   }
   redirect(`/${slug}/login?reason=reset`);
@@ -124,16 +157,22 @@ export async function signOutAction(slug: string): Promise<void> {
     await client.signOut(refresh).catch(() => undefined);
   }
   await clearSession(slug);
+  await clearMfaChallenge(slug);
   redirect(`/${slug}/login`);
 }
 
-export async function cancelSubscriptionAction(slug: string, organizationId: string | null): Promise<void> {
+export async function cancelSubscriptionAction(
+  slug: string,
+  organizationId: string | null,
+  subscriptionId: string,
+): Promise<void> {
   const client = await portalClientFor(slug);
   const access = await getAccessToken();
   if (!client || !access) redirect(`/${slug}/login?reason=expired`);
   try {
     await client.cancelSubscription(access, {
       atPeriodEnd: true,
+      subscriptionId,
       ...(organizationId && { organizationId }),
     });
   } catch (err) {
@@ -142,7 +181,7 @@ export async function cancelSubscriptionAction(slug: string, organizationId: str
     }
     throw err;
   }
-  redirect(`/${slug}?e=canceled`);
+  redirect(`/${slug}?e=canceled&sub=${encodeURIComponent(subscriptionId)}`);
 }
 
 export async function checkoutAction(
@@ -188,7 +227,7 @@ export async function checkoutAction(
     url = result.url;
   } catch (err) {
     if (err instanceof RekeyError) {
-      redirect(`/${slug}?error=${encodeURIComponent(err.code)}`);
+      redirect(`/${slug}?error=${encodeURIComponent(checkoutRefusalCode(err.code, rawProvider !== ''))}`);
     }
     throw err;
   }

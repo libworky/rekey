@@ -13,11 +13,16 @@
  */
 
 import { prisma } from '../../lib/prisma.js';
-import { cachedDashboard, forgetDashboard } from '../../lib/dashboard-cache.js';
+import { forgetDashboard } from '../../lib/dashboard-cache.js';
+import { cachedSwr } from '../../lib/swr-cache.js';
+import { dashboardBusy, dashboardSlots } from '../../lib/compute-semaphore.js';
+import { withReadOnlyBudget } from '../../lib/read-budget.js';
 import { RekeyError } from '../../lib/error.js';
+import { resolveAppUrl } from '../../lib/app-url.js';
 import { emailService, lockEmailCoupling } from '../email/email.service.js';
 import { organizationRolesService } from '../organization-roles/organization-roles.service.js';
 import { generatePublicKey } from '../../lib/keys.js';
+import { assertNominatableFreePlan } from '../billing/free-plan.js';
 import { assertProductionAppQuota } from '../../lib/tenant-limits.js';
 import {
   AuthConfigSchema,
@@ -25,8 +30,10 @@ import {
   type AuthConfig,
   type BillingConfig,
   type BillingProvider,
+  type SignupRestrictions,
 } from '@rekey.dev/shared-types';
 import { Prisma, type AppEnvironment, type Application } from '@prisma/client';
+import { activityStatsSql, parseActivityStats, type ApplicationActivity } from '../end-users/activity-stats.js';
 
 export interface CreateApplicationInput {
   tenantId: string;
@@ -83,6 +90,7 @@ const DEFAULT_AUTH_CONFIG: AuthConfig = {
   // they click it is a separate, opt-in decision.
   sendVerificationEmailOnSignUp: true,
   requireEmailVerification: false,
+  welcomeEmail: 'on_signup',
   // MCP server + OAuth AS off by default, operators opt in per app.
   mcpEnabled: false,
   // OpenID Provider off by default. Turning an Application into an IdP puts a
@@ -388,6 +396,11 @@ export const applicationsService = {
       organizationsEnabled?: boolean | undefined;
       signupEnabled?: boolean | undefined;
       signupMode?: 'public' | 'secret_only' | 'invite_only' | undefined;
+      /**
+       * Email domain rules for self sign-up. Replaces the stored rules as a
+       * whole; `null` removes them.
+       */
+      signupRestrictions?: SignupRestrictions | null | undefined;
       mfa?: 'off' | 'optional' | 'required' | undefined;
       mcpEnabled?: boolean | undefined;
       /**
@@ -404,6 +417,8 @@ export const applicationsService = {
        * never confirmed their address is locked out until they do.
        */
       requireEmailVerification?: boolean | undefined;
+      /** When a new account gets the welcome mail. See `AuthConfigSchema.welcomeEmail`. */
+      welcomeEmail?: 'on_signup' | 'on_verified' | 'off' | undefined;
       /**
        * Access-token signature alg. `RS256` makes NEW access tokens
        * offline-verifiable against /.well-known/jwks.json; outstanding HS256
@@ -492,10 +507,15 @@ export const applicationsService = {
       const clearHostedAuthorize =
         cleaned.hostedAuthorizeUrl === null || cleaned.hostedAuthorizeUrl === '';
       if (clearHostedAuthorize) delete cleaned.hostedAuthorizeUrl;
+      const clearSignupRestrictions = cleaned.signupRestrictions === null;
       const merged: Record<string, unknown> = { ...current, ...cleaned };
+      if (clearSignupRestrictions) delete merged.signupRestrictions;
       if (clearAppUrl) delete merged.appUrl;
       if (clearHostedAuthorize) delete merged.hostedAuthorizeUrl;
       const next = AuthConfigSchema.parse(merged);
+      if (strandsNewSignUps(next) && !strandsNewSignUps(current)) {
+        throw verificationLinkUnavailable();
+      }
       return tx.application.update({
         where: { id: args.applicationId },
         data: { authConfig: next as object },
@@ -506,7 +526,8 @@ export const applicationsService = {
   /**
    * Patch the application's billingConfig, currently the `enabled` master
    * switch. Off (default for new apps) gates the public billing API + hides the
-   * Billing group in the panel.
+   * Billing group in the panel. A `defaultPlanSlug` must name an active plan
+   * that costs nothing (DEFAULT_PLAN_NOT_FOUND, BILLING_FREE_PLAN_NOT_FREE).
    */
   async updateBillingConfig(args: {
     applicationId: string;
@@ -519,6 +540,9 @@ export const applicationsService = {
     };
   }): Promise<Application> {
     const app = await this.get(args.applicationId);
+    if (typeof args.patch.defaultPlanSlug === 'string') {
+      await assertNominatableFreePlan(args.applicationId, args.patch.defaultPlanSlug);
+    }
     const current = BillingConfigSchema.parse(app.billingConfig);
     const cleaned = Object.fromEntries(
       Object.entries(args.patch).filter(([, v]) => v !== undefined),
@@ -847,20 +871,41 @@ export const applicationsService = {
    * instead of one query per number, which was 13 statements holding up to
    * 13 pool connections at once for a single page tile.
    *
-   * Cached in Redis for 60s under `rk:stats:app:<id>` (lib/dashboard-cache.ts).
-   * The counts may lag by that much; `billing.enabled` is the one value an
-   * operator edits directly, so `updateBillingConfig` drops the key.
+   * Cached under `rk:stats:app:<id>` (lib/swr-cache.ts): fresh for 60s, then
+   * served stale for up to 15 minutes while one caller refreshes it. Computed
+   * in a read-only transaction with a statement timeout, inside the shared
+   * dashboard slots, so a cold burst cannot take the pool. `billing.enabled`
+   * is the one value an operator edits directly, so `updateBillingConfig`
+   * bumps the key's version.
    */
   async stats(applicationId: string): Promise<ApplicationStats> {
-    return cachedDashboard(statsCacheKey(applicationId), 60, () => computeStats(applicationId));
+    const result = await cachedSwr(statsCacheKey(applicationId), STATS_CACHE, () =>
+      dashboardSlots.run(() =>
+        withReadOnlyBudget((tx) => computeStats(tx, applicationId), { onTimeout: statsTimeout }),
+      ),
+    );
+    if (result.status === 'pending') throw dashboardBusy();
+    return result.value;
   },
 };
+
+const STATS_CACHE = { freshSeconds: 60, staleSeconds: 15 * 60 };
+
+function statsTimeout(): RekeyError {
+  return new RekeyError({
+    statusCode: 503,
+    code: 'ANALYTICS_TIMEOUT',
+    message: 'The Overview counts for this Application took longer than the query budget allows.',
+    fix: 'Retry in a minute. If it keeps happening, report it with the Application id: its tables have outgrown the Overview query.',
+    retryAfterSeconds: 60,
+  });
+}
 
 export function statsCacheKey(applicationId: string): string {
   return `rk:stats:app:${applicationId}`;
 }
 
-async function computeStats(applicationId: string): Promise<ApplicationStats> {
+async function computeStats(db: Prisma.TransactionClient, applicationId: string): Promise<ApplicationStats> {
   const now = Date.now();
   const since7d = new Date(now - 7 * 24 * 60 * 60 * 1000);
   const since30d = new Date(now - 30 * 24 * 60 * 60 * 1000);
@@ -868,8 +913,11 @@ async function computeStats(applicationId: string): Promise<ApplicationStats> {
   const TREND_DAYS = 30;
   const trendStart = new Date(now - (TREND_DAYS - 1) * 24 * 60 * 60 * 1000);
   trendStart.setUTCHours(0, 0, 0, 0);
+  // Once the rollup holds all 30 days, usage is summed from it instead of
+  // from usage_records, whose size grows with traffic.
+  const rollupStart = trendStart.toISOString().slice(0, 10);
 
-  const [row] = await prisma.$queryRaw<
+  const [row] = await db.$queryRaw<
     Array<{
       billing_config: unknown;
       users_total: bigint;
@@ -885,6 +933,7 @@ async function computeStats(applicationId: string): Promise<ApplicationStats> {
       credits_outstanding: bigint | null;
       usage_30d: bigint | null;
       trend: Array<{ day: string; count: number }> | null;
+      activity: unknown;
     }>
   >(Prisma.sql`
     SELECT
@@ -897,9 +946,13 @@ async function computeStats(applicationId: string): Promise<ApplicationStats> {
       pl.active AS plans_active, pl.total AS plans_total,
       (SELECT sum("balance") FROM "credit_balances"
         WHERE "application_id" = ${applicationId}) AS credits_outstanding,
-      (SELECT sum(ur."quantity") FROM "usage_records" ur
-        JOIN "usage_meters" um ON um."id" = ur."meter_id"
-        WHERE um."application_id" = ${applicationId} AND ur."occurred_at" >= ${since30d}) AS usage_30d,
+      CASE WHEN (SELECT count(*) FROM "application_activity_days" d
+                  WHERE d."application_id" = ${applicationId} AND d."day" >= ${rollupStart}::date) >= ${TREND_DAYS}
+           THEN (SELECT sum(u.value::bigint) FROM "application_activity_days" d, jsonb_each_text(d."usage_by_meter") u
+                  WHERE d."application_id" = ${applicationId} AND d."day" >= ${rollupStart}::date)
+           ELSE (SELECT sum(ur."quantity") FROM "usage_records" ur
+                   JOIN "usage_meters" um ON um."id" = ur."meter_id"
+                  WHERE um."application_id" = ${applicationId} AND ur."occurred_at" >= ${since30d}) END AS usage_30d,
       (SELECT json_agg(json_build_object('day', t.day, 'count', t.count) ORDER BY t.day)
         FROM (
           SELECT to_char(date_trunc('day', "created_at"), 'YYYY-MM-DD') AS day,
@@ -907,7 +960,8 @@ async function computeStats(applicationId: string): Promise<ApplicationStats> {
           FROM "end_users"
           WHERE "application_id" = ${applicationId} AND "created_at" >= ${trendStart}
           GROUP BY 1
-        ) t) AS trend
+        ) t) AS trend,
+      ${activityStatsSql(applicationId)} AS activity
     FROM
       (SELECT count(*) AS total,
               count(*) FILTER (WHERE "email_verified") AS verified,
@@ -959,6 +1013,7 @@ async function computeStats(applicationId: string): Promise<ApplicationStats> {
       creditsOutstanding: Number(row.credits_outstanding ?? 0),
       usageLast30d: Number(row.usage_30d ?? 0),
     },
+    ...parseActivityStats(row.activity),
   };
 }
 
@@ -986,4 +1041,41 @@ export interface ApplicationStats {
     creditsOutstanding: number;
     usageLast30d: number;
   };
+  activeUsers: ApplicationActivity['activeUsers'];
+  activitySeries: ApplicationActivity['activitySeries'];
+}
+
+/**
+ * True when the config requires a verified email but no verification link can
+ * be built. Sign-up then sends nothing and the gate refuses every new user, so
+ * the account is unreachable (#357). A caller-supplied `verifyUrl` cannot save
+ * it either: `assertAllowedTokenUrl` needs the same appUrl or redirect URLs
+ * that make a link resolvable here. Its other allowance, the app's own hosted
+ * portal, has no verification page.
+ */
+function strandsNewSignUps(config: AuthConfig): boolean {
+  return (
+    config.requireEmailVerification &&
+    resolveAppUrl({ authConfig: config as Prisma.JsonObject }) === null
+  );
+}
+
+/**
+ * Refuses a change that turns on `requireEmailVerification` (or removes the
+ * last URL under it) while no verification link resolves. Only the transition
+ * is refused, so an Application already in that state can still be edited
+ * and repaired.
+ */
+function verificationLinkUnavailable(): RekeyError {
+  return new RekeyError({
+    statusCode: 409,
+    code: 'EMAIL_VERIFICATION_URL_REQUIRED',
+    message:
+      'A verified email cannot be required yet: this Application has no Application URL or http(s) ' +
+      'redirect URL, so no verification link can be built and new users could never confirm their address.',
+    fix:
+      'Set the Application URL or add an http(s) redirect URL (Panel → Application → Authentication → Methods, ' +
+      'or `appUrl` / `redirectUrls` in the same auth-config update), then require a verified email. ' +
+      'Setting DEFAULT_APP_URL on the API also works, for every Application on this deployment.',
+  });
 }

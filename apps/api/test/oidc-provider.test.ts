@@ -17,6 +17,9 @@ import jwt from 'jsonwebtoken';
 import type { FastifyInstance } from 'fastify';
 import { buildApp } from '../src/app.js';
 
+// Requiring a verified email needs a URL the verification link can be built on.
+const VERIFY_BASE = 'https://app.example.com';
+
 function pkce(): { verifier: string; challenge: string } {
   const verifier = randomBytes(32).toString('base64url');
   return { verifier, challenge: createHash('sha256').update(verifier).digest('base64url') };
@@ -103,7 +106,7 @@ describe('OIDC provider', () => {
       method: 'PATCH',
       url: `/api/v1/tenant/applications/${appId}/auth-config`,
       headers: { authorization: `Bearer ${operatorToken}` },
-      payload: { oidcEnabled: true, requireEmailVerification: true, ...toggles },
+      payload: { oidcEnabled: true, requireEmailVerification: true, appUrl: VERIFY_BASE, ...toggles },
     });
     expect(patched.statusCode).toBe(200);
     const liveKey = await app
@@ -285,7 +288,10 @@ describe('OIDC provider', () => {
       url: `/api/v1/mcp/${fx.slug}/oauth/authorize?response_type=code&client_id=${fx.clientId}&redirect_uri=${encodeURIComponent(REDIRECT)}&code_challenge=${pkce().challenge}&code_challenge_method=S256&scope=openid`,
     });
     expect(authorize.statusCode).toBe(200);
-    expect(authorize.body).toContain('Confirm who you are');
+    expect(authorize.body).toContain('Know which account is yours');
+    // The client names itself, so the screen names where the answer goes.
+    expect(authorize.body).toContain(`<p class="dest">${new URL(REDIRECT).host}</p>`);
+    expect(authorize.body).toContain('Deny sends you back to');
     // …but the MCP resource server itself stays 404, because mcpEnabled is off.
     const mcp = await app.inject({ method: 'POST', url: `/api/v1/mcp/${fx.slug}` });
     expect(mcp.statusCode).toBe(404);

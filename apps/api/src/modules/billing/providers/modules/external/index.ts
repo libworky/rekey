@@ -252,7 +252,7 @@ async function verify(
       statusCode: 503,
       code: 'BILLING_CREDENTIALS_NOT_CONFIGURED',
       message: 'This Application has no signing secret for the external billing provider.',
-      fix: 'Save a signing secret on the Billing tab, then resend.',
+      fix: 'Save a signing secret in Panel → Application → Billing → Setup → Providers → External billing system, then resend.',
     };
   }
   const expected = createHmac('sha256', creds.webhookSecret)
@@ -315,6 +315,7 @@ function translate(payload: unknown, ctx: TranslateCtx): DomainBillingEvent[] | 
             currentPeriodEnd: d.subscription.currentPeriodEnd,
           }),
           ...(d.subscription.trialEndsAt !== undefined && { trialEndsAt: d.subscription.trialEndsAt }),
+          ...(env.occurredAt !== undefined && { occurredAt: env.occurredAt }),
           raw,
         },
       ];
@@ -341,7 +342,8 @@ function translate(payload: unknown, ctx: TranslateCtx): DomainBillingEvent[] | 
           },
         ];
       }
-      const at = effectiveAt ?? env.occurredAt ?? now;
+      const senderAt = effectiveAt ?? env.occurredAt;
+      const at = senderAt ?? now;
       return [
         {
           type: 'subscription.canceled',
@@ -351,6 +353,7 @@ function translate(payload: unknown, ctx: TranslateCtx): DomainBillingEvent[] | 
           status: 'CANCELED',
           cancelAt: at,
           canceledAt: at,
+          canceledAtFromSender: senderAt !== undefined,
           raw,
         },
       ];

@@ -16,13 +16,13 @@
  *     end-user surface 1:1; the only change is which JWT shape we issue.
  */
 
-import type { Tenant, TenantRole, TenantUser } from '@prisma/client';
+import type { Tenant, TenantRefreshToken, TenantRole, TenantUser } from '@prisma/client';
 import { expandScopes, type Scope } from '../../lib/operator-scopes.js';
 import { invalidateOperatorAuth } from '../../lib/operator-auth-cache.js';
 import { prisma } from '../../lib/prisma.js';
 import { RekeyError } from '../../lib/error.js';
 import { hashPassword, verifyPassword, verifyPasswordOrDecoy } from '../../lib/passwords.js';
-import { resolveNewTenantLimits } from '../../lib/tenant-limits.js';
+import { joinOrCreateWorkspace } from './workspace-join.js';
 import {
   assertNotLocked,
   registerFailure,
@@ -36,6 +36,12 @@ import {
   verifyTenantMfaChallengeToken,
 } from '../../lib/tenant-jwt.js';
 import { tenantMfaService } from '../tenant-mfa/tenant-mfa.service.js';
+import {
+  claimMfaChallenge,
+  isMfaChallengeSpent,
+  mfaChallengeUsedError,
+  mfaCodeReusedError,
+} from '../../lib/mfa-replay.js';
 import {
   issueTenantRefreshToken,
   lookupTenantRefreshToken,
@@ -61,6 +67,7 @@ import { emailService } from '../email/email.service.js';
 import { recordAuthEmailDeliveryFailure } from '../../lib/email-transport.js';
 import { checkPasswordBreached } from '../../lib/breached-password.js';
 import { env } from '../../config/env.js';
+import { judgeReplay, REFRESH_REUSE_WINDOW_MS } from '../../lib/refresh-reuse-window.js';
 
 /**
  * Whether to echo raw reset / magic-link tokens back in API responses.
@@ -79,7 +86,11 @@ function echoAuthTokensInDev(): boolean {
   if (env.NODE_ENV === 'test') return true;
   return env.NODE_ENV === 'development' && process.env.REKEY_DEV_ECHO_AUTH_TOKENS === 'true';
 }
-import { resolveSignupInvite, consumeSignupInvite } from './operator-signup-policy.js';
+import {
+  assertBoundEmail,
+  consumeSignupInvite,
+  resolveSignupInvite,
+} from './operator-signup-policy.js';
 import { recordSecurityEvent } from '../../lib/security-events.js';
 
 const PASSWORD_MIN_LENGTH = 8;
@@ -263,6 +274,7 @@ async function issueSession(
   const refresh = await issueTenantRefreshToken(user.id, {
     userAgent: device?.userAgent ?? null,
     ip: device?.ip ?? null,
+    activeTenantId,
   });
   const access = issueTenantAccessToken(user.id, activeTenantId, activeRole, {
     sessionId: refresh.record.sessionId,
@@ -277,6 +289,110 @@ async function issueSession(
     refreshToken: refresh.raw,
     refreshTokenExpiresAt: refresh.record.expiresAt,
   };
+}
+
+/**
+ * Answer a replay of a ROTATED operator refresh token. Always throws. The
+ * operator twin of `refuseRotatedReplay` in auth.service.ts, same rule (see
+ * lib/refresh-reuse-window.ts): inside the reuse window, while the successor
+ * is unused, `REFRESH_TOKEN_RACED` and nothing revoked; otherwise every
+ * session the operator has is revoked. Operator chains carry no device
+ * binding, so timing and the successor's state are the whole test.
+ *
+ * The event names the workspace the session was in (`replayEventTenant`), so
+ * it lands in a feed an owner of THAT workspace can read; an operator with no
+ * membership left gets a row with no workspace, which the super-admin log
+ * still holds.
+ */
+/**
+ * The workspace a replay's security event is filed under: the one the session
+ * was active in (`activeTenantId` on the refresh row, the same choice the
+ * refresh itself makes), while the operator is still a member there. Else the
+ * oldest membership, as before, which covers a row from before the column
+ * existed and an operator since removed from that workspace.
+ *
+ * The event carries the replaying request's IP and user agent, and every owner
+ * of the workspace it names can read it. Filing it under the OLDEST
+ * membership showed an operator's session activity in some other workspace to
+ * that workspace's owner, who has nothing to do with the session.
+ */
+async function replayEventTenant(presented: TenantRefreshToken): Promise<string | null> {
+  if (presented.activeTenantId) {
+    const active = await prisma.tenantMembership.findFirst({
+      where: { tenantUserId: presented.tenantUserId, tenantId: presented.activeTenantId },
+      select: { tenantId: true },
+    });
+    if (active) return active.tenantId;
+  }
+  const home = await prisma.tenantMembership.findFirst({
+    where: { tenantUserId: presented.tenantUserId },
+    orderBy: { createdAt: 'asc' },
+    select: { tenantId: true },
+  });
+  return home?.tenantId ?? null;
+}
+
+async function refuseRotatedTenantReplay(
+  presented: TenantRefreshToken,
+  device: TenantDeviceContext | undefined,
+  via: 'lookup' | 'rotation_race',
+): Promise<never> {
+  const successor = presented.replacedById
+    ? await prisma.tenantRefreshToken.findUnique({ where: { id: presented.replacedById } })
+    : null;
+  const verdict = judgeReplay(presented, successor, new Date());
+  const trail = {
+    actorType: 'operator' as const,
+    actorId: presented.tenantUserId,
+    tenantId: await replayEventTenant(presented),
+    ip: device?.ip ?? null,
+    userAgent: device?.userAgent ? device.userAgent.slice(0, 512) : null,
+  };
+  if (verdict.kind === 'raced') {
+    await recordSecurityEvent({
+      ...trail,
+      type: 'operator.refresh_token_raced',
+      metadata: {
+        sessionId: presented.sessionId,
+        presentedTokenId: presented.id,
+        successorTokenId: presented.replacedById,
+        msSinceRotation: verdict.msSinceRotation,
+        windowSeconds: REFRESH_REUSE_WINDOW_MS / 1000,
+        via,
+      },
+    });
+    throw new RekeyError({
+      statusCode: 401,
+      code: 'REFRESH_TOKEN_RACED',
+      message:
+        'This refresh token was rotated moments ago by another request. No session was revoked.',
+      fix: 'Do not retry with this token. Use the refresh token the other request received (re-read the cookie); if this client never got it, sign in again. Replaying this token later revokes every session.',
+    });
+  }
+  const revokedCount = await revokeAllTenantRefreshTokensForUser(presented.tenantUserId);
+  await recordSecurityEvent({
+    ...trail,
+    type: 'operator.refresh_token_reused',
+    metadata: {
+      sessionId: presented.sessionId,
+      presentedTokenId: presented.id,
+      reason: verdict.reason,
+      revokedCount,
+      via,
+    },
+  });
+  throw new RekeyError({
+    statusCode: 401,
+    code: 'REFRESH_TOKEN_REUSED',
+    message:
+      via === 'lookup'
+        ? 'Refresh token has already been used. All sessions for this operator have been revoked as a precaution.'
+        : 'Refresh token rotation lost a race with another request. All sessions revoked as a precaution.',
+    fix:
+      via === 'lookup'
+        ? 'A used refresh token cannot be replayed. Sign in again to obtain a fresh session.'
+        : 'Sign in again to obtain a fresh session.',
+  });
 }
 
 export const tenantAuthService = {
@@ -298,6 +414,8 @@ export const tenantAuthService = {
   /**
    * Self-serve sign-up. Atomically creates a TenantUser + a Tenant + an
    * OWNER Membership, then issues a session scoped to the new workspace.
+   * With a workspace-bound invite key it joins that workspace at the key's
+   * role instead, and `workspaceName` is not used.
    *
    * If the email already exists, returns EMAIL_ALREADY_EXISTS, sign-in
    * is the right action there.
@@ -306,7 +424,8 @@ export const tenantAuthService = {
     email: string;
     password: string;
     name?: string | undefined;
-    workspaceName: string;
+    /** Required unless `inviteKey` is bound to a workspace. */
+    workspaceName?: string | undefined;
     /** Single-use invite key, required when OPERATOR_SIGNUP_MODE='invite'. */
     inviteKey?: string | undefined;
     device?: TenantDeviceContext;
@@ -316,6 +435,16 @@ export const tenantAuthService = {
     // the key is consumed atomically inside the creation transaction below, so
     // a later failure (e.g. duplicate email) does not burn it.
     const invite = await resolveSignupInvite(input.inviteKey);
+    if (invite?.workspace) assertBoundEmail(invite.workspace, input.email);
+    const workspaceName = input.workspaceName?.trim();
+    if (!invite?.workspace && !workspaceName) {
+      throw new RekeyError({
+        statusCode: 400,
+        code: 'WORKSPACE_NAME_REQUIRED',
+        message: 'Sign-up creates a workspace, and no `workspaceName` was given.',
+        fix: 'Pass `workspaceName` (1 to 120 characters). It is only optional with an invite key bound to an existing workspace.',
+      });
+    }
     const existing = await prisma.tenantUser.findUnique({
       where: { email: input.email.toLowerCase() },
     });
@@ -330,16 +459,6 @@ export const tenantAuthService = {
 
     const passwordHash = await hashPassword(input.password);
     const result = await prisma.$transaction(async (tx) => {
-      const tenant = await tx.tenant.create({
-        // `resolveNewTenantLimits()` stamps the deployment's
-        // DEFAULT_TENANT_LIMITS on the workspace. Unset = no `limits` key at
-        // all = unlimited, i.e. what self-serve sign-up has always produced.
-        data: {
-          name: input.workspaceName,
-          ownerEmail: input.email.toLowerCase(),
-          ...resolveNewTenantLimits(),
-        },
-      });
       const user = await tx.tenantUser.create({
         data: {
           email: input.email.toLowerCase(),
@@ -347,11 +466,15 @@ export const tenantAuthService = {
           ...(input.name !== undefined && { name: input.name }),
         },
       });
-      await tx.tenantMembership.create({
-        data: { tenantUserId: user.id, tenantId: tenant.id, role: 'OWNER' },
+      const joined = await joinOrCreateWorkspace(tx, {
+        userId: user.id,
+        email: user.email,
+        invite,
+        // Checked above: only a bound invite gets here without a name.
+        workspaceName: workspaceName ?? '',
       });
       if (invite) await consumeSignupInvite(tx, invite, user.id);
-      return { tenant, user };
+      return { ...joined, user };
     });
 
     // Audit the invite→operator linkage (the most useful operator-creation
@@ -361,15 +484,19 @@ export const tenantAuthService = {
         type: 'operator.invite_redeemed',
         actorType: 'operator',
         actorId: result.user.id,
-        tenantId: result.tenant.id,
+        tenantId: result.tenantId,
         ip: input.device?.ip ?? null,
         userAgent: input.device?.userAgent ?? null,
-        metadata: { inviteId: invite.inviteId, via: 'password' },
+        metadata: {
+          inviteId: invite.inviteId,
+          via: 'password',
+          ...(invite.workspace && { joinedAs: invite.workspace.role }),
+        },
       });
     }
 
     const memberships = await loadMemberships(result.user.id);
-    return issueSession(result.user, result.tenant.id, 'OWNER', memberships, input.device);
+    return issueSession(result.user, result.tenantId, result.role, memberships, input.device);
   },
 
   /**
@@ -407,16 +534,8 @@ export const tenantAuthService = {
     }
     // This branch creates a brand-new operator → enforce OPERATOR_SIGNUP_MODE.
     const invite = await resolveSignupInvite(input.inviteKey);
+    if (invite?.workspace) assertBoundEmail(invite.workspace, email);
     const created = await prisma.$transaction(async (tx) => {
-      const tenant = await tx.tenant.create({
-        // Same deployment default as the password path, an operator must not
-        // land in a wider workspace by choosing the OAuth button.
-        data: {
-          name: deriveWorkspaceName(input.name, email),
-          ownerEmail: email,
-          ...resolveNewTenantLimits(),
-        },
-      });
       const user = await tx.tenantUser.create({
         data: {
           email,
@@ -424,11 +543,14 @@ export const tenantAuthService = {
           ...(input.name !== undefined && { name: input.name }),
         },
       });
-      await tx.tenantMembership.create({
-        data: { tenantUserId: user.id, tenantId: tenant.id, role: 'OWNER' },
+      const { tenantId } = await joinOrCreateWorkspace(tx, {
+        userId: user.id,
+        email,
+        invite,
+        workspaceName: deriveWorkspaceName(input.name, email),
       });
       if (invite) await consumeSignupInvite(tx, invite, user.id);
-      return { user, tenantId: tenant.id };
+      return { user, tenantId };
     });
     if (invite) {
       void recordSecurityEvent({
@@ -438,7 +560,11 @@ export const tenantAuthService = {
         tenantId: created.tenantId,
         ip: input.device?.ip ?? null,
         userAgent: input.device?.userAgent ?? null,
-        metadata: { inviteId: invite.inviteId, via: 'oauth' },
+        metadata: {
+          inviteId: invite.inviteId,
+          via: 'oauth',
+          ...(invite.workspace && { joinedAs: invite.workspace.role }),
+        },
       });
     }
     return created.user;
@@ -721,15 +847,21 @@ export const tenantAuthService = {
         fix: 'Sign in again to obtain a fresh challenge token (they expire after 5 minutes).',
       });
     }
-    const ok = await tenantMfaService.verify({ tenantUserId: claims.sub, code: input.code });
-    if (!ok) {
-      throw new RekeyError({
-        statusCode: 401,
-        code: 'MFA_CODE_INVALID',
-        message: 'TOTP or backup code did not verify.',
-        fix: 'Enter the current 6-digit code from your authenticator, or a backup code.',
-      });
-    }
+    if (await isMfaChallengeSpent(input.mfaChallengeToken)) throw mfaChallengeUsedError();
+    const codeRefused = (outcome: 'invalid' | 'reused'): RekeyError =>
+      outcome === 'reused'
+        ? mfaCodeReusedError('sign-in')
+        : new RekeyError({
+            statusCode: 401,
+            code: 'MFA_CODE_INVALID',
+            message: 'TOTP or backup code did not verify.',
+            fix: 'Enter the current 6-digit code from your authenticator, or a backup code.',
+          });
+    // Same two phases as the end-user flow: match without spending, refuse
+    // on membership only after the second factor is proven and still without
+    // spending, then spend the code and claim the challenge.
+    const match = await tenantMfaService.match({ tenantUserId: claims.sub, code: input.code });
+    if (match.outcome !== 'matched') throw codeRefused(match.outcome);
     const user = await prisma.tenantUser.findUniqueOrThrow({ where: { id: claims.sub } });
     const memberships = await loadMemberships(user.id);
     if (memberships.length === 0) {
@@ -740,11 +872,14 @@ export const tenantAuthService = {
         fix: 'Ask an existing workspace owner for a fresh invitation.',
       });
     }
+    const spent = await match.spend();
+    if (spent !== 'accepted') throw codeRefused(spent);
+    if (!(await claimMfaChallenge(input.mfaChallengeToken, claims.exp))) throw mfaChallengeUsedError();
     const active = memberships[0]!;
     return issueSession(user, active.tenantId, active.role, memberships, input.device);
   },
 
-  async refresh(presentedRaw: string): Promise<AuthSessionResult> {
+  async refresh(presentedRaw: string, device?: TenantDeviceContext): Promise<AuthSessionResult> {
     const outcome = await lookupTenantRefreshToken(presentedRaw);
     if (outcome.kind === 'unknown') {
       throw new RekeyError({
@@ -771,15 +906,13 @@ export const tenantAuthService = {
       // replayed its token, was read as chain compromise, and signed the
       // operator out of the session they had deliberately KEPT. A revocation
       // the operator performed themselves is not evidence of an attacker.
+      //
+      // Except a rotated token presented again within moments of its
+      // rotation, while its successor is unused: that is the panel racing
+      // itself (two tabs, two instances, a retry after a lost response), and
+      // it is refused without revoking anything. See `refuseRotatedTenantReplay`.
       if (outcome.token.replacedById !== null) {
-        await revokeAllTenantRefreshTokensForUser(outcome.token.tenantUserId);
-        throw new RekeyError({
-          statusCode: 401,
-          code: 'REFRESH_TOKEN_REUSED',
-          message:
-            'Refresh token has already been used. All sessions for this operator have been revoked as a precaution.',
-          fix: 'A used refresh token cannot be replayed. Sign in again to obtain a fresh session.',
-        });
+        await refuseRotatedTenantReplay(outcome.token, device, 'lookup');
       }
       throw new RekeyError({
         statusCode: 401,
@@ -796,22 +929,11 @@ export const tenantAuthService = {
         fix: 'Sign in again.',
       });
     }
-    let replacement;
-    try {
-      replacement = await rotateTenantRefreshToken(outcome.token);
-    } catch (e) {
-      if ((e as Error).message === 'TENANT_REFRESH_RACE') {
-        await revokeAllTenantRefreshTokensForUser(outcome.token.tenantUserId);
-        throw new RekeyError({
-          statusCode: 401,
-          code: 'REFRESH_TOKEN_REUSED',
-          message:
-            'Refresh token rotation lost a race with another request. All sessions revoked as a precaution.',
-          fix: 'Sign in again to obtain a fresh session.',
-        });
-      }
-      throw e;
-    }
+    // Reads before the rotation. The rotation spends the presented token, so
+    // anything that can fail after it (a dropped database connection during
+    // these reads, answered 503) leaves the client holding a spent token, and
+    // the retry it is told to make is a replay. Done first, a failure here
+    // costs the client nothing and a 503 is safe to retry.
     const user = await prisma.tenantUser.findUniqueOrThrow({
       where: { id: outcome.token.tenantUserId },
     });
@@ -824,7 +946,26 @@ export const tenantAuthService = {
         fix: 'Ask a workspace owner for a fresh invitation.',
       });
     }
-    const active = memberships[0]!;
+    // Stay in the workspace the session was in (a switch persists it on the
+    // row), as long as the operator is still a member there. Removed since,
+    // or a row from before the column existed: the oldest membership, and the
+    // replacement row is written there so the next refresh does not search
+    // again. Picked before the rotation and handed to it, so nothing is
+    // written after the presented token is spent.
+    const active =
+      memberships.find((m) => m.tenantId === outcome.token.activeTenantId) ?? memberships[0]!;
+    let replacement;
+    try {
+      replacement = await rotateTenantRefreshToken(outcome.token, active.tenantId);
+    } catch (e) {
+      // Passed the lookup, lost the rotation to a concurrent request: a replay
+      // caught mid-flight, judged on the row as the winner committed it.
+      if ((e as Error).message === 'TENANT_REFRESH_RACE') {
+        const spent = await prisma.tenantRefreshToken.findUniqueOrThrow({ where: { id: outcome.token.id } });
+        await refuseRotatedTenantReplay(spent, device, 'rotation_race');
+      }
+      throw e;
+    }
     const access = issueTenantAccessToken(user.id, active.tenantId, active.role, {
       sessionId: replacement.record.sessionId,
     });

@@ -6,8 +6,11 @@
  *   - rekey_access , short-lived operator JWT (OPERATOR_ACCESS_TOKEN_TTL_SECONDS on the API)
  *   - rekey_refresh, long-lived opaque token (OPERATOR_REFRESH_TOKEN_TTL_DAYS)
  *
- * Auto-refresh on 401: when the access token expires, we exchange the
- * refresh token, rotate cookies, and retry the original request once.
+ * Auto-refresh on 401: when the access token expires, a Server Action or
+ * Route Handler exchanges the refresh token, rotates cookies, and retries the
+ * original request once. A Server Component render cannot write cookies, so it
+ * never refreshes; it redirects through `/session/refresh` (see
+ * `lib/session-refresh.ts` for why spending the token there is dangerous).
  * If even refresh fails, both cookies are cleared and the user lands on
  * /login?reason=expired. A 429 or 503 is not a failure of either kind: it
  * throws a retryable busy error instead (see `lib/api-busy.ts`).
@@ -15,12 +18,27 @@
  * Server-only module, never import from a client component.
  */
 
+import { createHash } from 'node:crypto';
 import { cache } from 'react';
 import { cookies, headers } from 'next/headers';
 import { forbidden, notFound, redirect } from 'next/navigation';
 import { cookieSecure } from './cookie-secure';
+import { parseBuildInfo, type BuildInfo } from '@/lib/build-info';
 import { CLIENT_IP_SOURCE_HEADER, clientIpFrom } from '@/lib/client-ip';
-import { busyDigest, isApiBusyStatus, parseRetryAfter } from '@/lib/api-busy';
+import { publicHttpUrl } from '@/lib/public-url';
+import { DEFAULT_RETRY_AFTER_SECONDS, busyDigest, isApiBusyStatus, parseRetryAfter } from '@/lib/api-busy';
+import { neverConnected } from '@rekey.dev/shared-types/transport';
+import {
+  RACED_COOKIE,
+  RACED_MARK_MAX_AGE_SECONDS,
+  REFRESH_RACED_CODE,
+  RETURN_TO_HEADER,
+  SESSION_INTERRUPTED_REASON,
+  isGatewayFailure,
+  racedMark,
+  refreshRouteFor,
+  wasIssuedRecently,
+} from '@/lib/session-refresh';
 
 export const ACCESS_COOKIE = 'rekey_access';
 export const REFRESH_COOKIE = 'rekey_refresh';
@@ -234,7 +252,7 @@ export function sessionCookieMaxAges(result: {
   };
 }
 
-export async function setSessionCookies(args: {
+export interface SessionTokens {
   accessToken: string;
   refreshToken: string;
   /**
@@ -245,8 +263,22 @@ export async function setSessionCookies(args: {
    */
   accessTokenExpiresAt?: string;
   refreshTokenExpiresAt?: string;
-}): Promise<void> {
-  const jar = await cookies();
+}
+
+/** Anything cookies can be set on: the `cookies()` jar, or a response's. */
+interface CookieSink {
+  set(name: string, value: string, options: { httpOnly: boolean; sameSite: 'lax'; secure: boolean; path: string; maxAge: number }): unknown;
+}
+
+export async function setSessionCookies(args: SessionTokens): Promise<void> {
+  await writeSessionCookies(await cookies(), args);
+}
+
+/**
+ * The session cookies, written to `sink`. The refresh route writes them onto
+ * its own redirect response, so the new pair travels with the redirect.
+ */
+export async function writeSessionCookies(jar: CookieSink, args: SessionTokens): Promise<void> {
   const secure = await cookieSecure();
   const { access: accessMaxAge, refresh: refreshMaxAge } = sessionCookieMaxAges(args);
   // `lax`, not `strict`: an operator can legitimately ARRIVE at the panel via a
@@ -286,91 +318,177 @@ async function clearSessionCookiesSafe(): Promise<boolean> {
   }
 }
 
-/** Same try/catch pattern for write, server components can't `set`. */
-async function setSessionCookiesSafe(args: {
-  accessToken: string;
-  refreshToken: string;
-  accessTokenExpiresAt?: string;
-  refreshTokenExpiresAt?: string;
-}): Promise<boolean> {
+/**
+ * Can this context write cookies?
+ *
+ * Next seals the cookie jar outside a Server Action or Route Handler; `set` and
+ * `delete` both throw there. The probe deletes a cookie nobody sets, which is
+ * harmless when it succeeds and tells us where we are when it does not. Same
+ * probe as `canWriteCookies` in `@rekey.dev/nextjs/server`.
+ *
+ * This has to be asked BEFORE refreshing, not after. The API rotates the
+ * refresh token on every use and reads a replay of a rotated token as theft:
+ * `REFRESH_TOKEN_REUSED`, every session the operator has, on every device,
+ * revoked. Refreshing where the new pair cannot be stored leaves the browser
+ * holding the spent token, and its next request is that replay.
+ */
+export async function canWriteCookies(jar: Awaited<ReturnType<typeof cookies>>): Promise<boolean> {
   try {
-    await setSessionCookies(args);
+    jar.delete(PROBE_COOKIE);
     return true;
   } catch {
     return false;
   }
 }
 
+/** Deleting a cookie nothing ever sets. */
+const PROBE_COOKIE = '__rekey_probe';
+
 /**
- * In-flight refresh exchanges, keyed by the refresh token being spent.
+ * Refresh exchanges IN FLIGHT, keyed by a SHA-256 digest of the refresh token
+ * being spent (never the token itself).
  *
  * Refresh tokens rotate and are single-use: the first exchange invalidates the
- * presented token, so a second concurrent exchange of the SAME token gets a
- * 401. That is correct server behaviour, reuse detection is a security
- * feature, but every RSC on a page calls `api()` independently, so a
- * navigation after the access token expires fires several 401s at
- * once and each one tried to refresh. One won; the rest were told their token
- * was already spent and bounced the operator to `/login?reason=expired`,
- * discarding whatever they had typed.
+ * presented token, so a second concurrent exchange of the SAME token is
+ * refused. Every RSC on a page calls `api()` independently, so a navigation
+ * after the access token expires fires several 401s at once and each one tried
+ * to refresh. One won; the rest were told their token was already spent and
+ * bounced the operator to `/login?reason=expired`, discarding whatever they
+ * had typed. Observed live: 5 of 8 refreshes in a 40-minute session returned
+ * 401, with pairs landing in the same millisecond. Concurrent callers now wait
+ * on the one exchange.
  *
- * Observed live: 5 of 8 refreshes in a 40-minute session returned 401, with
- * pairs landing in the same millisecond, throwing the operator out roughly
- * every quarter of an hour.
+ * An entry is deleted the moment its exchange settles. A request that arrives
+ * after that (a second tab, a prefetch sent before the new cookie landed) goes
+ * to the API with the token it holds, and the API decides: a token it rotated
+ * moments ago is `REFRESH_TOKEN_RACED`, refused with nothing revoked, and the
+ * raced handling retries with whatever the browser holds by then. This map
+ * used to keep a settled pair for ten seconds and hand it to any later request
+ * presenting the spent cookie, which re-issued a live session to a copy of
+ * that cookie without the API ever seeing the request.
  *
- * Keying on the token rather than using a bare module-level promise matters:
- * two different tokens (different operators, or a stale tab) must not share an
- * exchange. The entry is deleted in a `finally` so a later expiry refreshes
- * again rather than replaying a resolved promise.
+ * Keyed per token rather than a bare module-level promise: two different
+ * tokens (different operators, or a stale tab) must not share an exchange.
  */
-const inFlightRefreshes = new Map<string, Promise<RefreshOutcome>>();
+const refreshExchanges = new Map<string, Promise<RefreshOutcome>>();
 
 /**
  * What a refresh attempt came to.
  *
- *   - `ok`: new access token, cookies rotated.
- *   - `failed`: the session is over (refresh refused, no refresh cookie, or the
- *     new cookies could not be written from this context). The caller signs the
- *     operator out.
- *   - `busy`: the API said 429, and ONLY 429. The refresh route's limiter sets
- *     no hook, so it answers at `onRequest`, before the refresh handler runs
- *     and before the body is even parsed: a 429 never rotated anything, so the
- *     refresh token is unspent and the session is intact.
- *     Signing out here turned "the API is briefly overloaded" into "every
- *     operator on this deployment is logged out".
+ *   - `ok`: the API rotated the pair. The caller must persist `tokens`.
+ *   - `failed`: the session is over (refresh refused, or no refresh cookie).
+ *     The caller signs the operator out. `interrupted` is set when the token
+ *     may have been spent rather than refused (see below), so sign-in can say
+ *     the session was interrupted instead of expired.
+ *   - `busy`: the token is unspent and the session intact, so nothing is
+ *     cleared. Three cases:
+ *       - the API said 429. The refresh route's limiter sets no hook, so it
+ *         answers at `onRequest`, before the refresh handler runs and before
+ *         the body is even parsed. Signing out here turned "the API is
+ *         briefly overloaded" into "every operator on this deployment is
+ *         logged out";
+ *       - a 502, 503 or 504 with no Rekey error envelope: a proxy answering
+ *         for an API that is not listening, which is every API redeploy. The
+ *         request never reached the API.
+ *       - a connection that was never made: refused, a failed DNS lookup,
+ *         or a connect timeout. Self-hosted, the panel talks to the API
+ *         container directly, so this is what every redeploy looks like.
  *
- * Everything else that is not a success stays `failed`, a 503 included, on
- * purpose. The API's `refresh()` commits the rotation FIRST and only then reads
- * the user and memberships; if Postgres drops during those reads, the error
- * handler answers 503 with a Retry-After while the presented token is already
- * spent. Retrying it would present a spent token, the API would answer
- * `REFRESH_TOKEN_REUSED`, and reuse detection revokes every session the
- * operator has on every device. Signing out of this one session is the lesser
- * harm. A timeout or network error is `failed` for the same reason: the API may
- * have rotated before we stopped listening. (Moving those reads before the
- * rotation in the API would make a 503 safe to retry; that is an API change.)
+ * Everything else that is not a success stays `failed`, a 503 the API itself
+ * answered included, on purpose. The API's `refresh()` commits the rotation
+ * FIRST and only then reads the user and memberships; if Postgres drops during
+ * those reads, the error handler answers 503 with a Retry-After while the
+ * presented token is already spent. Retrying it would present a spent token,
+ * the API would answer `REFRESH_TOKEN_REUSED`, and reuse detection revokes
+ * every session the operator has on every device. Signing out of this one
+ * session is the lesser harm. A timeout or network error is `failed` for the
+ * same reason: the API may have rotated before we stopped listening. Those
+ * are the `interrupted` ones.
+ *
+ *   - `raced`: the API said `REFRESH_TOKEN_RACED`. Another request rotated
+ *     this token moments ago and nothing was revoked, so the session lives
+ *     on in the pair that request received. The caller leaves the session
+ *     cookies alone, writes `mark` to {@link RACED_COOKIE} and retries with
+ *     whatever the browser holds next. Returned once per token: a second
+ *     `RACED` for a token whose mark the browser already carries comes back
+ *     as `failed` (see `RACED_COOKIE` in `lib/session-refresh.ts` for why a
+ *     repeat must clear the spent token rather than keep it).
  */
-type RefreshOutcome =
-  | { kind: 'ok'; accessToken: string }
-  | { kind: 'failed' }
+export type RefreshOutcome =
+  | { kind: 'ok'; tokens: SessionTokens }
+  | { kind: 'failed'; interrupted?: boolean }
+  | { kind: 'raced'; mark: string }
   | { kind: 'busy'; status: number; retryAfterSeconds: number; envelope?: ErrorEnvelope['error'] };
 
 /**
- * Attempt token refresh. Concurrent callers presenting the same refresh token
- * share one exchange.
+ * Exchange the refresh cookie for a new pair. Concurrent callers presenting the
+ * same refresh token share one exchange.
+ *
+ * Spends the token, so only call it where the result can be written: a Server
+ * Action or a Route Handler. A render redirects to the refresh route instead
+ * (see `api()` and `lib/session-refresh.ts`).
  */
-async function tryRefresh(): Promise<RefreshOutcome> {
+export async function refreshSessionTokens(): Promise<RefreshOutcome> {
   const jar = await cookies();
   const refresh = jar.get(REFRESH_COOKIE)?.value;
   if (!refresh) return { kind: 'failed' };
 
-  const existing = inFlightRefreshes.get(refresh);
+  const outcome = await sharedExchange(refresh);
+  // The loop guard is per browser, so it is read here rather than inside the
+  // exchange that concurrent callers share.
+  if (outcome.kind === 'raced' && jar.get(RACED_COOKIE)?.value === outcome.mark) return { kind: 'failed' };
+  return outcome;
+}
+
+function sharedExchange(refresh: string): Promise<RefreshOutcome> {
+  // Hashed synchronously: nothing may await between this lookup and the
+  // insert below, or two concurrent callers could both miss and both rotate.
+  const key = createHash('sha256').update(refresh).digest('hex');
+  const existing = refreshExchanges.get(key);
   if (existing) return existing;
 
-  const exchange = exchangeRefreshToken(refresh).finally(() => {
-    inFlightRefreshes.delete(refresh);
+  const exchange = exchangeRefreshToken(refresh);
+  refreshExchanges.set(key, exchange);
+  void exchange.finally(() => {
+    if (refreshExchanges.get(key) === exchange) refreshExchanges.delete(key);
   });
-  inFlightRefreshes.set(refresh, exchange);
   return exchange;
+}
+
+/** Refresh in place and write the cookies. Server Actions and Route Handlers only. */
+async function tryRefresh(): Promise<
+  { kind: 'ok'; accessToken: string } | Exclude<RefreshOutcome, { kind: 'ok' }>
+> {
+  const outcome = await refreshSessionTokens();
+  if (outcome.kind === 'raced') await writeRacedMark(await cookies(), outcome.mark);
+  if (outcome.kind !== 'ok') return outcome;
+  await setSessionCookies(outcome.tokens);
+  return { kind: 'ok', accessToken: outcome.tokens.accessToken };
+}
+
+/** Set the raced-refresh loop guard. Touches no session cookie. */
+export async function writeRacedMark(jar: CookieSink, mark: string): Promise<void> {
+  jar.set(RACED_COOKIE, mark, {
+    httpOnly: true, sameSite: 'lax', secure: await cookieSecure(), path: '/', maxAge: RACED_MARK_MAX_AGE_SECONDS,
+  });
+}
+
+/**
+ * A raced refresh inside a Server Action or Route Handler. The request that
+ * got here carried the old pair, so it cannot finish; the browser, though,
+ * holds (or is about to hold) the pair the winning request received. So it is
+ * reported as a busy error with a one-second wait: the error boundary retries,
+ * and the retry is a fresh request that sends the browser's current cookies.
+ * The session cookies are not touched.
+ */
+function racedError(): PanelApiError {
+  return new PanelApiError({
+    code: REFRESH_RACED_CODE,
+    message: 'Your session was renewed by another tab at the same moment, so this request did not run.',
+    fix: 'Retry. You are still signed in.',
+    statusCode: 503,
+    retryAfterSeconds: 1,
+  });
 }
 
 async function exchangeRefreshToken(refresh: string): Promise<RefreshOutcome> {
@@ -388,10 +506,7 @@ async function exchangeRefreshToken(refresh: string): Promise<RefreshOutcome> {
       signal: AbortSignal.timeout(10_000),
     });
     const json = (await res.json().catch(() => ({}))) as
-      | {
-          success: true;
-          data: { accessToken: string; refreshToken: string; accessTokenExpiresAt?: string; refreshTokenExpiresAt?: string };
-        }
+      | { success: true; data: SessionTokens }
       | ErrorEnvelope;
     // 429 only: see `RefreshOutcome` for why a 503 here must sign out.
     if (res.status === 429) {
@@ -403,12 +518,30 @@ async function exchangeRefreshToken(refresh: string): Promise<RefreshOutcome> {
         ...(envelope ? { envelope } : {}),
       };
     }
+    // A proxy answering while the API restarts: the request never got there.
+    if (isGatewayFailure(res.status, json)) {
+      return {
+        kind: 'busy',
+        status: 503,
+        retryAfterSeconds: parseRetryAfter(res.headers.get('retry-after'), undefined),
+      };
+    }
+    // The one refusal that is not terminal, checked before everything else
+    // falls through to `failed`.
+    if (res.status === 401 && 'error' in json && json.error?.code === REFRESH_RACED_CODE) {
+      return { kind: 'raced', mark: await racedMark(refresh) };
+    }
+    // The API answered 5xx itself: it may have rotated first.
+    if (res.status >= 500) return { kind: 'failed', interrupted: true };
     if (!res.ok || !('success' in json) || json.success === false) return { kind: 'failed' };
-    const wrote = await setSessionCookiesSafe(json.data);
-    if (!wrote) return { kind: 'failed' };
-    return { kind: 'ok', accessToken: json.data.accessToken };
-  } catch {
-    return { kind: 'failed' };
+    return { kind: 'ok', tokens: json.data };
+  } catch (err) {
+    if (neverConnected(err)) {
+      return { kind: 'busy', status: 503, retryAfterSeconds: DEFAULT_RETRY_AFTER_SECONDS };
+    }
+    // A timeout or a dropped connection: the API may have rotated before we
+    // stopped listening.
+    return { kind: 'failed', interrupted: true };
   }
 }
 
@@ -500,15 +633,38 @@ export async function api<T>(args: RequestArgs): Promise<T> {
   let access = jar.get(ACCESS_COOKIE)?.value ?? null;
 
   let res = await callOnce(args.method, args.path, args.body, access);
+  /** Set when a refresh here ended the session because the token may be spent. */
+  let interrupted = false;
 
   if (res.status === 401) {
-    const refreshed = await tryRefresh();
-    if (refreshed.kind === 'ok') {
-      access = refreshed.accessToken;
-      res = await callOnce(args.method, args.path, args.body, access);
-    } else if (refreshed.kind === 'busy') {
-      // Not a sign-out: the session is fine, the API is just not answering yet.
-      throw busyError(refreshed.status, refreshed.retryAfterSeconds, refreshed.envelope);
+    if (!(await canWriteCookies(jar))) {
+      // A Server Component render. Refreshing here would spend the single-use
+      // refresh token without any way to store its replacement, and the
+      // browser's next request would replay the spent one, which the API
+      // treats as theft and answers by revoking every session this operator
+      // has. So the render never refreshes: it sends the browser to a Route
+      // Handler that refreshes, writes the cookies and comes back here.
+      //
+      // Not for a token minted moments ago: that is the refresh route's own
+      // result being refused, and another lap would only rotate again. It
+      // falls through to the sign-out below instead.
+      if (args.redirectOn401 !== false && jar.get(REFRESH_COOKIE)?.value && !wasIssuedRecently(access)) {
+        redirect(refreshRouteFor((await headers()).get(RETURN_TO_HEADER)));
+      }
+    } else {
+      const refreshed = await tryRefresh();
+      if (refreshed.kind === 'ok') {
+        access = refreshed.accessToken;
+        res = await callOnce(args.method, args.path, args.body, access);
+      } else if (refreshed.kind === 'busy') {
+        // Not a sign-out: the session is fine, the API is just not answering yet.
+        throw busyError(refreshed.status, refreshed.retryAfterSeconds, refreshed.envelope);
+      } else if (refreshed.kind === 'raced') {
+        // Not a sign-out either: another request holds the new pair.
+        throw racedError();
+      } else {
+        interrupted = refreshed.interrupted === true;
+      }
     }
   }
 
@@ -531,10 +687,11 @@ export async function api<T>(args: RequestArgs): Promise<T> {
         // components can't (Next 15), bounce through /sign-out which is a
         // Route Handler that does the clear and then redirects to /login.
         const cleared = await clearSessionCookiesSafe();
+        const reason = interrupted ? SESSION_INTERRUPTED_REASON : 'expired';
         if (cleared) {
-          redirect('/login?reason=expired');
+          redirect(`/login?reason=${reason}`);
         } else {
-          redirect('/sign-out?reason=expired');
+          redirect(`/sign-out?reason=${reason}`);
         }
       }
     }
@@ -642,11 +799,16 @@ export interface WorkspaceLimitsDto {
   limits: {
     maxProductionApps?: number | null;
     maxActiveEndUsers?: number | null;
+    maxContacts?: number | null;
+    maxContactLists?: number | null;
   };
   usage: {
     /** Production applications that are RUNNING, not disabled. */
     productionApps: number;
     activeEndUsers: number;
+    /** Absent from an API older than lists. */
+    contacts?: number;
+    contactLists?: number;
   };
 }
 
@@ -693,6 +855,40 @@ export async function getWorkspaceCreationOpen(now: number = Date.now()): Promis
 /** Test seam: forget the cached creation mode. */
 export function resetWorkspaceCreationModeCache(): void {
   creationModeCache = null;
+}
+
+/**
+ * The operator MCP endpoint's public URL, from the API's own protected-resource
+ * metadata, which derives it from PUBLIC_WEBHOOK_BASE_URL or API_URL. The
+ * panel's REKEY_URL can be an in-cluster host such as `http://api:3030`, so it
+ * is never what an operator is shown. Null when the API does not answer, for
+ * example with operator MCP turned off. A deployment constant, so an answer is
+ * cached for five minutes; a failure is not cached.
+ */
+const OPERATOR_MCP_TTL_MS = 5 * 60_000;
+let operatorMcpCache: { url: string; expiresAt: number } | null = null;
+
+export async function getOperatorMcpUrl(now: number = Date.now()): Promise<string | null> {
+  if (operatorMcpCache && operatorMcpCache.expiresAt > now) return operatorMcpCache.url;
+  try {
+    const res = await fetch(`${apiUrl()}/api/v1/tenant/mcp/.well-known/oauth-protected-resource`, {
+      cache: 'no-store',
+      signal: AbortSignal.timeout(3_000),
+    });
+    if (!res.ok) return null;
+    const body = (await res.json()) as { resource?: unknown };
+    const url = publicHttpUrl(typeof body.resource === 'string' ? body.resource : undefined);
+    if (url === null) return null;
+    operatorMcpCache = { url, expiresAt: now + OPERATOR_MCP_TTL_MS };
+    return url;
+  } catch {
+    return null;
+  }
+}
+
+/** Test seam: forget the cached operator MCP URL. */
+export function resetOperatorMcpUrlCache(): void {
+  operatorMcpCache = null;
 }
 
 /**
@@ -770,6 +966,11 @@ export interface ApplicationRow {
     appUrl?: string;
     signupEnabled?: boolean;
     signupMode?: 'public' | 'secret_only' | 'invite_only';
+    signupRestrictions?: {
+      allowedDomains?: string[];
+      blockedDomains?: string[];
+      blockDisposable?: boolean;
+    };
     mfa?: 'off' | 'optional' | 'required';
     mcpEnabled?: boolean;
     /** Application acts as an OpenID Connect provider. Independent of `mcpEnabled`. */
@@ -778,6 +979,8 @@ export interface ApplicationRow {
     passwordBreachCheckEnabled?: boolean;
     sendVerificationEmailOnSignUp?: boolean;
     requireEmailVerification?: boolean;
+    /** When a new account gets the welcome email. Absent on apps saved before it existed: `on_signup`. */
+    welcomeEmail?: 'on_signup' | 'on_verified' | 'off';
     /**
      * Whether a sign-in must carry a device fingerprint. `required` refuses
      * one that does not; `optional` binds the device when a fingerprint is
@@ -816,12 +1019,32 @@ export interface ApplicationRow {
   /** Public MCP server URL, computed API-side from PUBLIC_WEBHOOK_BASE_URL/API_URL. */
   mcpUrl?: string;
   /**
+   * Origin of this deployment's hosted portal (the API's PUBLIC_PORTAL_URL),
+   * or null when it runs none. Absent from APIs that predate the field.
+   */
+  portalBaseUrl?: string | null;
+  /**
    * How the caller reached this Application and their effective scopes on it.
    * The panel renders navigation from `scopes`: a section whose scope is
    * absent is not shown, rather than shown and refused. Optional only for the
    * moment between deploys; the API always sends it.
    */
   access?: { level: string; scopes: string[] };
+  /**
+   * IANA zone the Users overview counts days in. Arrives with the analytics
+   * API, so its absence also means that API is not there yet.
+   */
+  reportingTimezone?: string;
+  /**
+   * Only on list rows fetched with `include=summary`. Each field is left out
+   * when the caller may not read it, so absent means "unknown", not zero.
+   */
+  summary?: {
+    /** Keys that authenticate today: not revoked, not expired. */
+    activeApiKeys?: number;
+    /** Last UTC day an end-user was active or a key was used. */
+    lastActiveOn?: string | null;
+  };
   createdAt: string;
 }
 
@@ -849,6 +1072,9 @@ export interface ApplicationStatsRow {
     creditsOutstanding: number;
     usageLast30d: number;
   };
+  /** Absent from an API older than the activity columns. */
+  activeUsers?: { d1: number; d7: number; d30: number };
+  activitySeries?: Array<{ date: string; count: number }>;
 }
 
 export interface SecurityEventRow {
@@ -1091,7 +1317,20 @@ export interface EndUserRow {
   emailVerified: boolean;
   role: string;
   metadata: Record<string, unknown> | null;
+  /** Absent from an older API. */
+  bannedAt?: string | null;
   createdAt: string;
+  /** Last credential sign-in; null if never. Absent from an API older than the column. */
+  lastSignedInAt?: string | null;
+  /** Platform of the latest sign-in; null if never. Absent from an older API. */
+  lastPlatform?: string | null;
+  /** Profile answers keyed by field key. Absent from an older API. */
+  profile?: Record<string, string | number | boolean>;
+  /** UTC day of the last sign-in or session refresh. Absent from an API older than the field. */
+  lastActiveOn?: string | null;
+  lastCountry?: string | null;
+  /** Derived from the completion and skip times. Absent from an API older than onboarding skip. */
+  onboardingStatus?: 'pending' | 'completed' | 'skipped';
 }
 
 /**
@@ -1175,7 +1414,7 @@ export interface OrganizationDetail {
   invitations: OrganizationInvitationRow[];
 }
 
-export type EmailLogStatus = 'sent' | 'error' | 'no_transport' | 'suppressed';
+export type EmailLogStatus = 'sent' | 'error' | 'no_transport' | 'suppressed' | 'pending' | 'unknown';
 
 export interface EmailLogRow {
   id: string;
@@ -1188,6 +1427,9 @@ export interface EmailLogRow {
   status: EmailLogStatus | string;
   messageId: string | null;
   error: string | null;
+  /** Set for custom template sends; `eventKey` is null on those. */
+  customTemplateKey?: string | null;
+  customTemplateVersion?: number | null;
   createdAt: string;
 }
 
@@ -1434,6 +1676,30 @@ export async function getReadyReport(): Promise<ReadyReport | null> {
     const json = (await res.json().catch(() => null)) as ReadyReport | null;
     if (json === null || typeof json !== 'object') return null;
     return json;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The API's release version and commit, from `/health/live`.
+ *
+ * Cached for five minutes and bounded to 1.5 seconds, because the authed
+ * layout shows it on every page. Null on any failure: the sidebar then shows
+ * no version rather than a wrong one.
+ *
+ * @example
+ * const api = await getApiBuildInfo(); // { version: '2.2.0-rc.4', commit: 'unknown' }
+ */
+export async function getApiBuildInfo(): Promise<BuildInfo | null> {
+  try {
+    const res = await fetch(`${apiUrl()}/health/live`, {
+      headers: await apiCallerHeaders(),
+      next: { revalidate: 300 },
+      signal: AbortSignal.timeout(1500),
+    });
+    if (!res.ok) return null;
+    return parseBuildInfo(await res.json().catch(() => null));
   } catch {
     return null;
   }

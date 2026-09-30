@@ -46,16 +46,22 @@ export const SECURITY_EVENT_LABEL = {
   'operator.mcp_tool_called': 'MCP tool called',
   'operator.api_token.revoked': 'Operator API token revoked',
   'operator.invite_redeemed': 'Operator invite redeemed',
+  // Refresh-token replay, the operator counterparts of the `user.refresh_token_*`
+  // pair below (same semantics, see there).
+  'operator.refresh_token_raced': 'Operator refresh token replayed within the reuse window',
+  'operator.refresh_token_reused': 'Operator refresh token reused (all sessions revoked)',
 
   // ── Application configuration ──
   'app.created': 'Application created',
   'app.auth_config_updated': 'Auth settings updated',
+  'app.profile_schema_updated': 'Profile fields updated',
   'app.access_updated': 'Access controls updated',
   'app.api_key.created': 'API key created',
   'app.api_key.revoked': 'API key revoked',
   'app.sessions_rotated': 'App sessions rotated (kill-switch)',
   'app.public_key.rotated': 'Publishable key rotated',
   'app.portal_config_updated': 'Hosted portal settings updated',
+  'app.settings_updated': 'Application settings updated',
   // Lifecycle. All three are workspace-billing-relevant as well as
   // operationally significant: promotion consumes a production slot and cannot
   // be undone, and disable/enable release and re-take one.
@@ -68,6 +74,10 @@ export const SECURITY_EVENT_LABEL = {
   'app.organization_role_created': 'Organization role created',
   'app.organization_role_updated': 'Organization role updated',
   'app.organization_role_deleted': 'Organization role deleted',
+  // Membership writes by an operator. The organization's own hierarchy does
+  // not apply to them, so the trail is the only record of who granted a tier.
+  'app.organization_member_added': 'Organization member added by operator',
+  'app.organization_member_role_changed': 'Organization member role changed by operator',
   'app.ip_blocked': 'Request blocked by IP allowlist',
   'app.origin_blocked': 'Request blocked by CORS origin allowlist',
 
@@ -76,6 +86,30 @@ export const SECURITY_EVENT_LABEL = {
   'app.billing_credentials_updated': 'Billing provider credentials updated',
   'app.billing_credentials_configured': 'Billing provider configured (via MCP)',
   'app.billing_credentials_deleted': 'Billing provider credentials deleted',
+  // The free-tier default plan charges money, so it was not applied. Written at
+  // most once an hour per plan price. Metadata carries the slug and the price.
+  'app.default_plan_ignored': 'Free-tier plan ignored because it charges money',
+  // A checkout whose successUrl or cancelUrl is on an origin the Application
+  // has not registered. Allowed for now and refused from the next minor, so
+  // this is the operator's notice to register the origin first. Metadata
+  // carries `origins` and `fields`.
+  'app.checkout_return_url_unregistered': 'Checkout return URL on an unregistered origin',
+  // An EMBEDDED checkout that failed a readiness check and was served on the
+  // provider's page instead. Metadata carries `check`, `paymentMode` and
+  // `provider`.
+  'app.checkout_embedded_fallback': 'Rekey checkout page unavailable, provider page used',
+  // An operator changed the checkout page setting or the failure behaviour.
+  // An EMBEDDED checkout refused (failure behaviour "refuse") because a
+  // readiness check failed. Metadata carries the check, its message and fix.
+  'app.checkout_embedded_refused': 'Rekey checkout page unavailable, checkout refused',
+  'app.checkout_settings_updated': 'Checkout page setting changed',
+  // A hosted checkout refused because its payment mode no longer matches the
+  // provider's credentials (sandbox switched to live, or back).
+  'app.checkout_mode_mismatch': 'Checkout refused after a test/live credential switch',
+  // The checkout page reported a PayPal approval that PayPal did not confirm
+  // for that checkout: a different subscription, plan or buyer, or not yet
+  // approved. Metadata carries `reason` and the presented id.
+  'app.checkout_confirmation_refused': 'Checkout approval refused after checking with the provider',
   'app.plan_created': 'Plan created',
   'app.plan_updated': 'Plan updated',
   'app.plan_active_changed': 'Plan activated or deactivated',
@@ -106,6 +140,22 @@ export const SECURITY_EVENT_LABEL = {
   'app.webhook_endpoint_created': 'Webhook endpoint created',
   'app.webhook_endpoint_updated': 'Webhook endpoint updated',
 
+  // ── Lists and contacts ──
+  // Settings changes are in the trail because `publicCapture` decides whether
+  // a browser can write to the list at all. Metadata carries `listId`, `key`
+  // and `changed` (field names, never values).
+  'app.contact_list.created': 'List created',
+  'app.contact_list.updated': 'List settings updated',
+  'app.contact_list.archived': 'List archived',
+  'app.contact_list.restored': 'List restored from the archive',
+  // A browser subscribe that would have added a contact past `maxContacts`.
+  // The browser still got its constant answer, so this is how the operator
+  // finds out. At most one per workspace per hour; metadata carries `listKey`.
+  'app.contact_quota_reached': 'Subscribe dropped at the contact limit',
+  // Every address on a list left the building as a CSV. Metadata carries
+  // `listId`, `key` and `count`.
+  'app.contacts_exported': 'List members exported',
+
   // ── End-user actions (the end-user is the actor) ──
   'user.signed_up': 'End-user signed up',
   'user.signed_in': 'End-user signed in',
@@ -120,6 +170,15 @@ export const SECURITY_EVENT_LABEL = {
   'user.passkey_added': 'End-user added a passkey',
   'user.passkey_removed': 'End-user removed a passkey',
   'user.sessions_revoked': 'End-user revoked their sessions',
+  // Refresh-token replay. `raced`: a rotated token came back within
+  // REFRESH_TOKEN_REUSE_WINDOW_SECONDS while its successor was unused, and was
+  // refused WITHOUT revoking anything (two tabs refreshing at once, a retry
+  // after a lost response). It is recorded because the same shape is also a
+  // thief replaying a token moments after the victim used it, and the IP and
+  // user agent here are what tell the two apart afterwards. `reused`: a replay
+  // outside that allowance, and every session the user had was revoked.
+  'user.refresh_token_raced': 'End-user refresh token replayed within the reuse window',
+  'user.refresh_token_reused': 'End-user refresh token reused (all sessions revoked)',
   // App-authorised session handoff, the Application's own server exchanged a
   // live end-user session for an OIDC authorization code (see
   // POST /api/v1/mcp/:slug/oauth/authorize/grant). The end-user is the actor
@@ -144,12 +203,20 @@ export const SECURITY_EVENT_LABEL = {
   // answer. The actor is the system; `metadata.provider` names the module.
   'end_user.created_by_billing_webhook': 'End-user created by a billing webhook',
   'end_user.erased': 'End-user erased (GDPR)',
+  // A contact (someone on a list, not an account) erased by an operator.
+  // Erasing an end user also erases their contact; that is counted in the
+  // `end_user.erased` metadata, not recorded twice.
+  'contact.erased': 'Contact erased (GDPR)',
   'end_user.delete_blocked': 'End-user deletion blocked',
   'end_user.deleted': 'End-user deleted',
   'end_user.data_exported': 'End-user data exported',
   'end_user.device_released': 'Device released by an operator or the application server',
   'end_user.device_blocked': 'Device blocked',
   'end_user.device_unblocked': 'Device unblocked',
+  // Whole-account ban. `metadata.reason` on `banned` is operator-only and is
+  // removed by erasure; `via` says whether a panel session or an API token acted.
+  'end_user.banned': 'End-user banned',
+  'end_user.unbanned': 'End-user ban lifted',
   'end_user.devices_released_by_operator': 'All devices released by an operator',
   'end_user.created_by_import': 'End-user created by a subscription import',
 
@@ -179,12 +246,19 @@ export const SECURITY_EVENT_LABEL = {
   // `workspace.member_invited` on purpose: a member appearing with no
   // invitation behind them should be explicable from the log alone.
   'workspace.member_added_by_admin': 'Teammate added by deployment automation',
+  // A workspace's ceilings replaced through the super-admin surface, with the
+  // limits before and after, so a changed quota can be traced to when it moved.
+  'workspace.limits_set_by_admin': 'Workspace limits set by deployment automation',
 
   // ── Deployment administration ──
   'admin.operator_invite.minted': 'Operator invite minted',
   'admin.operator_invite.revoked': 'Operator invite revoked',
   'license.org_key_rotated': 'Organization licence key rotated',
   'auth.email_delivery_failed': 'Outbound email failed to send',
+  // Failed sign-in / MFA attempts with no visitor address (a backend that
+  // does not send X-Rekey-Client-Ip) reached RATE_LIMIT_AUTH_UNATTRIBUTED_FAILURE_MAX
+  // for one Application. At most one per Application per rate-limit window.
+  'auth.unattributed_failure_cap_reached': 'Failed sign-ins without a visitor address reached the cap',
   'system.dependency_unavailable': 'A dependency was unavailable',
 } as const satisfies Record<string, string>;
 

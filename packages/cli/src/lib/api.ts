@@ -23,8 +23,40 @@ export function withListOptions(command: Command): Command {
     .option('--offset <n>', 'Rows to skip (0-based)');
 }
 
-/** Pull the `--limit` / `--offset` values off a parsed options object. */
-export function readListOpts(opts: { limit?: string; offset?: string }): Record<string, string> {
+/** The admin list routes' page-size ceiling (`MAX_LIMIT` in the API). */
+export const MAX_LIST_LIMIT = 100;
+
+/**
+ * Pull the `--limit` / `--offset` values off a parsed options object, refusing
+ * values the API would reject before any request is made.
+ *
+ * @example
+ * const qs = listQuery(readListOpts(ctx, opts));
+ */
+export function readListOpts(
+  ctx: OutputContext,
+  opts: { limit?: string; offset?: string },
+): Record<string, string> {
+  if (opts.limit !== undefined) {
+    const limit = Number(opts.limit);
+    if (!Number.isInteger(limit) || limit < 1 || limit > MAX_LIST_LIMIT) {
+      fail(ctx, {
+        code: 'CLI_LIST_LIMIT_INVALID',
+        message: `--limit must be an integer from 1 to ${MAX_LIST_LIMIT}. Got "${opts.limit}".`,
+        fix: `Pass a whole number between 1 and ${MAX_LIST_LIMIT}, and page further with --offset.`,
+      });
+    }
+  }
+  if (opts.offset !== undefined) {
+    const offset = Number(opts.offset);
+    if (!Number.isInteger(offset) || offset < 0) {
+      fail(ctx, {
+        code: 'CLI_LIST_OFFSET_INVALID',
+        message: `--offset must be a non-negative integer. Got "${opts.offset}".`,
+        fix: 'Pass a whole number such as 0 or 50.',
+      });
+    }
+  }
   return {
     ...(opts.limit !== undefined ? { limit: opts.limit } : {}),
     ...(opts.offset !== undefined ? { offset: opts.offset } : {}),
@@ -84,6 +116,49 @@ export async function adminRequest<T>(args: RequestArgs): Promise<T> {
     if ('error' in json) {
       fail(args.ctx, json.error);
     }
+    fail(args.ctx, {
+      code: 'CLI_HTTP_ERROR',
+      message: `Request failed with HTTP ${res.status}.`,
+      fix: 'Check the Rekey API logs for details.',
+    });
+  }
+  return (json as { success: true; data: T }).data;
+}
+
+/**
+ * A request to an operator route (`/api/v1/tenant/*`) with an operator
+ * personal access token.
+ *
+ * @example
+ * const data = await operatorRequest<T>({ ctx, method: 'GET', path: '/api/v1/tenant/applications' });
+ */
+export async function operatorRequest<T>(args: RequestArgs): Promise<T> {
+  if (!args.ctx.apiUrl) {
+    fail(args.ctx, {
+      code: 'CLI_API_URL_MISSING',
+      message: 'No Rekey API URL configured.',
+      fix: 'Set REKEY_URL in your environment, or pass --api-url=https://your-rekey.example.',
+    });
+  }
+  if (!args.ctx.operatorToken) {
+    fail(args.ctx, {
+      code: 'CLI_OPERATOR_TOKEN_MISSING',
+      message: 'This command reads as a workspace member and needs an operator personal access token.',
+      fix: 'Create one in the panel under Account, API tokens (read scope is enough), then set REKEY_OPERATOR_TOKEN or pass --operator-token.',
+    });
+  }
+  const url = `${args.ctx.apiUrl.replace(/\/$/, '')}${args.path}`;
+  const res = await fetch(url, {
+    method: args.method,
+    headers: {
+      Authorization: `Bearer ${args.ctx.operatorToken}`,
+      ...(args.body !== undefined ? { 'Content-Type': 'application/json' } : {}),
+    },
+    ...(args.body !== undefined ? { body: JSON.stringify(args.body) } : {}),
+  });
+  const json = (await res.json().catch(() => ({}))) as { success: true; data: T } | ErrorEnvelope;
+  if (!res.ok || ('success' in json && json.success === false)) {
+    if ('error' in json) fail(args.ctx, json.error);
     fail(args.ctx, {
       code: 'CLI_HTTP_ERROR',
       message: `Request failed with HTTP ${res.status}.`,

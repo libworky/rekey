@@ -65,11 +65,12 @@
 import type { Application, Prisma, Subscription } from '@prisma/client';
 import { prisma } from '../../lib/prisma.js';
 import { RekeyError } from '../../lib/error.js';
+import { costsNothing, freePlanNotFree } from './free-plan.js';
 import { plansService } from '../plans/plans.service.js';
 import { entitlementsService } from './entitlements.service.js';
-import { enqueueSubscriptionEvent } from './webhooks/billing-events.js';
+import { enqueueActivation } from './trial-events.js';
 import { kickDeliveries } from '../webhooks/webhook.service.js';
-import { BillingConfigSchema } from '@rekey.dev/shared-types';
+import { BillingConfigSchema, ENTITLING_SUBSCRIPTION_STATUSES } from '@rekey.dev/shared-types';
 import { isOneTimePlan } from './plan-kind.js';
 import { claimGrantedTrial, trialSubjectKey } from './trial-eligibility.service.js';
 
@@ -163,6 +164,22 @@ export interface GrantSubscriptionInput {
    * set it: an operator handing out value is a deliberate act, not a tap.
    */
   freeTierClaim?: boolean;
+  /**
+   * Answer a live row billed to a different subject with `heldForAnotherSubject`
+   * instead of BILLING_SUBSCRIPTION_SUBJECT_CONFLICT.
+   *
+   * Set only by `activateFreePlan` for a free plan that materialises nothing
+   * (FEATURE / USAGE only). Those resolve at read time for every subject, so
+   * the other subject is already on the free tier without a row of its own.
+   */
+  otherSubjectIsNoop?: boolean;
+  /**
+   * Run first inside the grant transaction. A row it returns is the subject's
+   * existing subscription and is answered as the no-op instead of granting.
+   * Set only by `activateFreePlan`, to find another admin's free row for the
+   * same organization under a lock (`organizationFreeRowUnderLock`).
+   */
+  heldBySubject?: (tx: Prisma.TransactionClient) => Promise<Subscription | null>;
 }
 
 export interface GrantSubscriptionResult {
@@ -179,6 +196,21 @@ export interface GrantSubscriptionResult {
    * whether that is worth telling somebody.
    */
   trialRefused?: { reason: 'already_used' | 'attempt_spent' };
+  /**
+   * Set when `otherSubjectIsNoop` answered: `subscription` is the caller's row
+   * for a DIFFERENT subject and must not be shown as the requested one's.
+   */
+  heldForAnotherSubject?: true;
+}
+
+/**
+ * What `activateFreePlan` did. `subscription` is null when the requested
+ * subject has no row of its own because the caller's one row for the plan is
+ * billed to another subject; a FEATURE / USAGE free tier still applies to it.
+ */
+export interface FreePlanActivation {
+  subscription: Subscription | null;
+  activated: boolean;
 }
 
 /**
@@ -323,15 +355,21 @@ export const subscriptionGrantsService = {
    * anchor and the per-pool licence lookup already collide.
    *
    * FEATURE and USAGE resolve at read time and lapse with the subscription,
-   * so a free plan carrying only those is left as it was: an admin of several
-   * teams can still put each of them on it.
+   * so a free plan carrying only those has no such limit: an admin of several
+   * teams can put each of them on it. The subscription row is unique per
+   * (end-user, plan), so only the first subject gets a row. On an org-billed
+   * Application every activation for an organization also records an
+   * `OrganizationFreeTierClaim`, and the org view applies the free tier's
+   * features and included usage to a claimed organization at read time
+   * (`entitlementsService.resolveGrants`). A later subject is answered with
+   * `subscription: null`, never with the first subject's row.
    */
   async activateFreePlan(input: {
     application: Application;
     endUserId: string;
     /** Beneficiary org, when the Application bills per organization. */
     organizationId?: string;
-  }): Promise<GrantSubscriptionResult> {
+  }): Promise<FreePlanActivation> {
     const billingConfig = BillingConfigSchema.parse(input.application.billingConfig);
     const slug = billingConfig.defaultPlanSlug;
     if (!slug) {
@@ -344,14 +382,7 @@ export const subscriptionGrantsService = {
     }
 
     const plan = await plansService.getBySlug(input.application.id, slug);
-    if (plan.amount !== 0 || plan.pricePerUnitCents !== null) {
-      throw new RekeyError({
-        statusCode: 409,
-        code: 'BILLING_FREE_PLAN_NOT_FREE',
-        message: `The Application's default plan "${plan.slug}" is not free, so it cannot be self-activated.`,
-        fix: 'A self-activated plan must cost nothing on both axes: `amount` 0 and no `pricePerUnitCents`. Send buyers of a priced plan through POST /api/v1/billing/checkout instead.',
-      });
-    }
+    if (!costsNothing(plan)) throw freePlanNotFree(plan.slug, 'activate');
 
     // Mirrors the conditions under which `entitlementsService.provision`
     // actually writes something, so the claim is required exactly when an
@@ -360,14 +391,28 @@ export const subscriptionGrantsService = {
       (e) => (e.kind === 'CREDIT' && (e.quantity ?? 0) > 0) || (e.kind === 'LICENSE' && !!e.licenseKind),
     );
 
-    return this.grantSubscription({
+    const claimsForOrganization = input.organizationId !== undefined && billingConfig.billingSubject === 'org';
+    const organizationId = input.organizationId;
+    const result = await this.grantSubscription({
       application: input.application,
       planSlug: plan.slug,
       endUserId: input.endUserId,
-      ...(input.organizationId !== undefined && { organizationId: input.organizationId }),
+      ...(organizationId !== undefined && { organizationId }),
       note: 'self-serve free tier',
-      ...(materialises && { freeTierClaim: true }),
+      ...(materialises ? { freeTierClaim: true } : { otherSubjectIsNoop: true }),
+      ...(claimsForOrganization &&
+        organizationId !== undefined && {
+          heldBySubject: (tx: Prisma.TransactionClient) =>
+            organizationFreeRowUnderLock(tx, input.application.id, organizationId, plan.id, input.endUserId),
+        }),
     });
+    if (claimsForOrganization) {
+      await recordOrganizationClaim(input.application.id, input.organizationId!, plan.id, input.endUserId);
+    }
+    return {
+      subscription: result.heldForAnotherSubject ? null : result.subscription,
+      activated: result.activated,
+    };
   },
 
   /**
@@ -382,6 +427,9 @@ export const subscriptionGrantsService = {
    * returned unchanged with `activated: false`: nothing is written, no
    * entitlement is materialised a second time, and no event is emitted. That
    * bound is the contract, granting twice must cost the same as granting once.
+   * It holds for the SAME billing subject: a live row billed to a different
+   * one (another organization, or the personal account) is refused with 409
+   * BILLING_SUBSCRIPTION_SUBJECT_CONFLICT rather than reported as a no-op.
    *
    * Concurrently, too. Two simultaneous grants both read the pre-transaction
    * state, so the read alone settles nothing: the create path is separated by
@@ -429,7 +477,7 @@ export const subscriptionGrantsService = {
         statusCode: 400,
         code: 'BILLING_ORGANIZATION_REQUIRED',
         message: 'This Application bills per organization, but no organization was named for the grant.',
-        fix: "Pass `organizationId` of a team in this Application, or change the model in Panel → Application → Billing → Subject.",
+        fix: "Pass `organizationId` of a team in this Application, or change the model in Panel → Application → Billing → Setup → Settings.",
       });
     }
     if (input.organizationId !== undefined) {
@@ -480,8 +528,11 @@ export const subscriptionGrantsService = {
       activated: boolean;
       deliveryIds: string[];
       trialRefused?: GrantSubscriptionResult['trialRefused'];
+      heldForAnotherSubject?: true;
     }> =>
       prisma.$transaction(async (tx) => {
+        const held = input.heldBySubject ? await input.heldBySubject(tx) : null;
+        if (held) return { subscription: held, activated: false, deliveryIds: [] as string[] };
         // Settled first, under a lock, so eight concurrent activations for
         // eight different organizations cannot all read "no claim yet". Ahead
         // of the entitled no-op on purpose: a request for a beneficiary that
@@ -503,6 +554,15 @@ export const subscriptionGrantsService = {
           where: { applicationId_endUserId_planId: key },
         });
         if (existing && ENTITLED.has(existing.status)) {
+          // The no-op is for the SAME subject only. Answering "already
+          // entitled" with another organization's row told the caller their
+          // organization was covered when nothing had been granted to it.
+          if (existing.beneficiaryOrgId !== (input.organizationId ?? null)) {
+            if (input.otherSubjectIsNoop !== true) {
+              throw subjectConflict(plan.slug, existing.beneficiaryOrgId, input.organizationId);
+            }
+            return { subscription: existing, activated: false, deliveryIds: [] as string[], heldForAnotherSubject: true as const };
+          }
           return { subscription: existing, activated: false, deliveryIds: [] as string[] };
         }
 
@@ -594,7 +654,7 @@ export const subscriptionGrantsService = {
           return {
             subscription: created,
             activated: true,
-            deliveryIds: await enqueueSubscriptionEvent(tx, 'subscription.activated', created.id),
+            deliveryIds: await enqueueActivation(tx, created),
             ...(trialRefused && { trialRefused }),
           };
         }
@@ -626,7 +686,7 @@ export const subscriptionGrantsService = {
         return {
           subscription: row,
           activated: true,
-          deliveryIds: await enqueueSubscriptionEvent(tx, 'subscription.activated', row.id),
+          deliveryIds: await enqueueActivation(tx, row),
           ...(trialRefused && { trialRefused }),
         };
       });
@@ -650,10 +710,17 @@ export const subscriptionGrantsService = {
       const won = await prisma.subscription.findUniqueOrThrow({
         where: { applicationId_endUserId_planId: key },
       });
+      if (won.beneficiaryOrgId !== (input.organizationId ?? null)) {
+        if (input.otherSubjectIsNoop !== true) {
+          throw subjectConflict(plan.slug, won.beneficiaryOrgId, input.organizationId);
+        }
+        return { subscription: won, activated: false, heldForAnotherSubject: true };
+      }
       return { subscription: won, activated: false };
     }
-    const { subscription, activated, deliveryIds, trialRefused } = outcome;
+    const { subscription, activated, deliveryIds, trialRefused, heldForAnotherSubject } = outcome;
 
+    if (heldForAnotherSubject) return { subscription, activated: false, heldForAnotherSubject };
     if (!activated) return { subscription, activated: false };
 
     // `firstPeriod` is deliberately not passed. The flag pins the grant to the
@@ -733,6 +800,70 @@ async function settleFreeTierClaim(
       },
     });
   };
+}
+
+/**
+ * The subscriber's live subscription to this plan is billed to a different
+ * subject. A subscription to one plan is one row per subscriber (#431), so
+ * granting it for another subject would move it, the refusal hosted checkout
+ * makes with the same code.
+ */
+/**
+ * Another admin's live free row for this organization, read under a lock held
+ * until the grant transaction ends. Without the lock, admins racing for one
+ * organization each saw no row and each got one, doubling its included usage
+ * and, for a credit plan, granting the pool twice. The lock is per
+ * (application, organization, plan), unlike the per-end-user claim lock.
+ */
+async function organizationFreeRowUnderLock(
+  tx: Prisma.TransactionClient,
+  applicationId: string,
+  organizationId: string,
+  planId: string,
+  endUserId: string,
+): Promise<Subscription | null> {
+  await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`free-tier-org:${applicationId}:${organizationId}:${planId}`}, 0))`;
+  return tx.subscription.findFirst({
+    where: {
+      applicationId,
+      planId,
+      beneficiaryOrgId: organizationId,
+      endUserId: { not: endUserId },
+      status: { in: [...ENTITLING_SUBSCRIPTION_STATUSES] },
+    },
+    orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
+  });
+}
+
+/**
+ * Record that an organization is on the free tier. Idempotent under any number
+ * of concurrent claims: the unique key settles it and a duplicate is skipped.
+ */
+async function recordOrganizationClaim(
+  applicationId: string,
+  organizationId: string,
+  planId: string,
+  claimedByEndUserId: string,
+): Promise<void> {
+  await prisma.organizationFreeTierClaim.createMany({
+    data: [{ applicationId, organizationId, planId, claimedByEndUserId }],
+    skipDuplicates: true,
+  });
+}
+
+function subjectConflict(
+  planSlug: string,
+  heldOrgId: string | null,
+  wantedOrgId: string | undefined,
+): RekeyError {
+  const held = heldOrgId === null ? 'their personal account' : 'a different organization';
+  const wanted = wantedOrgId === undefined ? 'their personal account' : 'this organization';
+  return new RekeyError({
+    statusCode: 409,
+    code: 'BILLING_SUBSCRIPTION_SUBJECT_CONFLICT',
+    message: `This subscriber already holds a live subscription to "${planSlug}" billed to ${held}, and a subscription to one plan is stored once per subscriber. Granting "${planSlug}" to ${wanted} would move that subscription instead of adding a second one.`,
+    fix: `Cancel the existing "${planSlug}" subscription and let it end before granting it to a different billing subject, or use a separate plan for each subject.`,
+  });
 }
 
 /** Resolve the subscriber by id or email, always scoped to the Application. */

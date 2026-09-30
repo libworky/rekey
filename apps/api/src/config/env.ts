@@ -57,6 +57,16 @@ export const env = createEnv({
     // sessions on trusted machines; the ceiling is 12 hours.
     OPERATOR_ACCESS_TOKEN_TTL_SECONDS: z.coerce.number().int().min(60).max(12 * 60 * 60).default(15 * 60),
     OPERATOR_REFRESH_TOKEN_TTL_DAYS: z.coerce.number().int().min(1).max(365).default(30),
+    // Refresh-token reuse window, both kinds. A rotated refresh token presented
+    // again within this many seconds of its rotation, while its successor is
+    // still unused, is answered 401 REFRESH_TOKEN_RACED instead of being read
+    // as theft: the family is NOT revoked, and nothing is issued. That is two
+    // tabs refreshing at once on two server instances, or a retry whose first
+    // response was lost. Outside the window, or once the successor has been
+    // used, a replay revokes every session as before. 15 seconds covers a
+    // concurrent refresh through a serverless cold start and one client retry
+    // after a 10 second timeout; 0 turns the window off.
+    REFRESH_TOKEN_REUSE_WINDOW_SECONDS: z.coerce.number().int().min(0).max(60).default(15),
     HOST: z.string().default('0.0.0.0'),
 
     // Global rate limit (the `@fastify/rate-limit` plugin), one bucket per
@@ -64,15 +74,31 @@ export const env = createEnv({
     // budget per kind of caller, all per RATE_LIMIT_WINDOW_MS:
     //   RATE_LIMIT_MAX                unauthenticated traffic, per client IP (100)
     //   RATE_LIMIT_AUTHENTICATED_MAX  per operator / signed-in end user (600)
-    //   RATE_LIMIT_API_KEY_MAX        per secret API key (6000)
+    //   RATE_LIMIT_API_KEY_MAX        per secret API key (30000)
     // The last two default to the larger of their default and RATE_LIMIT_MAX,
     // so a deployment that had raised RATE_LIMIT_MAX keeps at least that.
     // Auth endpoints keep their own tighter per-route caps regardless.
     // Sizing and the reasoning behind each number: docs/rate-limits.md.
+    //
+    // RATE_LIMIT_AUTH_CEILING_MAX is the aggregate cap on one Application's
+    // auth routes together (sign-in, sign-up, MFA, magic link, reset, verify),
+    // default 3000 and never below RATE_LIMIT_MAX. It used to be RATE_LIMIT_MAX
+    // itself, which let anyone holding the public publishable key refuse every
+    // sign-in to the Application. One client IP's share of it stays at
+    // RATE_LIMIT_MAX, so raising this does not loosen what one address may do.
     RATE_LIMIT_MAX: z.coerce.number().int().positive().default(100),
     RATE_LIMIT_WINDOW_MS: z.coerce.number().int().positive().default(60_000),
     RATE_LIMIT_AUTHENTICATED_MAX: z.coerce.number().int().positive().optional(),
     RATE_LIMIT_API_KEY_MAX: z.coerce.number().int().positive().optional(),
+    RATE_LIMIT_AUTH_CEILING_MAX: z.coerce.number().int().positive().optional(),
+    // Failed sign-in / MFA attempts per Application per window from traffic
+    // that carries no visitor address (300): a secret-key backend that does
+    // not send `X-Rekey-Client-Ip`, or a proxy we cannot identify. Once spent,
+    // until the window ends, such sign-in / MFA attempts are refused for any
+    // account that already failed one this window; other accounts and other
+    // routes proceed. A backend that forwards the visitor address is limited
+    // per visitor instead and never counts here.
+    RATE_LIMIT_AUTH_UNATTRIBUTED_FAILURE_MAX: z.coerce.number().int().positive().optional(),
     // Per client IP across all operators and end users seen from it (3000,
     // never below RATE_LIMIT_AUTHENTICATED_MAX). API-key traffic is exempt.
     RATE_LIMIT_AUTHENTICATED_IP_MAX: z.coerce.number().int().positive().optional(),
@@ -96,6 +122,23 @@ export const env = createEnv({
     // mistake fails the deploy instead of degrading it to one warning line.
     // Do not relax that back to `:-`.
     API_PROXY_SECRET: z.string().min(16).optional(),
+    // Record the visitor's country from Cloudflare's CF-IPCountry on end-user
+    // sessions. Set `true` ONLY when the proxy that sends API_PROXY_SECRET
+    // receives nothing but Cloudflare traffic (its origin is locked to
+    // Cloudflare's ranges or authenticated origin pulls): anyone who reaches
+    // the proxy another way writes the header themselves. Off by default, and
+    // then no country is ever recorded. See docs/analytics.md.
+    TRUST_CF_IPCOUNTRY: z
+      .union([z.literal('true'), z.literal('false'), z.literal('')])
+      .optional()
+      .transform((v) => v === 'true'),
+    // The hourly analytics rollup (modules/analytics/rollup). On unless set to
+    // `false`: without it the Users overview can only answer the last 63 days
+    // and loses a day of per-day history every day. See docs/analytics.md.
+    ANALYTICS_ROLLUP_ENABLED: z
+      .union([z.literal('true'), z.literal('false'), z.literal('')])
+      .optional()
+      .transform((v) => v !== 'false'),
     API_PROXY_HOPS: z.coerce.number().int().min(1).max(5).default(1),
     // Proves a request came from OUR panel or portal whatever path it took
     // (the hosted units call the public API origin through the CDN). They send
@@ -106,7 +149,7 @@ export const env = createEnv({
     RATE_LIMIT_REFRESH_MAX: z.coerce.number().int().positive().default(60),
     // Per-window cap for server-to-server usage ingestion
     // (POST /api/v1/usage/record), keyed per API key, in its own bucket.
-    // Defaults to the per-key budget (RATE_LIMIT_API_KEY_MAX, 6000): it was
+    // Defaults to the per-key budget (RATE_LIMIT_API_KEY_MAX, 30000): it was
     // 1000, sized when a key only had 100, and ingestion is the hottest
     // server-to-server path, so it must not be the tighter of the two.
     RATE_LIMIT_USAGE_MAX: z.coerce.number().int().positive().optional(),
@@ -119,10 +162,10 @@ export const env = createEnv({
     // directly, because it must build the client before this module's
     // side-effecting parse has necessarily run.
     //
-    // Default 20, NOT Prisma's `num_cpus * 2 + 1`: the webhook worker runs at
-    // concurrency 10 against this same client, so a CPU-derived default on a
-    // small container gave the whole API fewer connections than one background
-    // worker could want. See the docblock in lib/prisma.ts before changing it.
+    // Default 20, NOT Prisma's `num_cpus * 2 + 1`: the webhook delivery path
+    // uses up to half of this pool (at most 10 connections) against this same
+    // client, so a CPU-derived default on a small container gave the whole API
+    // fewer connections than one background worker could want. See the docblock in lib/prisma.ts before changing it.
     // A `connection_limit` already present in DATABASE_URL wins over this.
     DATABASE_POOL_SIZE: z.coerce.number().int().positive().default(20),
     DATABASE_POOL_TIMEOUT_SECONDS: z.coerce.number().int().positive().default(10),
@@ -186,6 +229,19 @@ export const env = createEnv({
     // infrastructure. Unset means portal links are simply not offered.
     PUBLIC_PORTAL_URL: z.string().url().optional(),
 
+    // Kill switch for the Rekey-hosted checkout page. `false` makes every
+    // readiness check fail at checkout time, so each Application falls back
+    // to the provider's page or refuses, per its own failure behaviour.
+    CHECKOUT_EMBEDDED_ENABLED: z
+      .union([z.literal('true'), z.literal('false'), z.literal('')])
+      .optional()
+      .transform((v) => v !== 'false'),
+    // Checkout creation ceilings on top of the per-end-user 10/hour, 30/day
+    // (see billing/checkout/creation-limit.ts). Per vouched client IP, and
+    // per Application, both per rolling hour.
+    CHECKOUT_LIMIT_PER_IP_HOUR: z.coerce.number().int().min(1).max(100_000).default(20),
+    CHECKOUT_LIMIT_PER_APP_HOUR: z.coerce.number().int().min(1).max(10_000_000).default(1000),
+
     // Public base URL of the operator panel. The operator MCP OAuth authorize
     // endpoint redirects here (`/mcp-consent`) so the operator signs in through
     // the real panel login (session reuse, passkeys, MFA, magic-link) instead
@@ -230,6 +286,26 @@ export const env = createEnv({
     RESEND_DEFAULT_FROM: z.string().email().optional(),
     RESEND_DEFAULT_FROM_NAME: z.string().optional(),
 
+    // Default caps on `POST /api/v1/email/send` (custom templates), counted per
+    // workspace. `Tenant.limits.emailSendDailyCap` / `emailSendRecipientHourlyCap`
+    // override them for one workspace. The backstop if a key holding
+    // `email:send` leaks. Replays and suppressed sends are not counted.
+    EMAIL_SEND_DAILY_CAP: z.coerce.number().int().positive().default(1000),
+    EMAIL_SEND_RECIPIENT_HOURLY_CAP: z.coerce.number().int().positive().default(10),
+
+    // Signs one-click unsubscribe links in custom notification email. The links
+    // never expire, so the key rotates by id: set a new secret and id, and move
+    // the old pair into EMAIL_UNSUBSCRIBE_PREVIOUS_SECRETS (`id:secret,id:secret`)
+    // so links already in inboxes keep working. Unset, the key is derived from
+    // JWT_SECRET under id `jwt`, and those links break if JWT_SECRET changes.
+    EMAIL_UNSUBSCRIBE_SECRET: z.string().min(32).optional(),
+    EMAIL_UNSUBSCRIBE_SECRET_ID: z
+      .string()
+      .regex(/^[A-Za-z0-9_-]{1,32}$/)
+      .refine((id) => id !== 'jwt', 'The id "jwt" is reserved for the key derived from JWT_SECRET.')
+      .default('k1'),
+    EMAIL_UNSUBSCRIBE_PREVIOUS_SECRETS: z.string().optional(),
+
     // Deployment-wide fallback for the base URL transactional emails link
     // back to (`{{appUrl}}`, and the base for reset/verify/magic-link URLs
     // when the SDK caller doesn't pass one). LAST resort in the resolution
@@ -259,6 +335,18 @@ export const env = createEnv({
       .union([z.literal('true'), z.literal('false'), z.literal('')])
       .optional()
       .transform((v) => v === 'true'),
+    // How long one outbound webhook request may take, in milliseconds, before
+    // it counts as a failed attempt. 10s is what every release up to 2.2.x
+    // used; receivers on serverless platforms answer cold starts in 6-9s and
+    // time out every time under anything shorter. Bounded so a typo cannot
+    // hold a delivery slot for minutes (the slot lease is derived from it,
+    // see modules/webhooks/endpoint-gate.ts).
+    WEBHOOK_TIMEOUT_MS: z.coerce.number().int().min(1_000).max(30_000).default(10_000),
+    // Outbound webhook sends one Application may have in flight at once,
+    // across every replica and all of its endpoints. The per-endpoint cap (4)
+    // alone let one tenant with a dozen slow endpoints hold the whole
+    // delivery pool.
+    WEBHOOK_APP_MAX_IN_FLIGHT: z.coerce.number().int().min(1).max(200).default(8),
 
     // Operator/tenant MCP HTTP surface (POST /api/v1/tenant/mcp + its OAuth
     // authorization server). Enabled by default; set OPERATOR_MCP_ENABLED=false

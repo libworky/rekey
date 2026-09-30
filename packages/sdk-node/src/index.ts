@@ -21,6 +21,8 @@
  */
 
 import type {
+  EmailSendRequest,
+  EmailSendResult,
   ApplicationDto,
   AuthResultDto,
   MeInclude,
@@ -40,6 +42,8 @@ import type {
   EndUserDto,
   EndUserLicenseDto,
   FeatureCheckDto,
+  ProfileValue,
+  ProfileStateDto,
   ForgotPasswordRequest,
   ForgotPasswordResultDto,
   LicenseVerifyResultDto,
@@ -52,6 +56,7 @@ import type {
   MfaVerifyRequest,
   OAuthAuthServerMetadata,
   OAuthIntrospectionResponse,
+  OAuthProvidersListDto,
   OrganizationDto,
   OrganizationInvitationDto,
   OrganizationMemberDto,
@@ -67,7 +72,7 @@ import type {
   SignInRequest,
   DeviceBindingRequest,
   SignUpRequest,
-  SubscriptionDto,
+  SelfSubscriptionDto,
   UsageAggregateDto,
   UsageMeterCatalogueEntryDto,
   UsageRecordDto,
@@ -83,10 +88,24 @@ import type {
 // `/error` subpath is the zod-free module the class actually lives in, same
 // class object the barrel re-exports, so `instanceof` is identical.
 import { RekeyError } from '@rekey.dev/shared-types/error';
+import { ListsClient } from './lists.js';
 
 export type {
+  EmailSendRequest,
+  EmailSendResult,
+  ContactListPublicDto,
+  ContactListSummaryDto,
+  ListMemberDto,
+  ListMembersPage,
+  ListSubscribeOutcome,
+  ListSubscribeReceived,
+  ListSubscribeRequest,
   ApplicationDto,
   EndUserDto,
+  ProfileField,
+  ProfileValue,
+  ProfileStateDto,
+  OnboardingStatus,
   CurrentUserDto,
   EndUserLicenseDto,
   FeatureCheckDto,
@@ -112,8 +131,10 @@ export type {
   ChangePasswordRequest,
   PlanDto,
   SubscriptionDto,
+  SelfSubscriptionDto,
   CreateCheckoutRequest,
   CheckoutResultDto,
+  CheckoutWarning,
   CouponDto,
   // `billing.getProviders()` returns ProvidersListDto and this file already
   // imported it, but it was missing from the public block. Typing a
@@ -182,6 +203,8 @@ export type {
   JwksDto,
   OAuthIntrospectionResponse,
   OAuthAuthServerMetadata,
+  OAuthProvidersListDto,
+  OAuthProviderSummaryDto,
 } from '@rekey.dev/shared-types';
 
 /**
@@ -218,6 +241,55 @@ export interface RekeyConfig {
    * replaced by, any per-call `signal`.
    */
   signal?: AbortSignal | undefined;
+  /**
+   * The address of the visitor this server is acting for, sent to the API as
+   * `X-Rekey-Client-Ip` so its per-IP sign-in limits count the visitor rather
+   * than your server. Without it every sign-in your server makes shares one
+   * address, and the per-IP bucket either never fills or fills for everyone.
+   *
+   * Set it per visitor, usually with {@link Rekey.with}:
+   * `rekey.with({ clientIp }).auth.signIn(...)`. Take it from the header your
+   * own proxy sets, never from anything the browser can choose. One address,
+   * IPv4 or IPv6; anything else is not sent.
+   */
+  clientIp?: string | undefined;
+  /**
+   * The User-Agent of the visitor this server is acting for, sent as
+   * `X-Rekey-Client-User-Agent` so the session a sign-in mints records the
+   * visitor's browser and platform rather than your server's runtime. The API
+   * believes it only from a secret key. Set it per visitor with
+   * {@link Rekey.with}: `rekey.with({ clientIp, clientUserAgent }).auth.signIn(...)`.
+   */
+  clientUserAgent?: string | undefined;
+}
+
+/**
+ * The header {@link RekeyConfig.clientIp} travels in. The API reads it from a
+ * secret-key caller as the visitor's address; it is never the caller's own.
+ */
+export const CLIENT_IP_HEADER = 'X-Rekey-Client-Ip';
+
+/** The header {@link RekeyConfig.clientUserAgent} travels in. Believed only from a secret-key caller. */
+export const CLIENT_USER_AGENT_HEADER = 'X-Rekey-Client-User-Agent';
+
+/**
+ * `value` as a single IP address, or null. Deliberately strict: a list
+ * (`a, b`), a port, or anything with whitespace inside is refused rather than
+ * guessed at, so what reaches the API is always exactly one address.
+ */
+export function normalizeClientIp(value: string | null | undefined): string | null {
+  if (typeof value !== 'string') return null;
+  let ip = value.trim();
+  if (ip.startsWith('[') && ip.endsWith(']')) ip = ip.slice(1, -1);
+  if (ip.length === 0 || ip.length > 45) return null;
+  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(ip)) {
+    return ip.split('.').every((o) => Number(o) <= 255) ? ip : null;
+  }
+  // IPv6, optionally with an embedded IPv4 tail (::ffff:203.0.113.9).
+  // Two colons at least, so `203.0.113.9:443` (an address with a port) is not one.
+  const colons = ip.split(':').length - 1;
+  if (/^[0-9a-fA-F:.]+$/.test(ip) && colons >= 2 && colons <= 7) return ip;
+  return null;
 }
 
 /**
@@ -242,11 +314,16 @@ export interface RekeyCallOptions {
   timeoutMs?: number | undefined;
   /** Abort signal for this one call. Composed with the client's signal and the deadline. */
   signal?: AbortSignal | undefined;
+  /** The visitor's address for this call. See {@link RekeyConfig.clientIp}. */
+  clientIp?: string | undefined;
+  /** The visitor's User-Agent for this call. See {@link RekeyConfig.clientUserAgent}. */
+  clientUserAgent?: string | undefined;
 }
 
 // RekeyError is the shared class (imported above), re-exported so the public
 // API name is preserved and `instanceof` is consistent with @rekey.dev/react.
 export { RekeyError };
+export { ListsClient, type ListMembersOptions, type ListSubscribeOptions } from './lists.js';
 
 /**
  * Outbound webhook event registry, the events Rekey can POST to your app
@@ -321,6 +398,10 @@ export class Rekey {
   public readonly credits: CreditsClient;
   /** MCP, validate Rekey-issued MCP tokens from your own MCP server. */
   public readonly mcp: McpClient;
+  /** Custom email, send a template registered and published in the panel. */
+  public readonly email: EmailClient;
+  /** Lists, subscribe people to a waitlist or newsletter and read them out. */
+  public readonly lists: ListsClient;
 
   constructor(config: RekeyConfig) {
     if (!config.apiUrl) {
@@ -360,6 +441,8 @@ export class Rekey {
     this.usage = new UsageClient(this);
     this.credits = new CreditsClient(this);
     this.mcp = new McpClient(this);
+    this.email = new EmailClient(this);
+    this.lists = new ListsClient(this);
   }
 
   /**
@@ -391,10 +474,14 @@ export class Rekey {
       options.signal && this.signal
         ? AbortSignal.any([this.signal, options.signal])
         : (options.signal ?? this.signal);
+    const clientIp = options.clientIp ?? this.config.clientIp;
+    const clientUserAgent = options.clientUserAgent ?? this.config.clientUserAgent;
     return new Rekey({
       ...this.config,
       timeoutMs: options.timeoutMs ?? this.config.timeoutMs,
       ...(signal !== undefined && { signal }),
+      ...(clientIp !== undefined && { clientIp }),
+      ...(clientUserAgent !== undefined && { clientUserAgent }),
     });
   }
 
@@ -466,6 +553,7 @@ export class Rekey {
         headers: {
           Authorization: `Bearer ${this.secretKey}`,
           ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}),
+          ...this.clientIpHeader(options),
           ...extraHeaders,
         },
         ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
@@ -521,6 +609,7 @@ export class Rekey {
         headers: {
           ...(auth ? { Authorization: `Bearer ${this.secretKey}` } : {}),
           ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}),
+          ...this.clientIpHeader(options),
         },
         ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
       },
@@ -538,6 +627,16 @@ export class Rekey {
       throw new RekeyError({ code, message, statusCode: res.status });
     }
     return json as T;
+  }
+
+  /** @internal The visitor headers for one call: address and User-Agent, each when known. */
+  private clientIpHeader(options?: RekeyCallOptions): Record<string, string> {
+    const ip = normalizeClientIp(options?.clientIp ?? this.config.clientIp);
+    const ua = (options?.clientUserAgent ?? this.config.clientUserAgent)?.trim().slice(0, 512);
+    return {
+      ...(ip ? { [CLIENT_IP_HEADER]: ip } : {}),
+      ...(ua ? { [CLIENT_USER_AGENT_HEADER]: ua } : {}),
+    };
   }
 
   /**
@@ -765,6 +864,10 @@ class AuthClient {
    * // store both in your session, the access token expires in 15 minutes
    * ```
    *
+   * The result's `isNewUser` is always true here; `signIn`, `completeOAuth` and
+   * `verifyMagicLink` set it only when that call created the account, so one
+   * check routes new users to onboarding whichever way they arrived.
+   *
    * @throws {RekeyError} `EMAIL_ALREADY_EXISTS` (409) if the email is taken in this Application.
    * @throws {RekeyError} `PASSWORD_TOO_SHORT` (400) if shorter than the Application's `passwordMinLength`.
    * @throws {RekeyError} `AUTH_METHOD_DISABLED` (400) if the Application doesn't have `"password"` enabled.
@@ -806,6 +909,10 @@ class AuthClient {
    *   token was issued under a different Application.
    * @throws {RekeyError} `MFA_CODE_INVALID` (401) if the code doesn't
    *   verify against the user's TOTP secret or remaining backup codes.
+   * @throws {RekeyError} `MFA_CODE_REUSED` (401) if the TOTP code was
+   *   already accepted. Ask the user for the next code.
+   * @throws {RekeyError} `MFA_CHALLENGE_USED` (401) if the token already
+   *   completed a sign-in. Each token works once; call `signIn` again.
    */
   mfaVerify(input: MfaVerifyRequest): Promise<AuthResultDto> {
     return this.client.send('POST', '/api/v1/auth/mfa-verify', input);
@@ -832,7 +939,7 @@ class AuthClient {
    * Consume a magic-link token. Returns `SignInOutcome`, branch on
    * `mfaRequired` before reading `accessToken`. For MFA-enrolled users
    * the response carries `mfaChallengeToken` and you must complete via
-   * `mfaVerify(...)`.
+   * `mfaVerify(...)`. `isNewUser` is true when this link created the account.
    */
   verifyMagicLink(input: {
     token: string;
@@ -1268,6 +1375,22 @@ class AuthClient {
   // Linking flow (authenticated): `startOAuthLink` → `completeOAuthLink`.
 
   /**
+   * The OAuth providers this Application can sign users in with, one entry per
+   * button a sign-in page should render. Only providers configured with both a
+   * client id and a client secret are listed, so every entry can be started.
+   * Returns ids and display names only, never client ids or secrets.
+   *
+   * @example
+   * ```ts
+   * const { providers } = await rekey.auth.listOAuthProviders();
+   * // [{ id: 'google', name: 'Google' }]
+   * ```
+   */
+  listOAuthProviders(): Promise<OAuthProvidersListDto> {
+    return this.client.send('GET', '/api/v1/auth/oauth/providers');
+  }
+
+  /**
    * Get the provider authorization URL to redirect the browser to. Pass an
    * unguessable `state` and verify it on return before calling `completeOAuth`.
    */
@@ -1283,6 +1406,12 @@ class AuthClient {
    * Exchange the provider `code` for a Rekey session. Returns a
    * `SignInOutcome`, branch on `mfaRequired` before reading `accessToken`.
    * Verify the `state` CSRF value yourself before calling.
+   *
+   * @example
+   * ```ts
+   * const outcome = await rekey.auth.completeOAuth('google', code);
+   * if (!outcome.mfaRequired) redirect(outcome.isNewUser ? '/onboarding' : '/dashboard');
+   * ```
    */
   completeOAuth(
     provider: string,
@@ -1668,7 +1797,9 @@ class LicensesClient {
    * The signed-in end-user's own licences, newest first:
    * `GET /api/v1/users/me/licenses`, authorized by their access token. In an
    * org-billed Application whose session acts for an organization, that
-   * organization's pooled licences are included too.
+   * organization's pooled licences are included too. Pass `{ organizationId }`
+   * to include that organization's pool instead; the caller must be a member,
+   * or the API answers 403 `ORGANIZATION_NOT_MEMBER`.
    *
    * No raw keys: only a hash is stored, so each row carries its display
    * `keyPrefix`. Needs `billing:read` on a secret key.
@@ -1677,10 +1808,18 @@ class LicensesClient {
    * ```ts
    * const { items } = await rekey.licenses.listMine(accessToken);
    * const active = items.filter((l) => l.status === 'ACTIVE');
+   * const team = await rekey.licenses.listMine(accessToken, { limit: 20 }, { organizationId });
    * ```
    */
-  listMine(accessToken: string, page?: ListPage): Promise<Paged<EndUserLicenseDto>> {
-    return this.client.send('GET', `/api/v1/users/me/licenses/${listQuery(page)}`, undefined, {
+  listMine(
+    accessToken: string,
+    page?: ListPage,
+    opts?: { organizationId?: string },
+  ): Promise<Paged<EndUserLicenseDto>> {
+    const q = new URLSearchParams(listQuery(page));
+    if (opts?.organizationId) q.set('organizationId', opts.organizationId);
+    const query = q.toString();
+    return this.client.send('GET', `/api/v1/users/me/licenses/${query ? `?${query}` : ''}`, undefined, {
       'X-Rekey-User-Token': accessToken,
     });
   }
@@ -1825,6 +1964,53 @@ class UsersClient {
   import(users: ImportUserInput[]): Promise<ImportUsersResult> {
     return this.client.send('POST', '/api/v1/users/import', { users });
   }
+
+  /**
+   * Set profile answers for an end user. Any field may be set from the server,
+   * including `writableBy: "server"` ones. `null` clears an answer; keys you
+   * omit are kept. Throws PROFILE_FIELD_UNKNOWN, PROFILE_FIELD_INVALID or
+   * PROFILE_TOO_LARGE. See docs/profile-fields.md.
+   *
+   * @example
+   * ```ts
+   * await rekey.users.updateProfile(userId, { plan_tier: 'enterprise', company: null });
+   * ```
+   */
+  updateProfile(endUserId: string, patch: Record<string, ProfileValue | null>): Promise<ProfileStateDto> {
+    return this.client.send('PATCH', `/api/v1/users/${encodeURIComponent(endUserId)}/profile`, patch);
+  }
+
+  /**
+   * Mark an end user's onboarding complete. Every `requiredForOnboarding`
+   * field must be answered, or this throws PROFILE_INCOMPLETE with
+   * `details.missing`. Completing after a skip is allowed. Idempotent: the
+   * first call emits `user.onboarding_completed`, later calls return the same
+   * state. See docs/profile-fields.md.
+   *
+   * @example
+   * ```ts
+   * const { onboardingStatus } = await rekey.users.completeOnboarding(userId); // 'completed'
+   * ```
+   */
+  completeOnboarding(endUserId: string): Promise<ProfileStateDto> {
+    return this.client.send('POST', `/api/v1/users/${encodeURIComponent(endUserId)}/onboarding/complete`);
+  }
+
+  /**
+   * Record that an end user skipped onboarding. Nothing is validated and
+   * nothing is gated on it: Rekey only records the skip, and your app decides
+   * where a skipped user goes. Idempotent: the first call emits
+   * `user.onboarding_skipped`; a repeat, or a skip after completion, changes
+   * nothing and returns the current state. See docs/profile-fields.md.
+   *
+   * @example
+   * ```ts
+   * const { onboardingStatus, onboardingSkippedAt } = await rekey.users.skipOnboarding(userId);
+   * ```
+   */
+  skipOnboarding(endUserId: string): Promise<ProfileStateDto> {
+    return this.client.send('POST', `/api/v1/users/${encodeURIComponent(endUserId)}/onboarding/skip`);
+  }
 }
 
 export interface ImportUserInput {
@@ -1853,9 +2039,20 @@ class UsageClient {
   constructor(private readonly client: Rekey) {}
 
   /**
-   * Record a usage event against a named meter. `quantity` can be
-   * negative to credit back (e.g. refunds). `occurredAt` defaults to
-   * server time; pass an ISO string when ingesting historical events.
+   * Record a usage event against a named meter. `quantity` is a positive
+   * integer. `occurredAt` defaults to server time and must fall in the
+   * current UTC month.
+   *
+   * Pass `idempotencyKey` so a retry never counts twice: a repeat with the
+   * same quantity in the same month returns the original record, even with a
+   * regenerated `occurredAt`. The same key with a different quantity, or in
+   * another month, throws `IDEMPOTENCY_KEY_REUSED` (409). Keys are scoped per
+   * meter and subject.
+   *
+   * @example
+   * ```ts
+   * await rekey.usage.record({ meterSlug: 'api_calls', quantity: 1, endUserId, idempotencyKey: requestId });
+   * ```
    */
   record(input: {
     meterSlug: string;
@@ -1866,6 +2063,7 @@ class UsageClient {
     organizationId?: string;
     occurredAt?: string;
     metadata?: Record<string, unknown>;
+    idempotencyKey?: string;
   }): Promise<UsageRecordDto> {
     return this.client.send('POST', '/api/v1/usage/record', input);
   }
@@ -1959,6 +2157,89 @@ function creditSubjectQuery(subject: CreditSubject): URLSearchParams {
   if ('organizationId' in subject) p.set('organizationId', subject.organizationId);
   else p.set('endUserId', subject.endUserId);
   return p;
+}
+
+/**
+ * Every `code` `rekey.email.send()` can throw besides the generic ones
+ * (`API_KEY_*`, `RATE_LIMITED`, `DEPENDENCY_UNAVAILABLE`, `VALIDATION_ERROR`).
+ * See docs/errors.md, "Email: custom templates".
+ */
+export const EMAIL_SEND_ERROR_CODES = [
+  'EMAIL_TRANSPORT_NOT_CUSTOM',
+  'EMAIL_TEMPLATE_NOT_FOUND',
+  'EMAIL_TEMPLATE_NOT_PUBLISHED',
+  'EMAIL_SENDER_DOMAIN_MISMATCH',
+  'EMAIL_VARIABLES_INVALID',
+  'EMAIL_RECIPIENT_NOT_END_USER',
+  'EMAIL_RATE_LIMITED',
+  'EMAIL_IDEMPOTENCY_KEY_REUSED',
+  'EMAIL_SEND_IN_FLIGHT',
+  'EMAIL_SEND_OUTCOME_UNKNOWN',
+  'EMAIL_DELIVERY_FAILED',
+] as const;
+export type EmailSendErrorCode = (typeof EMAIL_SEND_ERROR_CODES)[number];
+
+/** True when `err` is a `RekeyError` from `rekey.email.send()` with one of its own codes. */
+export function isEmailSendError(err: unknown): err is RekeyError & { code: EmailSendErrorCode } {
+  return err instanceof RekeyError && (EMAIL_SEND_ERROR_CODES as readonly string[]).includes(err.code);
+}
+
+/**
+ * The per-variable problems of an `EMAIL_VARIABLES_INVALID` error, or an empty
+ * array for any other error.
+ *
+ * @example
+ * ```ts
+ * try {
+ *   await rekey.email.send({ template: 'order_shipped', to, variables });
+ * } catch (err) {
+ *   for (const issue of emailVariableIssues(err)) console.warn(issue.path, issue.message);
+ * }
+ * ```
+ */
+export function emailVariableIssues(err: unknown): Array<{ path: string; message: string }> {
+  if (!(err instanceof RekeyError) || err.code !== 'EMAIL_VARIABLES_INVALID') return [];
+  const issues = err.details?.issues;
+  return Array.isArray(issues) ? (issues as Array<{ path: string; message: string }>) : [];
+}
+
+class EmailClient {
+  constructor(private readonly client: Rekey) {}
+
+  /**
+   * Send a custom template that was registered and published in the panel
+   * (Application → Email → Custom templates). The call names the template
+   * and passes variables; the subject, body and From address come from the
+   * published version, and the mail goes out through the Application's own
+   * Resend or SMTP provider, never a shared pool.
+   *
+   * Needs a secret key minted with the elevated `email:send` scope; `*` does
+   * not include it. Resolves with `status: 'suppressed'` (nothing sent) when
+   * the address is on the suppression list or the Application's email is off.
+   *
+   * Pass `idempotencyKey` so a retry never sends twice: a repeat returns the
+   * first result, and a repeat of a failed send throws the same
+   * `EMAIL_DELIVERY_FAILED` without sending. Use a new key to try again. A key
+   * whose first send never recorded an outcome throws `EMAIL_SEND_OUTCOME_UNKNOWN`
+   * after five minutes: check whether it arrived before sending with a new key.
+   *
+   * A recipient who used the one-click unsubscribe in a `notification` email
+   * resolves `suppressed` for notification templates only; `critical`
+   * templates and Rekey's own account emails still reach them.
+   *
+   * @example
+   * ```ts
+   * const { id, status } = await rekey.email.send({
+   *   template: 'order_shipped',
+   *   to: 'buyer@example.com',
+   *   variables: { orderNumber: 'A-1042', trackingUrl: 'https://track.example.com/A-1042' },
+   *   idempotencyKey: `order-shipped:${order.id}`,
+   * });
+   * ```
+   */
+  send(input: EmailSendRequest): Promise<EmailSendResult> {
+    return this.client.send('POST', '/api/v1/email/send', input);
+  }
 }
 
 /**
@@ -2518,17 +2799,43 @@ class BillingClient {
    *
    * `opts.organizationId` reads an organization's subscription instead of the
    * user's own on an org-billed app. The caller must be a member.
+   *
+   * A buyer can hold several live subscriptions; this returns one (a paid
+   * plan before the free tier, then the newest). {@link listSubscriptions}
+   * returns them all. No `metadata` on this end-user view.
    */
   getSubscription(
     accessToken: string,
     opts?: { organizationId?: string; includeEnded?: boolean },
-  ): Promise<SubscriptionDto | null> {
+  ): Promise<SelfSubscriptionDto | null> {
     const qs = new URLSearchParams();
     if (opts?.organizationId) qs.set('organizationId', opts.organizationId);
     if (opts?.includeEnded) qs.set('includeEnded', 'true');
     const query = qs.toString();
     const suffix = query ? `?${query}` : '';
     return this.client.send('GET', `/api/v1/billing/subscription${suffix}`, undefined, {
+      'X-Rekey-User-Token': accessToken,
+    });
+  }
+
+  /**
+   * Every live (ACTIVE, TRIALING, PAST_DUE) subscription of the user, or of
+   * `opts.organizationId` (member-only), with the one {@link getSubscription}
+   * returns first. Check it before offering a checkout, so a buyer is never
+   * offered a plan they already hold.
+   *
+   * @example
+   * ```ts
+   * const { items } = await rekey.billing.listSubscriptions(userAccessToken);
+   * const held = new Set(items.map((s) => s.planId));
+   * ```
+   */
+  listSubscriptions(
+    accessToken: string,
+    opts?: { organizationId?: string },
+  ): Promise<{ items: SelfSubscriptionDto[] }> {
+    const suffix = opts?.organizationId ? `?organizationId=${encodeURIComponent(opts.organizationId)}` : '';
+    return this.client.send('GET', `/api/v1/billing/subscriptions${suffix}`, undefined, {
       'X-Rekey-User-Token': accessToken,
     });
   }
@@ -2551,9 +2858,14 @@ class BillingClient {
    * the trial the next checkout was about to grant.
    *
    * If the Application's billing subject is **org** (Panel → Application →
-   * Billing → Subject), an individual can't hold a subscription, you MUST
+   * Billing → Setup → Settings), an individual can't hold a subscription, you MUST
    * pass `organizationId` of a team the user owns/admins. Omitting it throws
    * `RekeyError` `code: "BILLING_ORGANIZATION_REQUIRED"`.
+   *
+   * `successUrl` and `cancelUrl` should be on an origin the Application has
+   * registered (its App URL or a redirect URL). One that is not still works
+   * today but comes back in `warnings` as `CHECKOUT_RETURN_URL_UNREGISTERED`,
+   * and the next minor release refuses it. A non-http(s) URL is refused now.
    *
    * @example
    * ```ts
@@ -2590,6 +2902,10 @@ class BillingClient {
    * false` means they were already entitled and nothing was written,
    * re-provisioned or re-announced.
    *
+   * `subscription` is null when the plan carries only FEATURE or USAGE
+   * entitlements and this user already holds it for another beneficiary: the
+   * requested one is on the free tier at read time, with no row of its own.
+   *
    * Pass `organizationId` on an org-billed Application; the caller must be an
    * OWNER or ADMIN of it. Omit it and the session's active organization is used.
    *
@@ -2602,14 +2918,14 @@ class BillingClient {
    * @example
    * ```ts
    * const { subscription, activated } = await rekey.billing.subscribe(accessToken);
-   * if (activated) welcomeWithStarterCredits(subscription);
+   * if (activated && subscription) welcomeWithStarterCredits(subscription);
    * ```
    */
   async subscribe(
     accessToken: string,
     input: { organizationId?: string } = {},
-  ): Promise<{ subscription: SubscriptionDto; activated: boolean }> {
-    const { data, status } = await this.client.sendWithStatus<SubscriptionDto>(
+  ): Promise<{ subscription: SelfSubscriptionDto | null; activated: boolean }> {
+    const { data, status } = await this.client.sendWithStatus<SelfSubscriptionDto | null>(
       'POST',
       '/api/v1/billing/subscribe',
       { ...(input.organizationId !== undefined && { organizationId: input.organizationId }) },
@@ -2678,7 +2994,8 @@ class BillingClient {
    *
    * @throws {RekeyError} with one of `COUPON_NOT_FOUND` / `COUPON_INACTIVE`
    *   / `COUPON_NOT_YET_STARTED` / `COUPON_EXPIRED` / `COUPON_NOT_APPLICABLE`
-   *   / `COUPON_CURRENCY_MISMATCH` / `COUPON_REDEMPTION_LIMIT_REACHED` /
+   *   / `COUPON_CURRENCY_REQUIRED` / `COUPON_CURRENCY_MISMATCH` /
+   *   `COUPON_REDEMPTION_LIMIT_REACHED` /
    *   `COUPON_USER_LIMIT_REACHED`. Surface the message + fix to the user.
    */
   validateCoupon(
@@ -2812,7 +3129,8 @@ class BillingClient {
    * at the provider to schedule against.
    *
    * Pass `organizationId` when the subscription belongs to a team; the caller
-   * must be its OWNER or ADMIN.
+   * must be its OWNER or ADMIN. Pass `subscriptionId` to cancel one of several
+   * live subscriptions ({@link listSubscriptions}).
    *
    * @example
    * ```ts
@@ -2823,8 +3141,8 @@ class BillingClient {
    */
   cancelSubscription(
     accessToken: string,
-    input?: { atPeriodEnd?: boolean; organizationId?: string },
-  ): Promise<SubscriptionDto> {
+    input?: { atPeriodEnd?: boolean; organizationId?: string; subscriptionId?: string },
+  ): Promise<SelfSubscriptionDto> {
     return this.client.send(
       'POST',
       '/api/v1/billing/subscription/cancel',
@@ -2833,6 +3151,7 @@ class BillingClient {
         // default (at period end) instead of parsing a null-ish field.
         ...(input?.atPeriodEnd !== undefined && { atPeriodEnd: input.atPeriodEnd }),
         ...(input?.organizationId && { organizationId: input.organizationId }),
+        ...(input?.subscriptionId && { subscriptionId: input.subscriptionId }),
       },
       { 'X-Rekey-User-Token': accessToken },
     );

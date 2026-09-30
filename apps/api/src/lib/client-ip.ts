@@ -63,6 +63,14 @@ export const CLIENT_IP_HEADER = 'x-rekey-client-ip';
 
 /** Where the resolver leaves its decision on the raw request (see `rewriteUrl` in app.ts). */
 export const CLIENT_IP_VOUCHED = Symbol('rekey.clientIpVouched');
+/** Where the resolver leaves a well-formed `X-Rekey-Client-Ip`, whoever sent it. */
+export const DECLARED_CLIENT_IP = Symbol('rekey.declaredClientIp');
+/** The visitor's country our panel or portal forwards, believed only with the caller secret. */
+export const CLIENT_COUNTRY_HEADER = 'x-rekey-client-country';
+/** Where the resolver leaves the country it believes (see `visitorCountry` below). */
+export const VISITOR_COUNTRY = Symbol('rekey.visitorCountry');
+/** Where the resolver leaves whether the caller proved INTERNAL_CALLER_SECRET. */
+export const INTERNAL_CALLER = Symbol('rekey.internalCaller');
 
 declare module 'fastify' {
   interface FastifyRequest {
@@ -72,7 +80,44 @@ declare module 'fastify' {
      * behind it. Set by the first onRequest hook in app.ts.
      */
     clientIpVouched: boolean;
+    /**
+     * The one address the caller sent in `X-Rekey-Client-Ip`, when it is a
+     * syntactically valid IP; null otherwise. UNVERIFIED: anyone can send the
+     * header. It becomes `request.ip` only with the internal caller secret
+     * (above), and the auth tier reads it only from a verified secret-key
+     * caller (`attributedAuthClientIp` in lib/rate-limit.ts). Nothing else may
+     * read it.
+     */
+    declaredClientIp: string | null;
+    /**
+     * The visitor's two-letter country, or null. Only ever set when
+     * TRUST_CF_IPCOUNTRY is on, and then only from Cloudflare's
+     * `CF-IPCountry` on a request that came through our proxy (proven by
+     * X-Rekey-Proxy-Secret), or from `X-Rekey-Client-Country` sent by our
+     * panel or portal (proven by INTERNAL_CALLER_SECRET). Anyone else can
+     * write either header.
+     */
+    visitorCountry: string | null;
+    /** The request carried INTERNAL_CALLER_SECRET: it is our panel or portal acting for a visitor. */
+    internalCaller: boolean;
   }
+}
+
+/** A two-letter country code from a header, or null. `XX` and `T1` are Cloudflare's unknown and Tor. */
+function countryCode(value: string | string[] | undefined): string | null {
+  if (typeof value !== 'string') return null;
+  const code = value.trim().toUpperCase();
+  if (!/^[A-Z]{2}$/.test(code) || code === 'XX' || code === 'T1') return null;
+  return code;
+}
+
+/** A single, syntactically valid address from `X-Rekey-Client-Ip`, else null. */
+function declaredAddress(value: string | string[] | undefined): string | null {
+  // A repeated header arrives as an array: more than one address is not one
+  // visitor, so it is ignored rather than picking one.
+  if (typeof value !== 'string') return null;
+  const single = normalizeIp(value);
+  return single !== '' && isIP(single) !== 0 ? single : null;
 }
 
 export interface ClientIpPolicy {
@@ -84,6 +129,12 @@ export interface ClientIpPolicy {
   proxyHops: number;
   /** INTERNAL_CALLER_SECRET: proves a request came from our panel or portal. */
   internalCallerSecret?: string | undefined;
+  /**
+   * TRUST_CF_IPCOUNTRY: the deployment asserts that its proxy only receives
+   * traffic from Cloudflare, so a `CF-IPCountry` arriving through it is
+   * Cloudflare's. Off, no country is ever recorded.
+   */
+  trustCfIpCountry?: boolean | undefined;
   /**
    * Called when API_PROXY_SECRET is set but a private-network peer forwarded
    * without it: a proxy route missing the secret middleware. Rate-limit any
@@ -209,14 +260,34 @@ export function createClientIpResolver(policy: ClientIpPolicy): (raw: IncomingMe
     const xff = headerValue(raw, 'x-forwarded-for');
     const presented = headerValue(raw, PROXY_SECRET_HEADER);
     const presentedCaller = headerValue(raw, CALLER_SECRET_HEADER);
-    const callerClientIp = raw.headers[CLIENT_IP_HEADER];
+    const callerClientIp = declaredAddress(raw.headers[CLIENT_IP_HEADER]);
     // Neither secret may reach a log line, a handler, or anything forwarded,
-    // and the caller-vouched address means nothing without its secret.
+    // and the caller-vouched address means nothing without its secret. The
+    // declared address is kept aside, unverified, for the one reader allowed
+    // to use it without the secret: the auth tier, for a secret-key caller.
     delete raw.headers[PROXY_SECRET_HEADER];
     delete raw.headers[CALLER_SECRET_HEADER];
     delete raw.headers[CLIENT_IP_HEADER];
+    (raw as unknown as Record<symbol, string | null>)[DECLARED_CLIENT_IP] = callerClientIp;
     const viaOurProxy =
       secret !== null && presented !== undefined && sameSecret(presented, secret);
+    const internalCaller =
+      callerSecret !== null && presentedCaller !== undefined && sameSecret(presentedCaller, callerSecret);
+    // The country: Cloudflare's header through our proxy, or the one our panel
+    // or portal forwards for its visitor (its own CF-IPCountry is the country
+    // of the portal's host, never the visitor's). Both only when the
+    // deployment says its proxy sits behind Cloudflare alone.
+    const forwardedCountry = countryCode(raw.headers[CLIENT_COUNTRY_HEADER]);
+    delete raw.headers[CLIENT_COUNTRY_HEADER];
+    const visitorCountry = !policy.trustCfIpCountry
+      ? null
+      : internalCaller
+        ? forwardedCountry
+        : viaOurProxy
+          ? countryCode(raw.headers['cf-ipcountry'])
+          : null;
+    (raw as unknown as Record<symbol, unknown>)[VISITOR_COUNTRY] = visitorCountry;
+    (raw as unknown as Record<symbol, unknown>)[INTERNAL_CALLER] = internalCaller;
     // Forwarded host and scheme are believed only from our proxy. Nothing
     // reads them today; this keeps it that way for any caller that could forge
     // them.
@@ -242,9 +313,8 @@ export function createClientIpResolver(policy: ClientIpPolicy): (raw: IncomingMe
     // append to it even when the caller sent none, so its entries would be
     // the caller's own egress or the proxy, shared by every visitor. Missing
     // or malformed means the caller had no visitor address: not vouched.
-    if (callerSecret && presentedCaller !== undefined && sameSecret(presentedCaller, callerSecret)) {
-      const single = typeof callerClientIp === 'string' ? normalizeIp(callerClientIp) : '';
-      return believe(single !== '' && isIP(single) !== 0 ? single : null);
+    if (internalCaller) {
+      return believe(callerClientIp);
     }
 
     // Legacy: a hop count believes the chain from any peer.

@@ -12,7 +12,10 @@ import { cookies } from 'next/headers';
 import { type NextRequest, NextResponse } from 'next/server';
 import { publicPost, PanelApiError, ACCESS_COOKIE, REFRESH_COOKIE, sessionCookieMaxAges } from '@/lib/api';
 import { cookieSecure } from '@/lib/cookie-secure';
+import { clearMfaChallenge, mfaVerifyPath, writeMfaChallenge } from '@/lib/mfa-challenge';
 import { safeNext } from '@/lib/safe-next';
+import { normalizeErrorCode } from '@/lib/error-code';
+import { LOGIN_ERROR_MESSAGES } from '../../../error-messages';
 
 type CallbackResult =
   | { mfaRequired: true; mfaChallengeToken: string }
@@ -88,24 +91,22 @@ export async function GET(
       { code, state },
     );
   } catch (err) {
-    if (err instanceof PanelApiError) return fail(err.code);
+    if (err instanceof PanelApiError) return fail(normalizeErrorCode(err.code, LOGIN_ERROR_MESSAGES));
     throw err;
   }
 
-  // MFA-enrolled operator → hand off to the verify page with the challenge.
   // Carry `next` through the MFA hop so an invite round-trip survives it.
   if (result.mfaRequired) {
-    return clearOAuthCookies(
-      seeOther(
-        `/mfa-verify?challenge=${encodeURIComponent(result.mfaChallengeToken)}${next ? `&next=${encodeURIComponent(next)}` : ''}`,
-      ),
-    );
+    const mfa = seeOther(mfaVerifyPath({ next }));
+    await writeMfaChallenge(mfa.cookies, result.mfaChallengeToken);
+    return clearOAuthCookies(mfa);
   }
 
   const secure = await cookieSecure();
   const res = seeOther(
     next ? `${next}${next.includes('?') ? '&' : '?'}e=login_oauth` : '/applications?e=login_oauth',
   );
+  clearMfaChallenge(res.cookies);
   const maxAges = sessionCookieMaxAges(result);
   res.cookies.set(ACCESS_COOKIE, result.accessToken, {
     httpOnly: true, sameSite: 'strict', secure, path: '/', maxAge: maxAges.access,

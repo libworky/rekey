@@ -24,7 +24,9 @@
  */
 
 import { Prisma } from '@prisma/client';
-import type { Application, EndUser } from '@prisma/client';
+import type { Application, EndUser, RefreshToken } from '@prisma/client';
+import { createHash, timingSafeEqual } from 'node:crypto';
+import { isDeepStrictEqual } from 'node:util';
 import { prisma } from '../../lib/prisma.js';
 import { RekeyError } from '../../lib/error.js';
 import { sessionEnded } from '../../lib/session-stamp.js';
@@ -79,17 +81,36 @@ import {
   LOGIN_POLICY,
 } from '../../lib/brute-force.js';
 import type { WebAuthnCredential } from '@prisma/client';
-import { AuthConfigSchema } from '@rekey.dev/shared-types';
+import { AuthConfigSchema, onboardingStatus, type OnboardingStatus } from '@rekey.dev/shared-types';
 import { assertNoReservedMetadataKey } from '../../lib/oidc-profile.js';
 import { assertSignupAllowed, signupAllowed, type AuthKind } from '../../lib/signup-policy.js';
 import { assertEndUserQuota } from '../../lib/tenant-limits.js';
 import { applicationRolesService } from '../application-roles/application-roles.service.js';
 import { mfaService } from '../mfa/mfa.service.js';
+import {
+  claimMfaChallenge,
+  isMfaChallengeSpent,
+  mfaBackupCodeUsedError,
+  mfaChallengeUsedError,
+  mfaCodeReusedError,
+} from '../../lib/mfa-replay.js';
 import { emailService } from '../email/email.service.js';
 import { resolveAppUrl, buildTokenUrl , assertAllowedTokenUrl } from '../../lib/app-url.js';
 import { recordAuthEmailDeliveryFailure } from '../../lib/email-transport.js';
 import { recordSecurityEvent } from '../../lib/security-events.js';
-import { emitDetached } from '../webhooks/webhook.service.js';
+import { judgeReplay, REFRESH_REUSE_WINDOW_MS, type ReuseReason } from '../../lib/refresh-reuse-window.js';
+import { withSavepoint } from '../../lib/savepoint.js';
+import { enqueueEvent, kickDeliveries } from '../webhooks/webhook.service.js';
+import {
+  claimPendingWelcome,
+  enqueueSessionCreated,
+  enqueueUserUpdated,
+  sendWelcomeEmail,
+  userSnapshot,
+  welcomeTiming,
+} from './user-lifecycle.js';
+import { recordActivitySafely } from '../end-users/daily-activity.js';
+import type { ClientContext } from '../../lib/client-platform.js';
 
 export interface SignUpInput {
   application: Application;
@@ -155,12 +176,40 @@ const PUBLISHABLE_MAGIC_LINK_RESPONSE = {
   magicLinkToken: null,
 } as const;
 
-/** Public-safe shape of an EndUser, `passwordHash` stripped. */
-export type PublicEndUser = Omit<EndUser, 'passwordHash' | 'sessionsInvalidBefore'>;
+/** Public-safe shape of an EndUser, `passwordHash` and internal bookkeeping stripped. */
+export type PublicEndUser = Omit<
+  EndUser,
+  | 'passwordHash'
+  | 'sessionsInvalidBefore'
+  | 'welcomeEmailPending'
+  | 'firstSignedInAt'
+  | 'activityBits'
+  | 'bannedAt'
+  | 'bannedBy'
+  | 'banReason'
+  | 'createdVia'
+> & { onboardingStatus: OnboardingStatus; createdVia: string };
+
+/** The secret-key view: the customer's own backend also sees whether the user is banned. */
+export type ServerEndUser = PublicEndUser & Pick<EndUser, 'bannedAt'>;
 
 function redact(user: EndUser): PublicEndUser {
-  const { passwordHash, sessionsInvalidBefore, ...rest } = user;
-  return rest;
+  const {
+    passwordHash,
+    sessionsInvalidBefore,
+    welcomeEmailPending,
+    firstSignedInAt,
+    activityBits,
+    // Operator-only: who banned and why never leave through an end-user or
+    // secret-key payload. `bannedAt` is added back for the secret-key lookup
+    // only (`getByIdForServer`); the end-user's own payloads never carry it.
+    bannedAt,
+    bannedBy,
+    banReason,
+    createdVia,
+    ...rest
+  } = user;
+  return { ...rest, onboardingStatus: onboardingStatus(user), createdVia: createdVia ?? 'unknown' };
 }
 
 /**
@@ -215,6 +264,34 @@ function assertEndUserNotErased(user: Pick<EndUser, 'erasedAt'>): void {
   }
 }
 
+/**
+ * Operator ban gate. Runs beside the erasure gate at every session chokepoint,
+ * and only AFTER the primary factor has succeeded, so the distinct code tells
+ * nothing to someone who does not already hold the credential. The operator's
+ * reason is never part of the error.
+ *
+ * The OAuth/OIDC surface enforces the same rule in `liveGrantSubject`
+ * (modules/mcp/oauth.service.ts). Change one, change both.
+ */
+export function assertEndUserNotBanned(user: Pick<EndUser, 'bannedAt'>): void {
+  if (user.bannedAt !== null) throw endUserBannedError();
+}
+
+export function endUserBannedError(): RekeyError {
+  return new RekeyError({
+    statusCode: 403,
+    code: 'END_USER_BANNED',
+    message: 'This account cannot sign in to this app. Contact the app\'s support team.',
+    fix: 'Show the person a suspended-account message with your support contact. Do not retry; an operator has to lift the ban.',
+  });
+}
+
+/** Both terminal refusals, erased first: an erased user's ban no longer matters. */
+function assertEndUserCanAuthenticate(user: Pick<EndUser, 'erasedAt' | 'bannedAt'>): void {
+  assertEndUserNotErased(user);
+  assertEndUserNotBanned(user);
+}
+
 export interface AuthResult {
   endUser: PublicEndUser;
   /** Short-lived access JWT. Pass via X-Rekey-User-Token. */
@@ -230,6 +307,8 @@ export interface AuthResult {
    * null when the client sent no fingerprint.
    */
   deviceId: string | null;
+  /** True when the request that minted this session also created the account. */
+  isNewUser: boolean;
 }
 
 /**
@@ -276,6 +355,8 @@ export interface DeviceContext {
    * primary; `refresh` and org switch pass `false`.
    */
   primary?: boolean;
+  /** The client the session is started from, recorded on its refresh row (lib/client-platform.ts). */
+  client?: ClientContext | null;
 }
 
 /**
@@ -424,6 +505,129 @@ async function planDeviceBinding(
   return { fingerprint, via, label: device?.label ?? undefined, ip: device?.ip ?? null };
 }
 
+/** Equal fingerprints, compared in constant time (digests first, so lengths match). */
+function sameFingerprint(a: string, b: string): boolean {
+  const da = createHash('sha256').update(a).digest();
+  const db = createHash('sha256').update(b).digest();
+  return timingSafeEqual(da, db);
+}
+
+/**
+ * Why an in-window replay must still be treated as reuse, judged on what the
+ * REQUEST carries rather than on timing: `null` when nothing disqualifies it.
+ *
+ * The window forgives a client racing itself. A replay presented under a
+ * different Application's key, or from a machine the successor is not bound
+ * to, is not that client: a fingerprint the session never had is the
+ * stolen-token signature the device binding exists to catch, and a request
+ * that sends one against a chain the winning request left unbound did not
+ * come from the same code path as the winner.
+ */
+async function replayContextMismatch(
+  application: Application,
+  presented: RefreshToken,
+  successor: RefreshToken,
+  device: DeviceContext | undefined,
+): Promise<ReuseReason | null> {
+  if (presented.applicationId !== application.id || presented.kind !== 'session') {
+    return 'wrong_application';
+  }
+  const fingerprint = device?.fingerprint;
+  if (!fingerprint) return null;
+  if (!successor.deviceId) return 'device_mismatch';
+  const bound = await prisma.device.findUnique({
+    where: { id: successor.deviceId },
+    select: { fingerprint: true },
+  });
+  if (!bound || !sameFingerprint(bound.fingerprint, fingerprint)) return 'device_mismatch';
+  return null;
+}
+
+/**
+ * Answer a replay of a ROTATED refresh token. Always throws.
+ *
+ * Inside the reuse window (see lib/refresh-reuse-window.ts) the answer is
+ * `REFRESH_TOKEN_RACED`: nothing is issued and nothing is revoked, so the
+ * other tab, instance or retry that won keeps its session and so does every
+ * other device. Outside it the whole family is revoked, as it always was.
+ * Both outcomes are written to the security log with the replaying request's
+ * IP and user agent, awaited rather than fire-and-forget: the in-window row is
+ * the only trace a forgiven replay leaves, so it must exist by the time the
+ * caller sees the 401.
+ *
+ * `via` records which door the replay came through: the lookup already saw
+ * the token spent, or it passed the lookup and lost the rotation to a
+ * concurrent request.
+ */
+async function refuseRotatedReplay(
+  application: Application,
+  presented: RefreshToken,
+  device: DeviceContext | undefined,
+  via: 'lookup' | 'rotation_race',
+): Promise<never> {
+  const successor = presented.replacedById
+    ? await prisma.refreshToken.findUnique({ where: { id: presented.replacedById } })
+    : null;
+  let verdict = judgeReplay(presented, successor, new Date());
+  if (verdict.kind === 'raced' && successor) {
+    const mismatch = await replayContextMismatch(application, presented, successor, device);
+    if (mismatch) verdict = { kind: 'reused', reason: mismatch };
+  }
+  const trail = {
+    actorType: 'end_user' as const,
+    actorId: presented.endUserId,
+    tenantId: application.tenantId,
+    applicationId: presented.applicationId,
+    ip: device?.ip ?? null,
+    userAgent: device?.userAgent ? device.userAgent.slice(0, 512) : null,
+  };
+  if (verdict.kind === 'raced') {
+    await recordSecurityEvent({
+      ...trail,
+      type: 'user.refresh_token_raced',
+      metadata: {
+        sessionId: presented.sessionId,
+        presentedTokenId: presented.id,
+        successorTokenId: presented.replacedById,
+        msSinceRotation: verdict.msSinceRotation,
+        windowSeconds: REFRESH_REUSE_WINDOW_MS / 1000,
+        via,
+      },
+    });
+    throw new RekeyError({
+      statusCode: 401,
+      code: 'REFRESH_TOKEN_RACED',
+      message:
+        'This refresh token was rotated moments ago by another request. No session was revoked.',
+      fix: 'Do not retry with this token. Use the refresh token the other request received (re-read the cookie or token store); if this client never got it, sign in again. Replaying this token later revokes every session.',
+    });
+  }
+  const revokedCount = await revokeAllForEndUser(presented.endUserId);
+  await recordSecurityEvent({
+    ...trail,
+    type: 'user.refresh_token_reused',
+    metadata: {
+      sessionId: presented.sessionId,
+      presentedTokenId: presented.id,
+      reason: verdict.reason,
+      revokedCount,
+      via,
+    },
+  });
+  throw new RekeyError({
+    statusCode: 401,
+    code: 'REFRESH_TOKEN_REUSED',
+    message:
+      via === 'lookup'
+        ? 'Refresh token has already been used. All sessions for this user have been revoked as a precaution.'
+        : 'Refresh token rotation lost a race with another request. All sessions revoked as a precaution.',
+    fix:
+      via === 'lookup'
+        ? 'A used refresh token cannot be replayed. Sign the user in again to obtain a fresh session.'
+        : 'Sign the user in again to obtain a fresh session.',
+  });
+}
+
 /**
  * A device refusal that lands AFTER the presented refresh token was spent,
  * re-coded as the terminal `REFRESH_TOKEN_REVOKED` (the session was ended),
@@ -459,13 +663,28 @@ async function commitDeviceBinding(
   return outcome.device.id;
 }
 
+/** The sign-in method a new session is announced with, `session.created`'s `data.via`. */
+export type SignInVia = 'password' | 'magic_link' | 'oauth' | 'passkey' | 'mfa';
+
+/**
+ * A sign-in that just verified a factor. `isNewUser` when the same request
+ * created the account.
+ */
+export interface SignInCredential {
+  via: SignInVia;
+  isNewUser?: boolean;
+}
+
 /**
  * Where a new session pair comes from. Required on every `issuePair` call so
- * a caller has to say it: `'credential'` when a sign-in factor was just
- * verified (password, MFA code, passkey, magic link, OAuth), or the session
- * the request is acting from, carrying its impersonation context if any.
+ * a caller has to say it: a `credential` when a sign-in factor was just
+ * verified, which is a real sign-in and announced with `session.created`, or
+ * the session the request is acting from, carrying its impersonation context
+ * if any, which re-mints a session and announces nothing.
  */
-type PairOrigin = 'credential' | { session: { impersonation: ImpersonationContext | undefined } };
+type PairOrigin =
+  | { credential: SignInCredential }
+  | { session: { impersonation: ImpersonationContext | undefined } };
 
 async function issuePair(
   application: Application,
@@ -481,9 +700,13 @@ async function issuePair(
   // end-user, which is what the org switch routes did before they refused.
   // The routes refuse first with the same error; this is the backstop, so a
   // future route that re-mints from a session cannot reopen it.
-  if (origin !== 'credential' && origin.session.impersonation) {
+  if ('session' in origin && origin.session.impersonation) {
     throw impersonationForbidden('mint a new session');
   }
+  // Backstop for the doors that reach here without `issueSessionOrMfaChallenge`:
+  // passkey sign-in, MFA verification (a ban can land inside the challenge's
+  // five minutes) and org switching.
+  assertEndUserCanAuthenticate(endUser);
   // Email-verification chokepoint. THE place a session comes into existence in
   // this service, sign-up, sign-in, MFA verification and org switching all end
   // up here, which is why the gate lives here rather than beside each caller.
@@ -498,13 +721,31 @@ async function issuePair(
   // an unconfirmed address does not register devices it cannot use.
   const deviceId = await bindDevice(application, endUser, device);
   // The refresh row first: it mints the session id the access token carries
-  // as `sid`, which is what lets a single-session revoke end this pair.
-  const refresh = await issueRefreshToken(application.id, endUser.id, {
+  // as `sid`, which is what lets a single-session revoke end this pair. A
+  // sign-in writes it with its `session.created` in one transaction, so the
+  // session and its announcement commit together.
+  const refreshOptions = {
     userAgent: device?.userAgent ?? null,
     ip: device?.ip ?? null,
     activeOrganizationId: activeOrganizationId ?? null,
     deviceId,
-  });
+    client: device?.client ?? null,
+  };
+  const { refresh, deliveryIds } =
+    'credential' in origin
+      ? await prisma.$transaction(async (tx) => {
+          const issued = await issueRefreshToken(application.id, endUser.id, refreshOptions, tx);
+          const ids = await enqueueSessionCreated(tx, {
+            endUser,
+            sessionId: issued.record.sessionId,
+            deviceId,
+            via: origin.credential.via,
+            client: device?.client ?? null,
+          });
+          return { refresh: issued, deliveryIds: ids };
+        })
+      : { refresh: await issueRefreshToken(application.id, endUser.id, refreshOptions), deliveryIds: [] };
+  kickDeliveries(deliveryIds);
   // Honours the app's `authConfig.tokenAlg` (HS256 default, RS256 = JWKS).
   const access = await issueUserAccessTokenForApp(application, endUser.id, {
     ...(activeOrganizationId && { activeOrganizationId }),
@@ -518,6 +759,7 @@ async function issuePair(
     refreshToken: refresh.raw,
     refreshTokenExpiresAt: refresh.record.expiresAt,
     deviceId,
+    isNewUser: 'credential' in origin && origin.credential.isNewUser === true,
   };
 }
 
@@ -532,12 +774,14 @@ async function issuePair(
 export async function issueSessionOrMfaChallenge(
   application: Application,
   endUser: EndUser,
+  credential: SignInCredential,
   device?: DeviceContext,
 ): Promise<SignInOutcome> {
-  // GDPR erasure chokepoint: every primary-factor success (password,
+  // Erasure and ban chokepoint: every primary-factor success (password,
   // magic-link, OAuth sign-in, OAuth link) funnels through here before a
-  // session/challenge is minted, so an erased user is rejected uniformly.
-  assertEndUserNotErased(endUser);
+  // session/challenge is minted, so an erased or banned user is rejected
+  // uniformly and no MFA challenge is handed out.
+  assertEndUserCanAuthenticate(endUser);
   // Same gate `issuePair` runs, repeated here for the branch that returns
   // BEFORE it: an MFA-enrolled user with an unconfirmed address would otherwise
   // be asked for a TOTP code and only then told to go and read their email.
@@ -553,7 +797,7 @@ export async function issueSessionOrMfaChallenge(
       mfaChallengeExpiresAt: challenge.expiresAt,
     };
   }
-  const result = await issuePair(application, endUser, 'credential', device);
+  const result = await issuePair(application, endUser, { credential }, device);
   // When the app requires MFA but the user hasn't enrolled, still issue the
   // session but flag it so the customer app can force enrollment.
   const policy = AuthConfigSchema.parse(application.authConfig).mfa;
@@ -760,7 +1004,7 @@ export const authService = {
     ensurePasswordMethodEnabled(input.application);
 
     const config = AuthConfigSchema.parse(input.application.authConfig);
-    assertSignupAllowed(config, input.authKind);
+    assertSignupAllowed(config, input.authKind, input.email);
     assertDeviceBindingSatisfiable(input.application, input.device);
     if (input.password.length < config.passwordMinLength) {
       throw new RekeyError({
@@ -792,19 +1036,35 @@ export const authService = {
     // tenant PATCH endpoint.
     const defaultRole = await applicationRolesService.getDefault(input.application.id);
 
+    // A new password account is never verified yet.
+    const welcome = welcomeTiming(input.application, false);
     let endUser: EndUser;
+    let deliveryIds: string[];
     try {
-      endUser = await prisma.endUser.create({
-        data: {
+      // `user.created` is written in the same transaction as the row it
+      // announces, so a crash after the commit cannot lose it and a create
+      // that fails (the P2002 below included) announces nothing.
+      ({ endUser, deliveryIds } = await prisma.$transaction(async (tx) => {
+        const created = await tx.endUser.create({
+          data: {
+            applicationId: input.application.id,
+            email: input.email.toLowerCase(),
+            passwordHash,
+            role: defaultRole.name,
+            createdVia: 'password',
+            welcomeEmailPending: welcome === 'pending',
+            ...(input.metadata !== undefined && {
+              metadata: input.metadata as never,
+            }),
+          },
+        });
+        const ids = await enqueueEvent(tx, {
           applicationId: input.application.id,
-          email: input.email.toLowerCase(),
-          passwordHash,
-          role: defaultRole.name,
-          ...(input.metadata !== undefined && {
-            metadata: input.metadata as never,
-          }),
-        },
-      });
+          type: 'user.created',
+          data: { user: userSnapshot(created), via: 'password' },
+        });
+        return { endUser: created, deliveryIds: ids };
+      }));
     } catch (e) {
       if ((e as { code?: string }).code === 'P2002') {
         throw new RekeyError({
@@ -817,24 +1077,8 @@ export const authService = {
       throw e;
     }
 
-    // Welcome email, fire-and-forget. A delivery failure must not break
-    // sign-up (the account was created successfully and the user has a
-    // session; the email is best-effort).
-    void emailService
-      .dispatch({
-        application: input.application,
-        eventKey: 'welcome',
-        to: endUser.email,
-        variables: {
-          userEmail: endUser.email,
-          // Resolution chain (caller → per-app setting → redirect-URL origin
-          // → DEFAULT_APP_URL). Empty when nothing resolves, which makes the
-          // template drop the "Get started" button entirely rather than ship
-          // a dead one. See lib/app-url.ts.
-          appUrl: resolveAppUrl(input.application, input.appUrl) ?? '',
-        },
-      })
-      .catch(() => undefined);
+    // A held welcome goes out on the first verification (`claimPendingWelcome`).
+    if (welcome === 'now') sendWelcomeEmail(input.application, endUser.email, input.appUrl);
 
     // Verification email, same fire-and-forget contract as the welcome mail
     // it rides alongside (it does not replace it). On by default: a new
@@ -864,22 +1108,9 @@ export const authService = {
       }).catch(() => undefined);
     }
 
-    // Outbound webhook, `user.created`. Same fire-and-forget contract;
-    // the dispatcher's delivery worker handles retries on its own.
-    emitDetached({
-      applicationId: input.application.id,
-      type: 'user.created',
-      data: {
-        user: {
-          id: endUser.id,
-          email: endUser.email,
-          emailVerified: endUser.emailVerified,
-          role: endUser.role,
-          createdAt: endUser.createdAt.toISOString(),
-          metadata: endUser.metadata ?? null,
-        },
-      },
-    });
+    // `user.created` was written with the row above; this only asks for the
+    // first attempt now instead of at the poller's next pass.
+    kickDeliveries(deliveryIds);
 
     // Throws 403 EMAIL_NOT_VERIFIED when the Application requires a confirmed
     // address. The account IS created and the verification mail IS on its way,
@@ -888,7 +1119,12 @@ export const authService = {
     // published type across four SDKs, and making the tokens nullable to
     // describe a state only one Application in a hundred is in would push the
     // branch into every integrator's code.
-    return issuePair(input.application, endUser, 'credential', input.device);
+    return issuePair(
+      input.application,
+      endUser,
+      { credential: { via: 'password', isNewUser: true } },
+      input.device,
+    );
   },
 
   async signIn(input: SignInInput): Promise<SignInOutcome> {
@@ -1003,7 +1239,7 @@ export const authService = {
     // not a failed attempt and must not push the account toward a lockout. A
     // user waiting on their confirmation link would otherwise lock themselves
     // out by retrying.
-    return issueSessionOrMfaChallenge(input.application, endUser, input.device);
+    return issueSessionOrMfaChallenge(input.application, endUser, { via: 'password' }, input.device);
   },
 
   /**
@@ -1045,17 +1281,44 @@ export const authService = {
         fix: 'Sign in under the Application the calling secret key represents.',
       });
     }
-    const ok = await mfaService.verify({ endUserId: claims.sub, code: input.code });
-    if (!ok) {
-      throw new RekeyError({
-        statusCode: 401,
-        code: 'MFA_CODE_INVALID',
-        message: 'TOTP or backup code did not verify.',
-        fix: 'Enter the current 6-digit code from your authenticator app, or one of the backup codes shown at MFA enrollment.',
-      });
-    }
     const endUser = await prisma.endUser.findUniqueOrThrow({ where: { id: claims.sub } });
-    return issuePair(input.application, endUser, 'credential', input.device);
+    // Before the code is matched, so a ban placed after the challenge was
+    // issued spends no backup code.
+    assertEndUserCanAuthenticate(endUser);
+    ensureEmailVerified(input.application, endUser);
+    if (await isMfaChallengeSpent(input.mfaChallengeToken)) throw mfaChallengeUsedError();
+    const codeRefused = (outcome: 'invalid' | 'reused'): RekeyError =>
+      outcome === 'reused'
+        ? mfaCodeReusedError('sign-in')
+        : new RekeyError({
+            statusCode: 401,
+            code: 'MFA_CODE_INVALID',
+            message: 'TOTP or backup code did not verify.',
+            fix: 'Enter the current 6-digit code from your authenticator app, or one of the backup codes shown at MFA enrollment.',
+          });
+    // Two phases. Match first, spending nothing: the device answers below
+    // name the user's devices and fire a webhook, so they wait for a proven
+    // second factor. Then refuse on the device, still spending nothing, so a
+    // user at the limit can release a device and resubmit the same challenge
+    // and code. Only then spend the code and claim the challenge.
+    const match = await mfaService.match({ endUserId: claims.sub, code: input.code });
+    if (match.outcome === 'invalid' && match.spentBackupCode) throw mfaBackupCodeUsedError();
+    if (match.outcome !== 'matched') throw codeRefused(match.outcome);
+    const plan = await planDeviceBinding(input.application, endUser, input.device);
+    if (plan) {
+      const check = await devicesService.preflight({
+        applicationId: input.application.id,
+        endUserId: endUser.id,
+        fingerprint: plan.fingerprint,
+        ip: plan.ip,
+        via: plan.via,
+      });
+      if (check.kind !== 'ok') throw deviceRefusal(check);
+    }
+    const spent = await match.spend();
+    if (spent !== 'accepted') throw codeRefused(spent);
+    if (!(await claimMfaChallenge(input.mfaChallengeToken, claims.exp))) throw mfaChallengeUsedError();
+    return issuePair(input.application, endUser, { credential: { via: 'mfa' } }, input.device);
   },
 
   /**
@@ -1097,15 +1360,14 @@ export const authService = {
       //
       // The operator surface has discriminated on this since it was written
       // (see tenant-auth.service.ts); the end-user path had not.
+      //
+      // A rotated token presented again within moments of its rotation, while
+      // its successor is still unused, is the one exception: that is a client
+      // racing itself (two tabs, two instances, a retry after a lost
+      // response), and it is refused without revoking anything. See
+      // `refuseRotatedReplay`.
       if (outcome.token.replacedById !== null) {
-        await revokeAllForEndUser(outcome.token.endUserId);
-        throw new RekeyError({
-          statusCode: 401,
-          code: 'REFRESH_TOKEN_REUSED',
-          message:
-            'Refresh token has already been used. All sessions for this user have been revoked as a precaution.',
-          fix: 'A used refresh token cannot be replayed. Sign the user in again to obtain a fresh session.',
-        });
+        await refuseRotatedReplay(application, outcome.token, device, 'lookup');
       }
       // Deliberately says nothing about OTHER sessions. A token reaches here
       // either because this one device was signed out, in which case the
@@ -1154,10 +1416,11 @@ export const authService = {
     // blocked device and an unverified address are ordinary refusals, not
     // compromise signals, and must cost the client nothing but this request.
     const endUser = await prisma.endUser.findUniqueOrThrow({ where: { id: outcome.token.endUserId } });
-    // GDPR erasure: a refresh token issued before erasure must not mint a fresh
-    // access token. (Erasure also revokes all refresh tokens, but a token
-    // rotated in a concurrent request could still reach here, belt and braces.)
-    assertEndUserNotErased(endUser);
+    // Erasure and ban: a refresh token issued before either must not mint a
+    // fresh access token. Both also revoke every refresh token, but a sign-in
+    // racing the ban can commit a new one after that revoke, and this read is
+    // what stops it.
+    assertEndUserCanAuthenticate(endUser);
     // Email-verification gate, re-checked rather than trusted from issue time.
     // A refresh chain lasts 30 days: without this, an operator who switches
     // `requireEmailVerification` on is switching it on for future sign-ins
@@ -1221,20 +1484,14 @@ export const authService = {
       replacement = await rotateRefreshToken(outcome.token);
     } catch (e) {
       // `rotateRefreshToken` throws `REFRESH_TOKEN_RACE` when a concurrent
-      // rotation already flipped the same row. From the caller's point of
-      // view that's indistinguishable from a replayed token, surface the
-      // same 401 REUSED code and revoke the family for safety. Without
-      // this catch the race propagated as an unhandled 500, leaking timing
-      // info AND keeping the chain live.
+      // rotation already flipped the same row: this request passed the lookup
+      // and lost the rotation. That is a replay caught mid-flight, so it gets
+      // the replay answer, judged on the row as the winner left it (the
+      // winner's transaction has committed by the time our conditional update
+      // returns 0). Without this catch the race propagated as an unhandled 500.
       if ((e as Error).message === 'REFRESH_TOKEN_RACE') {
-        await revokeAllForEndUser(outcome.token.endUserId);
-        throw new RekeyError({
-          statusCode: 401,
-          code: 'REFRESH_TOKEN_REUSED',
-          message:
-            'Refresh token rotation lost a race with another request. All sessions revoked as a precaution.',
-          fix: 'Sign the user in again to obtain a fresh session.',
-        });
+        const spent = await prisma.refreshToken.findUniqueOrThrow({ where: { id: outcome.token.id } });
+        await refuseRotatedReplay(application, spent, device, 'rotation_race');
       }
       throw e;
     }
@@ -1289,6 +1546,7 @@ export const authService = {
       });
       deviceId = rebound;
     }
+    await recordActivitySafely(endUser, replacement.record.clientPlatform);
     const access = await issueUserAccessTokenForApp(application, endUser.id, {
       ...(oid && { activeOrganizationId: oid }),
       ...(deviceId && { deviceId }),
@@ -1301,6 +1559,7 @@ export const authService = {
       refreshToken: replacement.raw,
       refreshTokenExpiresAt: replacement.record.expiresAt,
       deviceId,
+      isNewUser: false,
     };
   },
 
@@ -1391,6 +1650,9 @@ export const authService = {
     resetToken: string | null;
   }> {
     ensurePasswordMethodEnabled(input.application);
+    // Before the lookup: refusing only for a known address would tell a
+    // publishable-key caller which addresses have accounts.
+    assertAllowedTokenUrl(input.application, input.resetUrl, 'resetUrl');
     const endUser = await prisma.endUser.findUnique({
       where: {
         applicationId_email: {
@@ -1399,7 +1661,9 @@ export const authService = {
         },
       },
     });
-    if (!endUser) {
+    // A banned account gets exactly the unknown-address answer: no mail, and
+    // nothing in the response that tells a caller the address is banned.
+    if (!endUser || endUser.bannedAt !== null) {
       // Sleep a tiny constant amount to flatten timing attacks against the
       // existence-of-email side channel. Not bulletproof (requires lots more
       // work to fully neutralise), but raises the bar without much cost.
@@ -1408,7 +1672,6 @@ export const authService = {
       if (input.authKind === 'publishable') return PUBLISHABLE_SEND_RESPONSE;
       return { delivered: false, emailSent: false, resetToken: null };
     }
-    assertAllowedTokenUrl(input.application, input.resetUrl, 'resetUrl');
     const issued = await issueResetToken(input.application.id, endUser.id);
 
     const outcome = await emailService.dispatch({
@@ -1532,6 +1795,16 @@ export const authService = {
       });
     }
 
+    // Only the mailbox owner holds this token, so naming the ban tells nobody
+    // anything new. Checked before the token is spent so a lifted ban leaves
+    // it usable. The ban also deletes outstanding reset tokens; this catches
+    // one issued by a request that raced it.
+    const owner = await prisma.endUser.findUniqueOrThrow({
+      where: { id: outcome.token.endUserId },
+      select: { erasedAt: true, bannedAt: true },
+    });
+    assertEndUserCanAuthenticate(owner);
+
     const consumed = await consumeResetToken(outcome.token);
     if (!consumed) {
       // Lost the race; another request beat us. Treat as already-used.
@@ -1547,17 +1820,23 @@ export const authService = {
     // Atomic: revoke every refresh BEFORE flipping the password hash, so a
     // crash mid-flight never leaves us with a new password + the old
     // sessions still live. Both writes commit-or-rollback together.
-    const updated = await prisma.$transaction(async (tx) => {
+    const { updated, deliveryIds } = await prisma.$transaction(async (tx) => {
       await tx.refreshToken.updateMany({
         where: { endUserId: outcome.token.endUserId, revokedAt: null },
         data: { revokedAt: new Date() },
       });
-      return tx.endUser.update({
+      const user = await tx.endUser.update({
         where: { id: outcome.token.endUserId },
         // A reset is the compromise-recovery path: the attacker's access token
         // must stop now, not at its expiry.
         data: { passwordHash, sessionsInvalidBefore: new Date() },
       });
+      const ids = await enqueueEvent(tx, {
+        applicationId: input.application.id,
+        type: 'password.changed',
+        data: { userId: user.id, email: user.email, via: 'reset' },
+      });
+      return { updated: user, deliveryIds: ids };
     });
 
     // Notify the user that the password changed, security-critical event.
@@ -1573,11 +1852,7 @@ export const authService = {
         },
       })
       .catch(() => undefined);
-    emitDetached({
-      applicationId: input.application.id,
-      type: 'password.changed',
-      data: { userId: updated.id, email: updated.email, via: 'reset' },
-    });
+    kickDeliveries(deliveryIds);
 
     return { ok: true };
   },
@@ -1633,9 +1908,16 @@ export const authService = {
     await ensurePasswordNotBreached(input.application, input.newPassword);
 
     const newHash = await hashPassword(input.newPassword);
-    await prisma.endUser.update({
-      where: { id: endUser.id },
-      data: { passwordHash: newHash },
+    const deliveryIds = await prisma.$transaction(async (tx) => {
+      await tx.endUser.update({
+        where: { id: endUser.id },
+        data: { passwordHash: newHash },
+      });
+      return enqueueEvent(tx, {
+        applicationId: input.application.id,
+        type: 'password.changed',
+        data: { userId: endUser.id, email: endUser.email, via: 'change' },
+      });
     });
     await revokeAllForEndUser(endUser.id);
 
@@ -1650,11 +1932,7 @@ export const authService = {
         },
       })
       .catch(() => undefined);
-    emitDetached({
-      applicationId: input.application.id,
-      type: 'password.changed',
-      data: { userId: endUser.id, email: endUser.email, via: 'change' },
-    });
+    kickDeliveries(deliveryIds);
 
     return { ok: true };
   },
@@ -1698,6 +1976,8 @@ export const authService = {
   }> {
     ensureMagicLinkMethodEnabled(input.application);
     const config = AuthConfigSchema.parse(input.application.authConfig);
+    // Before the lookup, for the same reason as requestPasswordReset.
+    assertAllowedTokenUrl(input.application, input.signInUrl, 'signInUrl');
 
     const email = input.email.toLowerCase();
     const endUser = await prisma.endUser.findUnique({
@@ -1705,25 +1985,25 @@ export const authService = {
     });
 
     // Refuse to mint a magic link that would auto-create a user when this
-    // caller isn't allowed to create one (invite_only, or secret_only reached
-    // with a publishable key), preserves the invite-only / secret-only posture.
-    // Existing users still get a sign-in link.
+    // caller isn't allowed to create one (invite_only, secret_only reached with
+    // a publishable key, or an email domain the sign-up rules refuse). Existing
+    // users still get a sign-in link.
     //
-    // Under the default `public` signup mode this branch is unreachable, so a
-    // known and an unknown address are genuinely indistinguishable. Under
-    // invite_only / secret_only it is reachable, and then `delivered` differs on
-    // existence, the same caveat as requestPasswordReset. Silent refusal and
-    // padded timing narrow it; they do not close it.
-    if (!endUser && !signupAllowed(config, input.authKind)) {
+    // A banned account is answered the same way: no link is minted or mailed.
+    //
+    // For a publishable key every refusal here returns the constant reply, so
+    // it cannot tell a known, unknown or banned address apart. For a SECRET key
+    // `delivered` differs: a refused or banned address reads `false`, a sent
+    // link `true`. That is the same caveat as requestPasswordReset, and a
+    // secret key belongs to the operator's own backend, which may know.
+    if ((!endUser && !signupAllowed(config, input.authKind, email)) || endUser?.bannedAt) {
       // Sleep to flatten the timing side channel. A publishable caller gets the
-      // constant response so this refusal is indistinguishable from a real send;
-      // under the default `public` signup mode the branch is unreachable anyway.
+      // constant response so this refusal is indistinguishable from a real send.
       await new Promise((r) => setTimeout(r, 50));
       if (input.authKind === 'publishable') return PUBLISHABLE_MAGIC_LINK_RESPONSE;
       return { delivered: false, emailSent: false, magicLinkToken: null };
     }
 
-    assertAllowedTokenUrl(input.application, input.signInUrl, 'signInUrl');
     const issued = await issueMagicLinkToken({
       applicationId: input.application.id,
       endUserId: endUser?.id ?? null,
@@ -1839,10 +2119,34 @@ export const authService = {
       });
     }
 
+    // Before the token is consumed, so a banned account's link leaves no trace:
+    // no `emailVerified` promotion, no `user.updated`, no welcome mail. The ban
+    // deletes outstanding links; this catches one minted by a racing request.
+    // `issueSessionOrMfaChallenge` still gates whatever slips past this read.
+    const holder = await prisma.endUser.findFirst({
+      where: outcome.token.endUserId
+        ? { id: outcome.token.endUserId }
+        : { applicationId: input.application.id, email: outcome.token.email },
+      select: { erasedAt: true, bannedAt: true },
+    });
+    if (holder) assertEndUserCanAuthenticate(holder);
+
+    // Read BEFORE the transaction, as sign-up does: `getDefault` goes through
+    // the global client, so inside the callback it checked out a second pool
+    // connection while the transaction held the first. N concurrent verifies
+    // on a pool of N then each held one connection and waited for another
+    // until the transaction timeout.
+    const defaultRole = await applicationRolesService.getDefault(input.application.id);
+
     // Atomic: consume the token + (when needed) create the user. If
     // anything fails, the token stays unconsumed and the user isn't
     // created, operator retry is safe.
-    const endUser = await prisma.$transaction(async (tx) => {
+    const { endUser, deliveryIds, welcomeNow, createdHere } = await prisma.$transaction(async (tx): Promise<{
+      endUser: EndUser;
+      deliveryIds: string[];
+      welcomeNow: boolean;
+      createdHere: boolean;
+    }> => {
       const consumed = await tx.magicLinkToken.updateMany({
         where: { id: outcome.token.id, consumedAt: null },
         data: { consumedAt: new Date() },
@@ -1880,11 +2184,21 @@ export const authService = {
         // create branch below always set the flag, so only the account that
         // already existed threw the evidence away, and it kept shipping
         // `email_verified: false` to relying parties forever afterwards.
-        if (existing.emailVerified) return existing;
-        return tx.endUser.update({
-          where: { id: existing.id },
+        const flipped = await tx.endUser.updateMany({
+          where: { id: existing.id, emailVerified: false },
           data: { emailVerified: true },
         });
+        if (flipped.count === 0) {
+          return { endUser: existing, deliveryIds: [], welcomeNow: false, createdHere: false };
+        }
+        const verified = await tx.endUser.findUniqueOrThrow({ where: { id: existing.id } });
+        const ids = await enqueueUserUpdated(tx, {
+          user: verified,
+          changed: ['emailVerified'],
+          via: 'magic_link',
+        });
+        const welcome = await claimPendingWelcome(tx, input.application, verified.id);
+        return { endUser: verified, deliveryIds: ids, welcomeNow: welcome, createdHere: false };
       }
 
       // New user: create with verified email + default role. Re-check the
@@ -1893,28 +2207,36 @@ export const authService = {
       assertSignupAllowed(
         AuthConfigSchema.parse(input.application.authConfig),
         input.authKind,
+        outcome.token.email,
       );
       assertDeviceBindingSatisfiable(input.application, input.device);
       // Workspace ceiling, checked inside the same transaction as the create.
       // Throwing here rolls the token consume back too, so a link rejected for
       // quota stays usable and works once the workspace has room again.
       await assertEndUserQuota(input.application.tenantId, tx);
-      const defaultRole = await applicationRolesService.getDefault(input.application.id);
+      let created: EndUser;
       try {
-        return await tx.endUser.create({
-          data: {
-            applicationId: input.application.id,
-            email: outcome.token.email,
-            emailVerified: true,
-            role: defaultRole.name,
-          },
-        });
+        // Inside a savepoint so the P2002 below leaves the transaction usable
+        // for the read that recovers from it.
+        created = await withSavepoint(tx, () =>
+          tx.endUser.create({
+            data: {
+              applicationId: input.application.id,
+              email: outcome.token.email,
+              emailVerified: true,
+              role: defaultRole.name,
+              createdVia: 'magic_link',
+            },
+          }),
+        );
       } catch (e) {
-        // Race: another magic-link consume for the same email won the
-        // create. Fetch and return, both consumes converge on the same
-        // user, which is the right semantic.
+        // Race: a consume of ANOTHER link for the same new address won the
+        // create (one link cannot race itself, the conditional consume above
+        // lets only one request through). This link is still a valid,
+        // now-spent proof of the mailbox, so it signs in to the winner's user.
+        // The winner announced it, so this consume enqueues no `user.created`.
         if ((e as { code?: string }).code === 'P2002') {
-          return tx.endUser.findUniqueOrThrow({
+          const winner = await tx.endUser.findUniqueOrThrow({
             where: {
               applicationId_email: {
                 applicationId: input.application.id,
@@ -1922,46 +2244,33 @@ export const authService = {
               },
             },
           });
+          return { endUser: winner, deliveryIds: [], welcomeNow: false, createdHere: false };
         }
         throw e;
       }
-    });
-
-    // Lifecycle side-effects only when the user was newly created. We
-    // detect that by re-reading the token (consumed; if it carried no
-    // endUserId at issue, this consume just created one).
-    if (outcome.token.endUserId === null) {
-      void emailService
-        .dispatch({
-          application: input.application,
-          eventKey: 'welcome',
-          to: endUser.email,
-          variables: {
-            userEmail: endUser.email,
-            // Magic-link sign-up has no caller-supplied appUrl to pass, so
-            // this leans entirely on the per-app / inferred / env chain.
-            appUrl: resolveAppUrl(input.application) ?? '',
-          },
-        })
-        .catch(() => undefined);
-      emitDetached({
+      const welcomeAtCreation = welcomeTiming(input.application, created.emailVerified) === 'now';
+      // Written with the row and the token consume, so the three commit or
+      // roll back together.
+      const ids = await enqueueEvent(tx, {
         applicationId: input.application.id,
         type: 'user.created',
-        data: {
-          user: {
-            id: endUser.id,
-            email: endUser.email,
-            emailVerified: endUser.emailVerified,
-            role: endUser.role,
-            createdAt: endUser.createdAt.toISOString(),
-            metadata: endUser.metadata ?? null,
-          },
-          via: 'magic_link',
-        },
+        data: { user: userSnapshot(created), via: 'magic_link' },
       });
-    }
+      return { endUser: created, deliveryIds: ids, welcomeNow: welcomeAtCreation, createdHere: true };
+    });
+    kickDeliveries(deliveryIds);
 
-    return issueSessionOrMfaChallenge(input.application, endUser, input.device);
+    // Only when THIS consume created the user, or verified an account whose
+    // welcome sign-up held back. A consume that lost the create race to
+    // another link signs in to a user it did not create.
+    if (welcomeNow) sendWelcomeEmail(input.application, endUser.email);
+
+    return issueSessionOrMfaChallenge(
+      input.application,
+      endUser,
+      { via: 'magic_link', isNewUser: createdHere },
+      input.device,
+    );
   },
 
   /**
@@ -2048,6 +2357,8 @@ export const authService = {
     /** Which credential the caller presented; a publishable key gets the constant. */
     authKind?: AuthKind;
   }): Promise<{ emailSent: boolean; verificationToken: string | null }> {
+    // Before the lookup, for the same reason as requestPasswordReset.
+    assertAllowedTokenUrl(input.application, input.verifyUrl, 'verifyUrl');
     const endUser = await prisma.endUser.findUnique({
       where: {
         applicationId_email: {
@@ -2058,7 +2369,7 @@ export const authService = {
     });
     // No account, or nothing to verify. Same flattening sleep and the same
     // answer for both, see the docblock.
-    if (!endUser || endUser.emailVerified || endUser.erasedAt !== null) {
+    if (!endUser || endUser.emailVerified || endUser.erasedAt !== null || endUser.bannedAt !== null) {
       await new Promise((r) => setTimeout(r, 50));
       if (input.authKind === 'publishable') return PUBLISHABLE_VERIFICATION_SEND_RESPONSE;
       return { emailSent: false, verificationToken: null };
@@ -2140,7 +2451,11 @@ export const authService = {
     // tokens with it (`EmailVerificationToken.endUser` is `onDelete: Cascade`),
     // so the lookup misses and the caller already gets
     // EMAIL_VERIFICATION_TOKEN_INVALID.
-    assertEndUserNotErased(endUser);
+    //
+    // A ban refuses here too: verifying would still promote the address, fire
+    // `email.verified` and possibly the welcome mail for an account that
+    // cannot sign in.
+    assertEndUserCanAuthenticate(endUser);
     if (endUser.email !== outcome.token.email) {
       // Email changed since token was issued, verification belongs to a
       // stale address. Refuse rather than retroactively trust the old one.
@@ -2162,15 +2477,33 @@ export const authService = {
         fix: 'No further action needed.',
       });
     }
-    const updated = await prisma.endUser.update({
-      where: { id: endUser.id },
-      data: { emailVerified: true },
+    const { updated, deliveryIds, welcome } = await prisma.$transaction(async (tx) => {
+      // Conditional, so of several tokens redeemed at once only one sees the
+      // transition, announces it and takes the held-back welcome.
+      const flipped = await tx.endUser.updateMany({
+        where: { id: endUser.id, emailVerified: false },
+        data: { emailVerified: true },
+      });
+      const user = await tx.endUser.findUniqueOrThrow({ where: { id: endUser.id } });
+      const ids = await enqueueEvent(tx, {
+        applicationId: input.application.id,
+        type: 'email.verified',
+        data: { userId: user.id, email: user.email },
+      });
+      if (flipped.count === 0) return { updated: user, deliveryIds: ids, welcome: false };
+      const updatedIds = await enqueueUserUpdated(tx, {
+        user,
+        changed: ['emailVerified'],
+        via: 'email_verification',
+      });
+      return {
+        updated: user,
+        deliveryIds: [...ids, ...updatedIds],
+        welcome: await claimPendingWelcome(tx, input.application, user.id),
+      };
     });
-    emitDetached({
-      applicationId: input.application.id,
-      type: 'email.verified',
-      data: { userId: updated.id, email: updated.email },
-    });
+    kickDeliveries(deliveryIds);
+    if (welcome) sendWelcomeEmail(input.application, updated.email);
     return { ok: true, endUser: redact(updated) };
   },
 
@@ -2194,14 +2527,18 @@ export const authService = {
     endUserId: string;
     sessionId: string;
   }): Promise<{ revoked: boolean }> {
-    const revoked = await revokeSessionForEndUser(args.endUserId, args.sessionId);
-    if (revoked) {
-      emitDetached({
-        applicationId: args.application.id,
-        type: 'session.revoked',
-        data: { userId: args.endUserId, sessionId: args.sessionId, via: 'self' },
-      });
-    }
+    const { revoked, deliveryIds } = await prisma.$transaction(async (tx) => {
+      const didRevoke = await revokeSessionForEndUser(args.endUserId, args.sessionId, tx);
+      const ids = didRevoke
+        ? await enqueueEvent(tx, {
+            applicationId: args.application.id,
+            type: 'session.revoked',
+            data: { userId: args.endUserId, sessionId: args.sessionId, via: 'self' },
+          })
+        : [];
+      return { revoked: didRevoke, deliveryIds: ids };
+    });
+    kickDeliveries(deliveryIds);
     return { revoked };
   },
 
@@ -2286,22 +2623,26 @@ export const authService = {
     }
     const info = verified.registrationInfo.credential;
     try {
-      const created = await prisma.webAuthnCredential.create({
-        data: {
+      const { created, deliveryIds } = await prisma.$transaction(async (tx) => {
+        const credential = await tx.webAuthnCredential.create({
+          data: {
+            applicationId: input.application.id,
+            endUserId: input.endUserId,
+            credentialId: info.id,
+            publicKey: Buffer.from(info.publicKey).toString('base64url'),
+            counter: BigInt(info.counter),
+            transports: info.transports ?? [],
+            deviceName: input.deviceName ?? null,
+          },
+        });
+        const ids = await enqueueEvent(tx, {
           applicationId: input.application.id,
-          endUserId: input.endUserId,
-          credentialId: info.id,
-          publicKey: Buffer.from(info.publicKey).toString('base64url'),
-          counter: BigInt(info.counter),
-          transports: info.transports ?? [],
-          deviceName: input.deviceName ?? null,
-        },
+          type: 'mfa.enabled', // Passkeys are a strong factor; reuse the existing event channel.
+          data: { userId: input.endUserId, via: 'passkey', credentialId: credential.credentialId },
+        });
+        return { created: credential, deliveryIds: ids };
       });
-      emitDetached({
-        applicationId: input.application.id,
-        type: 'mfa.enabled', // Passkeys are a strong factor; reuse the existing event channel.
-        data: { userId: input.endUserId, via: 'passkey', credentialId: created.credentialId },
-      });
+      kickDeliveries(deliveryIds);
       return { credentialId: created.credentialId, deviceName: created.deviceName };
     } catch (e) {
       if ((e as { code?: string }).code === 'P2002') {
@@ -2450,7 +2791,7 @@ export const authService = {
     //
     // Customers who want passkey + TOTP belt-and-braces can opt in by not
     // bypassing here in their own flow; we make the simpler trade.
-    const result = await issuePair(input.application, endUser, 'credential', input.device);
+    const result = await issuePair(input.application, endUser, { credential: { via: 'passkey' } }, input.device);
     return { mfaRequired: false, ...result };
   },
 
@@ -2503,6 +2844,29 @@ export const authService = {
     return { deleted: result.count === 1 };
   },
 
+  /**
+   * `getById` for the secret-key routes: the same lookup plus `bannedAt`.
+   *
+   * @example
+   *   const user = await authService.getByIdForServer(appId, userId);
+   *   if (user.bannedAt) showSuspended();
+   */
+  async getByIdForServer(applicationId: string, endUserId: string): Promise<ServerEndUser> {
+    const endUser = await prisma.endUser.findUnique({ where: { id: endUserId } });
+    if (!endUser || endUser.applicationId !== applicationId) {
+      throw new RekeyError({
+        statusCode: 404,
+        code: 'END_USER_NOT_FOUND',
+        message: `EndUser "${endUserId}" not found in this application.`,
+        fix: 'Verify the user id and that the calling secret key belongs to the right Application.',
+      });
+    }
+    // Erased only, not banned: the customer's backend has to be able to read
+    // a banned user.
+    assertEndUserNotErased(endUser);
+    return { ...redact(endUser), bannedAt: endUser.bannedAt };
+  },
+
   async getById(applicationId: string, endUserId: string): Promise<PublicEndUser> {
     const endUser = await prisma.endUser.findUnique({ where: { id: endUserId } });
     if (!endUser || endUser.applicationId !== applicationId) {
@@ -2513,9 +2877,8 @@ export const authService = {
         fix: 'Verify the user id and that the calling secret key belongs to the right Application.',
       });
     }
-    // GDPR erasure chokepoint: `requireUserSession` resolves the current user
-    // through here on EVERY end-user-scoped route, so a still-unexpired access
-    // token minted before erasure is rejected the moment it's used.
+    // Erased only. Sessions resolve through `getByIdForSession`, which also
+    // refuses a ban; this serves `updateSelf`, reached only through one.
     assertEndUserNotErased(endUser);
     return redact(endUser);
   },
@@ -2526,7 +2889,7 @@ export const authService = {
    * session is over (`sid` head revoked, or `dev` no longer ACTIVE, see
    * lib/session-stamp.ts). The session and device rows are read in parallel
    * with the user row, each by an index and only when the claim is present.
-   * Same 404 and erasure rules as `getById`.
+   * Same 404 as `getById`, and it refuses banned users as well as erased ones.
    */
   async getByIdForSession(
     applicationId: string,
@@ -2556,7 +2919,7 @@ export const authService = {
         fix: 'Verify the user id and that the calling secret key belongs to the right Application.',
       });
     }
-    assertEndUserNotErased(row);
+    assertEndUserCanAuthenticate(row);
     return {
       endUser: redact(row),
       sessionsInvalidBefore: row.sessionsInvalidBefore,
@@ -2612,7 +2975,7 @@ export const authService = {
       // Clearing the whole object drops the reserved namespace with it, which
       // is a self-inflicted loss of the user's own claims, not an escalation,
       // they cannot write different ones.
-      data.metadata = Prisma.DbNull;
+      if (current.metadata !== null) data.metadata = Prisma.DbNull;
     } else if (args.metadata !== undefined) {
       assertNoReservedMetadataKey(args.metadata);
       const base =
@@ -2625,29 +2988,36 @@ export const authService = {
         else merged[key] = value;
       }
       assertMetadataWithinLimit(merged);
-      data.metadata = merged as Prisma.InputJsonValue;
+      if (!isDeepStrictEqual(merged, current.metadata)) {
+        data.metadata = merged as Prisma.InputJsonValue;
+      }
     }
 
     // Nothing to write, return the current record rather than bumping
-    // `updatedAt` for a no-op request.
+    // `updatedAt` or announcing a change for a no-op request.
     if (Object.keys(data).length === 0) return current;
 
     // The WHERE is scoped to (id, applicationId) so that even if a token from
     // another Application somehow reached here, it matches zero rows instead of
     // writing across the tenant boundary. `updateMany` (not `update`) because
     // only it accepts a compound WHERE on non-unique columns.
-    const result = await prisma.endUser.updateMany({
-      where: { id: args.endUserId, applicationId: args.applicationId },
-      data,
-    });
-    if (result.count !== 1) {
-      throw new RekeyError({
-        statusCode: 404,
-        code: 'END_USER_NOT_FOUND',
-        message: `EndUser "${args.endUserId}" not found in this application.`,
-        fix: 'Verify the user id and that the presented user token belongs to this Application.',
+    const deliveryIds = await prisma.$transaction(async (tx) => {
+      const result = await tx.endUser.updateMany({
+        where: { id: args.endUserId, applicationId: args.applicationId },
+        data,
       });
-    }
+      if (result.count !== 1) {
+        throw new RekeyError({
+          statusCode: 404,
+          code: 'END_USER_NOT_FOUND',
+          message: `EndUser "${args.endUserId}" not found in this application.`,
+          fix: 'Verify the user id and that the presented user token belongs to this Application.',
+        });
+      }
+      const user = await tx.endUser.findUniqueOrThrow({ where: { id: args.endUserId } });
+      return enqueueUserUpdated(tx, { user, changed: ['metadata'], via: 'self' });
+    });
+    kickDeliveries(deliveryIds);
 
     return authService.getById(args.applicationId, args.endUserId);
   },
