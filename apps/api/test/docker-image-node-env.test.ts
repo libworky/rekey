@@ -21,8 +21,8 @@ describe('Docker image', () => {
 
   it('has the runtime stages this test expects to find', () => {
     const names = runtimes.map((stage) => /^\S+ AS (\S+)/.exec(stage)![1]);
-    expect(names).toContain('api-runtime');
-    expect(names.length).toBeGreaterThanOrEqual(5);
+    // The stages every published tree has; the private tree adds more.
+    expect(names).toEqual(expect.arrayContaining(['api-runtime', 'panel-runtime', 'portal-runtime']));
   });
 
   it.each(runtimes.map((stage) => [/^\S+ AS (\S+)/.exec(stage)![1]!, stage] as const))(
