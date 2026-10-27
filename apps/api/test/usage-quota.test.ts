@@ -10,6 +10,9 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import type { FastifyInstance } from 'fastify';
 import { buildApp } from '../src/app.js';
 import { prisma } from '../src/lib/prisma.js';
+import { operatorsConfirmTheirEmail } from './confirmed-accounts.js';
+
+operatorsConfirmTheirEmail();
 
 describe('Usage — included-quota hard cap', () => {
   let app: FastifyInstance;
@@ -79,7 +82,7 @@ describe('Usage — included-quota hard cap', () => {
       method: 'POST',
       url: `/api/v1/tenant/applications/${appId}/plans`,
       headers: auth(),
-      payload: { slug, name: slug, amount: 0, kind: 'SUBSCRIPTION' },
+      payload: { slug, name: slug, kind: 'SUBSCRIPTION' },
     });
     await app.inject({
       method: 'PUT',

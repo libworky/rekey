@@ -34,17 +34,21 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import type { FastifyInstance } from 'fastify';
 import { randomUUID } from 'node:crypto';
 import Stripe from 'stripe';
+import { STRIPE_API_VERSION } from '../src/modules/billing/providers/stripe-api-version.js';
 import { buildApp } from '../src/app.js';
 import { prisma } from '../src/lib/prisma.js';
 import { configureSandboxStripe } from './fakes/billing-credentials.js';
 import { creditsService } from '../src/modules/credits/credits.service.js';
+import { operatorsConfirmTheirEmail } from './confirmed-accounts.js';
+
+operatorsConfirmTheirEmail();
 
 const PASSWORD = 'pw-one-two-three';
 const WEBHOOK_SECRET = 'whsec_ci_only';
 const PACK_AMOUNT = 4999;
 
 const stripe = new Stripe('sk_for_signing_only', {
-  apiVersion: '2024-11-20.acacia' as Stripe.LatestApiVersion,
+  apiVersion: STRIPE_API_VERSION,
 });
 
 describe('buying the same one-off plan twice', () => {
@@ -91,8 +95,8 @@ describe('buying the same one-off plan twice', () => {
     await configureSandboxStripe(applicationId);
 
     for (const plan of [
-      { slug: 'pack', name: 'Pack', amount: PACK_AMOUNT, kind: 'CREDIT', creditsAmount: 100 },
-      { slug: 'perp', name: 'Perpetual', amount: PACK_AMOUNT, kind: 'LICENSE', licenseKind: 'PERPETUAL' },
+      { slug: 'pack', name: 'Pack', price: { currency: 'USD', amount: PACK_AMOUNT }, kind: 'CREDIT', creditsAmount: 100 },
+      { slug: 'perp', name: 'Perpetual', price: { currency: 'USD', amount: PACK_AMOUNT }, kind: 'LICENSE', licenseKind: 'PERPETUAL' },
     ]) {
       const res = await app.inject({
         method: 'POST',

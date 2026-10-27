@@ -80,6 +80,13 @@ import {
   BillingProviderInfoDtoSchema,
   OAuthProviderSummaryDtoSchema,
   BillingStatsDtoSchema,
+  BillingLogEntrySchema,
+  BillingLogPageSchema,
+  BillingOutboxStatusSchema,
+  PriceFallbackSummarySchema,
+  ReconciliationReportSchema,
+  ReportingCurrencyDtoSchema,
+  RoutingPreviewDtoSchema,
   CheckoutResultDtoSchema,
   CheckoutPageViewSchema,
   CheckoutReadinessSchema,
@@ -88,6 +95,7 @@ import {
   TrialEligibilityItemSchema,
   ConsumeCreditsResultDtoSchema,
   CouponDtoSchema,
+  CouponWithStatsDtoSchema,
   CreditBalanceDtoSchema,
   CreditLedgerEntryDtoSchema,
   EndUserDtoSchema,
@@ -110,6 +118,7 @@ import {
   OrganizationMemberDtoSchema,
   OrganizationWithRoleDtoSchema,
   PlanDtoSchema,
+  PlanPriceDtoSchema,
   PublicPlanDtoSchema,
   PublicCouponDtoSchema,
   RetryWebhookDeliveryResultDtoSchema,
@@ -192,6 +201,13 @@ function openClosedObjects(node: unknown): JsonSchema {
   for (const [key, value] of Object.entries(node as Record<string, unknown>)) {
     if (key === 'additionalProperties' && value === false) continue;
     out[key] = openClosedObjects(value);
+  }
+  // `z.number().int().positive()` comes out as `minimum: 0, exclusiveMinimum:
+  // true`, the OpenAPI 3.0 spelling, which Fastify's validator (draft-07)
+  // refuses to compile. For an integer, "above n" is "at least n + 1".
+  if (out.type === 'integer' && out.exclusiveMinimum === true && typeof out.minimum === 'number') {
+    out.minimum += 1;
+    delete out.exclusiveMinimum;
   }
   return out as JsonSchema;
 }
@@ -474,8 +490,20 @@ const HAND_WRITTEN_COMPONENTS: Record<string, JsonSchema> = {
         enum: ['pending', 'accepted', 'expired', 'revoked'],
         description: 'Derived at read time. Precedence: revoked > accepted > expired > pending.',
       },
+      appGrants: {
+        type: 'array',
+        description: 'The app grants a MEMBER gets on joining. Always empty for OWNER and ADMIN.',
+        items: {
+          type: 'object',
+          properties: {
+            applicationId: { type: 'string' },
+            role: { type: 'string', enum: ['APP_ADMIN', 'APP_BILLING', 'APP_VIEWER'] },
+          },
+          required: ['applicationId', 'role'],
+        },
+      },
     },
-    required: ['id', 'email', 'role', 'expiresAt', 'createdAt', 'invitedById', 'status'],
+    required: ['id', 'email', 'role', 'expiresAt', 'createdAt', 'invitedById', 'status', 'appGrants'],
   },
 
   /**
@@ -546,7 +574,7 @@ const HAND_WRITTEN_COMPONENTS: Record<string, JsonSchema> = {
       'token hashes, no MFA secrets or backup codes, no license key hash, no passkey ' +
       'public keys. Several sections are capped server-side, `notes` says which.',
     properties: {
-      exportVersion: { type: 'integer', description: '1 today. Bumps when the shape changes.' },
+      exportVersion: { type: 'integer', description: '2 today: a subscription\'s `plan` no longer carries an amount or a currency, and `price` is the subscription\'s own or null. Bumps when the shape changes.' },
       exportedAt: { type: 'string', format: 'date-time' },
       applicationId: { type: 'string' },
       notes: {
@@ -622,6 +650,21 @@ const HAND_WRITTEN_COMPONENTS: Record<string, JsonSchema> = {
       usageRecords: { type: 'array', items: { type: 'object' } },
       securityEvents: { type: 'array', items: { type: 'object' } },
       impersonations: { type: 'array', items: { type: 'object' } },
+      supportCases: {
+        type: 'array',
+        description:
+          'Every support case opened on this user: status, capabilities, scope, devices and ' +
+          "times. The operator's reason and notes are left out.",
+        items: { type: 'object' },
+      },
+      billingEvents: {
+        type: 'array',
+        description:
+          "The billing log's events about this user, newest first: type, time, the ids of the " +
+          'subscription, payment, refund, plan and price involved, currency, amount, and `data` ' +
+          'shaped per type. The id of whoever acted is left out.',
+        items: { type: 'object' },
+      },
       contacts: {
         type: 'array',
         description:
@@ -649,6 +692,7 @@ const HAND_WRITTEN_COMPONENTS: Record<string, JsonSchema> = {
       'usageRecords',
       'securityEvents',
       'impersonations',
+      'billingEvents',
     ],
   },
 
@@ -736,10 +780,11 @@ const HAND_WRITTEN_COMPONENTS: Record<string, JsonSchema> = {
       via: { type: 'string', description: 'The transport that carried it (e.g. `resend`, `smtp`).' },
       status: {
         type: 'string',
-        enum: ['sent', 'error', 'no_transport', 'suppressed', 'pending', 'unknown'],
+        enum: ['sent', 'error', 'no_transport', 'suppressed', 'pending', 'unknown', 'scheduled', 'canceled'],
         description:
           '`pending`: a custom template send that has not finished. `unknown`: a pending send that ' +
-          'recorded no outcome within five minutes, so delivery is not known.',
+          'recorded no outcome within five minutes, so delivery is not known. `scheduled`: waiting for ' +
+          '`sendAt`. `canceled`: a scheduled send canceled before it fired.',
       },
       messageId: { type: 'string', nullable: true },
       error: { type: 'string', nullable: true },
@@ -749,7 +794,17 @@ const HAND_WRITTEN_COMPONENTS: Record<string, JsonSchema> = {
         description: 'The custom template sent, for mail from `POST /api/v1/email/send` or a custom test send.',
       },
       customTemplateVersion: { type: 'integer', nullable: true },
-      createdAt: { type: 'string', format: 'date-time' },
+      sendAt: {
+        type: 'string',
+        format: 'date-time',
+        nullable: true,
+        description: 'When a scheduled send is due. Null for a send made at once.',
+      },
+      createdAt: {
+        type: 'string',
+        format: 'date-time',
+        description: 'When the send was made; for a scheduled send, when it was scheduled until it fires.',
+      },
     },
     required: ['id', 'toAddress', 'subject', 'via', 'status', 'createdAt'],
   },
@@ -833,6 +888,7 @@ const ZOD_COMPONENTS: Record<string, z.ZodTypeAny> = {
   SignInOutcome: SignInOutcomeDtoSchema,
 
   Plan: PlanDtoSchema,
+  PlanPrice: PlanPriceDtoSchema,
   PublicPlan: PublicPlanDtoSchema,
   FeatureCheck: FeatureCheckDtoSchema,
   Subscription: SubscriptionDtoSchema,
@@ -845,11 +901,19 @@ const ZOD_COMPONENTS: Record<string, z.ZodTypeAny> = {
   CheckoutStatusPanel: CheckoutStatusPanelSchema,
   TrialEligibilityItem: TrialEligibilityItemSchema,
   Coupon: CouponDtoSchema,
+  CouponWithStats: CouponWithStatsDtoSchema,
   PublicCoupon: PublicCouponDtoSchema,
   ValidateCouponResult: ValidateCouponResultDtoSchema,
   BillingProviderInfo: BillingProviderInfoDtoSchema,
   OAuthProviderSummary: OAuthProviderSummaryDtoSchema,
   BillingStats: BillingStatsDtoSchema,
+  BillingLogEntry: BillingLogEntrySchema,
+  BillingLogPage: BillingLogPageSchema,
+  BillingOutboxStatus: BillingOutboxStatusSchema,
+  PriceFallbackSummary: PriceFallbackSummarySchema,
+  ReconciliationReport: ReconciliationReportSchema,
+  ReportingCurrency: ReportingCurrencyDtoSchema,
+  RoutingPreview: RoutingPreviewDtoSchema,
   MonthlyRevenuePoint: MonthlyRevenuePointSchema,
 
   License: LicenseDtoSchema,
@@ -948,7 +1012,7 @@ export function okPage(item: JsonSchema, description = 'A page of results.'): Js
     {
       type: 'object',
       properties: {
-        items: { type: 'array', items: item },
+        items: { type: 'array', items: item, description: 'The rows of this page.' },
         page: ref('PageMeta'),
       },
       required: ['items', 'page'],

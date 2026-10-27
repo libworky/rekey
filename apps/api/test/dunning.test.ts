@@ -19,22 +19,28 @@
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import type { FastifyInstance } from 'fastify';
 import Stripe from 'stripe';
+import { STRIPE_API_VERSION } from '../src/modules/billing/providers/stripe-api-version.js';
 import { randomUUID } from 'node:crypto';
 import { buildApp } from '../src/app.js';
 import { prisma } from '../src/lib/prisma.js';
+import { pricedAt } from './subscription-price-fixture.js';
 import { billingCredentialsService } from '../src/modules/billing/credentials.service.js';
 import { applicationsService } from '../src/modules/applications/applications.service.js';
 import { webhookService } from '../src/modules/webhooks/webhook.service.js';
 import { processDueDunningCases } from '../src/modules/billing/dunning.service.js';
 import { emailService } from '../src/modules/email/email.service.js';
 import type { WebhookDelivery } from '@prisma/client';
+import { operatorsConfirmTheirEmail } from './confirmed-accounts.js';
+import { seedPlan } from './seed-plan.js';
+
+operatorsConfirmTheirEmail();
 
 const ADMIN_KEY = process.env.SUPER_ADMIN_KEY!;
 const WEBHOOK_SECRET = 'whsec_test_secret_for_ci_only';
 const DAY_MS = 24 * 60 * 60 * 1000;
 
 const stripe = new Stripe('sk_for_signing_only', {
-  apiVersion: '2024-11-20.acacia' as Stripe.LatestApiVersion,
+  apiVersion: STRIPE_API_VERSION,
 });
 
 function stripeSigned(body: object): { payload: string; headers: Record<string, string> } {
@@ -149,22 +155,18 @@ describe('Dunning', () => {
       });
     }
 
-    const plan = await prisma.plan.create({
-      data: {
+    const plan = await seedPlan({
         applicationId: application.id,
         slug: 'pro_monthly',
         name: 'Pro',
-        amount: 999,
-        currency: 'USD',
         kind: 'SUBSCRIPTION',
         interval: 'MONTH',
-      },
-    });
+      }, { currency: 'USD', amount: 999 });
     const endUserEmail = `dun-eu-${slug}@example.com`;
     const endUser = await prisma.endUser.create({
       data: { applicationId: application.id, email: endUserEmail },
     });
-    const { endpoint } = await webhookService.createEndpoint({
+    const { endpoint } = await webhookService.createEndpoint({ createdByTenantUserId: null,
       applicationId: application.id,
       url: 'https://example.invalid/dunning-hook',
       events: ['*'],
@@ -342,41 +344,36 @@ describe('Dunning', () => {
     expect(emails[0]!.status).toBe('no_transport');
   });
 
-  it('the reminder links the hosted billing portal when the Application has one, and nothing when it does not', async () => {
+  it('the reminder quotes the failed charge, in its own amount and currency, not the price of the subscription', async () => {
     const dispatch = vi.spyOn(emailService, 'dispatch');
     try {
-      const seen: Record<string, unknown> = {};
-      for (const [slug, portal] of [['dun-portal-on', true], ['dun-portal-off', false]] as const) {
-        const b = await bootstrap(slug, 'stripe');
-        await prisma.application.update({ where: { id: b.applicationId }, data: { hostedPortalEnabled: portal } });
-        await prisma.subscription.create({
-          data: {
-            applicationId: b.applicationId,
-            endUserId: b.endUserId,
-            planId: b.planId,
-            status: 'ACTIVE',
-            provider: 'stripe',
-            providerSubId: `sub_${slug}`,
-          },
-        });
-        await fireStripe(
-          slug,
-          invoiceFailedEvt({
-            applicationId: b.applicationId,
-            providerSubId: `sub_${slug}`,
-            eventId: `evt_${slug}`,
-            invoiceId: `in_${slug}`,
-          }),
-        );
-        await waitForEmailLogs(b.applicationId, 'billing_payment_failed_reminder', 1);
-        const call = dispatch.mock.calls.find(
-          ([input]) => input.application.id === b.applicationId && input.eventKey === 'billing_payment_failed_reminder',
-        );
-        seen[slug] = call?.[0].variables.portalUrl;
-      }
-      const origin = new URL(process.env.PUBLIC_PORTAL_URL!).origin;
-      expect(seen['dun-portal-on']).toBe(`${origin}/dun-portal-on`);
-      expect(seen['dun-portal-off']).toBe('');
+      const slug = 'dun-amount';
+      const b = await bootstrap(slug, 'stripe');
+      await prisma.subscription.create({
+        data: {
+          applicationId: b.applicationId,
+          endUserId: b.endUserId,
+          planId: b.planId,
+          status: 'ACTIVE',
+          provider: 'stripe',
+          providerSubId: `sub_${slug}`,
+          ...(await pricedAt(b.planId, 'USD', 999)),
+        },
+      });
+      // A prorated invoice: less than the 9.99 the subscription costs.
+      await fireStripe(slug, {
+        id: `evt_${slug}`,
+        object: 'event',
+        type: 'invoice.payment_failed',
+        data: {
+          object: { id: `in_${slug}`, subscription: `sub_${slug}`, amount_due: 450, currency: 'usd', metadata: { applicationId: b.applicationId } },
+        },
+      });
+      await waitForEmailLogs(b.applicationId, 'billing_payment_failed_reminder', 1);
+      const call = dispatch.mock.calls.find(
+        ([input]) => input.application.id === b.applicationId && input.eventKey === 'billing_payment_failed_reminder',
+      );
+      expect(call?.[0].variables.amountDue).toBe('$4.50');
     } finally {
       dispatch.mockRestore();
     }
@@ -403,7 +400,8 @@ describe('Dunning', () => {
           applicationId: b.applicationId,
           providerSubId: 'sub_dun_bump',
           eventId: `evt_dun_bump_${n}`,
-          invoiceId: `in_dun_bump_${n}`,
+          // Stripe retries the SAME invoice, each failed attempt a new event.
+          invoiceId: 'in_dun_bump',
         }),
       );
     }
@@ -481,21 +479,21 @@ describe('Dunning', () => {
         applicationId: b.applicationId,
         providerSubId: 'sub_dun_rec',
         eventId: 'evt_dun_rec_fail',
-        invoiceId: 'in_dun_rec_fail',
+        invoiceId: 'in_dun_rec',
       }),
     );
     expect(
       (await prisma.dunningCase.findFirstOrThrow({ where: { subscriptionId: sub.id } })).status,
     ).toBe('OPEN');
 
-    // Stripe's retry succeeds → invoice.paid arrives.
+    // Stripe's retry of the same invoice succeeds → invoice.paid arrives.
     await fireStripe(slug, {
       id: 'evt_dun_rec_paid',
       object: 'event',
       type: 'invoice.paid',
       data: {
         object: {
-          id: 'in_dun_rec_paid',
+          id: 'in_dun_rec',
           subscription: 'sub_dun_rec',
           amount_paid: 999,
           currency: 'usd',
@@ -508,6 +506,10 @@ describe('Dunning', () => {
       where: { subscriptionId: sub.id },
     });
     expect(dunningCase.status).toBe('RECOVERED');
+    const payments = await prisma.payment.findMany({
+      where: { applicationId: b.applicationId, providerPaymentId: 'in_dun_rec' },
+    });
+    expect(payments.map((p) => p.status)).toEqual(['SUCCEEDED']);
     expect(dunningCase.closedAt).not.toBeNull();
     expect(dunningCase.nextActionAt).toBeNull();
     expect(
@@ -742,9 +744,7 @@ describe('Dunning', () => {
       })
       .then((r) => (r.json().data as { id: string }).id);
 
-    const plan = await prisma.plan.create({
-      data: { applicationId, slug: 'pro', name: 'Pro', amount: 999, currency: 'USD' },
-    });
+    const plan = await seedPlan({ applicationId, slug: 'pro', name: 'Pro' }, { currency: 'USD', amount: 999 });
     const endUser = await prisma.endUser.create({
       data: { applicationId, email: 'dun-list-eu@example.com' },
     });
@@ -760,9 +760,7 @@ describe('Dunning', () => {
         providerSubId: 'sub_dl_1',
       },
     });
-    const plan2 = await prisma.plan.create({
-      data: { applicationId, slug: 'pro2', name: 'Pro 2', amount: 1999, currency: 'USD' },
-    });
+    const plan2 = await seedPlan({ applicationId, slug: 'pro2', name: 'Pro 2' }, { currency: 'USD', amount: 1999 });
     const sub2 = await prisma.subscription.create({
       data: {
         applicationId,

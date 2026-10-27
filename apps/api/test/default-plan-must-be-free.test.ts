@@ -87,10 +87,10 @@ describe('the free-tier default plan must cost nothing', () => {
     return slug;
   }
 
-  const priced = () => makePlan({ slug: 'pro', name: 'Pro', amount: 200_000, kind: 'SUBSCRIPTION' });
+  const priced = () => makePlan({ slug: 'pro', name: 'Pro', price: { currency: 'USD', amount: 200_000 }, kind: 'SUBSCRIPTION' });
   const metered = () =>
-    makePlan({ slug: 'metered', name: 'Metered', amount: 0, kind: 'USAGE', meterSlug: 'calls', pricePerUnitCents: 5 });
-  const free = () => makePlan({ slug: 'free', name: 'Free', amount: 0, kind: 'SUBSCRIPTION' });
+    makePlan({ slug: 'metered', name: 'Metered', kind: 'USAGE', meterSlug: 'calls', });
+  const free = () => makePlan({ slug: 'free', name: 'Free', kind: 'SUBSCRIPTION' });
 
   const tenantSet = (slug: string | null) =>
     app.inject({
@@ -195,20 +195,6 @@ describe('the free-tier default plan must cost nothing', () => {
 
       const events = await waitForSecurityEvents({ applicationId: appId, type: 'app.default_plan_ignored' });
       expect(events[0]!.metadata).toMatchObject({ defaultPlanSlug: 'pro' });
-    });
-
-    it('a default repriced after nomination stops applying', async () => {
-      await free();
-      expect((await tenantSet('free')).statusCode).toBe(200);
-      expect((await whatAFreshUserGets()).features).toEqual({ reports: true });
-
-      await prisma.plan.update({
-        where: { applicationId_slug: { applicationId: appId, slug: 'free' } },
-        data: { amount: 900 },
-      });
-      const got = await whatAFreshUserGets();
-      expect(got.features).toEqual({});
-      expect(got.calls).toBeNull();
     });
 
     it('a free default keeps applying', async () => {

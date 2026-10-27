@@ -24,13 +24,34 @@ releases. The response carries the endpoint's signing **secret exactly once** �
 store it like a password; only its stored copy exists afterwards, and the only
 way to get a new one is `POST …/webhooks/:endpointId/rotate-secret`.
 
-The URL must be public `http(s)`. Loopback, private, link-local and CGNAT
-targets are refused at registration with `400 WEBHOOK_URL_UNSAFE`, and refused
-again at delivery time after DNS resolution — a public hostname with a private
-A record does not get through. Self-hosters who genuinely need to deliver to an
-internal service set `WEBHOOK_ALLOW_PRIVATE_TARGETS=true`; leave it `false` on
-anything internet-facing, because the endpoint URL is attacker-influenceable
-input and that flag is what stops it becoming an SSRF.
+The URL must be public, and in production it must be `https://`. Loopback,
+private, link-local and CGNAT targets are refused at registration with
+`400 WEBHOOK_URL_UNSAFE`, and refused again at delivery time after DNS
+resolution, so a public hostname with a private A record does not get through.
+Self-hosters who genuinely need to deliver to an internal service set
+`WEBHOOK_ALLOW_PRIVATE_TARGETS=true`; leave it `false` on anything
+internet-facing, because the endpoint URL is attacker-influenceable input and
+that flag is what stops it becoming an SSRF.
+
+### https only in production
+
+A payload carries your users' email addresses and ids, so a deployment running
+with `NODE_ENV=production` sends it only over TLS:
+
+- Creating an endpoint with an `http://` URL, or changing one to it, answers
+  `400 URL_NOT_HTTPS`. The panel form and the `create_webhook_endpoint` and
+  `update_webhook_endpoint` MCP tools apply the same rule.
+- An endpoint stored as `http://` before this rule receives nothing. Each of
+  its deliveries records the error `URL_NOT_HTTPS: not sent. …`, visible on the
+  endpoint's page in the panel, in `GET …/deliveries` and in the
+  `recent_failed_webhook_deliveries` MCP tool, and follows the normal retry
+  schedule. Change the endpoint to an `https://` URL and retry the delivery.
+- `GET …/webhooks` returns `httpsRequired`, true when the rule applies.
+
+Two deployments keep plain http: one not in production, and one with
+`WEBHOOK_ALLOW_PRIVATE_TARGETS=true`, where http is for receivers on your own
+private network. That flag allows http to any host, so do not set it only to
+get http back for a public receiver.
 
 Endpoint management, all under `/api/v1/tenant/applications/:id/webhooks`:
 
@@ -100,6 +121,11 @@ With the SDK:
 
 ```ts
 import { verifyWebhookSignature } from '@rekey.dev/node';
+import type { WebhookEventEnvelope } from '@rekey.dev/node';
+
+// Your own storage: has this eventId been handled, and the handler itself.
+declare function alreadyProcessed(eventId: string): Promise<boolean>;
+declare function handle(event: WebhookEventEnvelope): Promise<void>;
 
 // Next.js App Router route handler.
 export async function POST(req: Request): Promise<Response> {
@@ -111,7 +137,7 @@ export async function POST(req: Request): Promise<Response> {
   });
   if (!ok) return new Response('bad signature', { status: 401 });
 
-  const event = JSON.parse(raw);
+  const event = JSON.parse(raw) as WebhookEventEnvelope;
   if (await alreadyProcessed(event.eventId)) return new Response('ok');
   await handle(event);
   return new Response('ok');
@@ -169,7 +195,7 @@ implement, not something you receive.
 
 ## Event catalog
 
-Thirty-two events. The registry lives in
+Forty-two events. The registry lives in
 `apps/api/src/modules/webhooks/events.ts`, and `@rekey.dev/node` re-exports it
 as `WEBHOOK_EVENTS` (`{ name, description }` pairs), `KNOWN_WEBHOOK_EVENTS`
 (names only) and `isKnownWebhookEvent` — use those to build an event picker
@@ -214,7 +240,18 @@ rather than hardcoding this table.
 | `server` | A secret key's `PATCH /api/v1/users/:id/profile`. | `profile.<key>` per answer |
 | `operator` | An operator's `PATCH /api/v1/tenant/applications/:id/end-users/:euid`, or `.../end-users/:euid/profile`. | any of `role`, `emailVerified`, `metadata`, or `profile.<key>` |
 | `email_verification` | The first successful `POST /api/v1/auth/verify-email`. | `emailVerified` |
-| `magic_link` | A magic-link sign-in that proved an unverified address. | `emailVerified` |
+| `magic_link` | A magic-link sign-in that proved an unverified address and took the account over from whoever registered it. | `emailVerified`, `credentials` |
+| `oauth` | A social sign-in whose provider verified the address of an unverified account. | `emailVerified`, `credentials` |
+| `password_reset` | A completed password reset on an unverified account. | `emailVerified`, `credentials` |
+| `mfa` | A mailbox proof on an unverified account that already had MFA, finished by a correct code. Nothing was removed. | `emailVerified` |
+
+`credentials` in `changed` means the account's sign-in methods were replaced:
+the password (unless `via` is `password_reset`, which set a new one), every
+session, passkeys, a second factor, other linked providers and device bindings
+set before the mailbox was proven were removed. The user id and everything
+else on the account are unchanged. If your app grants access by membership or
+role, this is the event to review them on. See
+[auth.md](auth.md#an-unverified-account-belongs-to-whoever-proves-the-mailbox).
 
 It is written in the same transaction as the change, and only when a value
 actually changed: a PATCH that stores what was already there, or a second
@@ -279,6 +316,7 @@ nothing. Erasing a contact scrubs its stored deliveries (see
 | `contact.subscribed` | Someone joined a list: a first subscribe, or a secret-key subscribe with `consent` that added back a person who had left. `data.contact` (id, email, name), `data.list` (id, key), `data.member` (status, source, consentVersion, consentAt). |
 | `contact.unsubscribed` | Someone left a list: your server called `DELETE /api/v1/lists/:key/members/:email`, or an operator took them off in the panel. Sent once per change. `data.contact` (id, email, name), `data.list` (id, key), `data.member` (status, unsubscribedAt). |
 | `contact.submission.created` | A subscribe carried `fields` and they were stored, for example a contact form message. `data.contact` (id, email), `data.list` (id, key), `data.submission` (id, fields, createdAt). |
+| `email.unsubscribed` | A recipient left notification email: a one-click unsubscribe from a custom `notification` template, or your server set a topic to `unsubscribed` with `PATCH /api/v1/users/:id/email-preferences`. Sent once per change. `data.address`, `data.endUserId` (when the address is an end user), `data.category` (`notification`), `data.topic` (absent when they left every notification email). Rekey does not ingest provider bounces or complaints, so none of those reach this event. |
 
 ### Devices
 
@@ -295,29 +333,169 @@ timestamps) except `device.limit_reached`, which has no row to describe.
 | `device.limit_reached` | A new device was refused because the end-user is at `max_devices`. `data.devices` lists the active devices filling the cap, so you can prompt the user to release one. |
 | `license.deactivated` | A machine gave back its license seat — the customer's software called `POST /licenses/deactivate`, or an operator released the activation (`data.releasedBy`). `data.license` carries id, endUserId and kind; `data.machineFingerprint` names the machine. |
 
-### Billing
+### Support mode
 
-Emitted from the provider inbound-webhook handlers, and only when **local state
-actually transitions** — a provider event that changes nothing emits nothing.
+An operator put an end-user account into support mode, changed it, or ended
+it. See [support-mode.md](support-mode.md). Every payload carries
+`data.user.id` and `data.support`: `caseId`, `active`, `capabilities`, `scope`
+(`USER` or `DEVICES`), `deviceIds`, `since` and `updatedAt`. The reason and the
+operator are never sent.
 
 | Event | When |
 |---|---|
-| `subscription.activated` | A Subscription became ACTIVE. `data.subscription` carries ids, plan slug/name/kind, amount/currency/interval, the resolved `entitlements` array, the period end, and `trialEndsAt`. |
-| `subscription.canceled` | A Subscription became CANCELED (includes `canceledAt`). |
-| `subscription.past_due` | A Subscription became PAST_DUE — payment failed, provider retrying. |
+| `support.opened` | An operator opened a support case on the end-user. |
+| `support.updated` | The capabilities or devices of an open case changed: an operator edited it, or a device it named was released or blocked. `data.support` is the full state after the change. |
+| `support.closed` | The case closed and its capabilities stopped being reported. `data.support.active` is `false`, `capabilities` is empty, and `closedCause` is `operator`, `banned`, `erased` or `device_released`. |
+
+### Billing
+
+Sent when local state changes. A provider event that changes nothing sends
+nothing.
+
+| Event | When |
+|---|---|
+| `subscription.activated` | A Subscription became ACTIVE. |
+| `subscription.canceled` | A Subscription became CANCELED (includes `canceledAt`). When the subscriber gave a reason on cancel, every subscription event carries `data.subscription.cancellation` (`reason`, `feedback`). |
+| `subscription.past_due` | A Subscription became PAST_DUE: a payment failed and the provider is retrying. |
 | `subscription.trial_started` | A Subscription entered TRIALING: a checkout that completed on a trial, a billing system reporting a trial, or a provider moving the subscription onto one. Sent alongside `subscription.activated` when the trial is also the activation. `data.subscription.trialEndsAt` is the trial end. A re-dated trial is not a new start. |
 | `subscription.trial_will_end` | A TRIALING Subscription's trial ends within 3 days. A sweep checks every 10 minutes, and sends it once per subscription and trial end date; a trial re-dated after it was sent is announced again for the new date. Not sent for a trial that already converted or ended. |
-| `payment.succeeded` | A Payment was recorded SUCCEEDED. `data.payment` carries ids, plan slug when subscription-linked, amount/currency/status. |
+| `payment.succeeded` | A Payment was recorded SUCCEEDED. |
 | `payment.failed` | A Payment was recorded FAILED. |
+| `payment.refunded` | A refund was recorded against a payment, whoever started it: the provider, or an operator through Rekey. One event per refund. |
+
+Every amount in these payloads is an integer in the minor unit of its
+`currency`. Show one with `formatMoney(amount, currency)`.
+
+#### Subscriptions
+
+`data.subscription` of every `subscription.*` event (the type
+`SubscriptionWebhookData` in `@rekey.dev/node`):
+
+```json
+{
+  "subscription": {
+    "id": "sub_1",
+    "endUserId": "eu_1",
+    "organizationId": null,
+    "status": "ACTIVE",
+    "provider": "razorpay",
+    "planSlug": "pro",
+    "planName": "Pro",
+    "planKind": "SUBSCRIPTION",
+    "amount": 149900,
+    "currency": "INR",
+    "interval": "MONTH",
+    "entitlements": [
+      { "kind": "FEATURE", "key": "max_widgets", "valueType": "INT", "value": "25", "quantity": null,
+        "creditsPerUnit": null, "licenseKind": null, "rollover": false }
+    ],
+    "currentPeriodEnd": "2026-11-12T09:00:00.000Z",
+    "trialEndsAt": null,
+    "canceledAt": null,
+    "createdAt": "2026-10-12T09:00:00.000Z"
+  }
+}
+```
+
+`amount` and `currency` are **the subscription's own price**: what this
+subscriber pays each period, fixed by their checkout, grant or import. It can
+differ from the plan's default price. A subscriber in India on a plan whose
+default price is USD 19 reports `149900` and `INR` here, as above.
+
+A subscription with no price of its own reports `amount: 0` and
+`currency: null`. That is a subscription to a plan with no flat price (a free
+plan, a usage plan with no base fee), or one that has no price on record yet.
+Treat `currency: null` as "no price", never as a default currency.
 
 Act on `data.subscription.entitlements`, not on the plan slug. Two subscribers
 on the same plan can hold different quantities, and the slug cannot tell you
 so.
 
-The field is **absent** when Rekey could not resolve it while recording the
-event. Absent means unknown, not "grants nothing": leave what you provisioned
-alone and read the current grant from `GET /api/v1/billing/entitlements/for-user` (secret key with `billing:read`) instead. An empty array
-does mean the subscription grants nothing.
+The field `entitlements` is **absent** when Rekey could not resolve it while
+recording the event. Absent means unknown, not "grants nothing": leave what you
+provisioned alone and read the current grant from
+`GET /api/v1/billing/entitlements/for-user` (secret key with `billing:read`)
+instead. An empty array does mean the subscription grants nothing.
+
+#### Payments
+
+`data` of `payment.succeeded`, `payment.failed` and `payment.refunded` (the
+type `PaymentWebhookData` in `@rekey.dev/node`). This one is a
+`payment.refunded`:
+
+```json
+{
+  "payment": {
+    "id": "pay_1",
+    "endUserId": "eu_1",
+    "subscriptionId": "sub_1",
+    "planSlug": "pro",
+    "amount": 1900,
+    "currency": "USD",
+    "status": "PARTIALLY_REFUNDED",
+    "refundedAmount": 500,
+    "verification": "verified",
+    "providerPaymentId": "in_1",
+    "description": null,
+    "createdAt": "2026-10-12T09:00:00.000Z"
+  },
+  "refund": {
+    "id": "rf_1",
+    "amount": 500,
+    "currency": "USD",
+    "status": "succeeded",
+    "providerRefundId": "re_1",
+    "createdAt": "2026-10-12T10:00:00.000Z"
+  }
+}
+```
+
+- `payment.amount` is what the payment charged. `payment.refundedAmount` is
+  the sum of its refunds that have not failed: the running total, `0` when
+  nothing was refunded. What the buyer has paid net is
+  `amount - refundedAmount`.
+- `payment.status` is `PENDING`, `SUCCEEDED`, `FAILED`, `PARTIALLY_REFUNDED` or
+  `REFUNDED`.
+- `payment.verification` is `verified` for a charge Rekey applied. It is
+  `unverified` for a charge Rekey recorded and did not apply: it matched no
+  subscription, or not the price it was for. Nothing was granted for an
+  unverified payment, it is linked to no subscription, and it is not revenue
+  until an operator resolves it. **Do not provision on an unverified
+  `payment.succeeded`.**
+- `payment.planSlug` and `payment.subscriptionId` are null when the payment is
+  linked to no subscription.
+- `refund` is present on `payment.refunded` only: the one refund just
+  recorded. Its `status` is `pending`, `succeeded` or `failed`. A provider
+  that settles refunds later reports `pending` first. `providerRefundId` is
+  null when the provider's event named none.
+- A refund does not cancel the subscription and does not take back credits or
+  licences. If your product should do either on a refund, do it from this
+  event.
+
+```ts
+import { formatMoney } from '@rekey.dev/node';
+import type { PaymentWebhookData, SubscriptionWebhookData, WebhookEventEnvelope } from '@rekey.dev/node';
+
+export function describe(event: WebhookEventEnvelope<unknown>): string {
+  if (event.type === 'payment.refunded') {
+    const { payment, refund } = event.data as PaymentWebhookData;
+    const net = payment.amount - payment.refundedAmount;
+    return `Refunded ${refund ? formatMoney(refund.amount, refund.currency) : 'an amount'}, ${formatMoney(net, payment.currency)} kept`;
+  }
+  if (event.type === 'payment.succeeded') {
+    const { payment } = event.data as PaymentWebhookData;
+    if (payment.verification === 'unverified') return 'A charge that was not applied: do not provision';
+    return `Paid ${formatMoney(payment.amount, payment.currency)}`;
+  }
+  if (event.type === 'subscription.activated') {
+    const { subscription } = event.data as SubscriptionWebhookData;
+    return subscription.currency === null
+      ? `${subscription.planSlug}, no price`
+      : `${subscription.planSlug} at ${formatMoney(subscription.amount, subscription.currency)}`;
+  }
+  return event.type;
+}
+```
 
 ### Dunning
 

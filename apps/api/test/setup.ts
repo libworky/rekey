@@ -26,7 +26,7 @@
  * no credentials, deliberately, see `providers/index.ts`. Tests must not
  * reach api.stripe.com, so the seam is here in test-land rather than a
  * `NODE_ENV === 'test'` branch in the product. `pickProvider` and
- * `countryFromRequest` keep their real implementations: routing logic is
+ * `resolveBuyerCountry` keep their real implementations: routing logic is
  * under test, the network call is not.
  */
 
@@ -54,11 +54,35 @@ vi.mock('../src/modules/billing/providers/index.js', async (importOriginal) => {
   };
 });
 
+// Every sign-up asks the HIBP range API about the password, so without this
+// the suite makes a real HTTPS request per operator and per end user: around
+// 90ms each, and a test run that fails when that host is slow. Answer that one
+// host here with "no match". A test that stubs `fetch` itself replaces this
+// for as long as its stub is installed, so the breach-check suites are
+// unaffected.
+const HIBP_ORIGIN = 'https://api.pwnedpasswords.com/';
+const answersBreachLookups = Symbol.for('rekey.test.answersBreachLookups');
+const networkFetch = globalThis.fetch as typeof fetch & { [answersBreachLookups]?: true };
+if (!networkFetch[answersBreachLookups]) {
+  const offlineFetch = (async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+    const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+    if (url.startsWith(HIBP_ORIGIN)) return new Response('', { status: 200 });
+    return networkFetch(input, init);
+  }) as typeof fetch & { [answersBreachLookups]?: true };
+  offlineFetch[answersBreachLookups] = true;
+  globalThis.fetch = offlineFetch;
+}
+
+// This module is evaluated once per test file, so the flag is per file: the
+// first test truncates, the rest delete. See `domain-tables.ts`.
+let firstTestOfFile = true;
+
 beforeEach(async () => {
   // Globals first: dropping the request-log buffer removes the in-flight
   // INSERT that the TRUNCATE's deadlock retry exists to survive.
   await resetProcessGlobalState();
-  await truncateDomainTables((sql) => prisma.$executeRawUnsafe(sql));
+  await truncateDomainTables((sql) => prisma.$executeRawUnsafe(sql), firstTestOfFile ? 'truncate' : 'delete');
+  firstTestOfFile = false;
 });
 
 afterAll(async () => {

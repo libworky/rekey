@@ -11,6 +11,9 @@ import { Sidebar } from '@/components/Sidebar';
 import { MobileSidebar } from '@/components/MobileSidebar';
 import { CommandPalette } from '@/components/CommandPalette';
 import { DependencyBanner } from '@/components/DependencyBanner';
+import { ConfirmEmailNotice } from '@/components/ConfirmEmailNotice';
+import { normalizeErrorCode } from '@/lib/error-code';
+import { CONFIRM_SEND_ERRORS } from '@/lib/confirm-email-errors';
 import { TrackView } from '@/components/analytics/track-view';
 import { AnalyticsEvent } from '@/lib/analytics';
 import { BuildVersion, BuildVersionPlaceholder } from '@/components/BuildVersion';
@@ -142,6 +145,24 @@ async function createWorkspace(formData: FormData): Promise<void> {
   redirect('/applications?e=ws_created');
 }
 
+/**
+ * "Send confirmation email" in the notice below. Lands on a page that says
+ * what was sent and where, or why nothing was. Redirects and never
+ * revalidates, like every action here.
+ */
+async function sendConfirmationEmail(): Promise<void> {
+  'use server';
+  try {
+    await api<{ emailSent: boolean }>({ method: 'POST', path: '/api/v1/tenant/auth/resend-verification', body: {} });
+  } catch (err) {
+    if (err instanceof PanelApiError) {
+      redirect(`/account/confirm-email?error=${encodeURIComponent(normalizeErrorCode(err.code, CONFIRM_SEND_ERRORS))}`);
+    }
+    throw err;
+  }
+  redirect('/account/confirm-email');
+}
+
 export default async function AuthedLayout({
   children,
 }: {
@@ -172,7 +193,7 @@ export default async function AuthedLayout({
   const active = me.memberships.find((m) => m.tenantId === me.activeTenantId);
 
   return (
-    <div className="min-h-screen flex flex-col md:flex-row bg-neutral-50 dark:bg-neutral-950">
+    <div className="min-h-screen flex flex-col md:flex-row bg-[var(--color-bg)]">
       {/* Fires once when the operator enters the authed area (panel session). */}
       <TrackView event={AnalyticsEvent.PanelAccess} />
       {/* Keyboard users skip straight past the sidebar nav (WP6). */}
@@ -192,6 +213,7 @@ export default async function AuthedLayout({
             switchAction={switchWorkspace}
             {...(canCreateWorkspace && { createWorkspaceAction: createWorkspace })}
             signOutAction={signOut}
+            discordUrl={process.env.NEXT_PUBLIC_DISCORD_INVITE_URL}
             buildVersion={
               <Suspense fallback={<BuildVersionPlaceholder />}>
                 <BuildVersion />
@@ -219,6 +241,14 @@ export default async function AuthedLayout({
         <Suspense fallback={null}>
           <DependencyBanner />
         </Suspense>
+        {/* On every page until the address is confirmed, where this deployment
+            can confirm one: the API refuses a list of actions until then. */}
+        {!me.user.emailVerified && me.emailConfirmation?.required && (
+          <ConfirmEmailNotice
+            email={me.user.email}
+            {...(me.emailConfirmation.byEmail && { sendAction: sendConfirmationEmail })}
+          />
+        )}
         {children}
       </main>
       {/* Cmd+K palette, a client island; available on every authed page. */}

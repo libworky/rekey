@@ -33,6 +33,9 @@ import { createHash, randomBytes } from 'node:crypto';
 import type { FastifyInstance } from 'fastify';
 import { buildApp } from '../src/app.js';
 import { prisma } from '../src/lib/prisma.js';
+import { operatorsConfirmTheirEmail } from './confirmed-accounts.js';
+
+operatorsConfirmTheirEmail();
 
 const REDIRECT = 'https://claude.ai/api/mcp/auth_callback';
 
@@ -140,7 +143,7 @@ describe('Operator MCP create_plan covers every plan kind', () => {
       applicationId: appId,
       slug: 'credits-1000',
       name: '1,000 credits',
-      amount: 1000,
+      price: { currency: 'USD', amount: 1000 },
       kind: 'CREDIT',
       creditsAmount: 1000,
     });
@@ -156,28 +159,13 @@ describe('Operator MCP create_plan covers every plan kind', () => {
     expect(plan.creditsAmount).toBe(1000);
   });
 
-  it('still defaults to SUBSCRIPTION when kind is omitted', async () => {
-    const { token, appId } = await setup('default');
-    const res = await call(token, 'create_plan', {
-      applicationId: appId,
-      slug: 'pro-monthly',
-      name: 'Pro',
-      amount: 2500,
-    });
-    expect(res.isError).toBe(false);
-    const plan = await prisma.plan.findFirstOrThrow({
-      where: { applicationId: appId, slug: 'pro-monthly' },
-    });
-    expect(plan.kind).toBe('SUBSCRIPTION');
-  });
-
   it('creates a TIMED licence with its duration', async () => {
     const { token, appId } = await setup('timed');
     const res = await call(token, 'create_plan', {
       applicationId: appId,
       slug: 'license-1y',
       name: 'One year licence',
-      amount: 9900,
+      price: { currency: 'USD', amount: 9900 },
       kind: 'LICENSE',
       licenseKind: 'TIMED',
       licenseDurationDays: 365,
@@ -197,7 +185,7 @@ describe('Operator MCP create_plan covers every plan kind', () => {
       applicationId: appId,
       slug: 'license-seats',
       name: 'Team licence',
-      amount: 19900,
+      price: { currency: 'USD', amount: 19900 },
       kind: 'LICENSE',
       licenseKind: 'SEATS',
       licenseSeatsAllowed: 25,
@@ -230,10 +218,8 @@ describe('Operator MCP create_plan covers every plan kind', () => {
       applicationId: appId,
       slug: 'metered',
       name: 'Pay as you go',
-      amount: 0,
       kind: 'USAGE',
       meterSlug: 'tokens',
-      pricePerUnitCents: 5,
     });
     expect(res.isError).toBe(false);
     const plan = await prisma.plan.findFirstOrThrow({
@@ -241,7 +227,20 @@ describe('Operator MCP create_plan covers every plan kind', () => {
     });
     expect(plan.kind).toBe('USAGE');
     expect(plan.meterSlug).toBe('tokens');
-    expect(plan.pricePerUnitCents).toBe(5);
+    // No price of its own and no per-unit figure: the tool takes neither.
+    expect(res.data).toMatchObject({ kind: 'USAGE', price: null, prices: [] });
+    expect(res.data).not.toHaveProperty('pricePerUnitCents');
+
+    const perUnit = await call(token, 'create_plan', {
+      applicationId: appId,
+      slug: 'metered-2',
+      name: 'Pay as you go',
+      kind: 'USAGE',
+      meterSlug: 'tokens',
+      pricePerUnitCents: 5,
+    });
+    expect(perUnit.isError).toBe(true);
+    expect(JSON.stringify(perUnit.data)).toContain('BILLING_FIELD_REMOVED');
   });
 
   it('refuses to let operator metadata forge a provider registration', async () => {
@@ -261,7 +260,7 @@ describe('Operator MCP create_plan covers every plan kind', () => {
       applicationId: appId,
       slug: 'forged',
       name: 'Cheap looking plan',
-      amount: 100,
+      price: { currency: 'USD', amount: 100 },
       metadata: { stripe: { priceId: 'price_someone_elses_99_dollars' }, note: 'keep me' },
     });
     expect(res.isError).toBe(false);
@@ -286,10 +285,11 @@ describe('Operator MCP create_plan covers every plan kind', () => {
       applicationId: appId,
       slug: 'credits-broken',
       name: 'Broken pack',
-      amount: 500,
+      price: { currency: 'USD', amount: 500 },
       kind: 'CREDIT',
     });
     expect(res.isError).toBe(true);
+    expect(JSON.stringify(res.data)).toContain('PLAN_CREDITS_AMOUNT_REQUIRED');
     expect(
       await prisma.plan.findFirst({ where: { applicationId: appId, slug: 'credits-broken' } }),
     ).toBeNull();

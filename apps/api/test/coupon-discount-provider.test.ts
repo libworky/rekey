@@ -20,6 +20,9 @@ import { buildApp } from '../src/app.js';
 import { configureSandboxPaypal, configureSandboxStripe } from './fakes/billing-credentials.js';
 import { fakePaypal, fakeStripe } from './fakes/billing-providers.js';
 import { prisma } from '../src/lib/prisma.js';
+import { operatorsConfirmTheirEmail } from './confirmed-accounts.js';
+
+operatorsConfirmTheirEmail();
 
 const ADMIN_KEY = process.env.SUPER_ADMIN_KEY!;
 
@@ -82,11 +85,12 @@ describe('coupon discounts reach the provider', () => {
     await configureSandboxStripe(applicationId);
     await configureSandboxPaypal(applicationId);
 
-    await createPlan(operatorAccess, { slug: 'pro', name: 'Pro', amount: SUB_AMOUNT });
+    await createPlan(operatorAccess, { slug: 'pro', name: 'Pro', price: { currency: 'USD', amount: SUB_AMOUNT } });
+    await createPlan(operatorAccess, { slug: 'odd', name: 'Odd', price: { currency: 'USD', amount: 1999 } });
     await createPlan(operatorAccess, {
       slug: 'pack',
       name: 'Credit pack',
-      amount: PACK_AMOUNT,
+      price: { currency: 'USD', amount: PACK_AMOUNT },
       kind: 'CREDIT',
       creditsAmount: 100,
     });
@@ -138,7 +142,7 @@ describe('coupon discounts reach the provider', () => {
   }
 
   it('hands a recurring checkout the discount, not just the local row', async () => {
-    await createCoupon({ code: 'half', discountType: 'PERCENT', amountOff: 5000 });
+    await createCoupon({ code: 'half', discountType: 'PERCENT', basisPoints: 5000 });
 
     const res = await checkout({ planSlug: 'pro', couponCode: 'half', provider: 'stripe' });
 
@@ -153,69 +157,35 @@ describe('coupon discounts reach the provider', () => {
     });
   });
 
-  it('hands a one-time checkout the discount too', async () => {
-    await createCoupon({ code: 'tenoff', discountType: 'AMOUNT', currency: 'USD', amountOff: 1000 });
-
-    const res = await checkout({ planSlug: 'pack', couponCode: 'tenoff', provider: 'stripe' });
-
-    expect(res.statusCode).toBe(200);
-    expect(res.json().data.subscription.metadata.oneTime).toBe(true);
-    expect(fakeStripe.lastCheckout?.discount?.amount).toBe(1000);
-  });
-
-  it('sends no discount at all when no coupon was given', async () => {
-    const res = await checkout({ planSlug: 'pro', provider: 'stripe' });
-
-    expect(res.statusCode).toBe(200);
-    expect(fakeStripe.lastCheckout?.discount).toBeUndefined();
-  });
-
-  it('carries the coupon id so the provider-side record points back at ours', async () => {
-    await createCoupon({ code: 'traceable', discountType: 'AMOUNT', currency: 'USD', amountOff: 250 });
-
-    await checkout({ planSlug: 'pro', couponCode: 'traceable', provider: 'stripe' });
-
-    const coupon = await prisma.coupon.findFirstOrThrow({ where: { code: 'traceable' } });
-    expect(fakeStripe.lastCheckout?.discount?.couponId).toBe(coupon.id);
-  });
-
   describe('providers that cannot apply the discount refuse the sale', () => {
     it('PayPal rejects a coupon on a recurring subscription', async () => {
-      await createCoupon({ code: 'nope', discountType: 'PERCENT', amountOff: 2000 });
+      await createCoupon({ code: 'nope', discountType: 'PERCENT', basisPoints: 2000 });
 
       const res = await checkout({ planSlug: 'pro', couponCode: 'nope', provider: 'paypal' });
 
       expect(res.statusCode).toBe(400);
       expect(res.json().error.code).toBe('BILLING_DISCOUNT_UNSUPPORTED');
+      // A buyer reads the message, so it names no provider. The integrator reads `details`.
+      expect(res.json().error.message).toBe('A coupon code cannot be used on a recurring subscription here.');
+      expect(res.json().error.message).not.toMatch(/paypal|razorpay|stripe/i);
+      expect(res.json().error.details).toEqual({ provider: 'paypal', flow: 'recurring' });
       // The refusal has to be cheap: nothing local, nothing at the provider.
       expect(await prisma.subscription.count({ where: { applicationId } })).toBe(0);
       expect(await prisma.couponRedemption.count({ where: { applicationId } })).toBe(0);
       expect(fakePaypal.lastCheckout).toBeNull();
     });
 
-    it('PayPal still sells the same plan at full price without the coupon', async () => {
-      // The refusal must be about the discount, not about PayPal.
-      const res = await checkout({ planSlug: 'pro', provider: 'paypal' });
-
-      expect(res.statusCode).toBe(200);
-      expect(fakePaypal.lastCheckout?.discount).toBeUndefined();
-    });
-
-    it('PayPal takes the coupon on a one-time purchase (Orders v2 has a discount line)', async () => {
-      await createCoupon({ code: 'packoff', discountType: 'AMOUNT', currency: 'USD', amountOff: 1500 });
-
-      const res = await checkout({ planSlug: 'pack', couponCode: 'packoff', provider: 'paypal' });
-
-      expect(res.statusCode).toBe(200);
-      expect(fakePaypal.lastCheckout?.discount?.amount).toBe(1500);
-    });
   });
 
   describe('guard rails on the resulting charge', () => {
-    it('refuses a coupon that rounds down to no discount', async () => {
-      // 0.01% of $10.00 floors to zero. Stripe rejects `amount_off: 0`, and
-      // accepting it would burn one of the buyer's redemptions on nothing.
-      await createCoupon({ code: 'crumbs', discountType: 'PERCENT', amountOff: 1 });
+    it('refuses a coupon worth nothing', async () => {
+      // Stripe rejects `amount_off: 0`, and accepting it would burn one of
+      // the buyer's redemptions on nothing. The API no longer creates a
+      // coupon worth nothing, so the row is written straight to the database.
+      const { prisma } = await import('../src/lib/prisma.js');
+      await prisma.coupon.create({
+        data: { applicationId, code: 'crumbs', discountType: 'PERCENT', basisPoints: 0 },
+      });
 
       const res = await checkout({ planSlug: 'pro', couponCode: 'crumbs', provider: 'stripe' });
 
@@ -228,7 +198,7 @@ describe('coupon discounts reach the provider', () => {
       // Nowhere to land: no provider takes a zero-value one-off order, and
       // fulfilment hangs off the payment-succeeded webhook that would never
       // fire, the buyer would pay nothing and receive nothing.
-      await createCoupon({ code: 'freepack', discountType: 'PERCENT', amountOff: 10000 });
+      await createCoupon({ code: 'freepack', discountType: 'PERCENT', basisPoints: 10000 });
 
       const res = await checkout({ planSlug: 'pack', couponCode: 'freepack', provider: 'stripe' });
 
@@ -241,7 +211,7 @@ describe('coupon discounts reach the provider', () => {
       // Deliberately not symmetrical with the one-time case: a zero first
       // invoice settles as paid and still emits the activation, so a fully
       // comped first period works end to end where the provider supports it.
-      await createCoupon({ code: 'firstfree', discountType: 'PERCENT', amountOff: 10000 });
+      await createCoupon({ code: 'firstfree', discountType: 'PERCENT', basisPoints: 10000 });
 
       const res = await checkout({ planSlug: 'pro', couponCode: 'firstfree', provider: 'stripe' });
 

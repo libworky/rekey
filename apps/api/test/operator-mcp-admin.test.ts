@@ -19,6 +19,9 @@ import type { FastifyInstance } from 'fastify';
 import { buildApp } from '../src/app.js';
 import { prisma } from '../src/lib/prisma.js';
 import { waitForSecurityEvents } from './wait-for-security-events.js';
+import { operatorsConfirmTheirEmail } from './confirmed-accounts.js';
+
+operatorsConfirmTheirEmail();
 
 function pkce(): { verifier: string; challenge: string } {
   const verifier = randomBytes(32).toString('base64url');
@@ -188,7 +191,7 @@ describe('Operator MCP admin tools + get_end_user', () => {
       toolResult(
         (await rpc(token, 'tools/call', {
           name: 'create_plan',
-          arguments: { applicationId: appId, slug: 'pro', name: 'Pro', amount: 1000 },
+          arguments: { applicationId: appId, slug: 'pro', name: 'Pro', price: { currency: 'USD', amount: 1000 } },
         })).body,
       ).data as { id: string }
     ).id;

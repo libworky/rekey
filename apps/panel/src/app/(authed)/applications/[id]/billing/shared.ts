@@ -43,10 +43,13 @@ export async function getBillingProviders(applicationId: string): Promise<Billin
   return res.providers;
 }
 
-export function getWebhookEvents(applicationId: string): Promise<Page<WebhookEventRow>> {
+export function getWebhookEvents(
+  applicationId: string,
+  { limit, offset }: { limit: number; offset: number },
+): Promise<Page<WebhookEventRow>> {
   return apiGet<Page<WebhookEventRow>>(
-    `${appPath(applicationId)}/billing-credentials/webhook-events?limit=25`,
-  ).catch(unlessBusy(() => emptyPage<WebhookEventRow>(25)));
+    `${appPath(applicationId)}/billing-credentials/webhook-events?limit=${limit}&offset=${offset}`,
+  ).catch(unlessBusy(() => emptyPage<WebhookEventRow>(limit)));
 }
 
 /** Null when the plans could not be read, so a page never reports "no active plans" for a failed request. */
@@ -170,6 +173,7 @@ export function providerLabel(providers: BillingProviderDescriptor[], name: stri
 }
 
 export const BILLING_ERR: Record<string, string> = {
+  reportingCurrency: 'Enter a three-letter currency code, such as USD.',
   BILLING_CREDENTIALS_INVALID: 'Credentials format invalid for this provider. Check key prefixes.',
   TENANT_ROLE_INSUFFICIENT: 'Only owners and admins can configure billing.',
   BILLING_CREDENTIALS_NOT_CONFIGURED: 'Save the provider credentials first, then auto-configure the webhook.',

@@ -2,9 +2,11 @@
 
 Rekey sends its own account emails (verification, password reset, magic link and the rest). Custom templates are for everything else your product mails: order shipped, invoice ready, a teammate joined. You write the email once in the panel, publish it, and your backend sends it by key with values for its variables. The subject, body and From address never travel in the send call.
 
+For a scheduled nudge you can cancel, such as an onboarding sequence, follow the recipe in [lifecycle-email.md](lifecycle-email.md).
+
 ## Built-in account emails
 
-The built-in emails (password reset, email verification, magic link, welcome, two-factor enabled, password changed, payment failed) carry your Application's name and look, not Rekey's. They read the branding set in **Panel → Application → Portal**:
+The built-in emails (password reset, email verification, magic link, welcome, two-factor enabled, password changed, payment failed) carry your Application's name and look, not Rekey's. They read the branding set in **Panel → Application → Billing → Portal**:
 
 | Branding field | Used for |
 |---|---|
@@ -32,10 +34,25 @@ These are the `{{variables}}` a saved copy of each built-in email can use. Every
 | `welcome` | `userEmail`, `appUrl` |
 | `mfa_enabled` | `userEmail`, `enabledAtIso`, `enabledAt` |
 | `password_changed` | `userEmail`, `changedAtIso`, `changedAt` |
+| `account_claimed` | `userEmail`, `claimedAtIso`, `claimedAt`, `appUrl` |
+| `operator_account_claimed` | `userEmail`, `claimedAtIso`, `claimedAt`, `appUrl`, `reviewSummary` |
+| `operator_email_verification` | `userEmail`, `verifyUrl`, `expiresAtIso`, `expiresAt` |
+| `operator_email_confirmed` | `userEmail`, `confirmedAtIso`, `confirmedAt`, `appUrl` |
+| `signup_existing_account` | `userEmail`, `appUrl` |
+| `signup_finish_setup` | `userEmail`, `resetUrl`, `expiresAtIso`, `expiresAt` |
 | `billing_payment_failed_reminder` | `userEmail`, `planName`, `amountDue`, `attempt`, `graceEndsAtIso`, `graceEndsAt`, `portalUrl` |
 | `billing_unapplied_payment` | `amount`, `provider`, `providerPaymentId`, `endUserEmail`, `receivedAtIso`, `receivedAt` |
 
 `portalUrl` is the Application's hosted billing portal (`PUBLIC_PORTAL_URL` plus the slug), where the customer updates their payment method. It is empty when the hosted portal is off for the Application, and the default then leaves out its **Update payment method** button. Wrap a link to it in `{{#if portalUrl}}...{{/if}}` for the same effect in your own copy.
+
+Three built-in emails exist for the account-takeover and enumeration rules in [auth.md](auth.md#an-unverified-account-belongs-to-whoever-proves-the-mailbox):
+
+- `account_claimed` goes to an address after a magic link, a social sign-in or a completed reset proved the mailbox of an account that was still unverified and something other than the password a reset replaces was removed: the earlier password, a passkey, a linked provider, or a licence key. It is a security notice: it is not counted against the per-recipient limit.
+- `operator_account_claimed` is the operator version, sent by Rekey to the operator and not editable per Application. `reviewSummary` is one sentence per workspace the account owns or administers: every other member with their email and role, how many Applications it has, and how many live API keys, enabled webhook endpoints and billing providers those have, with how many keys and endpoints have no recorded creator and were left in place. It is sent when a claim removed something or left any of those to review.
+- `operator_email_verification` is the operator confirmation email, with the panel's `/verify-email` link. It says to sign in to the account and then confirm, to confirm only if you created the account yourself, and to ask for an emailed sign-in link if you did not. `operator_email_confirmed` follows a confirmation and says to reset the password if it was not you. Both are sent by Rekey to the operator and are not editable per Application; the second is a security notice and is not counted against the per-recipient limit.
+- `signup_existing_account` and `signup_finish_setup` go to the owner of an address when someone tries to sign up with it on an Application that requires a verified address, where sign-up itself must not say the address is taken. The first tells a verified owner to sign in or reset; the second gives an unverified one a link to choose a password. Keep `{{resetUrl}}` in a saved copy of the second: it is the only way in that mail offers.
+
+The default `email_verification` copy carries a boxed line telling the reader to confirm only if they signed up themselves, because confirming keeps the password chosen at sign-up. If you saved your own copy of that email before 2.2.0, it does not have the line; consider adding it.
 ## Sender identity
 
 Every email an Application sends, built-in or custom, introduces itself with three settings, set in **Panel → Application → Email → Sender** or with `PATCH /api/v1/tenant/applications/:id/email-sender`:
@@ -69,6 +86,7 @@ In **Panel → Application → Email → Custom templates**, create a template. 
 | `key` | Permanent. 3 to 64 characters of `a-z`, `0-9` and `_`, starting with a letter. Cannot be the key of a built-in email. |
 | `name` | Shown in the panel. |
 | `category` | `notification` or `critical`. See [Unsubscribe and suppressions](#unsubscribe-and-suppressions). |
+| `topic` | `notification` only, optional. What a recipient leaves when they unsubscribe from this email; templates sharing a topic are left together. Same shape as a key. Defaults to the key, and is copied onto each version at publish. |
 | `subject`, `bodyHtml`, `bodyText` | The content, with `{{variable}}` tokens and `{{#if variable}}...{{/if}}` sections. Without `bodyText`, the plain-text part is derived from the HTML and keeps link addresses. |
 | `fromName` | Optional display name, over the Application's [sender name](#sender-identity). The address is always the Application's From address. |
 | `variableSchema` | The variables a send may pass, up to 50. |
@@ -113,6 +131,7 @@ Mint a secret key with the elevated **`email:send`** scope: in **Panel → Appli
 
 With [`@rekey.dev/node`](../packages/sdk-node/README.md):
 
+<!-- snippet: no-check a fragment: no imports, and values from the surrounding code -->
 ```ts
 import { Rekey } from '@rekey.dev/node';
 
@@ -130,15 +149,56 @@ Over HTTP this is `POST /api/v1/email/send` with the same body. It answers `202`
 
 The Application setting **Only send to end users** (on the Custom templates page) makes a send to an address that is not one of the Application's end users fail with `403 EMAIL_RECIPIENT_NOT_END_USER`.
 
+### Send to an end user by id
+
+`to` can be `{ "endUserId": "..." }` instead of an address. Rekey looks the address up, so your worker never holds it, and refuses a user who should not get mail: `404 EMAIL_RECIPIENT_NOT_FOUND` for an unknown or erased user (the two read the same), `409 EMAIL_RECIPIENT_BANNED`, and `409 EMAIL_RECIPIENT_UNVERIFIED` for an address the user has not confirmed. Nothing is sent or logged on a refusal. An idempotency key is tied to the id, so a retry after the user changes address replays the first send.
+
+### Dry run
+
+`dryRun: true` (or `rekey.email.dryRun(...)`) runs every check a send runs, including the recipient and the suppression list, and answers `200` with `status: "would_send"` or `"suppressed"` and the rendered `subject`, `html` and `text`. It sends nothing, writes no log row, counts against no cap and does not use `idempotencyKey`. Point it at the published template from CI to catch a template change that breaks your variables.
+
+### Schedule a send
+
+Pass `sendAt` (ISO 8601 with an offset, in the future, at most 30 days ahead) to send later. Every check runs at once, so a bad template, variable or recipient is refused now, and the answer is `202` with `status: "scheduled"` and the `id`. Within about 15 seconds of `sendAt` the send runs as if made then: a recipient who unsubscribed from the topic, left every notification email, was suppressed, banned or erased in the meantime is logged `suppressed` and nothing goes out. Caps are counted when it fires. Cancel it with `DELETE /api/v1/email/sends/:id` (`rekey.email.cancelSend(id)`) until it fires; after that the call answers `409 EMAIL_SEND_NOT_SCHEDULED`. An idempotency key used for a scheduled send replays `scheduled`, or `canceled` once canceled. Erasing the recipient deletes their scheduled sends.
+
+<!-- snippet: no-check a fragment: no imports, and values from the surrounding code -->
+```ts
+const { id } = await rekey.email.send({
+  template: 'finish_setup',
+  to: { endUserId },
+  variables: { name },
+  sendAt: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
+  idempotencyKey: `finish-setup:${endUserId}`,
+});
+// They finished setup first:
+await rekey.email.cancelSend(id);
+```
+
+### Read a send back
+
+`GET /api/v1/email/sends/:id`, with the `id` a send returned, or `GET /api/v1/email/sends?idempotencyKey=...` (`rekey.email.getSend({ idempotencyKey })`) returns the log row: `status` is `sent`, `suppressed`, `error`, `pending`, `unknown`, `scheduled` or `canceled`, and `sendAt` is set for a scheduled send. Both need `email:send` and only see this Application's sends. The operator log (`/tenant/applications/:id/email-logs`) also filters by `customTemplateKey`, `toAddress` and `since`.
+
 ## Unsubscribe and suppressions
 
-`notification` mail carries RFC 8058 one-click unsubscribe headers (`List-Unsubscribe` and `List-Unsubscribe-Post`), when the API has a public URL to put in them (`PUBLIC_WEBHOOK_BASE_URL` or `API_URL`). Opening the link shows a confirm page and changes nothing; the button, or a mail client's one-click POST, adds the address to the Application's suppression list for `notification` mail only. `critical` custom mail and Rekey's built-in account emails still reach that address. `critical` mail has no unsubscribe headers.
+`notification` mail carries RFC 8058 one-click unsubscribe headers (`List-Unsubscribe` and `List-Unsubscribe-Post`), when the API has a public URL to put in them (`PUBLIC_WEBHOOK_BASE_URL` or `API_URL`). Opening the link shows a confirm page and changes nothing. The first button, or a mail client's one-click POST, leaves the email's [topic](#register-a-template): other notification topics keep arriving. The second button leaves every notification email, by adding the address to the Application's suppression list for `notification` mail. Either way `critical` custom mail and Rekey's built-in account emails still reach that address. `critical` mail has no unsubscribe headers. Each change sends the [`email.unsubscribed`](webhooks.md) webhook.
+
+Rekey does not read your provider's bounces or complaints. Add those to **Email → Suppressions** yourself, or watch your provider's own feed.
+
+### Email preferences
+
+For an in-app settings page, `GET /api/v1/users/:id/email-preferences` (secret key with `auth:read`) returns `{ allNotifications, topics }`, where `topics` holds every topic ever published on a notification template, each `subscribed` or `unsubscribed`. `PATCH` the same path with `{ "topics": { "onboarding": "unsubscribed" } }` to change them; it needs `email:send`, so a default key cannot sign someone back up. Setting a topic to `subscribed` never lifts "leave every notification email" or an operator's suppression. The unsubscribe link writes the same records, so the page and the email always agree. Opt-outs are kept by address, like suppressions: after an end user changes their email, the new address starts subscribed. Retagging a template's topic copies the old topic's opt-outs onto the new one at publish.
+
+<!-- snippet: no-check a fragment: no imports, and values from the surrounding code -->
+```ts
+const { topics } = await rekey.users.getEmailPreferences(userId);
+await rekey.users.updateEmailPreferences(userId, { leads_ready: 'unsubscribed' });
+```
 
 An address on the suppression list (after a bounce, a complaint, a manual entry in **Email → Suppressions**, or an unsubscribe) is not an error: the send answers `202` with `status: "suppressed"`, nothing goes out, and the attempt is logged. The same happens when all email is switched off for the Application.
 
 ## Idempotency
 
-Pass `idempotencyKey` in the body or an `Idempotency-Key` header (1 to 200 characters; if you send both, they must match). A repeat with the same key and the same template, recipient, version and variables returns the first result and sends nothing. That includes a failed first attempt: its `502 EMAIL_DELIVERY_FAILED` is returned again, so retry a failed send with a new key.
+Pass `idempotencyKey` in the body or an `Idempotency-Key` header (1 to 200 characters; if you send both, they must match). A key is remembered as long as its log row: forever, unless the deployment sets `LOG_RETENTION_DAYS`. A repeat with the same key and the same template, recipient, version and variables returns the first result and sends nothing. That includes a failed first attempt: its `502 EMAIL_DELIVERY_FAILED` is returned again, so retry a failed send with a new key.
 
 - The same key with a different template, recipient, version or variables: `409 EMAIL_IDEMPOTENCY_KEY_REUSED`.
 - The first send with the key has not finished: `409 EMAIL_SEND_IN_FLIGHT`; retry after `Retry-After`.

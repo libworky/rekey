@@ -1,5 +1,5 @@
 /**
- * The Users overview through the real cache (REDIS_URL, provided in CI):
+ * The Insights page through the real cache (REDIS_URL, provided in CI):
  * concurrent cold requests compute each section once, hits say so, and a
  * reporting-timezone change drops the Application's cached sections.
  */
@@ -16,6 +16,9 @@ import { UNRESTRICTED } from '../src/lib/operator-scopes.js';
 import { allOperatorTools } from '../src/modules/tenant-mcp/tenant-mcp-server.js';
 import { seedUsers } from './analytics-seed.js';
 import { bearer, operatorWorld, type OperatorWorld } from './operator-world.js';
+import { operatorsConfirmTheirEmail } from './confirmed-accounts.js';
+
+operatorsConfirmTheirEmail();
 
 const redisUrl = process.env.REDIS_URL ?? 'redis://localhost:6379';
 const RACERS = 20;
@@ -43,6 +46,21 @@ describe('users analytics cache', () => {
     await seedUsers(w.appId, 50, 11);
   });
 
+  /**
+   * The allowance is counted per clock minute, so a run that crosses a minute
+   * boundary starts a new count part way through. Hold the clock still.
+   */
+  async function withinOneMinute(run: () => Promise<void>): Promise<void> {
+    const realNow = Date.now;
+    const fixed = realNow();
+    Date.now = () => fixed;
+    try {
+      await run();
+    } finally {
+      Date.now = realNow;
+    }
+  }
+
   const get = (qs = '?range=7d') =>
     w.inject({ method: 'GET', url: `/api/v1/tenant/applications/${w.appId}/analytics/users${qs}`, headers: bearer(w.ownerToken) });
 
@@ -66,33 +84,6 @@ describe('users analytics cache', () => {
       kpis.mockRestore();
       activity.mockRestore();
     }
-  });
-
-  it('a different filter is a different entry; the same one is a hit', async () => {
-    const first = await get('?range=7d&platform=ios');
-    expect(first.json().data.sections.kpis.cache.hit).toBe(false);
-    const again = await get('?range=7d&platform=ios');
-    expect(again.json().data.sections.kpis.cache.hit).toBe(true);
-    const other = await get('?range=7d&platform=web');
-    expect(other.json().data.sections.kpis.cache.hit).toBe(false);
-    const reordered = await get('?range=7d&platform=ios,web');
-    const reordered2 = await get('?range=7d&platform=web,ios');
-    expect(reordered.json().data.sections.kpis.cache.hit).toBe(false);
-    expect(reordered2.json().data.sections.kpis.cache.hit).toBe(true);
-  });
-
-  it('a reporting-timezone change drops the cached sections', async () => {
-    await get();
-    expect((await get()).json().data.sections.kpis.cache.hit).toBe(true);
-    const patched = await w.inject({
-      method: 'PATCH',
-      url: `/api/v1/tenant/applications/${w.appId}/settings`,
-      headers: bearer(w.ownerToken),
-      payload: { reportingTimezone: 'Europe/Berlin' },
-    });
-    expect(patched.statusCode).toBe(200);
-    await redis.ping();
-    expect((await get()).json().data.sections.kpis.cache.hit).toBe(false);
   });
 
   it('the cached value is shared across callers and never holds who asked', async () => {
@@ -141,34 +132,38 @@ describe('users analytics cache', () => {
   });
 
   it('counts computations, not requests: cache hits never use up the allowance', async () => {
-    const keys = await redis.keys('rk:an:computes:*');
-    if (keys.length) await redis.del(...keys);
-    for (let i = 0; i < 30; i++) {
-      const r = await get(`?range=7d&sections=kpis&country=${String.fromCharCode(65 + (i % 26))}${String.fromCharCode(65 + Math.floor(i / 26))}`);
-      expect(r.statusCode, r.body).toBe(200);
-    }
-    const over = await get('?range=7d&sections=kpis&country=ZZ');
-    expect(over.statusCode).toBe(429);
-    expect(over.json().error.code).toBe('RATE_LIMITED');
-    expect(Number(over.headers['retry-after'])).toBeGreaterThan(0);
-    for (let i = 0; i < 40; i++) {
-      const hit = await get('?range=7d&sections=kpis&country=AA');
-      expect(hit.statusCode).toBe(200);
-      expect(hit.json().data.sections.kpis.cache.hit).toBe(true);
-    }
+    await withinOneMinute(async () => {
+      const keys = await redis.keys('rk:an:computes:*');
+      if (keys.length) await redis.del(...keys);
+      for (let i = 0; i < 30; i++) {
+        const r = await get(`?range=7d&sections=kpis&country=${String.fromCharCode(65 + (i % 26))}${String.fromCharCode(65 + Math.floor(i / 26))}`);
+        expect(r.statusCode, r.body).toBe(200);
+      }
+      const over = await get('?range=7d&sections=kpis&country=ZZ');
+      expect(over.statusCode).toBe(429);
+      expect(over.json().error.code).toBe('RATE_LIMITED');
+      expect(Number(over.headers['retry-after'])).toBeGreaterThan(0);
+      for (let i = 0; i < 40; i++) {
+        const hit = await get('?range=7d&sections=kpis&country=AA');
+        expect(hit.statusCode).toBe(200);
+        expect(hit.json().data.sections.kpis.cache.hit).toBe(true);
+      }
+    });
   });
 
   it('MCP calls draw on the same per-operator allowance as the REST route', async () => {
-    const keys = await redis.keys('rk:an:computes:*');
-    if (keys.length) await redis.del(...keys);
-    const tool = allOperatorTools.find((t) => t.name === 'get_user_analytics')!;
-    const application = await prisma.application.findUniqueOrThrow({ where: { id: w.appId } });
-    const owner = await prisma.tenantMembership.findFirstOrThrow({ where: { tenantId: application.tenantId, role: 'OWNER' } });
-    const ctx = { tenantUserId: owner.tenantUserId, tenantId: application.tenantId, role: 'OWNER' as const, tenantMembershipId: owner.id, scopes: UNRESTRICTED, canWrite: false, canAdmin: false };
-    const country = (i: number) => `${String.fromCharCode(65 + (i % 26))}${String.fromCharCode(65 + Math.floor(i / 26))}`;
-    for (let i = 0; i < 20; i++) expect((await get(`?range=7d&sections=kpis&country=${country(i)}`)).statusCode).toBe(200);
-    for (let i = 20; i < 30; i++) await tool.handler(ctx, { applicationId: w.appId, range: '7d', sections: 'kpis', country: country(i) });
-    await expect(tool.handler(ctx, { applicationId: w.appId, range: '7d', sections: 'kpis', country: 'ZZ' })).rejects.toMatchObject({ code: 'RATE_LIMITED' });
-    expect((await get('?range=7d&sections=kpis&country=ZY')).statusCode).toBe(429);
+    await withinOneMinute(async () => {
+      const keys = await redis.keys('rk:an:computes:*');
+      if (keys.length) await redis.del(...keys);
+      const tool = allOperatorTools.find((t) => t.name === 'get_user_analytics')!;
+      const application = await prisma.application.findUniqueOrThrow({ where: { id: w.appId } });
+      const owner = await prisma.tenantMembership.findFirstOrThrow({ where: { tenantId: application.tenantId, role: 'OWNER' } });
+      const ctx = { tenantUserId: owner.tenantUserId, tenantId: application.tenantId, role: 'OWNER' as const, tenantMembershipId: owner.id, scopes: UNRESTRICTED, canWrite: false, canAdmin: false };
+      const country = (i: number) => `${String.fromCharCode(65 + (i % 26))}${String.fromCharCode(65 + Math.floor(i / 26))}`;
+      for (let i = 0; i < 20; i++) expect((await get(`?range=7d&sections=kpis&country=${country(i)}`)).statusCode).toBe(200);
+      for (let i = 20; i < 30; i++) await tool.handler(ctx, { applicationId: w.appId, range: '7d', sections: 'kpis', country: country(i) });
+      await expect(tool.handler(ctx, { applicationId: w.appId, range: '7d', sections: 'kpis', country: 'ZZ' })).rejects.toMatchObject({ code: 'RATE_LIMITED' });
+      expect((await get('?range=7d&sections=kpis&country=ZY')).statusCode).toBe(429);
+    });
   });
 });

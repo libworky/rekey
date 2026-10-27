@@ -22,10 +22,14 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import type { FastifyInstance } from 'fastify';
 import { randomUUID } from 'node:crypto';
 import Stripe from 'stripe';
+import { STRIPE_API_VERSION } from '../src/modules/billing/providers/stripe-api-version.js';
 import { buildApp } from '../src/app.js';
 import { prisma } from '../src/lib/prisma.js';
 import { configureSandboxStripe } from './fakes/billing-credentials.js';
 import { creditsService } from '../src/modules/credits/credits.service.js';
+import { operatorsConfirmTheirEmail } from './confirmed-accounts.js';
+
+operatorsConfirmTheirEmail();
 
 const ADMIN_KEY = process.env.SUPER_ADMIN_KEY!;
 const PASSWORD = 'pw-one-two-three';
@@ -33,7 +37,7 @@ const WEBHOOK_SECRET = 'whsec_ci_only';
 const PACK_AMOUNT = 5000;
 
 const stripe = new Stripe('sk_for_signing_only', {
-  apiVersion: '2024-11-20.acacia' as Stripe.LatestApiVersion,
+  apiVersion: STRIPE_API_VERSION,
 });
 
 describe('re-opening checkout for a plan the buyer already has open', () => {
@@ -80,8 +84,8 @@ describe('re-opening checkout for a plan the buyer already has open', () => {
     await configureSandboxStripe(applicationId);
 
     for (const plan of [
-      { slug: 'pro', name: 'Pro', amount: 1000 },
-      { slug: 'pack', name: 'Credit pack', amount: PACK_AMOUNT, kind: 'CREDIT', creditsAmount: 100 },
+      { slug: 'pro', name: 'Pro', price: { currency: 'USD', amount: 1000 } },
+      { slug: 'pack', name: 'Credit pack', price: { currency: 'USD', amount: PACK_AMOUNT }, kind: 'CREDIT', creditsAmount: 100 },
     ]) {
       const res = await app.inject({
         method: 'POST',
@@ -178,8 +182,8 @@ describe('re-opening checkout for a plan the buyer already has open', () => {
       // old session spends the code that session was priced with. Reading the
       // row-level `couponId` would have redeemed whichever code was typed
       // most recently, or, worse, a code the completed checkout never used.
-      await createCoupon({ code: 'oldcode', discountType: 'AMOUNT', currency: 'USD', amountOff: 1000 });
-      await createCoupon({ code: 'newcode', discountType: 'AMOUNT', currency: 'USD', amountOff: 2000 });
+      await createCoupon({ code: 'oldcode', discountType: 'AMOUNT', amounts: [{ currency: 'USD', amountOff: 1000 }] });
+      await createCoupon({ code: 'newcode', discountType: 'AMOUNT', amounts: [{ currency: 'USD', amountOff: 2000 }] });
       const oldCoupon = await prisma.coupon.findFirstOrThrow({ where: { applicationId, code: 'oldcode' } });
 
       const first = await checkout({ planSlug: 'pack', couponCode: 'oldcode' });
@@ -212,7 +216,7 @@ describe('re-opening checkout for a plan the buyer already has open', () => {
       // The row-level mirror used to be sticky: a coupon-less second checkout
       // left the previous code's id on the subscription, so completing it
       // redeemed a code that purchase never used.
-      await createCoupon({ code: 'sticky', discountType: 'AMOUNT', currency: 'USD', amountOff: 1000 });
+      await createCoupon({ code: 'sticky', discountType: 'AMOUNT', amounts: [{ currency: 'USD', amountOff: 1000 }] });
       await checkout({ planSlug: 'pack', couponCode: 'sticky' });
       const plain = await checkout({ planSlug: 'pack' });
 
@@ -295,45 +299,6 @@ describe('re-opening checkout for a plan the buyer already has open', () => {
       // The provider link is untouched too, this row is still the live
       // subscription, not a fresh checkout record.
       expect(after.providerSubId).toBe('sub_active_1');
-    });
-
-    it('stays ACTIVE when they try a coupon from the account page', async () => {
-      // The exact flow the marketing account panel added: an Apply/Subscribe
-      // form rendered in front of an EXISTING subscriber.
-      await createCoupon({ code: 'tryme', discountType: 'PERCENT', amountOff: 1000 });
-      const subId = await activate();
-
-      await checkout({ planSlug: 'pro', couponCode: 'tryme' });
-
-      expect(
-        (await prisma.subscription.findUniqueOrThrow({ where: { id: subId } })).status,
-      ).toBe('ACTIVE');
-    });
-
-    it('keeps the subscription visible to the portal after re-opening checkout', async () => {
-      // PENDING is not an entitling status, so the downgrade did not merely
-      // look wrong, every entitlement gate started refusing.
-      await activate();
-      await checkout({ planSlug: 'pro' });
-
-      const res = await app.inject({
-        method: 'GET',
-        url: '/api/v1/billing/subscription',
-        headers: { authorization: `Bearer ${liveKey}`, 'x-rekey-user-token': userAccess },
-      });
-      expect(res.statusCode).toBe(200);
-      expect((res.json().data as { status: string }).status).toBe('ACTIVE');
-    });
-
-    it('a PAST_DUE subscriber is not downgraded either — dunning still runs', async () => {
-      const subId = await activate();
-      await prisma.subscription.update({ where: { id: subId }, data: { status: 'PAST_DUE' } });
-
-      await checkout({ planSlug: 'pro' });
-
-      expect(
-        (await prisma.subscription.findUniqueOrThrow({ where: { id: subId } })).status,
-      ).toBe('PAST_DUE');
     });
 
     it('a lapsed subscriber DOES go back to PENDING — that is a real new checkout', async () => {

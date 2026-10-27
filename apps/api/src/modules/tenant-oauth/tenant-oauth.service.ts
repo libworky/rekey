@@ -228,7 +228,7 @@ export const tenantOAuthService = {
       throw new RekeyError({
         statusCode: 400,
         code: 'OAUTH_NO_EMAIL',
-        message: `${provider} did not return an email — cannot sign in an operator.`,
+        message: `${provider} did not return an email, so Rekey cannot sign in an operator.`,
         fix: 'Grant the email scope to the OAuth client, or use password sign-in.',
       });
     }
@@ -236,17 +236,17 @@ export const tenantOAuthService = {
       throw new RekeyError({
         statusCode: 401,
         code: 'OAUTH_EMAIL_NOT_VERIFIED',
-        message: `${provider} did not verify the email — operator sign-in is refused.`,
+        message: `${provider} did not verify the email, so operator sign-in is refused.`,
         fix: 'Verify the email at the provider, then retry, or use password sign-in.',
       });
     }
-    const user = await tenantAuthService.findOrCreateOAuthOperator({
+    const { user, mailboxProven } = await tenantAuthService.findOrCreateOAuthOperator({
       email: identity.email,
       emailVerified: identity.emailVerified,
       ...(args.inviteKey !== undefined && { inviteKey: args.inviteKey }),
       ...(args.device !== undefined && { device: args.device }),
     });
-    return tenantAuthService.completeSignIn(user, args.device);
+    return tenantAuthService.completeSignIn(user, args.device, { mailboxProven });
   },
 
   /** Is this deployment configured to accept ID Token assertions? */
@@ -301,12 +301,13 @@ export const tenantOAuthService = {
     // out of here rather than waving the token through.
     if (!(await claimAssertionOnce(args.idToken, claims!.exp))) invalid();
 
-    const user = await tenantAuthService.findOrCreateOAuthOperator({
+    const { user, mailboxProven } = await tenantAuthService.findOrCreateOAuthOperator({
       email: claims!.email,
       // Guaranteed true by the verifier, an unverified email never returns.
       emailVerified: true,
+      claimNotice: 'silent',
       ...(args.device !== undefined && { device: args.device }),
     });
-    return tenantAuthService.completeSignIn(user, args.device);
+    return tenantAuthService.completeSignIn(user, args.device, { mailboxProven });
   },
 };

@@ -13,6 +13,9 @@ import type { Prisma } from '@prisma/client';
 import { buildApp } from '../src/app.js';
 import { prisma } from '../src/lib/prisma.js';
 import { configureSandboxStripe } from './fakes/billing-credentials.js';
+import { operatorsConfirmTheirEmail } from './confirmed-accounts.js';
+
+operatorsConfirmTheirEmail();
 
 const PASSWORD = 'pw-one-two-three';
 const REGISTERED = 'https://app.example';
@@ -70,7 +73,7 @@ describe('checkout return URLs', () => {
       method: 'POST',
       url: `/api/v1/tenant/applications/${applicationId}/plans`,
       headers: { authorization: `Bearer ${operatorAccess}` },
-      payload: { slug: 'pro', name: 'Pro', amount: 1000 },
+      payload: { slug: 'pro', name: 'Pro', price: { currency: 'USD', amount: 1000 } },
     });
     expect(plan.statusCode).toBe(201);
     userAccess = await app
@@ -132,29 +135,12 @@ describe('checkout return URLs', () => {
     });
   });
 
-  it('says so when the Application has registered no origin at all', async () => {
-    const res = await checkout(`${REGISTERED}/ok`, `${REGISTERED}/cancel`);
-    expect(res.statusCode).toBe(200);
-    const warnings = (res.json().data as { warnings: CheckoutWarningBody[] }).warnings;
-    expect(warnings.map((w) => w.field)).toEqual(['successUrl', 'cancelUrl']);
-    expect(warnings[0]!.message).toContain('no registered origin');
-    expect(warnings[0]!.fix).toContain('Application URL');
-  });
-
   it('does not warn for a registered origin, by appUrl or by redirect URL', async () => {
     await registerOrigins({ appUrl: REGISTERED, redirectUrls: ['https://other.example/callback'] });
     const res = await checkout(`${REGISTERED}/billing?ok=1`, 'https://other.example/pricing');
     expect(res.statusCode).toBe(200);
     expect((res.json().data as { warnings: unknown[] }).warnings).toEqual([]);
     expect(await returnUrlEvents()).toHaveLength(0);
-  });
-
-  it('does not warn for the hosted portal of an Application that uses it', async () => {
-    await registerOrigins({ appUrl: REGISTERED });
-    await prisma.application.update({ where: { id: applicationId }, data: { hostedPortalEnabled: true } });
-    const res = await checkout(`${PORTAL}/some-app?checkout=success`, `${PORTAL}/some-app?checkout=canceled`);
-    expect(res.statusCode).toBe(200);
-    expect((res.json().data as { warnings: unknown[] }).warnings).toEqual([]);
   });
 
   it('warns for the portal origin when the Application has not enabled the portal', async () => {

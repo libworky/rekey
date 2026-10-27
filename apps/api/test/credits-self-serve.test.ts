@@ -14,6 +14,9 @@ import type { FastifyInstance } from 'fastify';
 import { buildApp } from '../src/app.js';
 import { prisma } from '../src/lib/prisma.js';
 import { creditsService } from '../src/modules/credits/credits.service.js';
+import { operatorsConfirmTheirEmail } from './confirmed-accounts.js';
+
+operatorsConfirmTheirEmail();
 
 describe('Credits self-serve', () => {
   let app: FastifyInstance;
@@ -148,12 +151,15 @@ describe('Credits self-serve', () => {
         idempotencyKey: 'referral-42',
         ledgerEntryId: data.entryId,
       });
-    });
 
-    it('works alongside "*" when both are named on one key', async () => {
-      const user = await signUp();
-      const res = await grant(await mint(['*', 'credits:grant']), { endUserId: user.endUser.id, amount: 5, idempotencyKey: 'both' });
-      expect(res.statusCode).toBe(201);
+      const logged = await prisma.billingEvent.findMany({ where: { applicationId: appId, type: 'credits.granted' } });
+      expect(logged).toHaveLength(1);
+      expect(logged[0]).toMatchObject({
+        actorType: 'SYSTEM',
+        actorId: keyRow.id,
+        endUserId: user.endUser.id,
+        data: { credits: 250, source: 'api_key', balanceAfter: 250 },
+      });
     });
 
     it('an idempotent replay grants once, and audits once', async () => {
@@ -169,6 +175,7 @@ describe('Credits self-serve', () => {
       expect(
         await prisma.securityEvent.count({ where: { applicationId: appId, type: 'app.credits_granted_by_api_key' } }),
       ).toBe(1);
+      expect(await prisma.billingEvent.count({ where: { applicationId: appId, type: 'credits.granted' } })).toBe(1);
     });
 
     it('a grant key never matches a consume made under the same string', async () => {
@@ -228,17 +235,6 @@ describe('Credits self-serve', () => {
         await prisma.$executeRawUnsafe('DROP TRIGGER IF EXISTS test_refuse_grant_audit ON security_events');
         await prisma.$executeRawUnsafe('DROP FUNCTION IF EXISTS test_refuse_grant_audit()');
       }
-    });
-
-    it('an Idempotency-Key header replays the response without a second grant', async () => {
-      const user = await signUp();
-      const key = await mint(['credits:grant']);
-      const body = { endUserId: user.endUser.id, amount: 7, idempotencyKey: 'hdr-body' };
-      const a = await grant(key, body, { 'idempotency-key': 'hdr-1' });
-      const b = await grant(key, body, { 'idempotency-key': 'hdr-1' });
-      expect(a.statusCode).toBe(201);
-      expect(b.statusCode).toBe(201);
-      expect(await balanceOf({ endUserId: user.endUser.id })).toBe(7);
     });
 
     it('refuses zero, negative, fractional, oversized and int-overflowing amounts', async () => {

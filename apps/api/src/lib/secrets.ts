@@ -1,19 +1,15 @@
 /**
  * AES-256-GCM JSON encryption used to store provider credentials at rest.
  *
- * Key comes from `ENCRYPTION_KEY` (32 bytes hex, validated by env.ts in
- * production). Each ciphertext carries its own random IV, we never reuse
- * IVs across writes, even for the same plaintext.
+ * Key comes from `ENCRYPTION_KEY`: 64 hex characters (32 bytes), which env.ts
+ * requires at boot outside the test suite. Each ciphertext carries its own
+ * random IV, we never reuse IVs across writes, even for the same plaintext.
  *
  * Format on disk: `v1.<iv-hex>.<authTag-hex>.<ciphertext-hex>`. The version
  * prefix lets us rotate the algorithm later without breaking old rows.
  *
- * If `ENCRYPTION_KEY` isn't set we fall back to `plain.<json>` so a dev
- * deployment still functions. Production cannot reach that branch: `config/env.ts`
- * throws at boot when `NODE_ENV=production` and the key is absent, because
- * plaintext provider credentials at rest is exactly the kind of exposure nobody
- * notices. Note there is NO warning on the dev path, a mis-set `NODE_ENV` will
- * write `plain.` rows silently.
+ * Without a key, which only the test suite can reach, values are written as
+ * `plain.<json-hex>`. Such rows written by older releases still decrypt.
  */
 
 import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
@@ -33,7 +29,6 @@ export function encryptJson(value: unknown): string {
   const k = key();
   const json = JSON.stringify(value);
   if (!k) {
-    // Dev fallback. Env.ts already screamed at boot if NODE_ENV=production.
     return `plain.${Buffer.from(json, 'utf8').toString('hex')}`;
   }
   const iv = randomBytes(IV_LENGTH);
@@ -56,7 +51,7 @@ export function decryptJson<T = unknown>(stored: string): T {
   }
   const k = key();
   if (!k) {
-    throw new Error('ENCRYPTION_KEY is not set — cannot decrypt v1 ciphertext.');
+    throw new Error('ENCRYPTION_KEY is not set, so Rekey cannot decrypt v1 ciphertext.');
   }
   const [, ivHex, tagHex, ctHex] = stored.split('.');
   if (!ivHex || !tagHex || !ctHex) throw new Error('Malformed v1 ciphertext');

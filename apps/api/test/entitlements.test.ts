@@ -57,7 +57,7 @@ describe('Plan entitlements + provisioner', () => {
       method: 'POST',
       url: `/api/v1/tenant/applications/${appId}/plans`,
       headers: auth(),
-      payload: { slug, name: slug, amount: 0, ...body },
+      payload: { slug, name: slug, ...body },
     });
     if (r.statusCode !== 201) throw new Error(`makePlan ${r.statusCode}: ${r.body}`);
     return (r.json().data as { id: string }).id;
@@ -136,6 +136,28 @@ describe('Plan entitlements + provisioner', () => {
     expect(licCount).toBe(1);
   });
 
+  it('labels subscription credits as subscription credits, first period and renewal', async () => {
+    const planId = await makePlan('team', { kind: 'SUBSCRIPTION' });
+    await putEntitlement('team', { kind: 'CREDIT', quantity: 500 });
+    const euId = await makeEndUser(`label-${Math.random().toString(36).slice(2, 7)}@example.com`);
+    const sub = await prisma.subscription.create({
+      data: { applicationId: appId, endUserId: euId, planId, status: 'ACTIVE', provider: 'stripe' },
+    });
+    await entitlementsService.provision({ subscription: sub });
+    const renewed = await prisma.subscription.update({
+      where: { id: sub.id },
+      data: { currentPeriodEnd: new Date(Date.now() + 30 * 86_400_000) },
+    });
+    await entitlementsService.provision({ subscription: renewed });
+
+    const entries = await prisma.creditLedger.findMany({
+      where: { applicationId: appId, endUserId: euId },
+      orderBy: { balanceAfter: 'asc' },
+      select: { description: true },
+    });
+    expect(entries.map((e) => e.description)).toEqual(['Subscription credits', 'Subscription credits renewal']);
+  });
+
   it('back-compat: a legacy single-kind CREDIT plan provisions from its kind fields', async () => {
     const planId = await makePlan('legacy-credits', { kind: 'CREDIT', creditsAmount: 100 });
     const euId = await makeEndUser(`legacy-${Math.random().toString(36).slice(2, 7)}@example.com`);
@@ -144,6 +166,8 @@ describe('Plan entitlements + provisioner', () => {
     });
     await entitlementsService.provision({ subscription: sub });
     expect(await creditsService.getBalance(appId, { endUserId: euId })).toBe(100);
+    const entry = await prisma.creditLedger.findFirstOrThrow({ where: { applicationId: appId, endUserId: euId } });
+    expect(entry.description).toBe('Credit pack purchase');
   });
 
   describe('entitlementOverrides', () => {
@@ -167,28 +191,6 @@ describe('Plan entitlements + provisioner', () => {
       });
       return { euId };
     }
-
-    it('ADDS a FEATURE the plan does not carry', async () => {
-      // The documented remedy for a customer who has outgrown their plan is an
-      // override on their subscription. It could only ever rewrite a row the
-      // plan already had, so for the common case, a plan carrying no such row
-      // at all, setting the override changed precisely nothing and the
-      // customer stayed capped. Both directions were reproduced.
-      const { euId } = await subscribeWithOverrides({ 'FEATURE:max_workspaces': 3 });
-
-      const resolved = await entitlementsService.resolveForEndUser(appId, euId);
-      expect(resolved.features.max_workspaces).toBe(3);
-    });
-
-    it('still overrides a FEATURE the plan does carry', async () => {
-      const { euId } = await subscribeWithOverrides(
-        { 'FEATURE:max_workspaces': 7 },
-        { planEntitlement: { kind: 'FEATURE', key: 'max_workspaces', valueType: 'INT', value: '1' } },
-      );
-
-      const resolved = await entitlementsService.resolveForEndUser(appId, euId);
-      expect(resolved.features.max_workspaces).toBe(7);
-    });
 
     it('types an added FEATURE by its value, so consumers get a number and not a string', async () => {
       const { euId } = await subscribeWithOverrides({

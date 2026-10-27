@@ -11,6 +11,9 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { FastifyInstance } from 'fastify';
 import { buildApp } from '../src/app.js';
+import { operatorsConfirmTheirEmail } from './confirmed-accounts.js';
+
+operatorsConfirmTheirEmail();
 
 describe('Operator MCP plan edit + archive', () => {
   let app: FastifyInstance;
@@ -54,10 +57,27 @@ describe('Operator MCP plan edit + archive', () => {
     return (r.data as { id: string }).id;
   }
 
+  it('create_plan holds the default price to the rules every price follows', async () => {
+    const token = await mintPat(await makeOperator('rules'));
+    const appId = await createApp(token, 'plan-rules-app');
+    for (const [currency, amount, code] of [
+      ['KWD', 1005, 'PLAN_PRICE_CURRENCY_UNSUPPORTED'],
+      ['ZZZ', 1000, 'PLAN_PRICE_CURRENCY_INVALID'],
+      ['HUF', 150, 'PLAN_PRICE_AMOUNT_INVALID'],
+    ] as const) {
+      const refused = await rpc(token, 'create_plan', { applicationId: appId, slug: 'bad', name: 'Bad', price: { currency, amount } });
+      expect(refused.isError, currency).toBe(true);
+      expect(JSON.stringify(refused.data), currency).toContain(code);
+    }
+    const created = await rpc(token, 'create_plan', { applicationId: appId, slug: 'ok', name: 'Ok', price: { currency: 'usd', amount: 900 } });
+    expect(created.isError).toBe(false);
+    expect(created.data).toMatchObject({ price: { currency: 'USD', amount: 900 } });
+  });
+
   it('update_plan edits entitlements but never the price', async () => {
     const token = await mintPat(await makeOperator('edit'));
     const appId = await createApp(token, 'plan-edit-app');
-    await rpc(token, 'create_plan', { applicationId: appId, slug: 'pro', name: 'Pro', amount: 1500 });
+    await rpc(token, 'create_plan', { applicationId: appId, slug: 'pro', name: 'Pro', price: { currency: 'USD', amount: 1500 } });
 
     const updated = await rpc(token, 'update_plan', {
       applicationId: appId,
@@ -65,43 +85,54 @@ describe('Operator MCP plan edit + archive', () => {
       name: 'Pro Plus',
     });
     expect(updated.isError).toBe(false);
-    const d = updated.data as { name: string; amount: number };
+    const d = updated.data as { name: string; price: { currency: string; amount: number } };
     expect(d.name).toBe('Pro Plus');
     // Price is unchanged, update_plan can't touch it.
-    expect(d.amount).toBe(1500);
+    expect(d.price).toMatchObject({ currency: 'USD', amount: 1500 });
+    expect(d).not.toHaveProperty('amount');
 
-    // Even if an agent tries to smuggle a price change, it's ignored (the tool
-    // has no price field; the value never reaches the service).
-    const sneaky = await rpc(token, 'update_plan', {
-      applicationId: appId,
-      slug: 'pro',
-      name: 'Pro Plus 2',
-      // Not part of the tool's schema. The RPC params are `Record<string,
-      // unknown>`, so this is not a type error, the assertion below is what
-      // proves the field is ignored.
-      amount: 99,
-    });
-    expect((sneaky.data as { amount: number }).amount).toBe(1500);
+    // An agent that tries to smuggle a price change is refused, and nothing
+    // of the call is applied: the tool has no price field.
+    for (const smuggled of [{ amount: 99 }, { price: { currency: 'USD', amount: 99 } }]) {
+      const sneaky = await rpc(token, 'update_plan', { applicationId: appId, slug: 'pro', name: 'Pro Plus 2', ...smuggled });
+      expect(sneaky.isError).toBe(true);
+      expect(JSON.stringify(sneaky.data)).toContain('VALIDATION_ERROR');
+    }
+    const listed = await rpc(token, 'list_plans', { applicationId: appId });
+    const [plan] = (listed.data as { plans: Array<{ name: string; price: { amount: number } }> }).plans;
+    expect(plan).toMatchObject({ name: 'Pro Plus', price: { amount: 1500 } });
   });
 
-  it('set_plan_active archives a plan', async () => {
-    const token = await mintPat(await makeOperator('archive'));
-    const appId = await createApp(token, 'plan-archive-app');
-    await rpc(token, 'create_plan', { applicationId: appId, slug: 'legacy', name: 'Legacy', amount: 900 });
+  it('update_plan sets the local prices rule and the change reaches the billing log, once', async () => {
+    const token = await mintPat(await makeOperator('local'));
+    const appId = await createApp(token, 'plan-local-app');
+    await rpc(token, 'create_plan', { applicationId: appId, slug: 'pro', name: 'Pro', price: { currency: 'USD', amount: 1500 } });
 
-    const archived = await rpc(token, 'set_plan_active', {
-      applicationId: appId,
-      slug: 'legacy',
-      active: false,
+    const updated = await rpc(token, 'update_plan', { applicationId: appId, slug: 'pro', localPrices: 'OFF' });
+    expect(updated.isError, JSON.stringify(updated.data)).toBe(false);
+    expect((updated.data as { localPrices: string }).localPrices).toBe('OFF');
+    // The same value again is not a change.
+    await rpc(token, 'update_plan', { applicationId: appId, slug: 'pro', localPrices: 'OFF' });
+
+    const events = await rpc(token, 'recent_billing_events', { applicationId: appId, type: 'plan.local_prices_changed' });
+    expect(events.isError, JSON.stringify(events.data)).toBe(false);
+    const logged = (events.data as { events: Array<{ type: string; actor: { type: string }; data: Record<string, string> }> }).events;
+    expect(logged).toHaveLength(1);
+    expect(logged[0]).toMatchObject({
+      type: 'plan.local_prices_changed',
+      actor: { type: 'operator' },
+      data: { planSlug: 'pro', before: 'inherit', after: 'off' },
     });
-    expect(archived.isError).toBe(false);
-    expect((archived.data as { active: boolean }).active).toBe(false);
+
+    const refused = await rpc(token, 'update_plan', { applicationId: appId, slug: 'pro', localPrices: 'any' });
+    expect(refused.isError).toBe(true);
+    expect(JSON.stringify(refused.data)).toContain('VALIDATION_ERROR');
   });
 
   it('cannot edit a plan in another workspace', async () => {
     const victimToken = await mintPat(await makeOperator('pe-victim'));
     const victimApp = await createApp(victimToken, 'pe-victim-app');
-    await rpc(victimToken, 'create_plan', { applicationId: victimApp, slug: 'pro', name: 'Pro', amount: 1000 });
+    await rpc(victimToken, 'create_plan', { applicationId: victimApp, slug: 'pro', name: 'Pro', price: { currency: 'USD', amount: 1000 } });
 
     const attackerToken = await mintPat(await makeOperator('pe-attacker'));
     const attempt = await rpc(attackerToken, 'update_plan', {
@@ -112,4 +143,5 @@ describe('Operator MCP plan edit + archive', () => {
     expect(attempt.isError).toBe(true);
     expect((attempt.data as { error: string }).error).toMatch(/not found in this workspace/i);
   });
+
 });

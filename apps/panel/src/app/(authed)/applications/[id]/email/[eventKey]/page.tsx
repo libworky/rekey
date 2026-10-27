@@ -181,7 +181,7 @@ export default async function TemplateEditorPage({
         </div>
         {template.customised && (
           <ActionForm action={revertBound}>
-            <ConfirmButton confirm="Revert this template to the Rekey default? Your custom subject + body will be lost.">
+            <ConfirmButton title="Revert email template?" confirm="Revert this template to the Rekey default? Your custom subject + body will be lost.">
               Revert to default
             </ConfirmButton>
           </ActionForm>
@@ -258,6 +258,10 @@ export default async function TemplateEditorPage({
             </label>
             <SubmitButton pendingLabel="Sending…">Send test</SubmitButton>
           </ActionForm>
+          <p className="text-xs text-[var(--color-muted-fg)]">
+            Until this Application has its own email provider connected, a test can only go to your own address.
+            Test sends count toward the hourly limit of email to one address.
+          </p>
         </section>
       </div>
     </div>

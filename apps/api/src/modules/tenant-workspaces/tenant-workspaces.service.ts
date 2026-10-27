@@ -37,12 +37,13 @@ import {
   issueTenantAccessToken,
 } from '../../lib/tenant-jwt.js';
 import { issueTenantRefreshToken } from '../../lib/tenant-refresh-tokens.js';
+import { operatorSessionEndedMeanwhile } from '../../lib/session-refusals.js';
 import { resolveNewTenantLimits } from '../../lib/tenant-limits.js';
 import { env } from '../../config/env.js';
-import { emailService } from '../email/email.service.js';
-import { buildTokenUrl } from '../../lib/app-url.js';
-import { panelBaseUrl } from '../../lib/panel-url.js';
 import { withSavepoint } from '../../lib/savepoint.js';
+import { mailInvitation } from './invitation-mail.js';
+import { applyInvitationGrants, assertInvitationGrants, type InvitationAppGrant } from './invitation-grants.js';
+import { assertOperatorVerifiedForCredential } from '../tenant-auth/operator-confirmation.js';
 
 /**
  * Deployment policy for CREATING another workspace (`WORKSPACE_CREATION`).
@@ -131,7 +132,13 @@ export interface InvitationRow {
   invitedById: string;
   // Status is derived: revoked > accepted > expired > pending.
   status: 'pending' | 'accepted' | 'expired' | 'revoked';
+  /** The app grants a MEMBER gets on joining. Always empty for OWNER and ADMIN. */
+  appGrants: InvitationAppGrant[];
 }
+
+type InvitationWithGrants = TenantInvitation & { appGrants: InvitationAppGrant[] };
+
+const withGrants = { appGrants: { select: { applicationId: true, role: true } } } as const;
 
 function deriveStatus(inv: TenantInvitation): InvitationRow['status'] {
   if (inv.revokedAt) return 'revoked';
@@ -140,7 +147,7 @@ function deriveStatus(inv: TenantInvitation): InvitationRow['status'] {
   return 'pending';
 }
 
-function shapeInvitation(inv: TenantInvitation): InvitationRow {
+function shapeInvitation(inv: InvitationWithGrants): InvitationRow {
   return {
     id: inv.id,
     email: inv.email,
@@ -149,11 +156,12 @@ function shapeInvitation(inv: TenantInvitation): InvitationRow {
     createdAt: inv.createdAt,
     invitedById: inv.invitedById,
     status: deriveStatus(inv),
+    appGrants: inv.appGrants.map((g) => ({ applicationId: g.applicationId, role: g.role })),
   };
 }
 
 /** Permission helper. Throws if `actor` cannot manage `target` role. */
-function ensureCanManage(actor: TenantRole, target: TenantRole): void {
+export function ensureCanManage(actor: TenantRole, target: TenantRole): void {
   if (actor === 'OWNER') return;
   if (actor === 'ADMIN' && target === 'MEMBER') return;
   throw new RekeyError({
@@ -272,7 +280,7 @@ export const tenantWorkspacesService = {
       throw new RekeyError({
         statusCode: 400,
         code: 'APP_GRANT_MEMBER_ONLY',
-        message: `Per-application grants only apply to MEMBER roles — this membership is ${membership.role} and already has full access to every Application.`,
+        message: `Per-application grants only apply to MEMBER roles. This membership is ${membership.role} and already has full access to every Application.`,
         fix: 'Change the member role to MEMBER first (PATCH /api/v1/tenant/workspace/members/:id), then add grants.',
       });
     }
@@ -353,6 +361,7 @@ export const tenantWorkspacesService = {
     const [rows, total] = await Promise.all([
       prisma.tenantInvitation.findMany({
         where,
+        include: withGrants,
         orderBy: { createdAt: 'desc' },
         ...(opts.take !== undefined && { take: opts.take }),
         ...(opts.skip !== undefined && { skip: opts.skip }),
@@ -373,6 +382,8 @@ export const tenantWorkspacesService = {
     invitedByRole: TenantRole;
     email: string;
     role: TenantRole;
+    /** Apps a MEMBER gets on joining. Refused for OWNER and ADMIN. */
+    appGrants?: InvitationAppGrant[];
     /** Optional URL with `{token}` substituted in the email body. */
     inviteUrl?: string;
   }): Promise<{
@@ -381,6 +392,11 @@ export const tenantWorkspacesService = {
     invitation: InvitationRow;
   }> {
     ensureCanManage(input.invitedByRole, input.role);
+    const appGrants = input.appGrants ?? [];
+    await assertInvitationGrants(input.tenantId, input.role, appGrants);
+    // An invitation outlives the inviter's session, and whoever accepts it
+    // keeps their place in the workspace.
+    await assertOperatorVerifiedForCredential(input.invitedById, 'invite someone to the workspace');
 
     const email = input.email.toLowerCase();
     // Block invites to existing members of this workspace, they'd just
@@ -407,44 +423,21 @@ export const tenantWorkspacesService = {
         role: input.role,
         tokenHash,
         expiresAt: defaultInvitationExpiry(),
+        appGrants: { create: appGrants.map((g) => ({ applicationId: g.applicationId, role: g.role })) },
       },
+      include: withGrants,
     });
 
-    const [inviter, tenant] = await Promise.all([
-      prisma.tenantUser.findUnique({
-        where: { id: input.invitedById },
-        select: { name: true, email: true },
-      }),
-      prisma.tenant.findUnique({
-        where: { id: input.tenantId },
-        select: { name: true },
-      }),
-    ]);
-
-    const outcome = await emailService.dispatchSystem({
-      eventKey: 'workspace_invitation',
-      to: email,
-      tenantId: input.tenantId,
-      variables: {
-        inviteeEmail: email,
-        inviterName: inviter?.name ?? inviter?.email ?? 'A teammate',
-        workspaceName: tenant?.name ?? 'a workspace',
-        // An invitation is an OPERATOR-facing link, so its base is the panel,
-        // not a customer app: `panelBaseUrl()` (PANEL_OAUTH_REDIRECT_BASE, or
-        // inferred from CORS_ALLOWED_ORIGINS). A prior fallback to the
-        // placeholder `your-panel.example.com` mailed a live invitation token
-        // to a domain nobody owns; it now resolves to empty instead, and the
-        // template drops the button rather than rendering href="".
-        inviteUrl: input.inviteUrl
-          ? input.inviteUrl.replace('{token}', encodeURIComponent(rawToken))
-          : buildTokenUrl(panelBaseUrl(), '/accept-invite', rawToken),
-        expiresAtIso: invitation.expiresAt.toISOString(),
-      },
+    const emailSent = await mailInvitation({
+      invitation,
+      rawToken,
+      inviterId: input.invitedById,
+      ...(input.inviteUrl !== undefined && { inviteUrl: input.inviteUrl }),
     });
 
     return {
       rawToken,
-      emailSent: outcome.kind === 'sent',
+      emailSent,
       invitation: shapeInvitation(invitation),
     };
   },
@@ -456,6 +449,7 @@ export const tenantWorkspacesService = {
   }): Promise<InvitationRow> {
     const inv = await prisma.tenantInvitation.findUnique({
       where: { id: args.invitationId },
+      include: withGrants,
     });
     if (!inv || inv.tenantId !== args.tenantId) {
       throw new RekeyError({
@@ -478,6 +472,7 @@ export const tenantWorkspacesService = {
     const updated = await prisma.tenantInvitation.update({
       where: { id: inv.id },
       data: { revokedAt: new Date() },
+      include: withGrants,
     });
     return shapeInvitation(updated);
   },
@@ -546,6 +541,8 @@ export const tenantWorkspacesService = {
   async acceptInvitation(args: {
     rawToken: string;
     tenantUserId: string;
+    /** `req.tenantSessionStamp`: the stamp the session middleware admitted this request against. */
+    sessionStamp: Date | null;
   }): Promise<{
     membership: TenantMembership;
     accessToken: string;
@@ -555,7 +552,7 @@ export const tenantWorkspacesService = {
   }> {
     const tokenHash = hashInvitationToken(args.rawToken);
 
-    return prisma.$transaction(async (tx) => {
+    const accepted = await prisma.$transaction(async (tx) => {
       // Re-check inside txn so concurrent accepts don't both succeed.
       const inv = await tx.tenantInvitation.findUnique({ where: { tokenHash } });
       if (!inv || inv.revokedAt || inv.acceptedAt) {
@@ -636,10 +633,24 @@ export const tenantWorkspacesService = {
         }
       }
 
-      await tx.tenantInvitation.update({
-        where: { id: inv.id },
+      // Also for a membership that already existed: someone who joined another
+      // way since this was sent still gets the apps this inviter chose.
+      await applyInvitationGrants(tx, inv.id, membership.id);
+
+      // Conditional on the token still being this link's: a resend or revoke
+      // that committed after the read above rolls this accept back.
+      const consumed = await tx.tenantInvitation.updateMany({
+        where: { id: inv.id, tokenHash, acceptedAt: null, revokedAt: null },
         data: { acceptedAt: new Date(), acceptedById: args.tenantUserId },
       });
+      if (consumed.count !== 1) {
+        throw new RekeyError({
+          statusCode: 400,
+          code: 'INVITATION_NOT_USABLE',
+          message: 'This invitation was sent again or withdrawn while you were accepting it.',
+          fix: 'Open the newest invitation email, or ask the workspace owner for a fresh invite.',
+        });
+      }
 
       // Issue a session scoped to the newly-joined workspace so the panel can
       // hop straight in. Through `tx`, so the session commits with the
@@ -648,6 +659,7 @@ export const tenantWorkspacesService = {
       const refresh = await issueTenantRefreshToken(
         args.tenantUserId,
         { activeTenantId: inv.tenantId },
+        { sessionsInvalidBefore: args.sessionStamp, refusal: operatorSessionEndedMeanwhile },
         tx,
       );
       const access = issueTenantAccessToken(args.tenantUserId, inv.tenantId, inv.role, {
@@ -661,6 +673,8 @@ export const tenantWorkspacesService = {
         refreshTokenExpiresAt: refresh.record.expiresAt,
       };
     });
+    invalidateMembershipAuth({ operatorId: args.tenantUserId, membershipId: accepted.membership.id });
+    return accepted;
   },
 
   /**
@@ -806,7 +820,7 @@ export const tenantWorkspacesService = {
       throw new RekeyError({
         statusCode: 400,
         code: 'SCOPES_MEMBER_ONLY',
-        message: `Scopes only apply to MEMBER roles — this membership is ${target.role} and is unrestricted by definition.`,
+        message: `Scopes only apply to MEMBER roles. This membership is ${target.role} and is unrestricted by definition.`,
         fix: 'Change the member role to MEMBER first, then set scopes.',
       });
     }
@@ -921,6 +935,9 @@ export const tenantWorkspacesService = {
     actorEmail: string;
   }): Promise<{ id: string; name: string }> {
     assertWorkspaceCreationAllowed();
+    // Every operator has the workspace they signed up into. Another one is
+    // another place to hold keys and members, which waits for a confirmed address.
+    await assertOperatorVerifiedForCredential(args.tenantUserId, 'create another workspace');
     const name = args.name.trim();
     if (name.length < 2 || name.length > 80) {
       throw new RekeyError({

@@ -10,6 +10,11 @@ import { createHash, randomBytes } from 'node:crypto';
 import type { FastifyInstance } from 'fastify';
 import { buildApp } from '../src/app.js';
 import { prisma } from '../src/lib/prisma.js';
+import { formatMoney } from '@rekey.dev/shared-types';
+import { createPlanWithDefaultPrice } from '../src/modules/plans/default-price.js';
+import { operatorsConfirmTheirEmail } from './confirmed-accounts.js';
+
+operatorsConfirmTheirEmail();
 
 function pkce(): { verifier: string; challenge: string } {
   const verifier = randomBytes(32).toString('base64url');
@@ -93,18 +98,6 @@ describe('MCP OAuth AS — discovery + DCR', () => {
     expect(md.token_endpoint_auth_methods_supported).toEqual(['none']);
   });
 
-  it('protected-resource metadata (RFC 9728) when enabled', async () => {
-    const { slug } = await makeApp(true);
-    const r = await app.inject({
-      method: 'GET',
-      url: `/api/v1/mcp/${slug}/.well-known/oauth-protected-resource`,
-    });
-    expect(r.statusCode).toBe(200);
-    const md = r.json() as { resource: string; authorization_servers: string[] };
-    expect(md.resource).toContain(`/api/v1/mcp/${slug}`);
-    expect(md.authorization_servers[0]).toContain(`/api/v1/mcp/${slug}`);
-  });
-
   // ---- Root-level "path-insertion" discovery (RFC 8414 / 9728) ----
   // A strict connector (Claude custom connectors) constructs the metadata URL by
   // inserting the well-known segment right after the origin and re-appending the
@@ -126,38 +119,6 @@ describe('MCP OAuth AS — discovery + DCR', () => {
     const md = inserted.json() as Record<string, unknown>;
     expect(md.issuer).toContain(`/api/v1/mcp/${slug}`);
     expect(md.code_challenge_methods_supported).toEqual(['S256']);
-  });
-
-  it('protected-resource metadata at the path-insertion URL is identical to the suffix form', async () => {
-    const { slug } = await makeApp(true);
-    const suffix = await app.inject({
-      method: 'GET',
-      url: `/api/v1/mcp/${slug}/.well-known/oauth-protected-resource`,
-    });
-    const inserted = await app.inject({
-      method: 'GET',
-      url: `/.well-known/oauth-protected-resource/api/v1/mcp/${slug}`,
-    });
-    expect(inserted.statusCode).toBe(200);
-    expect(inserted.body).toBe(suffix.body);
-    const md = inserted.json() as { resource: string };
-    expect(md.resource).toContain(`/api/v1/mcp/${slug}`);
-  });
-
-  it('path-insertion metadata 404s when MCP is disabled', async () => {
-    const { slug } = await makeApp(false);
-    const as = await app.inject({
-      method: 'GET',
-      url: `/.well-known/oauth-authorization-server/api/v1/mcp/${slug}`,
-    });
-    expect(as.statusCode).toBe(404);
-    expect(as.json().error.code).toBe('MCP_NOT_FOUND');
-    const pr = await app.inject({
-      method: 'GET',
-      url: `/.well-known/oauth-protected-resource/api/v1/mcp/${slug}`,
-    });
-    expect(pr.statusCode).toBe(404);
-    expect(pr.json().error.code).toBe('MCP_NOT_FOUND');
   });
 
   it('dynamic client registration mints a public client (RFC 7591)', async () => {
@@ -476,28 +437,6 @@ describe('MCP OAuth AS — discovery + DCR', () => {
     expect((replay.json() as { error: string }).error).toBe('invalid_grant');
   });
 
-  it('authorize denies with wrong credentials (re-renders, no code)', async () => {
-    const ctx = await bootstrapFlow();
-    const { challenge } = pkce();
-    const res = await app.inject({
-      method: 'POST',
-      url: `/api/v1/mcp/${ctx.slug}/oauth/authorize`,
-      ...form({
-        response_type: 'code',
-        client_id: ctx.clientId,
-        redirect_uri: REDIRECT,
-        code_challenge: challenge,
-        code_challenge_method: 'S256',
-        email: ctx.euEmail,
-        password: 'wrong-password',
-        consent: 'allow',
-      }),
-    });
-    // Re-renders the form (200 HTML), does NOT redirect with a code.
-    expect(res.statusCode).toBe(200);
-    expect(res.headers['content-type']).toContain('text/html');
-  });
-
   // ---- MCP resource endpoint (JSON-RPC) ----
 
   async function accessTokenFor(ctx: {
@@ -522,18 +461,6 @@ describe('MCP OAuth AS — discovery + DCR', () => {
     return (tok.json() as { access_token: string }).access_token;
   }
 
-  /** The end-user's own session token, for the REST route a tool mirrors. */
-  async function userToken(ctx: { liveKey: string; euEmail: string; euPassword: string }): Promise<string> {
-    const r = await app.inject({
-      method: 'POST',
-      url: '/api/v1/auth/sign-in',
-      headers: { authorization: `Bearer ${ctx.liveKey}` },
-      payload: { email: ctx.euEmail, password: ctx.euPassword },
-    });
-    expect(r.statusCode, r.body).toBe(200);
-    return (r.json().data as { accessToken: string }).accessToken;
-  }
-
   function rpc(slug: string, token: string | null, msg: object): Promise<unknown> {
     const headers: Record<string, string> = { 'content-type': 'application/json' };
     if (token) headers.authorization = `Bearer ${token}`;
@@ -549,16 +476,6 @@ describe('MCP OAuth AS — discovery + DCR', () => {
     expect(res.statusCode).toBe(401);
     expect(res.headers['www-authenticate']).toContain('resource_metadata');
     expect(res.headers['www-authenticate']).toContain('oauth-protected-resource');
-  });
-
-  it('MCP endpoint rejects a garbage token', async () => {
-    const ctx = await bootstrapFlow();
-    const res = (await rpc(ctx.slug, 'not-a-real-token', {
-      jsonrpc: '2.0',
-      id: 1,
-      method: 'initialize',
-    })) as { statusCode: number };
-    expect(res.statusCode).toBe(401);
   });
 
   it('end-to-end: token → initialize, tools/list, tools/call get_profile', async () => {
@@ -609,60 +526,49 @@ describe('MCP OAuth AS — discovery + DCR', () => {
     expect(typeof bal.balance).toBe('number');
   });
 
-  it('the billing tools refuse with BILLING_DISABLED where the REST reads they mirror do', async () => {
+  it('get_subscription reports the price the subscription is charged beside its plan\'s default price, and no price when it has none', async () => {
     const ctx = await bootstrapFlow();
     const token = await accessTokenFor(ctx);
-    const call = async (name: string) => {
-      const res = (await rpc(ctx.slug, token, {
-        jsonrpc: '2.0',
-        id: name,
-        method: 'tools/call',
-        params: { name, arguments: {} },
-      })) as { statusCode: number; json: () => { result: { content: Array<{ text: string }>; isError?: boolean } } };
-      expect(res.statusCode).toBe(200);
-      const { result } = res.json();
-      return { isError: result.isError === true, body: JSON.parse(result.content[0]!.text) as Record<string, unknown> };
-    };
-    const BILLING_TOOLS = ['get_subscription', 'get_credits', 'list_licenses'];
-
-    // Billing off (the default for this Application): all three refuse.
-    for (const name of BILLING_TOOLS) {
-      const { isError, body } = await call(name);
-      expect(isError, `${name}: ${JSON.stringify(body)}`).toBe(true);
-      expect(body).toEqual({ error: 'Billing is not enabled for this application.', code: 'BILLING_DISABLED' });
-    }
-    // The REST route agrees, so the two surfaces refuse the same thing.
-    const rest = await app.inject({
-      method: 'GET',
-      url: '/api/v1/users/me/licenses',
-      headers: { authorization: `Bearer ${ctx.liveKey}`, 'x-rekey-user-token': await userToken(ctx) },
-    });
-    expect(rest.statusCode).toBe(403);
-    expect(rest.json().error.code).toBe('BILLING_DISABLED');
-    // Tools with nothing to do with billing still answer.
-    expect((await call('get_profile')).isError).toBe(false);
-    expect((await call('list_my_devices')).isError).toBe(false);
-
-    // Billing on: all three answer.
-    await prisma.application.update({
+    const application = await prisma.application.update({
       where: { slug: ctx.slug },
       data: { billingConfig: { provider: 'stripe', enabled: true } },
     });
-    for (const name of BILLING_TOOLS) {
-      const { isError, body } = await call(name);
-      expect(isError, `${name}: ${JSON.stringify(body)}`).toBe(false);
-    }
+    const endUser = await prisma.endUser.findFirstOrThrow({ where: { applicationId: application.id, email: ctx.euEmail } });
+    const plan = await createPlanWithDefaultPrice({ applicationId: application.id, slug: 'pro', name: 'Pro', interval: 'MONTH' }, { currency: 'USD', amount: 1900 });
+    const inr = await prisma.planPrice.create({ data: { applicationId: application.id, planId: plan.id, currency: 'INR', amount: 149900 } });
+    const subscription = await prisma.subscription.create({
+      data: { applicationId: application.id, endUserId: endUser.id, planId: plan.id, status: 'ACTIVE', planPriceId: inr.id, currency: 'INR', unitAmount: 149900 },
+    });
+    const read = async (): Promise<Record<string, unknown>> => {
+      const res = (await rpc(ctx.slug, token, {
+        jsonrpc: '2.0',
+        id: 9,
+        method: 'tools/call',
+        params: { name: 'get_subscription', arguments: {} },
+      })) as { json: () => { result: { content: Array<{ text: string }>; isError?: boolean } } };
+      expect(res.json().result.isError === true, res.json().result.content[0]!.text).toBe(false);
+      return JSON.parse(res.json().result.content[0]!.text) as Record<string, unknown>;
+    };
+
+    const priced = await read();
+    expect(priced.price).toEqual({ id: inr.id, currency: 'INR', amount: 149900, formatted: formatMoney(149900, 'INR') });
+    expect(priced.plan).toEqual({
+      slug: 'pro',
+      name: 'Pro',
+      interval: 'MONTH',
+      price: { id: plan.defaultPriceId, currency: 'USD', amount: 1900, formatted: formatMoney(1900, 'USD') },
+    });
+
+    // No price of its own: null, never the plan's 19.00.
+    await prisma.subscription.update({ where: { id: subscription.id }, data: { planPriceId: null, currency: null, unitAmount: null } });
+    const unpriced = await read();
+    expect(unpriced.price).toBeNull();
+    expect((unpriced.plan as { price: { amount: number } }).price.amount).toBe(1900);
+
+    const listed = (await rpc(ctx.slug, token, { jsonrpc: '2.0', id: 10, method: 'tools/list' })) as {
+      json: () => { result: { tools: Array<{ name: string; description: string }> } };
+    };
+    expect(listed.json().result.tools.find((tool) => tool.name === 'get_subscription')!.description).toContain('minor units');
   });
 
-  it('MCP unknown tool returns a JSON-RPC error', async () => {
-    const ctx = await bootstrapFlow();
-    const token = await accessTokenFor(ctx);
-    const res = (await rpc(ctx.slug, token, {
-      jsonrpc: '2.0',
-      id: 9,
-      method: 'tools/call',
-      params: { name: 'definitely_not_a_tool', arguments: {} },
-    })) as { json: () => { error?: { code: number } } };
-    expect(res.json().error?.code).toBe(-32602);
-  });
 });

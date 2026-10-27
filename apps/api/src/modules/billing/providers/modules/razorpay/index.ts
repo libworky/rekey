@@ -20,7 +20,9 @@
  */
 
 import { createHmac, createHash, timingSafeEqual } from 'node:crypto';
+import { CHECKOUT_BROWSER_ORIGINS } from '@rekey.dev/shared-types';
 import { RekeyError } from '../../../../../lib/error.js';
+import { RAZORPAY_SUPPORTED_CURRENCIES, razorpayWebhookAmount } from '../../razorpay-money.js';
 import type {
   AppRef,
   DomainBillingEvent,
@@ -36,6 +38,7 @@ interface RzpSubscriptionEntity {
   status?: string;
   current_end?: number | null;
   paid_count?: number;
+  plan_id?: string;
 }
 
 interface RzpPaymentEntity {
@@ -49,6 +52,13 @@ interface RzpPaymentLinkEntity {
   id: string;
 }
 
+interface RzpOrderEntity {
+  id: string;
+  amount?: number;
+  amount_paid?: number;
+  notes?: Record<string, string> | unknown[] | null;
+}
+
 interface RazorpayEventPayload {
   event?: string;
   created_at?: number;
@@ -56,6 +66,7 @@ interface RazorpayEventPayload {
     subscription?: { entity?: RzpSubscriptionEntity };
     payment?: { entity?: RzpPaymentEntity };
     payment_link?: { entity?: RzpPaymentLinkEntity };
+    order?: { entity?: RzpOrderEntity };
   };
 }
 
@@ -132,9 +143,9 @@ function extractEventId(payload: unknown, req?: RawWebhookReq): string {
 }
 
 /**
- * Port of the razorpay.handler.ts dispatch switch, the same 7 handled
- * event types (incl. the payment_link.paid one-time path), translated to
- * normalized domain events. Everything else → null (logged + acked
+ * The razorpay.handler.ts dispatch switch (incl. the payment_link.paid
+ * one-time path), plus `order.paid` for the checkout page's one-time Orders,
+ * translated to normalized domain events. Everything else → null (logged + acked
  * upstream). All events carry `checkoutSessionId` so the appliers keep the
  * bespoke metadata-OR-providerSubId row matching, and payment events set
  * `requireLocalSubscription`, the bespoke handler never wrote an unlinked
@@ -194,11 +205,12 @@ function translate(payload: unknown, ctx: TranslateCtx): DomainBillingEvent[] | 
           providerSubscriptionId: sub.id,
           checkoutSessionId: sub.id,
           requireLocalSubscription: true,
-          amount: payment.amount,
+          amount: razorpayWebhookAmount(payment.currency ?? 'INR', payment.amount),
           currency: payment.currency ?? 'INR',
           description: payment.description ?? null,
           firstPeriod: (sub.paid_count ?? 1) <= 1,
           ...(sub.current_end ? { currentPeriodEnd: new Date(sub.current_end * 1000) } : {}),
+          ...(typeof sub.plan_id === 'string' && sub.plan_id !== '' && { providerPriceId: sub.plan_id }),
           raw: payload,
         },
       ];
@@ -255,7 +267,7 @@ function translate(payload: unknown, ctx: TranslateCtx): DomainBillingEvent[] | 
           providerSubscriptionId: sub.id,
           checkoutSessionId: sub.id,
           requireLocalSubscription: true,
-          amount: payment.amount,
+          amount: razorpayWebhookAmount(payment.currency ?? 'INR', payment.amount),
           currency: payment.currency ?? 'INR',
           description: payment.description ?? null,
           raw: payload,
@@ -292,7 +304,7 @@ function translate(payload: unknown, ctx: TranslateCtx): DomainBillingEvent[] | 
           providerSubscriptionId: null,
           checkoutSessionId: link.id,
           requireLocalSubscription: true,
-          amount: payment.amount,
+          amount: razorpayWebhookAmount(payment.currency ?? 'INR', payment.amount),
           currency: payment.currency ?? 'INR',
           description: payment.description ?? null,
           firstPeriod: true,
@@ -300,9 +312,48 @@ function translate(payload: unknown, ctx: TranslateCtx): DomainBillingEvent[] | 
         },
       ];
     }
+    // One-off purchase on the Rekey checkout page, paid through an Order
+    // (createEmbeddedCheckout). It completes exactly like a Stripe one-time
+    // session: the completion carries its charge. Razorpay also fires
+    // `order.paid` for the order behind every Payment Link; only orders Rekey
+    // marked `rekey_checkout: embedded` are taken here, and a Payment Link's
+    // purchase is left to `payment_link.paid`.
+    case 'order.paid': {
+      const order = event.payload?.order?.entity;
+      if (!order || !payment) {
+        ctx.log.warn({ eventId: providerEventId }, 'order.paid missing order/payment entity');
+        return [];
+      }
+      if (!isEmbeddedOrder(order)) return null;
+      if (typeof order.amount !== 'number' || order.amount_paid !== order.amount) {
+        ctx.log.warn({ eventId: providerEventId, orderId: order.id }, 'order.paid for an order not paid in full, not fulfilled');
+        return [];
+      }
+      return [
+        {
+          type: 'checkout.completed',
+          providerEventId,
+          applicationId,
+          checkoutSessionId: order.id,
+          providerSubscriptionId: null,
+          payment: {
+            providerPaymentId: payment.id,
+            amount: razorpayWebhookAmount(payment.currency, payment.amount),
+            currency: payment.currency ?? null,
+            description: payment.description ?? null,
+          },
+          raw: payload,
+        },
+      ];
+    }
     default:
       return null;
   }
+}
+
+function isEmbeddedOrder(order: RzpOrderEntity): boolean {
+  const notes = order.notes;
+  return notes !== null && typeof notes === 'object' && !Array.isArray(notes) && notes.rekey_checkout === 'embedded';
 }
 
 export const razorpayModule: ProviderModule = {
@@ -313,6 +364,9 @@ export const razorpayModule: ProviderModule = {
     // Suggested only, the panel pre-fills "IN" here. `pickProvider` reads the
     // stored row, so India routes to Razorpay only once an operator saves it.
     defaultCountries: ['IN'],
+    // Other currencies need international payments activated on the account.
+    supportedCurrencies: [...RAZORPAY_SUPPORTED_CURRENCIES],
+    preselectedCurrencies: ['INR'],
     priority: 100,
   },
   capabilities: {
@@ -344,7 +398,11 @@ export const razorpayModule: ProviderModule = {
     // and `addons` only ever ADD to a cycle. Nothing here can take an ad-hoc
     // discount off one period, so the coupon is refused instead.
     discounts: { oneTime: true, recurring: false },
+    // Standard Checkout's modal, opened from the page on a subscription or an
+    // Order. Never Custom Checkout, which puts card fields in our DOM.
+    embeddedCheckout: { recurring: true, oneTime: true },
   },
+  browser: CHECKOUT_BROWSER_ORIGINS.razorpay!,
   credentialSchema: [
     {
       key: 'keyId',

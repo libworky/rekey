@@ -62,6 +62,9 @@ import {
   parsePagination,
   PaginationQuery,
 } from '../../lib/pagination.js';
+import { assertOperatorVerifiedForCredential } from '../tenant-auth/operator-claim.js';
+import { applicationEmailScope, authEmailCappedError, reserveAuthEmail } from './auth-email-caps.js';
+import { recipientCapKey } from './custom/send-caps.js';
 
 const AppParam = z.object({ id: z.string().min(1) });
 const EventParam = z.object({ id: z.string().min(1), eventKey: z.string().min(1).max(64) });
@@ -74,8 +77,7 @@ const fromFields = {
 };
 
 // Provider-discriminated credential body. Resend (API key) or SMTP
-// (host/port/user/pass). A missing `provider` is coerced to 'resend' in the
-// handler for backward compatibility with the old { apiKey, fromAddress } body.
+// (host/port/user/pass).
 const SetCredsBody = z.discriminatedUnion('provider', [
   z.object({
     provider: z.literal('resend'),
@@ -108,7 +110,10 @@ const LogQuery = z.object({
   // (application off, event off, or the address on the suppression list). It
   // has to be filterable: the Settings and Templates copy sends an operator
   // here to find out WHY a mail did not go, and without it the query 400s.
-  status: z.enum(['sent', 'error', 'no_transport', 'suppressed', 'pending', 'unknown']).optional(),
+  status: z.enum(['sent', 'error', 'no_transport', 'suppressed', 'pending', 'unknown', 'scheduled', 'canceled']).optional(),
+  customTemplateKey: z.string().min(1).max(64).optional(),
+  toAddress: z.string().min(1).max(254).optional(),
+  since: z.coerce.date().optional(),
 });
 
 const UpsertTemplateBody = z.object({
@@ -130,18 +135,18 @@ const TestSendBody = z.object({
 /** Every route here sits behind `requireTenantSession` (plugin `onRequest` hook). */
 const TENANT_SESSION_ERRORS = {
   401:
-    'TENANT_SESSION_MISSING — no `Authorization: Bearer <accessToken>` header; or ' +
-    'TENANT_SESSION_INVALID — the token is invalid, expired, or the operator account no ' +
+    'TENANT_SESSION_MISSING: no `Authorization: Bearer <accessToken>` header; or ' +
+    'TENANT_SESSION_INVALID: the token is invalid, expired, or the operator account no ' +
     'longer exists.',
-  429: 'RATE_LIMITED — too many requests. Honour the `Retry-After` header.',
+  429: 'RATE_LIMITED: too many requests. Honour the `Retry-After` header.',
 } as const;
 
 /** Errors from `ensureAppAccess(req, id, 'read')`. */
 const APP_READ_ERRORS = {
   ...TENANT_SESSION_ERRORS,
-  403: 'TENANT_MEMBERSHIP_REVOKED — you are no longer a member of this workspace.',
+  403: 'TENANT_MEMBERSHIP_REVOKED: you are no longer a member of this workspace.',
   404:
-    'APPLICATION_NOT_FOUND — no Application with that id in this workspace (also returned, ' +
+    'APPLICATION_NOT_FOUND: no Application with that id in this workspace (also returned, ' +
     'without disclosing existence, when a MEMBER holds no grant on it).',
 };
 
@@ -149,18 +154,18 @@ const APP_READ_ERRORS = {
 const APP_WRITE_ERRORS = {
   ...TENANT_SESSION_ERRORS,
   403:
-    'TENANT_MEMBERSHIP_REVOKED — you are no longer a member of this workspace; or ' +
-    'TENANT_ROLE_INSUFFICIENT — a legacy MEMBER (no application grants anywhere) cannot ' +
-    'write; or APP_ACCESS_DENIED — your application grant role does not allow this action ' +
+    'TENANT_MEMBERSHIP_REVOKED: you are no longer a member of this workspace; or ' +
+    'TENANT_ROLE_INSUFFICIENT: a legacy MEMBER (no application grants anywhere) cannot ' +
+    'write; or APP_ACCESS_DENIED: your application grant role does not allow this action ' +
     '(requires APP_ADMIN).',
   404:
-    'APPLICATION_NOT_FOUND — no Application with that id in this workspace (also returned, ' +
+    'APPLICATION_NOT_FOUND: no Application with that id in this workspace (also returned, ' +
     'without disclosing existence, when a MEMBER holds no grant on it).',
 };
 
 /** `EMAIL_EVENT_UNKNOWN`, folded into the same 404 status as `APPLICATION_NOT_FOUND`. */
 const EMAIL_EVENT_UNKNOWN_DESC =
-  'EMAIL_EVENT_UNKNOWN — `eventKey` is not in the event registry (see GET .../email-templates).';
+  'EMAIL_EVENT_UNKNOWN: `eventKey` is not in the event registry (see GET .../email-templates).';
 
 /** One suppressed address, as the routes return it. */
 const EMAIL_SUPPRESSION = {
@@ -364,7 +369,7 @@ export async function tenantEmailRoutes(app: FastifyInstance): Promise<void> {
           ...errs({
             ...APP_WRITE_ERRORS,
             404: `${APP_WRITE_ERRORS[404]}; or ${EMAIL_EVENT_UNKNOWN_DESC}`,
-            409: 'EMAIL_EVENT_REQUIRED_BY_AUTH_CONFIG — a live auth method depends on this email.',
+            409: 'EMAIL_EVENT_REQUIRED_BY_AUTH_CONFIG: a live auth method depends on this email.',
           }),
         },
       },
@@ -634,7 +639,7 @@ export async function tenantEmailRoutes(app: FastifyInstance): Promise<void> {
           '`APP_ADMIN` grant on it.',
         body: {
           type: 'object',
-          required: ['fromAddress'],
+          required: ['provider', 'fromAddress'],
           properties: {
             provider: { type: 'string', enum: ['resend', 'smtp'] },
             // resend
@@ -665,7 +670,7 @@ export async function tenantEmailRoutes(app: FastifyInstance): Promise<void> {
           ),
           ...errs({
             400:
-              'VALIDATION_ERROR — the body does not match the discriminated `resend`/`smtp` ' +
+              'VALIDATION_ERROR: the body does not match the discriminated `resend`/`smtp` ' +
               'credential shape for the given (or defaulted) `provider`.',
             ...APP_WRITE_ERRORS,
           }),
@@ -673,11 +678,10 @@ export async function tenantEmailRoutes(app: FastifyInstance): Promise<void> {
       },
     },
     async (req) => {
+      await assertOperatorVerifiedForCredential(req.tenantUser!.id, 'set the credentials this Application sends email with');
       const { id } = AppParam.parse(req.params);
       await ensureAppAccess(req, id, 'write');
-      // Back-compat: an absent `provider` means the legacy Resend-only body.
-      const rawBody = (req.body ?? {}) as Record<string, unknown>;
-      const body = SetCredsBody.parse({ ...rawBody, provider: rawBody.provider ?? 'resend' });
+      const body = SetCredsBody.parse(req.body);
       const credentials: EmailCredentials =
         body.provider === 'resend'
           ? { provider: 'resend', apiKey: body.apiKey }
@@ -786,6 +790,7 @@ export async function tenantEmailRoutes(app: FastifyInstance): Promise<void> {
       },
     },
     async (req) => {
+      await assertOperatorVerifiedForCredential(req.tenantUser!.id, 'change the address this Application sends email from');
       const { id } = AppParam.parse(req.params);
       await ensureAppAccess(req, id, 'write');
       const body = SenderBody.parse(req.body ?? {});
@@ -812,7 +817,10 @@ export async function tenantEmailRoutes(app: FastifyInstance): Promise<void> {
           properties: {
             limit: { type: 'integer', minimum: 1, maximum: 200 },
             offset: { type: 'integer', minimum: 0, maximum: 2147483647 },
-            status: { type: 'string', enum: ['sent', 'error', 'no_transport', 'suppressed', 'pending', 'unknown'] },
+            status: { type: 'string', enum: ['sent', 'error', 'no_transport', 'suppressed', 'pending', 'unknown', 'scheduled', 'canceled'] },
+            customTemplateKey: { type: 'string', description: 'Only sends of this custom template key.' },
+            toAddress: { type: 'string', description: 'Only sends to this address, exact and case-insensitive.' },
+            since: { type: 'string', format: 'date-time', description: 'Only rows created at or after this instant.' },
           },
         },
         response: {
@@ -831,17 +839,16 @@ export async function tenantEmailRoutes(app: FastifyInstance): Promise<void> {
       // `page.limit` describes the window that was served.
       const limit = q.limit ?? 100;
       const offset = q.offset ?? 0;
+      const filter = {
+        applicationId: id,
+        status: q.status,
+        customTemplateKey: q.customTemplateKey,
+        toAddress: q.toAddress,
+        since: q.since,
+      };
       const [rows, total] = await Promise.all([
-        emailService.listAppLogs({
-          applicationId: id,
-          limit,
-          offset,
-          ...(q.status !== undefined && { status: q.status }),
-        }),
-        emailService.countAppLogs({
-          applicationId: id,
-          ...(q.status !== undefined && { status: q.status }),
-        }),
+        emailService.listAppLogs({ ...filter, limit, offset }),
+        emailService.countAppLogs(filter),
       ]);
       return {
         success: true,
@@ -977,7 +984,7 @@ export async function tenantEmailRoutes(app: FastifyInstance): Promise<void> {
             'The saved template row (id + eventKey only).',
           ),
           ...errs({
-            400: 'VALIDATION_ERROR — `subject`, `bodyHtml`, or `bodyText` failed schema validation.',
+            400: 'VALIDATION_ERROR: `subject`, `bodyHtml`, or `bodyText` failed schema validation.',
             ...APP_WRITE_ERRORS,
             404: `${APP_WRITE_ERRORS[404]}; or ${EMAIL_EVENT_UNKNOWN_DESC}`,
           }),
@@ -985,6 +992,7 @@ export async function tenantEmailRoutes(app: FastifyInstance): Promise<void> {
       },
     },
     async (req) => {
+      await assertOperatorVerifiedForCredential(req.tenantUser!.id, 'replace a sign-in email template');
       const { id, eventKey } = EventParam.parse(req.params);
       await ensureAppAccess(req, id, 'write');
       const body = UpsertTemplateBody.parse(req.body);
@@ -1082,10 +1090,12 @@ export async function tenantEmailRoutes(app: FastifyInstance): Promise<void> {
       schema: {
         tags: ['Tenant · Email'],
         security: [{ tenantSession: [] }],
-        summary: 'Render the template with sample values and send to a chosen address',
+        summary: 'Render the template with sample values and send it as a test',
         description:
           'Requires **write** access to this Application, OWNER/ADMIN, or a MEMBER with an ' +
-          '`APP_ADMIN` grant on it.',
+          '`APP_ADMIN` grant on it, and a confirmed operator email address. `to` must be the ' +
+          "calling operator's own address unless the Application has its own email provider " +
+          'connected. Counted against the per-recipient auth email cap.',
         body: {
           type: 'object',
           required: ['to'],
@@ -1121,11 +1131,16 @@ export async function tenantEmailRoutes(app: FastifyInstance): Promise<void> {
             'The test send outcome.',
           ),
           ...errs({
-            400: 'VALIDATION_ERROR — `to` is missing or not a valid email.',
+            400: 'VALIDATION_ERROR: `to` is missing or not a valid email.',
             ...APP_WRITE_ERRORS,
+            403:
+              `${APP_WRITE_ERRORS[403]} Or EMAIL_NOT_VERIFIED: the operator's own address is unconfirmed; or ` +
+              'EMAIL_TEST_RECIPIENT_NOT_ALLOWED: the Application sends through the shared transport and `to` ' +
+              "is not the operator's own address.",
             404: `${APP_WRITE_ERRORS[404]}; or ${EMAIL_EVENT_UNKNOWN_DESC}`,
+            429: 'AUTH_EMAIL_RECIPIENT_CAPPED: this address has had its hourly or daily allowance of auth email.',
             409:
-              'EMAIL_ADDRESS_SUPPRESSED — that address is on this Application’s suppression ' +
+              'EMAIL_ADDRESS_SUPPRESSED: that address is on this Application’s suppression ' +
               'list. A test send deliberately bypasses the master switch and the per-event ' +
               'switch, but never the suppression list: mailing a hard-bounced or complaining ' +
               'address again is how a sending domain gets blocked.',
@@ -1136,9 +1151,26 @@ export async function tenantEmailRoutes(app: FastifyInstance): Promise<void> {
     async (req) => {
       const { id, eventKey } = EventParam.parse(req.params);
       await ensureAppAccess(req, id, 'write');
+      // A test send is mail to an address the caller names. An operator whose
+      // own address nobody has confirmed does not get to send any.
+      await assertOperatorVerifiedForCredential(req.tenantUser!.id, 'send a test email');
       const body = TestSendBody.parse(req.body);
       const application = await prisma.application.findUniqueOrThrow({ where: { id } });
+      // First, so an unknown event is a 404 whoever the mail was for.
       const rendered = await emailService.previewWithSamples(id, eventKey);
+      // Without a mail provider of its own, the Application's mail leaves
+      // through the deployment's shared transport, under the deployment's
+      // name. That transport may only be pointed at the operator themselves.
+      const own = req.tenantUser!.email;
+      const sharedTransport = !['byo_resend', 'byo_smtp'].includes(describeTransport(application).via);
+      if (sharedTransport && recipientCapKey(body.to) !== recipientCapKey(own)) {
+        throw new RekeyError({
+          statusCode: 403,
+          code: 'EMAIL_TEST_RECIPIENT_NOT_ALLOWED',
+          message: 'This Application has no email provider of its own, so a test send can only go to your own address.',
+          fix: `Send the test to ${own}, or connect this Application's own email provider (PUT /api/v1/tenant/applications/${id}/email-credentials, or Panel → Application → Email) to test with other addresses.`,
+        });
+      }
       // A test send deliberately IGNORES the Application's master switch and
       // the per-event switch: an operator configuring transport has to be able
       // to prove it works before turning sending back on, and that is the
@@ -1157,6 +1189,10 @@ export async function tenantEmailRoutes(app: FastifyInstance): Promise<void> {
           fix: 'Test with a different address. Sending to a hard-bounced or complaining address again is how a sending domain gets blocked, remove it from Email → Suppressions only if you know the bounce is resolved.',
         });
       }
+      // Counted like the mail it previews: one address is sent no more auth
+      // email in an hour or a day by test sends than by anything else.
+      const reserved = await reserveAuthEmail(applicationEmailScope(application), body.to);
+      if (!reserved.allowed) throw authEmailCappedError(reserved.retryAfterSeconds);
       const outcome = await sendEmail(
         application,
         {

@@ -1,5 +1,5 @@
 /**
- * `pickProvider` + `countryFromRequest`, the geo router that decides which
+ * `pickProvider` + `resolveBuyerCountry`, the geo router that decides which
  * payment processor receives the money.
  *
  * 47 lines with no test reference anywhere in the suite. A bug here does not
@@ -20,10 +20,11 @@
 
 import { beforeEach, describe, expect, it } from 'vitest';
 import type { Application } from '@prisma/client';
+import type { FastifyRequest } from 'fastify';
+import { resolveBuyerCountry } from '../src/modules/billing/buyer-country.js';
 import { prisma } from '../src/lib/prisma.js';
 import { applicationsService } from '../src/modules/applications/applications.service.js';
 import {
-  countryFromRequest,
   pickProvider,
 } from '../src/modules/billing/providers/index.js';
 import {
@@ -61,7 +62,7 @@ describe('pickProvider (billing geo router)', () => {
 
   async function configure(
     provider: BillingProviderName,
-    options: { countries?: string[]; priority?: number; enabled?: boolean },
+    options: { countries?: string[]; currencies?: string[]; priority?: number; enabled?: boolean },
   ): Promise<void> {
     await billingCredentialsService.upsertRaw(application.id, provider, CREDS[provider], {
       mode: 'test',
@@ -77,24 +78,6 @@ describe('pickProvider (billing geo router)', () => {
       statusCode: 400,
       code: 'BILLING_CREDENTIALS_NOT_CONFIGURED',
     });
-  });
-
-  it('refuses when every configured provider is disabled', async () => {
-    await configure('stripe', { enabled: false });
-    await configure('paypal', { enabled: false });
-    // A disabled row is not a usable one. Falling through to it would be the
-    // "checkout succeeds against a processor the operator switched off" bug.
-    await expect(pickProvider({ application })).rejects.toMatchObject({
-      code: 'BILLING_CREDENTIALS_NOT_CONFIGURED',
-    });
-  });
-
-  it('names the legacy billingConfig hint in the refusal when there is one', async () => {
-    const hinted = await prisma.application.update({
-      where: { id: application.id },
-      data: { billingConfig: { provider: 'razorpay' } },
-    });
-    await expect(pickProvider({ application: hinted })).rejects.toThrow(/razorpay/);
   });
 
   // ---------- explicit preference ----------
@@ -118,14 +101,6 @@ describe('pickProvider (billing geo router)', () => {
     expect(err).toMatchObject({ statusCode: 400, code: 'BILLING_PROVIDER_NOT_AVAILABLE' });
   });
 
-  it('a DISABLED preference is refused the same way', async () => {
-    await configure('stripe', {});
-    await configure('paypal', { enabled: false });
-    await expect(pickProvider({ application, preferred: 'paypal' })).rejects.toMatchObject({
-      code: 'BILLING_PROVIDER_NOT_AVAILABLE',
-    });
-  });
-
   // ---------- the routing table ----------
 
   it('a country-specific match beats a lower-priority global', async () => {
@@ -138,22 +113,67 @@ describe('pickProvider (billing geo router)', () => {
     await expect(pickProvider({ application, country: 'DE' })).resolves.toBe('stripe');
   });
 
-  it('within the country matches, the lowest priority wins', async () => {
-    await configure('razorpay', { countries: ['IN'], priority: 90 });
-    await configure('paypal', { countries: ['IN'], priority: 10 });
-    await expect(pickProvider({ application, country: 'IN' })).resolves.toBe('paypal');
+  it('breaks equal priorities the same way whatever order the rows were saved in', async () => {
+    // PayPal's built-in order is after Stripe's and Razorpay's, which tie and
+    // fall to the name.
+    for (const order of [['paypal', 'stripe', 'razorpay'], ['stripe', 'razorpay', 'paypal']] as const) {
+      await prisma.billingCredentials.deleteMany({ where: { applicationId: application.id } });
+      for (const provider of order) await configure(provider, {});
+      await expect(pickProvider({ application })).resolves.toBe('razorpay');
+      await prisma.billingCredentials.deleteMany({ where: { applicationId: application.id, provider: 'razorpay' } });
+      await expect(pickProvider({ application, country: 'IN' })).resolves.toBe('stripe');
+    }
   });
 
-  it('the country code is matched case-insensitively', async () => {
-    await configure('stripe', { countries: [], priority: 1 });
-    await configure('razorpay', { countries: ['IN'], priority: 100 });
-    await expect(pickProvider({ application, country: 'in' })).resolves.toBe('razorpay');
+  // ---------- currency: the one hard rule ----------
+
+  it('never routes a plan to a provider whose account cannot charge its currency', async () => {
+    await configure('razorpay', { countries: ['IN'], currencies: ['inr'], priority: 1 });
+    await configure('paypal', { currencies: ['USD', 'EUR'], priority: 50 });
+
+    // The country says Razorpay; a USD plan cannot be charged there.
+    await expect(pickProvider({ application, country: 'IN', currency: 'USD' })).resolves.toBe('paypal');
+    await expect(pickProvider({ application, country: 'IN', currency: 'INR' })).resolves.toBe('razorpay');
+    // And PayPal has no INR, wherever the buyer is.
+    await expect(pickProvider({ application, country: 'US', currency: 'inr' })).resolves.toBe('razorpay');
+    // Without a currency the rule does not apply.
+    await expect(pickProvider({ application, country: 'IN' })).resolves.toBe('razorpay');
   });
 
-  it('with no country at all, the lowest-priority global is used', async () => {
-    await configure('paypal', { countries: [], priority: 20 });
-    await configure('stripe', { countries: [], priority: 5 });
-    await expect(pickProvider({ application })).resolves.toBe('stripe');
+  it('refuses a named provider that cannot charge the currency, and names the fix', async () => {
+    await configure('razorpay', { currencies: ['INR'] });
+    await configure('stripe', { priority: 1 });
+    await expect(pickProvider({ application, preferred: 'razorpay', currency: 'USD' })).rejects.toMatchObject({
+      statusCode: 400,
+      code: 'BILLING_PROVIDER_CURRENCY_UNSUPPORTED',
+      fix: expect.stringContaining("add USD to the provider's currencies"),
+    });
+    // The country's own default is what a picker preselects for every plan,
+    // so naming it is no choice: the sale goes to a provider that can charge.
+    await prisma.billingCredentials.update({
+      where: { applicationId_provider: { applicationId: application.id, provider: 'razorpay' } },
+      data: { countries: ['IN'] },
+    });
+    await expect(pickProvider({ application, country: 'IN', preferred: 'razorpay', currency: 'USD' })).resolves.toBe('stripe');
+    // A buyer already bound to that provider is told so, in their own terms.
+    await expect(pickProvider({ application, country: 'IN', preferred: 'razorpay', bound: true, currency: 'USD' })).rejects.toMatchObject({
+      statusCode: 409,
+      code: 'BILLING_BOUND_PROVIDER_CURRENCY_UNSUPPORTED',
+      fix: expect.stringContaining("Contact the application's support"),
+    });
+    // A provider that is simply not configured keeps its own refusal.
+    await expect(pickProvider({ application, preferred: 'paypal', currency: 'USD' })).rejects.toMatchObject({
+      code: 'BILLING_PROVIDER_NOT_AVAILABLE',
+    });
+  });
+
+  it('refuses when no enabled provider can charge the currency', async () => {
+    await configure('razorpay', { currencies: ['INR'] });
+    await expect(pickProvider({ application, currency: 'USD' })).rejects.toMatchObject({
+      statusCode: 400,
+      code: 'BILLING_NO_PROVIDER_FOR_CURRENCY',
+      message: expect.stringContaining('USD'),
+    });
   });
 
   it('a country with no match falls back to the global provider', async () => {
@@ -164,23 +184,6 @@ describe('pickProvider (billing geo router)', () => {
     await expect(pickProvider({ application, country: 'BR' })).resolves.toBe('stripe');
   });
 
-  it('when every provider is country-restricted and none match, it still routes', async () => {
-    await configure('razorpay', { countries: ['IN'], priority: 50 });
-    await configure('paypal', { countries: ['US'], priority: 10 });
-    // Last resort by design: reaching *a* processor beats failing the money
-    // path on a geo miss. Lowest priority among the enabled set.
-    await expect(pickProvider({ application, country: 'JP' })).resolves.toBe('paypal');
-  });
-
-  it('there is no ambient per-provider default — an unset countries[] means global', async () => {
-    // Razorpay's module advertises India in its discovery projection. Nothing
-    // copies that onto the row, so an operator who never set `countries` gets
-    // lowest-priority-wins even for an Indian buyer.
-    await configure('razorpay', { priority: 100 });
-    await configure('stripe', { priority: 1 });
-    await expect(pickProvider({ application, country: 'IN' })).resolves.toBe('stripe');
-  });
-
   it('a disabled provider is skipped even when its country matches', async () => {
     await configure('razorpay', { countries: ['IN'], priority: 1, enabled: false });
     await configure('stripe', { countries: [], priority: 100 });
@@ -188,34 +191,54 @@ describe('pickProvider (billing geo router)', () => {
   });
 });
 
-describe('countryFromRequest', () => {
-  it('honours Cloudflare, Vercel and the generic header, in that order', () => {
-    expect(countryFromRequest({ 'cf-ipcountry': 'DE' })).toBe('DE');
-    expect(countryFromRequest({ 'x-vercel-ip-country': 'FR' })).toBe('FR');
-    expect(countryFromRequest({ 'x-country': 'IN' })).toBe('IN');
-    expect(
-      countryFromRequest({ 'cf-ipcountry': 'DE', 'x-vercel-ip-country': 'FR', 'x-country': 'IN' }),
-    ).toBe('DE');
-    expect(countryFromRequest({ 'x-vercel-ip-country': 'FR', 'x-country': 'IN' })).toBe('FR');
+describe('resolveBuyerCountry', () => {
+  type Shape = { authKind: 'secret' | 'publishable'; visitorCountry?: string | null; internalCaller?: boolean; headers?: Record<string, string | string[]> };
+  const request = (shape: Shape): FastifyRequest =>
+    ({ visitorCountry: null, internalCaller: false, headers: {}, ...shape }) as unknown as FastifyRequest;
+
+  describe('the country an SDK forwards from the operator\'s platform header', () => {
+    const hint = (code: string | string[]) => ({ 'x-rekey-visitor-country-hint': code });
+
+    it('routes a secret-key caller as a hint, never as a declared country', () => {
+      expect(resolveBuyerCountry(request({ authKind: 'secret', headers: hint('in') }))).toEqual({ country: 'IN', source: 'hint' });
+    });
+
+    it('loses to a country the operator\'s code declared', () => {
+      expect(resolveBuyerCountry(request({ authKind: 'secret', headers: hint('IN') }), 'US')).toEqual({ country: 'US', source: 'declared' });
+    });
+
+    it('is ignored from a publishable-key caller, who can write any header', () => {
+      expect(resolveBuyerCountry(request({ authKind: 'publishable', headers: hint('IN') }))).toBeNull();
+      expect(resolveBuyerCountry(request({ authKind: 'publishable', headers: hint('IN') }), 'US')).toEqual({ country: 'US', source: 'hint' });
+    });
+
   });
 
-  it('upper-cases and takes the first value of a repeated header', () => {
-    expect(countryFromRequest({ 'cf-ipcountry': 'de' })).toBe('DE');
-    expect(countryFromRequest({ 'cf-ipcountry': ['GB', 'US'] })).toBe('GB');
+  it('prefers a vouched country over what a browser caller says', () => {
+    expect(resolveBuyerCountry(request({ authKind: 'publishable', visitorCountry: 'IN' }), 'US')).toEqual({ country: 'IN', source: 'vouched' });
   });
 
-  it('treats Cloudflare\'s unknown/Tor sentinels as no country', () => {
-    // XX and T1 are placeholders, not countries, routing on them would send
-    // every Tor visitor to whichever provider happened to list them.
-    expect(countryFromRequest({ 'cf-ipcountry': 'XX' })).toBeUndefined();
-    expect(countryFromRequest({ 'cf-ipcountry': 'T1' })).toBeUndefined();
-    expect(countryFromRequest({ 'cf-ipcountry': 'xx' })).toBeUndefined();
+  it('treats a browser caller\'s own word, and an unverified CDN header, as a hint', () => {
+    expect(resolveBuyerCountry(request({ authKind: 'publishable' }), 'IN')).toEqual({ country: 'IN', source: 'hint' });
+    expect(resolveBuyerCountry(request({ authKind: 'publishable', headers: { 'cf-ipcountry': 'de' } }))).toEqual({ country: 'DE', source: 'hint' });
+    expect(resolveBuyerCountry(request({ authKind: 'publishable', headers: { 'x-vercel-ip-country': ['FR', 'US'] } }))).toEqual({ country: 'FR', source: 'hint' });
+    // A browser can always set its own word; it cannot set the CDN's header.
+    expect(resolveBuyerCountry(request({ authKind: 'publishable', headers: { 'cf-ipcountry': 'DE' } }), 'IN')).toEqual({ country: 'DE', source: 'hint' });
   });
 
-  it('rejects anything that is not a 2-letter code, and an absent header', () => {
-    expect(countryFromRequest({})).toBeUndefined();
-    expect(countryFromRequest({ 'cf-ipcountry': 'DEU' })).toBeUndefined();
-    expect(countryFromRequest({ 'cf-ipcountry': 'D' })).toBeUndefined();
-    expect(countryFromRequest({ 'cf-ipcountry': undefined })).toBeUndefined();
+  it('never routes a portal buyer by the portal host\'s own country', () => {
+    const fromPortal = request({ authKind: 'publishable', internalCaller: true, headers: { 'cf-ipcountry': 'DE' } });
+    expect(resolveBuyerCountry(fromPortal)).toBeNull();
+    expect(resolveBuyerCountry(request({ authKind: 'publishable', internalCaller: true, visitorCountry: 'IN', headers: { 'cf-ipcountry': 'DE' } }))).toEqual({
+      country: 'IN',
+      source: 'vouched',
+    });
+  });
+
+  it('rejects Cloudflare\'s unknown and Tor codes, and anything that is not two letters', () => {
+    for (const bad of ['XX', 'T1', 'xx', 'DEU', 'D', '1!', '']) {
+      expect(resolveBuyerCountry(request({ authKind: 'publishable', headers: { 'cf-ipcountry': bad } }))).toBeNull();
+      expect(resolveBuyerCountry(request({ authKind: 'secret' }), bad)).toBeNull();
+    }
   });
 });

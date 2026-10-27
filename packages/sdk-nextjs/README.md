@@ -1,7 +1,5 @@
 # `@rekey.dev/nextjs`
 
-> **ReliPay is now Rekey.** This package was previously published as the equivalent `@relipay/*` package, which is deprecated. Env vars renamed `RELIPAY_*` → `REKEY_*` (as of 2.0.0 the old names are no longer read — set `REKEY_*`). relipay.dev (the old domain) will redirect to rekey.dev after the domain migration.
-
 [Rekey](https://rekey.dev) helpers for the **Next.js App Router** (14, 15 and 16): route-gating middleware, server-side `auth()` / `signIn()` / `signUp()` / `signOut()`, and an httpOnly cookie session — built on top of [`@rekey.dev/node`](https://www.npmjs.com/package/@rekey.dev/node).
 
 > **For AI coding agents:** start at [AGENTS.md](../../AGENTS.md).
@@ -202,7 +200,9 @@ Keep `new Rekey(...)` out of the `'use server'` file itself: Next.js lets a `'us
 // lib/rekey.ts
 import { Rekey } from '@rekey.dev/node';
 export const rekey = new Rekey({ apiUrl: process.env.REKEY_URL!, secretKey: process.env.REKEY_SECRET! });
+```
 
+```ts
 // app/actions.ts
 'use server';
 import { rekey } from '@/lib/rekey';
@@ -210,6 +210,56 @@ export async function listPlans() {
   return rekey.billing.getPlans();
 }
 ```
+
+## Checkout by the buyer's country
+
+A checkout is created from your server, so Rekey cannot see where the buyer is, and per-country provider routing (Razorpay for India, say) has nothing to go on. This package does not add the country to a checkout for you: its own calls (sign-in, sign-up, MFA, lists) carry it, and a checkout goes through your `@rekey.dev/node` client. Read the platform's geo header with `visitorCountryHint()` and scope your client with it:
+
+```ts
+// app/billing/actions.ts (with `rekey` exported from lib/rekey.ts, as above)
+'use server';
+import { redirect } from 'next/navigation';
+import { auth, visitorCountryHint } from '@rekey.dev/nextjs/server';
+import { rekey } from '@/lib/rekey';
+
+export async function checkout(formData: FormData) {
+  const session = await auth();
+  if (!session) redirect('/sign-in');
+
+  const scoped = rekey.with({ visitorCountryHint: await visitorCountryHint() });
+  const result = await scoped.billing.createCheckout(session.accessToken, {
+    planSlug: String(formData.get('planSlug')),
+    successUrl: 'https://yourapp.com/billing?status=ok',
+    cancelUrl: 'https://yourapp.com/billing?status=cancel',
+  });
+  // Set when the default price is charged because the selected one could not be.
+  if (result.priceFallback) redirect(`/billing/confirm?session=${result.checkoutSessionId}`);
+  redirect(result.url);
+}
+```
+
+The result's `price` is always the price charged. When no provider can charge the price selected for the buyer, the checkout charges the plan's default price and `priceFallback` says so, with both prices. Tell the buyer before you send them to pay: `<PriceFallbackNotice fallback={result.priceFallback} />` from `@rekey.dev/react` renders the sentence, and `priceFallbackMessage` from `@rekey.dev/node` returns it.
+
+A pricing page reads its plans through the same scoped client, so each plan's `price` is the one this visitor's checkout would charge, and `<PricingTable>` renders it as it is:
+
+```tsx
+// app/pricing/page.tsx
+import { PricingTable } from '@rekey.dev/react';
+import { auth, visitorCountryHint } from '@rekey.dev/nextjs/server';
+import { rekey } from '@/lib/rekey';
+import { checkout } from '../billing/actions';
+
+export default async function Pricing() {
+  const session = await auth();
+  const scoped = rekey.with({ visitorCountryHint: await visitorCountryHint() });
+  const { items } = await scoped.billing.getPlans(undefined, session ? { accessToken: session.accessToken } : {});
+  return <PricingTable plans={items} checkoutAction={checkout} />;
+}
+```
+
+`visitorCountryHint()` returns Cloudflare's `cf-ipcountry`, else Vercel's `x-vercel-ip-country`, or `undefined` when neither names a country. Use the same `scoped` client for `billing.getProviders()` and `billing.validateCoupon()` so they are routed like the checkout.
+
+It is a hint: a visitor who reaches your origin directly can write that header. It routes the buyer to a provider. It selects a plan's local price only when the Application's **Local prices** setting is **Any country** (`billingConfig.localPrices: 'any'`). Under the default, the buyer is charged the default price unless you pass `country` to `createCheckout` yourself, from something the buyer cannot write, such as a billing address. See [Which provider a buyer gets](https://github.com/rekey-dev/rekey/blob/main/docs/billing.md#which-provider-a-buyer-gets).
 
 ## Publishable login → secret-key API routes
 
@@ -312,6 +362,7 @@ export async function signInAction(fd: FormData) {
 
 **Keep sending it on refresh.** A chain bound at sign-in is checked on every rotation: a bound chain refreshed from a different fingerprint is `REFRESH_TOKEN_DEVICE_MISMATCH`, which Rekey treats as a stolen token and answers by revoking every session that user has. `auth()` and `refreshSession()` both take the same option:
 
+<!-- snippet: no-check a fragment: no imports, and values from the surrounding code -->
 ```ts
 const session = await auth({ device: { fingerprint } });
 ```
@@ -322,11 +373,12 @@ Pass nothing and nothing changes: no key is sent, an unbound chain stays unbound
 
 Two common refusals are not the user's password, and rendering them as one leaves people stuck:
 
-- **`DEVICE_LIMIT_REACHED` (403)**: the account is at its `max_devices` entitlement. The error carries the active devices filling the cap, and that list is the whole repair path: no token was issued, so the user cannot release a device from inside your app.
+- **`DEVICE_LIMIT_REACHED` (403)**: the account is at its `max_devices` entitlement. The error carries the active devices filling the cap, and that list is the whole repair path: no token was issued, so the user cannot release a device from inside your app. `selfRelease` is false when the Application keeps release with its operators; send the user to support then.
 - **`PASSWORD_VERIFY_BUSY` (503)**: the server was saturated and did **not check the password**. Nothing was counted toward lockout and the credentials may be right. "Email or password is incorrect" is simply false here, and it sends the user to password reset to fix a problem that is not theirs.
 
 `classifySignInError` turns a thrown error into the arms a sign-in page has to render:
 
+<!-- snippet: no-check a fragment from inside a function body, shown without the function -->
 ```ts
 import { signIn, classifySignInError } from '@rekey.dev/nextjs/server';
 
@@ -338,7 +390,7 @@ try {
   switch (failure.kind) {
     case 'invalid_credentials': return { error: 'Email or password is incorrect.' };
     case 'device_required':     return { error: 'This app must be signed in from a registered device.' };
-    case 'device_limit':        return { devices: failure.devices, limit: failure.limit };
+    case 'device_limit':        return { devices: failure.devices, limit: failure.limit, selfRelease: failure.selfRelease };
     case 'device_blocked':      return { error: 'This device was blocked. Contact support.' };
     case 'retry_later':         return { error: `Server busy. Try again in ${failure.retryAfterSeconds ?? 5}s.` };
     case 'other':               return { error: failure.code };
@@ -397,6 +449,7 @@ Your `matcher` must cover the pages that post actions. A Server Action POSTs to 
 | `signUp({ email, password, metadata?, device? })` | Create the user + start a session (always sets cookies). |
 | `createSession({ accessToken, refreshToken })` | Set the httpOnly session cookies from tokens a **browser** login produced. Use in a route handler to finalize a `@rekey.dev/nextjs/client` sign-in. |
 | `signOut(redirectTo?)` | Revoke the refresh token + clear cookies; optionally redirect. |
+| `visitorCountryHint()` | The visitor's country from the platform's geo header, or `undefined`. Pass it to `rekey.with({ visitorCountryHint })` before a checkout. See [Checkout by the buyer's country](#checkout-by-the-buyers-country). |
 | `classifySignInError(err)` | Turn a thrown sign-in failure into `invalid_credentials` / `device_required` / `device_limit` / `device_blocked` / `retry_later` / `other`. `null` means it was not an API error, so rethrow it. See [Reading a failed sign-in](#reading-a-failed-sign-in). |
 | `Session` / `SignInOutcome` / `SignInFailure` / `DeviceChoice` / `DeviceBindingRequest` | Session, sign-in result, and failure types. |
 

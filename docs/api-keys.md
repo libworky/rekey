@@ -16,7 +16,7 @@ Rekey has **three** distinct credentials. Confusing them is the #1 cause of inte
 
 **Rule of thumb**: if it starts with `rp_pub_`, it's safe in HTML. If it starts with `rp_live_` or `rp_test_`, it must never reach a browser.
 
-The `rp_` comes from Rekey's earlier name, ReliPay. It stays because the API and the SDKs recognise a key by that prefix, so changing it would invalidate every key already issued.
+The `rp_` prefix is historical. It stays because the API and the SDKs recognise a key by that prefix, so changing it would invalidate every key already issued.
 
 > The publishable and secret keys are **not interchangeable**. A publishable key sent to a secret-only route is rejected (`401 API_KEY_INVALID`); a secret key in the browser is a credential leak. The split is the security model, not a limitation — see the [can/cannot table](#what-the-publishable-key-can-and-cannot-do) below.
 
@@ -28,12 +28,14 @@ It is **identity, not authorization**. It names the Application and asserts "leg
 
 Pass it to `@rekey.dev/react`:
 
+<!-- snippet: no-check a JSX fragment: no imports, and values from the surrounding page -->
 ```tsx
 <RekeyProvider apiUrl="https://api.rekey.example.com" publishableKey="rp_pub_myapp-prod_…">
   <App />
 </RekeyProvider>
 ```
 
+<!-- snippet: no-check a fragment: no imports, and values from the surrounding code -->
 ```ts
 // Browser, no backend:
 const out = await client.signIn({ email, password });   // → SignInOutcome

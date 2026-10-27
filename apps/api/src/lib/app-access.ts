@@ -58,6 +58,7 @@
  */
 
 import type { FastifyRequest } from 'fastify';
+import { BillingConfigSchema } from '@rekey.dev/shared-types';
 import {
   accessContextFromRequest,
   accessScope,
@@ -67,6 +68,7 @@ import {
   type AppAccessScope,
 } from './access-context.js';
 import { NO_SCOPES } from './operator-scopes.js';
+import { supportEmailOf } from './email-transport.js';
 
 // These two are the request-shaped adapters over the decision in
 // ./access-context.ts; names, signatures and observable behaviour unchanged.
@@ -132,6 +134,20 @@ export function redactApplicationForBilling<
 }
 
 /**
+ * The Application with its `billingConfig` complete. The column holds the
+ * JSON as it was last saved, so a setting added since is missing from it; a
+ * read route answers with the default the API itself applies, never with a
+ * gap. A stored config the schema refuses is returned as it is.
+ *
+ * @example
+ * withBillingDefaults(application).billingConfig.onUnavailableCurrency; // 'fallback'
+ */
+export function withBillingDefaults<T extends { billingConfig: unknown }>(application: T): T {
+  const parsed = BillingConfigSchema.safeParse(application.billingConfig);
+  return parsed.success ? { ...application, billingConfig: parsed.data } : application;
+}
+
+/**
  * Remove the encrypted-credential blobs from an Application payload.
  *
  * `Application` carries `oauthCredentialsCiphertext` (OAuth client secrets),
@@ -164,4 +180,18 @@ export function stripApplicationSecrets<T extends Record<string, unknown>>(appli
     ...safe
   } = application as Record<string, unknown>;
   return safe as T;
+}
+
+/**
+ * An Application row as every route returns it: no credential blobs,
+ * `billingConfig` complete, and `supportEmail` at the top level where
+ * `ApplicationDto` has it.
+ *
+ * @example
+ * return { success: true, data: applicationPayload(await applicationsService.get(id)) };
+ */
+export function applicationPayload<T extends { billingConfig: unknown; emailConfig: unknown }>(
+  application: T,
+): T & { supportEmail: string | null } {
+  return { ...stripApplicationSecrets(withBillingDefaults(application)), supportEmail: supportEmailOf(application) };
 }

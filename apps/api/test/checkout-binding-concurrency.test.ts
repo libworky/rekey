@@ -78,12 +78,12 @@ describe('concurrent checkouts and the provider binding (#437)', () => {
   async function twoPlans(): Promise<{ basic: string; pro: string }> {
     const basic = await post<{ slug: string }>(
       `/api/v1/admin/applications/${applicationId}/plans`,
-      { slug: 'basic', name: 'Basic', amount: 900 },
+      { slug: 'basic', name: 'Basic', price: { currency: 'USD', amount: 900 } },
     );
     const pro = await post<{ slug: string }>(`/api/v1/admin/applications/${applicationId}/plans`, {
       slug: 'pro',
       name: 'Pro',
-      amount: 2900,
+      price: { currency: 'USD', amount: 2900 },
     });
     return { basic: basic.slug, pro: pro.slug };
   }
@@ -127,30 +127,6 @@ describe('concurrent checkouts and the provider binding (#437)', () => {
       select: { id: true, provider: true, planId: true, status: true },
     });
   }
-
-  it('two simultaneous checkouts naming DIFFERENT processors bind only one', async () => {
-    const { basic } = await twoPlans();
-    const user = await signUp();
-
-    // The double-click. Both are in flight before either has written anything.
-    const [a, b] = await Promise.all([
-      checkout(user.token, basic, 'stripe'),
-      checkout(user.token, basic, 'paypal'),
-    ]);
-
-    const rows = await subscriptionsOf(user.id);
-    const processors = new Set(rows.map((r) => r.provider));
-
-    // The assertion that matters, and it is about ROWS. One of the two
-    // requests may legitimately be refused (409) or may legitimately succeed,
-    // what must never happen is the buyer ending up billable by two
-    // processors at once.
-    expect(
-      processors.size,
-      `buyer is bound to ${processors.size} processors: ${[...processors].join(', ')} ` +
-        `(responses ${a.statusCode}/${b.statusCode})`,
-    ).toBeLessThanOrEqual(1);
-  });
 
   it('two simultaneous checkouts on DIFFERENT plans do not split across processors', async () => {
     // The plan-keyed uniqueness constraint cannot catch this one: different

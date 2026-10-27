@@ -34,6 +34,7 @@ import { authRateLimit } from '../../lib/rate-limit.js';
 import { assertTenantStepUp } from '../../lib/step-up.js';
 import { ok, okFlag, errs } from '../../lib/openapi.js';
 import { CREDENTIAL_BODY_LIMIT } from '../../lib/body-limits.js';
+import { assertOperatorVerifiedForCredential } from '../tenant-auth/operator-claim.js';
 
 /**
  * The 401/403 pair `requireTenantSession` (middleware/tenant-session.ts) produces, shared by
@@ -41,9 +42,9 @@ import { CREDENTIAL_BODY_LIMIT } from '../../lib/body-limits.js';
  */
 const TENANT_SESSION_ERRORS = {
   401:
-    'TENANT_SESSION_MISSING — no `Authorization: Bearer` header; or TENANT_SESSION_INVALID — ' +
+    'TENANT_SESSION_MISSING: no `Authorization: Bearer` header; or TENANT_SESSION_INVALID: ' +
     'the session JWT is malformed, expired, or its operator no longer exists.',
-  403: "TENANT_MEMBERSHIP_REVOKED — the session's workspace no longer has a live membership for this operator.",
+  403: "TENANT_MEMBERSHIP_REVOKED: the session's workspace no longer has a live membership for this operator.",
 } as const;
 
 const CodeBody = z.object({ code: z.string().min(1).max(64) });
@@ -157,21 +158,22 @@ export async function tenantMfaRoutes(app: FastifyInstance): Promise<void> {
           ),
           ...errs({
             400:
-              'STEP_UP_UNAVAILABLE — the operator has neither a password nor MFA enrolled to ' +
+              'STEP_UP_UNAVAILABLE: the operator has neither a password nor MFA enrolled to ' +
               'prove identity with (only possible when re-enrolling over an existing factor).',
             401:
               TENANT_SESSION_ERRORS[401] +
-              '; or STEP_UP_REQUIRED — re-enrolling over an existing authenticator requires a ' +
+              '; or STEP_UP_REQUIRED: re-enrolling over an existing authenticator requires a ' +
               'current code or unused backup code (only when already enrolled); ' +
               'or MFA_CODE_REUSED: the authenticator code was already accepted, wait for the next one.',
             403: TENANT_SESSION_ERRORS[403],
-            429: 'RATE_LIMITED — too many requests. Honour `Retry-After`.',
+            429: 'RATE_LIMITED: too many requests. Honour `Retry-After`.',
           }),
         },
       },
     },
     async (req, reply) => {
       const proof = ProofBody.parse(req.body ?? {});
+      await assertOperatorVerifiedForCredential(req.tenantUser!.id, 'turn on two-factor authentication');
       await stepUpIfEnrolled(req.tenantUser!.id, proof, 're-enroll two-factor authentication');
       const result = await tenantMfaService.setup({
         tenantUserId: req.tenantUser!.id,
@@ -206,18 +208,19 @@ export async function tenantMfaRoutes(app: FastifyInstance): Promise<void> {
         response: {
           200: okFlag('MFA enrollment confirmed.'),
           ...errs({
-            400: 'MFA_NOT_INITIATED — POST /setup was not called first.',
+            400: 'MFA_NOT_INITIATED: POST /setup was not called first.',
             401: TENANT_SESSION_ERRORS[401],
             403: TENANT_SESSION_ERRORS[403],
             422:
               'MFA_CODE_INVALID: the TOTP code did not verify; or MFA_CODE_REUSED: the code was already accepted, wait for the next one.',
-            429: 'RATE_LIMITED — too many requests. Honour `Retry-After`.',
+            429: 'RATE_LIMITED: too many requests. Honour `Retry-After`.',
           }),
         },
       },
     },
     async (req) => {
       const body = CodeBody.parse(req.body);
+      await assertOperatorVerifiedForCredential(req.tenantUser!.id, 'turn on two-factor authentication');
       return {
         success: true,
         data: await tenantMfaService.confirm({
@@ -257,15 +260,15 @@ export async function tenantMfaRoutes(app: FastifyInstance): Promise<void> {
           ),
           ...errs({
             400:
-              'STEP_UP_UNAVAILABLE — the operator has neither a password nor MFA enrolled to ' +
+              'STEP_UP_UNAVAILABLE: the operator has neither a password nor MFA enrolled to ' +
               'prove identity with (only possible when enrollment is already complete).',
             401:
               TENANT_SESSION_ERRORS[401] +
-              '; or STEP_UP_REQUIRED — disabling requires a current authenticator code or ' +
+              '; or STEP_UP_REQUIRED: disabling requires a current authenticator code or ' +
               'unused backup code (only when enrollment is already complete); ' +
               'or MFA_CODE_REUSED: the authenticator code was already accepted, wait for the next one.',
             403: TENANT_SESSION_ERRORS[403],
-            429: 'RATE_LIMITED — too many requests. Honour `Retry-After`.',
+            429: 'RATE_LIMITED: too many requests. Honour `Retry-After`.',
           }),
         },
       },

@@ -46,6 +46,7 @@ export const SECURITY_EVENT_LABEL = {
   'operator.mcp_tool_called': 'MCP tool called',
   'operator.api_token.revoked': 'Operator API token revoked',
   'operator.invite_redeemed': 'Operator invite redeemed',
+  'operator.email_confirmed': 'Operator confirmed their email address',
   // Refresh-token replay, the operator counterparts of the `user.refresh_token_*`
   // pair below (same semantics, see there).
   'operator.refresh_token_raced': 'Operator refresh token replayed within the reuse window',
@@ -110,6 +111,10 @@ export const SECURITY_EVENT_LABEL = {
   // for that checkout: a different subscription, plan or buyer, or not yet
   // approved. Metadata carries `reason` and the presented id.
   'app.checkout_confirmation_refused': 'Checkout approval refused after checking with the provider',
+  // A one-time order's approval webhook was not captured because the
+  // provider's record of the order (buyer, amount or currency) does not match
+  // what the checkout charged. No money moved. Metadata carries `reason`.
+  'app.checkout_capture_refused': 'One-time order not captured: it does not match its checkout',
   'app.plan_created': 'Plan created',
   'app.plan_updated': 'Plan updated',
   'app.plan_active_changed': 'Plan activated or deactivated',
@@ -231,6 +236,11 @@ export const SECURITY_EVENT_LABEL = {
   'end_user.verification_resent': 'Verification email re-sent by an operator',
   'end_user.password_reset_sent': 'Password reset email sent by an operator',
   'end_user.sessions_revoked_by_operator': 'Sessions revoked by an operator',
+  // Support mode. The reason stays on the case row and is never in metadata,
+  // so neither the data export nor erasure has to strip it from events.
+  'end_user.support_opened': 'Support case opened',
+  'end_user.support_updated': 'Support case changed',
+  'end_user.support_closed': 'Support case closed',
 
   // ── Workspace / team ──
   'workspace.member_invited': 'Teammate invited',
@@ -255,6 +265,13 @@ export const SECURITY_EVENT_LABEL = {
   'admin.operator_invite.revoked': 'Operator invite revoked',
   'license.org_key_rotated': 'Organization licence key rotated',
   'auth.email_delivery_failed': 'Outbound email failed to send',
+  // An account whose address nobody had confirmed was signed in to by someone
+  // who proved the mailbox. Every credential set before that was removed.
+  // Recorded for end-users and operators alike; `actorType` says which.
+  'auth.unverified_account_claimed': 'Unconfirmed account claimed by the mailbox owner',
+  // One mailbox reached AUTH_EMAIL_RECIPIENT_HOURLY_CAP or _DAILY_CAP for auth
+  // email. At most one per recipient per hour; the recipient is a hash.
+  'auth.email_recipient_capped': 'Auth email to one address reached its limit',
   // Failed sign-in / MFA attempts with no visitor address (a backend that
   // does not send X-Rekey-Client-Ip) reached RATE_LIMIT_AUTH_UNATTRIBUTED_FAILURE_MAX
   // for one Application. At most one per Application per rate-limit window.

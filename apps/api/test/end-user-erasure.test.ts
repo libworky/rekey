@@ -9,6 +9,8 @@
  *   - financial rows are RETAINED but PII-scrubbed (metadata/description);
  *   - an erased user can't sign in / magic-link / refresh / use a live access
  *     token (all surface END_USER_ERASED, HTTP 410);
+ *   - organization invitations to the address, and their webhook payloads,
+ *     lose the address;
  *   - a `user.erased` outbound webhook is emitted;
  *   - an `end_user.erased` security event is recorded;
  *   - OWNER/ADMIN gate (MEMBER → 403);
@@ -27,6 +29,10 @@ import { tombstoneEmail } from '../src/modules/tenant-applications/end-user-eras
 import { euLoginLockScope, getScopeLockState, LOGIN_POLICY } from '../src/lib/brute-force.js';
 import { FakeStripeProvider } from './fakes/billing-providers.js';
 import { waitForSecurityEvents } from './wait-for-security-events.js';
+import { operatorsConfirmTheirEmail } from './confirmed-accounts.js';
+import { seedPlan } from './seed-plan.js';
+
+operatorsConfirmTheirEmail();
 
 interface Bootstrapped {
   applicationId: string;
@@ -193,9 +199,7 @@ describe('end-user erasure (GDPR right to be forgotten)', () => {
 
     // Seed financial rows with PII in metadata/description that must be scrubbed
     // but the ROWS retained.
-    const plan = await prisma.plan.create({
-      data: { applicationId: b.applicationId, slug: 'erase-pro', name: 'Pro', amount: 999 },
-    });
+    const plan = await seedPlan({ applicationId: b.applicationId, slug: 'erase-pro', name: 'Pro' }, { currency: 'USD', amount: 999 });
     const sub = await prisma.subscription.create({
       data: {
         applicationId: b.applicationId,
@@ -656,55 +660,76 @@ describe('end-user erasure (GDPR right to be forgotten)', () => {
     expect((JSON.parse(exported.body) as { endUser: { email: string } }).endUser.email).toBe(neighbourEmail);
   });
 
-  it('is idempotent — erasing an already-erased user is a no-op', async () => {
-    const b = await bootstrap('idem');
-    const { euid } = await signUpUser(b, 'idem@example.com');
-    expect((await erase(b, euid)).statusCode).toBe(200);
-    const second = await erase(b, euid);
-    expect(second.statusCode).toBe(200);
-    expect((second.json().data as { alreadyErased: boolean }).alreadyErased).toBe(true);
-  });
-
-  it('MEMBER operators cannot erase — a grant-less member cannot even see the Application', async () => {
-    const b = await bootstrap('rolegate');
-    const { euid } = await signUpUser(b, 'gated@example.com');
-
-    const member = await app
-      .inject({
-        method: 'POST',
-        url: '/api/v1/tenant/auth/sign-up',
-        payload: {
-          email: 'member-erase@example.com',
-          password: 'pw-one-two-three',
-          workspaceName: 'Member erase Co',
+  it('erases the address from organization invitations and their webhook deliveries', async () => {
+    const b = await bootstrap('invites');
+    const email = 'invitee@example.com';
+    const { euid } = await signUpUser(b, email);
+    const org = await prisma.organization.create({
+      data: { applicationId: b.applicationId, name: 'Org', slug: 'invites-org' },
+    });
+    const invite = (tag: string, address: string, extra: Partial<Prisma.OrganizationInvitationUncheckedCreateInput> = {}) =>
+      prisma.organizationInvitation.create({
+        data: {
+          organizationId: org.id,
+          email: address,
+          role: 'MEMBER',
+          tokenHash: `hash-${tag}`,
+          expiresAt: new Date(Date.now() + 86_400_000),
+          invitedById: 'inviter',
+          ...extra,
         },
-      })
-      .then((r) => r.json().data as { accessToken: string });
-    const invite = await app.inject({
-      method: 'POST',
-      url: '/api/v1/tenant/workspace/invitations',
-      headers: { authorization: `Bearer ${b.tenantAccess}` },
-      payload: { email: 'member-erase@example.com', role: 'MEMBER' },
-    });
-    expect(invite.statusCode).toBe(201);
-    const accept = await app.inject({
-      method: 'POST',
-      url: '/api/v1/tenant/invitations/accept',
-      headers: { authorization: `Bearer ${member.accessToken}` },
-      payload: { token: (invite.json().data as { token: string }).token },
-    });
-    const memberAccess = (accept.json().data as { accessToken: string }).accessToken;
+      });
+    const pending = await invite('pending', email);
+    const accepted = await invite('accepted', email, { acceptedAt: new Date(), acceptedById: euid });
+    const lookalike = await invite('lookalike', `x${email}`);
 
-    // 404, not 403, since 2.0.0-rc.3: a freshly invited MEMBER holds no
-    // grants, so the Application is invisible to them and the refusal happens
-    // in ensureAppAccess before the OWNER/ADMIN role gate is ever consulted.
-    // Same non-disclosure posture as the cross-tenant case below.
-    const res = await erase(b, euid, memberAccess);
-    expect(res.statusCode).toBe(404);
-    expect(res.json().error.code).toBe('APPLICATION_NOT_FOUND');
-    // Not erased.
-    const still = await prisma.endUser.findUniqueOrThrow({ where: { id: euid } });
-    expect(still.erasedAt).toBeNull();
+    const endpoint = await prisma.webhookEndpoint.create({
+      data: {
+        applicationId: b.applicationId,
+        url: 'https://example.com/hook',
+        secret: 'whsec_test_invites',
+        events: ['organization.invitation.created'],
+        enabled: true,
+      },
+    });
+    const delivery = (eventId: string, address: string) =>
+      prisma.webhookDelivery.create({
+        data: {
+          endpointId: endpoint.id,
+          applicationId: b.applicationId,
+          eventId,
+          eventType: 'organization.invitation.created',
+          status: 'SUCCEEDED',
+          attempts: 1,
+          payload: {
+            eventId,
+            type: 'organization.invitation.created',
+            data: { invitation: { id: eventId, organizationId: org.id, email: address, role: 'MEMBER' } },
+          },
+        },
+      });
+    const subjectDelivery = await delivery('inv-subject', email);
+    const lookalikeDelivery = await delivery('inv-lookalike', `x${email}`);
+
+    const res = await erase(b, euid);
+    expect(res.statusCode).toBe(200);
+
+    expect(await prisma.organizationInvitation.findUnique({ where: { id: pending.id } })).toBeNull();
+    expect((await prisma.organizationInvitation.findUniqueOrThrow({ where: { id: accepted.id } })).email).toBe(
+      tombstoneEmail(euid),
+    );
+    expect((await prisma.organizationInvitation.findUniqueOrThrow({ where: { id: lookalike.id } })).email).toBe(
+      `x${email}`,
+    );
+    const payloadEmail = async (id: string) =>
+      ((await prisma.webhookDelivery.findUniqueOrThrow({ where: { id } })).payload as {
+        data: { invitation: { email: string } };
+      }).data.invitation.email;
+    expect(await payloadEmail(subjectDelivery.id)).toBe(tombstoneEmail(euid));
+    expect(await payloadEmail(lookalikeDelivery.id)).toBe(`x${email}`);
+
+    const [erased] = await waitForSecurityEvents({ applicationId: b.applicationId, type: 'end_user.erased' });
+    expect((erased!.metadata as { counts: Record<string, number> }).counts.organizationInvitationsErased).toBe(2);
   });
 
   it('cross-tenant and cross-application erasure 404 without leaking existence', async () => {
@@ -732,9 +757,7 @@ describe('end-user erasure (GDPR right to be forgotten)', () => {
   it('plain DELETE (no erasure flag) still hard-deletes everything (back-compat)', async () => {
     const b = await bootstrap('plain');
     const { euid } = await signUpUser(b, 'plain@example.com');
-    const plan = await prisma.plan.create({
-      data: { applicationId: b.applicationId, slug: 'plain-pro', name: 'Pro', amount: 100 },
-    });
+    const plan = await seedPlan({ applicationId: b.applicationId, slug: 'plain-pro', name: 'Pro' }, { currency: 'USD', amount: 100 });
     const sub = await prisma.subscription.create({
       data: { applicationId: b.applicationId, endUserId: euid, planId: plan.id, status: 'ACTIVE' },
     });
@@ -761,9 +784,7 @@ describe('end-user erasure (GDPR right to be forgotten)', () => {
 
     /** Create an ACTIVE provider-backed (stripe) subscription for a user. */
     async function seedProviderSub(b: Bootstrapped, euid: string, suffix: string): Promise<string> {
-      const plan = await prisma.plan.create({
-        data: { applicationId: b.applicationId, slug: `pcancel-${suffix}`, name: 'Pro', amount: 999 },
-      });
+      const plan = await seedPlan({ applicationId: b.applicationId, slug: `pcancel-${suffix}`, name: 'Pro' }, { currency: 'USD', amount: 999 });
       const sub = await prisma.subscription.create({
         data: {
           applicationId: b.applicationId,

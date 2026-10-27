@@ -9,6 +9,9 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import type { FastifyInstance } from 'fastify';
 import { buildApp } from '../src/app.js';
 import { prisma } from '../src/lib/prisma.js';
+import { operatorsConfirmTheirEmail } from './confirmed-accounts.js';
+
+operatorsConfirmTheirEmail();
 
 const PASSWORD = 'pw-one-two-three';
 
@@ -129,7 +132,7 @@ describe('secret-key end-user lookup and entitlements', () => {
       method: 'POST',
       url: `/api/v1/tenant/applications/${appId}/plans`,
       headers: auth(),
-      payload: { slug: 'free', name: 'Free', amount: 0, kind: 'SUBSCRIPTION' },
+      payload: { slug: 'free', name: 'Free', kind: 'SUBSCRIPTION' },
     });
     await app.inject({
       method: 'PUT',

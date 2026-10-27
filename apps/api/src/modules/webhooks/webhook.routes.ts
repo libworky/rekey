@@ -35,10 +35,10 @@ import { requireTenantSession } from '../../middleware/tenant-session.js';
 import { ensureAppAccess } from '../../lib/app-access.js';
 import { webhookService } from './webhook.service.js';
 import { KNOWN_WEBHOOK_EVENTS } from './events.js';
-import { isWebhookUrlSafe } from '../../lib/webhook-signing.js';
-import { env } from '../../config/env.js';
+import { plainHttpRefused } from '../../lib/ssrf-guard.js';
 import { ok, okPage, errs, ref } from '../../lib/openapi.js';
 import { PaginationQuery, parsePagination, paged, paginationJsonSchema } from '../../lib/pagination.js';
+import { assertOperatorVerifiedForCredential } from '../tenant-auth/operator-claim.js';
 
 /**
  * Ceiling on the stored `responseBody` this route returns per delivery.
@@ -83,18 +83,18 @@ const UpdateBody = z.object({
 /** Every route here sits behind `requireTenantSession` (plugin `onRequest` hook). */
 const TENANT_SESSION_ERRORS = {
   401:
-    'TENANT_SESSION_MISSING — no `Authorization: Bearer <accessToken>` header; or ' +
-    'TENANT_SESSION_INVALID — the token is invalid, expired, or the operator account no ' +
+    'TENANT_SESSION_MISSING: no `Authorization: Bearer <accessToken>` header; or ' +
+    'TENANT_SESSION_INVALID: the token is invalid, expired, or the operator account no ' +
     'longer exists.',
-  429: 'RATE_LIMITED — too many requests. Honour the `Retry-After` header.',
+  429: 'RATE_LIMITED: too many requests. Honour the `Retry-After` header.',
 } as const;
 
 /** Errors from `ensureAppAccess(req, id, 'read')`. */
 const APP_READ_ERRORS = {
   ...TENANT_SESSION_ERRORS,
-  403: 'TENANT_MEMBERSHIP_REVOKED — you are no longer a member of this workspace.',
+  403: 'TENANT_MEMBERSHIP_REVOKED: you are no longer a member of this workspace.',
   404:
-    'APPLICATION_NOT_FOUND — no Application with that id in this workspace (also returned, ' +
+    'APPLICATION_NOT_FOUND: no Application with that id in this workspace (also returned, ' +
     'without disclosing existence, when a MEMBER holds no grant on it).',
 };
 
@@ -102,18 +102,18 @@ const APP_READ_ERRORS = {
 const APP_WRITE_ERRORS = {
   ...TENANT_SESSION_ERRORS,
   403:
-    'TENANT_MEMBERSHIP_REVOKED — you are no longer a member of this workspace; or ' +
-    'TENANT_ROLE_INSUFFICIENT — a legacy MEMBER (no application grants anywhere) cannot ' +
-    'write; or APP_ACCESS_DENIED — your application grant role does not allow this action ' +
+    'TENANT_MEMBERSHIP_REVOKED: you are no longer a member of this workspace; or ' +
+    'TENANT_ROLE_INSUFFICIENT: a legacy MEMBER (no application grants anywhere) cannot ' +
+    'write; or APP_ACCESS_DENIED: your application grant role does not allow this action ' +
     '(requires APP_ADMIN).',
   404:
-    'APPLICATION_NOT_FOUND — no Application with that id in this workspace (also returned, ' +
+    'APPLICATION_NOT_FOUND: no Application with that id in this workspace (also returned, ' +
     'without disclosing existence, when a MEMBER holds no grant on it).',
 };
 
 /** `WEBHOOK_ENDPOINT_NOT_FOUND`, from `ensureEndpointInApp`, folded into the write/read 404. */
 const ENDPOINT_NOT_FOUND_DESC =
-  'WEBHOOK_ENDPOINT_NOT_FOUND — no webhook endpoint with that id on this Application.';
+  'WEBHOOK_ENDPOINT_NOT_FOUND: no webhook endpoint with that id on this Application.';
 
 const WebhookEndpointSchema = {
   type: 'object',
@@ -158,9 +158,26 @@ export async function tenantWebhookRoutes(app: FastifyInstance): Promise<void> {
           'any grant on it. A MEMBER with no grant on this Application gets 404.',
         querystring: { type: 'object', properties: { ...paginationJsonSchema } },
         response: {
-          200: okPage(WebhookEndpointSchema, 'A page of webhook endpoints for this Application.'),
+          200: ok(
+            {
+              type: 'object',
+              properties: {
+                items: { type: 'array', items: WebhookEndpointSchema, description: 'The rows of this page.' },
+                page: ref('PageMeta'),
+                httpsRequired: {
+                  type: 'boolean',
+                  description:
+                    'Whether this deployment refuses a plain `http://` endpoint URL (`URL_NOT_HTTPS`) and ' +
+                    'sends nothing to an endpoint already stored as one. True in production unless ' +
+                    '`WEBHOOK_ALLOW_PRIVATE_TARGETS=true`.',
+                },
+              },
+              required: ['items', 'page', 'httpsRequired'],
+            },
+            'A page of webhook endpoints for this Application, and the URL rule of this deployment.',
+          ),
           ...errs({
-            400: 'VALIDATION_ERROR — `limit` or `offset` is out of range.',
+            400: 'VALIDATION_ERROR: `limit` or `offset` is out of range.',
             ...APP_READ_ERRORS,
           }),
         },
@@ -178,18 +195,21 @@ export async function tenantWebhookRoutes(app: FastifyInstance): Promise<void> {
       ]);
       return {
         success: true,
-        data: paged(
-          endpoints.map((e) => ({
-            id: e.id,
-            url: e.url,
-            events: e.events,
-            enabled: e.enabled,
-            createdAt: e.createdAt.toISOString(),
-          })),
-          total,
-          take,
-          skip,
-        ),
+        data: {
+          ...paged(
+            endpoints.map((e) => ({
+              id: e.id,
+              url: e.url,
+              events: e.events,
+              enabled: e.enabled,
+              createdAt: e.createdAt.toISOString(),
+            })),
+            total,
+            take,
+            skip,
+          ),
+          httpsRequired: plainHttpRefused(),
+        },
       };
     },
   );
@@ -237,10 +257,12 @@ export async function tenantWebhookRoutes(app: FastifyInstance): Promise<void> {
           ),
           ...errs({
             400:
-              'VALIDATION_ERROR — `url` or `events` failed schema validation; or ' +
-              'WEBHOOK_URL_UNSAFE — the URL resolves to a private/loopback/link-local address ' +
+              'VALIDATION_ERROR: `url` or `events` failed schema validation; or ' +
+              'WEBHOOK_URL_UNSAFE: the URL resolves to a private/loopback/link-local address ' +
               '(unless `WEBHOOK_ALLOW_PRIVATE_TARGETS=true` on a self-hosted deploy); or ' +
-              'WEBHOOK_ENDPOINT_LIMIT_REACHED — the Application already has 100 webhook endpoints.',
+              'URL_NOT_HTTPS: the URL is plain http and the deployment runs in production ' +
+              'without `WEBHOOK_ALLOW_PRIVATE_TARGETS=true`; or ' +
+              'WEBHOOK_ENDPOINT_LIMIT_REACHED: the Application already has 100 webhook endpoints.',
             ...APP_WRITE_ERRORS,
           }),
         },
@@ -250,21 +272,11 @@ export async function tenantWebhookRoutes(app: FastifyInstance): Promise<void> {
       const { id } = AppParam.parse(req.params);
       await ensureAppAccess(req, id, 'write');
       const body = CreateBody.parse(req.body);
-      const safety = isWebhookUrlSafe(body.url, {
-        allowPrivate: env.WEBHOOK_ALLOW_PRIVATE_TARGETS ?? false,
-      });
-      if (!safety.ok) {
-        throw new RekeyError({
-          statusCode: 400,
-          code: 'WEBHOOK_URL_UNSAFE',
-          message: `Webhook URL is not allowed: ${safety.reason}`,
-          fix: 'Use a public HTTPS URL. To enable private targets on a self-hosted deploy, set WEBHOOK_ALLOW_PRIVATE_TARGETS=true.',
-        });
-      }
       const result = await webhookService.createEndpoint({
         applicationId: id,
         url: body.url,
         events: body.events,
+        createdByTenantUserId: req.tenantUser!.id,
       });
       return reply.status(201).send({
         success: true,
@@ -276,7 +288,7 @@ export async function tenantWebhookRoutes(app: FastifyInstance): Promise<void> {
           createdAt: result.endpoint.createdAt.toISOString(),
           secret: result.secret,
           warning:
-            'Store this secret now — it is shown exactly once. Use it to verify the X-Rekey-Signature header on inbound deliveries.',
+            'Store this secret now. It is shown exactly once. Use it to verify the X-Rekey-Signature header on inbound deliveries.',
         },
       });
     },
@@ -310,8 +322,10 @@ export async function tenantWebhookRoutes(app: FastifyInstance): Promise<void> {
           ),
           ...errs({
             400:
-              'VALIDATION_ERROR — `url` or `events` failed schema validation; or ' +
-              'WEBHOOK_URL_UNSAFE — the new URL resolves to a private/loopback/link-local address.',
+              'VALIDATION_ERROR: `url` or `events` failed schema validation; or ' +
+              'WEBHOOK_URL_UNSAFE: the new URL resolves to a private/loopback/link-local address; or ' +
+              'URL_NOT_HTTPS: the new URL is plain http and the deployment runs in production ' +
+              'without `WEBHOOK_ALLOW_PRIVATE_TARGETS=true`.',
             ...APP_WRITE_ERRORS,
             404: `${APP_WRITE_ERRORS[404]}; or ${ENDPOINT_NOT_FOUND_DESC}`,
           }),
@@ -323,22 +337,10 @@ export async function tenantWebhookRoutes(app: FastifyInstance): Promise<void> {
       await ensureAppAccess(req, id, 'write');
       await ensureEndpointInApp(id, endpointId);
       const body = UpdateBody.parse(req.body);
-      if (body.url !== undefined) {
-        const safety = isWebhookUrlSafe(body.url, {
-          allowPrivate: env.WEBHOOK_ALLOW_PRIVATE_TARGETS ?? false,
-        });
-        if (!safety.ok) {
-          throw new RekeyError({
-            statusCode: 400,
-            code: 'WEBHOOK_URL_UNSAFE',
-            message: `Webhook URL is not allowed: ${safety.reason}`,
-            fix: 'Use a public HTTPS URL. To enable private targets on a self-hosted deploy, set WEBHOOK_ALLOW_PRIVATE_TARGETS=true.',
-          });
-        }
-      }
       const updated = await webhookService.updateEndpoint({
         applicationId: id,
         endpointId,
+        actorTenantUserId: req.tenantUser!.id,
         ...(body.url !== undefined && { url: body.url }),
         ...(body.events !== undefined && { events: body.events }),
         ...(body.enabled !== undefined && { enabled: body.enabled }),
@@ -421,6 +423,7 @@ export async function tenantWebhookRoutes(app: FastifyInstance): Promise<void> {
       },
     },
     async (req) => {
+      await assertOperatorVerifiedForCredential(req.tenantUser!.id, 'rotate a webhook signing secret');
       const { id, endpointId } = EndpointParam.parse(req.params);
       await ensureAppAccess(req, id, 'write');
       await ensureEndpointInApp(id, endpointId);
@@ -584,7 +587,7 @@ export async function tenantWebhookRoutes(app: FastifyInstance): Promise<void> {
             ...APP_WRITE_ERRORS,
             404:
               `${APP_WRITE_ERRORS[404]}; or ${ENDPOINT_NOT_FOUND_DESC}; or ` +
-              'WEBHOOK_DELIVERY_NOT_FOUND — no delivery with that id on this endpoint, or it ' +
+              'WEBHOOK_DELIVERY_NOT_FOUND: no delivery with that id on this endpoint, or it ' +
               'already SUCCEEDED.',
           }),
         },

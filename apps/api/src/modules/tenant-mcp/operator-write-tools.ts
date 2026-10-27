@@ -31,14 +31,21 @@
  * validation, slug rules, provider registration, and secret generation behave
  * identically to the panel. Every successful write emits a `securityEvent`.
  *
- * Most tools here are reversible. The two that are not, `configure_billing_provider`
- * (the secret travels through the MCP client) and `cancel_subscription`
- * (irreversible), carry `admin: true`, which demands the `mcp:operator:admin`
- * scope on top of the role check rather than plain write capability.
- * `remove_member` is exposed as an ordinary write tool because re-inviting undoes
- * it. Still deliberately absent: delete application, refund, and webhook-secret
- * rotation, no undo, and no confirmation step an agent can be trusted to have
- * surfaced to a human.
+ * Write tier is for configuration that grants nobody authority. A tool carries
+ * `admin: true`, which demands the `mcp:operator:admin` scope on top of the
+ * role check, when it is irreversible, moves a secret through the MCP client,
+ * or could turn a write token into admin power, a credential or a copy of
+ * end-user data: `configure_billing_provider`, `cancel_subscription`,
+ * `mint_api_key`, `update_auth_config` (it decides where sign-in links land),
+ * the two webhook endpoint tools (they pick where every event is posted) and
+ * `change_member_role`. The capped tools stay in write tier for MEMBER-level
+ * work and call `assertAdminTierFor` before anything that touches OWNER or
+ * ADMIN authority. `test/operator-mcp-write-tier-escalation.test.ts` holds a
+ * ruling for every write tool and fails when a new one has none.
+ *
+ * Still deliberately absent: delete application and webhook-secret rotation,
+ * no undo, and no confirmation step an agent can be trusted to have surfaced
+ * to a human.
  */
 
 import type { Application, TenantRole } from '@prisma/client';
@@ -50,11 +57,10 @@ import type { SecurityEventType } from '@rekey.dev/shared-types';
 import { recordSecurityEvent } from '../../lib/security-events.js';
 import { apiKeysService } from '../api-keys/api-keys.service.js';
 import { assertMayMintScopes } from '../api-keys/elevated-scopes.js';
-import { accessContextFromTool } from '../../lib/access-context.js';
 import { entitlementsService } from '../billing/entitlements.service.js';
 import { usageService } from '../usage/usage.service.js';
 import { applicationsService } from '../applications/applications.service.js';
-import { planCheckoutReadiness, planCheckoutReadinessFor } from '../plans/plan-readiness.js';
+import { refreshWebhookAfterEdit, webhookStateBeforeEdit } from '../billing/webhook-registration.js';
 import { plansService } from '../plans/plans.service.js';
 import { webhookService } from '../webhooks/webhook.service.js';
 import { billingService } from '../billing/billing.service.js';
@@ -74,6 +80,11 @@ import {
   type OperatorTool,
   type OperatorToolContext,
 } from './operator-tools.js';
+import { assertAdminTierFor } from './admin-tier.js';
+import { z } from 'zod';
+import { defineTool } from './tool-definition.js';
+import { InvitationAppGrantsSchema } from '../tenant-workspaces/invitation-grants.js';
+import { accessContextFromTool, applicationAccess, type AppAccessNeed } from '../../lib/access-context.js';
 
 /**
  * Resolve a workspace member's membership id from their tenant-user id, scoped
@@ -81,6 +92,10 @@ import {
  * indistinguishable from a non-existent one (no cross-tenant reach).
  */
 async function membershipIdInTenant(tenantId: string, tenantUserId: string): Promise<string> {
+  return (await membershipInTenant(tenantId, tenantUserId)).id;
+}
+
+async function membershipInTenant(tenantId: string, tenantUserId: string): Promise<{ id: string; role: TenantRole }> {
   const membership = await prisma.tenantMembership.findUnique({
     where: { tenantUserId_tenantId: { tenantUserId, tenantId } },
   });
@@ -92,7 +107,7 @@ async function membershipIdInTenant(tenantId: string, tenantUserId: string): Pro
       fix: 'Call list_members to see members and their tenantUserId values.',
     });
   }
-  return membership.id;
+  return { id: membership.id, role: membership.role };
 }
 
 /**
@@ -114,28 +129,16 @@ async function membershipIdInTenant(tenantId: string, tenantUserId: string): Pro
  * equivalents enforce grants; the read-tool set in `operator-tools.ts`
  * grant-scopes MEMBERs correctly. This file was the seam between the two.
  *
- * ## What this is NOT
- *
- * `accessibleApplicationIds` models `need: 'read'` and only that. It ignores
- * `ApplicationGrant.role` (an `APP_VIEWER` is in the set) and it hands the whole
- * workspace to a `legacyWorkspaceRead` MEMBER, both of which `ensureAppAccess`
- * refuses for a WRITE (see `legacyWriteDenied` / `grantDenied` in
- * `lib/app-access.ts`).
- *
- * So this call is not what authorizes the writes in this file. The dispatcher's
- * `role >= ADMIN` gate is, and this is a redundant read check on top of it,
- * harmless because OWNER/ADMIN receive the whole workspace here anyway. Adding
- * a write tool with `minRole: 'MEMBER'` would NOT be protected by this line: a
- * legacy member would get a workspace-wide write that REST answers 403 for.
- * If that day comes, give this helper a `need` parameter mirroring
- * `ensureAppAccess` rather than assuming it already covers you.
- *
- * The grandfathered `legacyWorkspaceRead` exception survives here deliberately,
- * because it survives over REST too, this is parity, not a gap.
+ * `need` is the same classification `ensureAppAccess` takes over REST.
+ * `accessibleApplicationIds` answers `'read'` only: it admits an `APP_VIEWER`
+ * and a `legacyWorkspaceRead` MEMBER. Any other need is then checked against
+ * the grant role, so a viewer cannot write through a tool whose `minRole` lets
+ * a MEMBER in. The grandfathered legacy read survives, as it does over REST.
  */
 export async function loadAppInTenant(
   ctx: OperatorToolContext,
   applicationId: string,
+  need: AppAccessNeed,
 ): Promise<Application> {
   // Both resolved unconditionally and in parallel, so every rejection path
   // costs the same work. Checking the tenant first and the grants only on a
@@ -154,6 +157,7 @@ export async function loadAppInTenant(
       fix: 'Call list_applications to see the applications you can modify.',
     });
   }
+  if (need !== 'read') await applicationAccess(accessContextFromTool(ctx), app.id, need);
   return app;
 }
 
@@ -191,6 +195,9 @@ function audit(
   });
 }
 
+/** The same audit trail, for write tools that live in their own file. */
+export { audit as auditOperatorWrite };
+
 
 /**
  * Organization-role writes need organizations switched on for the Application.
@@ -212,13 +219,32 @@ export function assertOrganizationsEnabled(app: Application): void {
   }
 }
 
-/** Shared by the device tools: the end-user must be in an app the operator can read. */
-async function loadEndUserInApp(
+const PRIVILEGED_ORG_ROLE = 'an OWNER- or ADMIN-tier organization role';
+
+/**
+ * Security: an organization role above MEMBER tier is authority over a
+ * customer's organization, so write tier may only create, edit, reassign onto
+ * or delete MEMBER-tier roles.
+ */
+async function assertWriteTierMayTouchRole(
+  ctx: OperatorToolContext,
+  applicationId: string,
+  roleName: string,
+  action: string,
+): Promise<void> {
+  const tiers = await organizationRolesService.baseRoleMap(applicationId);
+  const tier = tiers.get(roleName);
+  if (tier !== undefined && tier !== 'MEMBER') assertAdminTierFor(ctx, `${action} ${PRIVILEGED_ORG_ROLE}`);
+}
+
+/** Shared by the device and support tools: the end-user must be in an app the operator can read. */
+export async function loadEndUserInApp(
   ctx: OperatorToolContext,
   applicationId: string,
   endUserId: string,
+  need: AppAccessNeed,
 ): Promise<Application> {
-  const app = await loadAppInTenant(ctx, applicationId);
+  const app = await loadAppInTenant(ctx, applicationId, need);
   await assertEndUserInApplication(app.id, endUserId, 'Use get_end_user to find the id.');
   return app;
 }
@@ -255,6 +281,21 @@ const DEVICE_TOOL_ARGS = {
   deviceId: { type: 'string', minLength: 1 },
 } as const;
 
+/** A stored list that matches nothing takes the provider out of routing, so a malformed code is refused, not saved. */
+function currencyCodes(value: unknown): string[] {
+  const codes = Array.isArray(value) ? value : [];
+  const bad = codes.find((c) => typeof c !== 'string' || !/^[A-Za-z]{3}$/.test(c));
+  if (bad !== undefined) {
+    throw new RekeyError({
+      statusCode: 400,
+      code: 'VALIDATION_ERROR',
+      message: `"${String(bad)}" is not an ISO 4217 currency code.`,
+      fix: 'Pass three-letter codes such as "USD" or "INR", or an empty array for a provider that is used for no checkout.',
+    });
+  }
+  return codes as string[];
+}
+
 export const operatorWriteTools: OperatorTool[] = [
   {
     name: 'list_devices',
@@ -272,7 +313,7 @@ export const operatorWriteTools: OperatorTool[] = [
       additionalProperties: false,
     },
     handler: async (ctx, args) => {
-      const app = await loadEndUserInApp(ctx, String(args.applicationId), String(args.endUserId));
+      const app = await loadEndUserInApp(ctx, String(args.applicationId), String(args.endUserId), 'read');
       const status = args.status === undefined ? undefined : (String(args.status) as 'ACTIVE' | 'RELEASED' | 'BLOCKED');
       const { items, total } = await devicesService.listForEndUser(app.id, String(args.endUserId), { status, take: 100 });
       return { total, devices: items.map((d) => deviceView(ctx, d)) };
@@ -291,7 +332,7 @@ export const operatorWriteTools: OperatorTool[] = [
       additionalProperties: false,
     },
     handler: async (ctx, args) => {
-      const app = await loadEndUserInApp(ctx, String(args.applicationId), String(args.endUserId));
+      const app = await loadEndUserInApp(ctx, String(args.applicationId), String(args.endUserId), 'write');
       const r = await devicesService.release({
         applicationId: app.id,
         endUserId: String(args.endUserId),
@@ -314,7 +355,7 @@ export const operatorWriteTools: OperatorTool[] = [
       additionalProperties: false,
     },
     handler: async (ctx, args) => {
-      const app = await loadEndUserInApp(ctx, String(args.applicationId), String(args.endUserId));
+      const app = await loadEndUserInApp(ctx, String(args.applicationId), String(args.endUserId), 'write');
       const r = await devicesService.block({
         applicationId: app.id,
         endUserId: String(args.endUserId),
@@ -338,7 +379,7 @@ export const operatorWriteTools: OperatorTool[] = [
       additionalProperties: false,
     },
     handler: async (ctx, args) => {
-      const app = await loadEndUserInApp(ctx, String(args.applicationId), String(args.endUserId));
+      const app = await loadEndUserInApp(ctx, String(args.applicationId), String(args.endUserId), 'write');
       const device = await devicesService.unblock({
         applicationId: app.id,
         endUserId: String(args.endUserId),
@@ -364,7 +405,7 @@ export const operatorWriteTools: OperatorTool[] = [
       additionalProperties: false,
     },
     handler: async (ctx, args) => {
-      const app = await loadAppInTenant(ctx, String(args.applicationId));
+      const app = await loadAppInTenant(ctx, String(args.applicationId), 'read');
       const config = AuthConfigSchema.parse(app.authConfig);
       const roles = await organizationRolesService.list(app.id);
       return {
@@ -390,7 +431,8 @@ export const operatorWriteTools: OperatorTool[] = [
       'enforces permissions on that tier, never on the name, so a "content-manager" on tier ' +
       'MEMBER can do exactly what MEMBER can. Requires organizations to be enabled on the ' +
       'application. Names are lowercase (letters, digits, hyphens, underscores); OWNER, ' +
-      'ADMIN and MEMBER are reserved built-ins.',
+      'ADMIN and MEMBER are reserved built-ins. A `baseRole` of OWNER or ADMIN needs admin ' +
+      'access (the mcp:operator:admin scope); write access creates MEMBER-tier roles only.',
     write: true,
     inputSchema: {
       type: 'object',
@@ -408,8 +450,9 @@ export const operatorWriteTools: OperatorTool[] = [
       additionalProperties: false,
     },
     handler: async (ctx, args) => {
-      const app = await loadAppInTenant(ctx, String(args.applicationId));
+      const app = await loadAppInTenant(ctx, String(args.applicationId), 'write');
       assertOrganizationsEnabled(app);
+      if (args.baseRole !== 'MEMBER') assertAdminTierFor(ctx, `Creating ${PRIVILEGED_ORG_ROLE}`);
       const created = await organizationRolesService.create({
         applicationId: app.id,
         name: String(args.name),
@@ -431,7 +474,8 @@ export const operatorWriteTools: OperatorTool[] = [
       'immutable because memberships store it by value, so renaming means deleting with ' +
       '`reassignTo` instead. A built-in role (OWNER/ADMIN/MEMBER) cannot be re-tiered. ' +
       'Changing `baseRole` changes what every member already holding this role may do, in ' +
-      'every organization in the application.',
+      'every organization in the application. Editing a role that is OWNER or ADMIN tier, or ' +
+      'raising one to those tiers, needs admin access (the mcp:operator:admin scope).',
     write: true,
     inputSchema: {
       type: 'object',
@@ -446,8 +490,12 @@ export const operatorWriteTools: OperatorTool[] = [
       additionalProperties: false,
     },
     handler: async (ctx, args) => {
-      const app = await loadAppInTenant(ctx, String(args.applicationId));
+      const app = await loadAppInTenant(ctx, String(args.applicationId), 'write');
       assertOrganizationsEnabled(app);
+      await assertWriteTierMayTouchRole(ctx, app.id, String(args.name), 'Editing');
+      if (args.baseRole !== undefined && args.baseRole !== 'MEMBER') {
+        assertAdminTierFor(ctx, `Raising a role to ${PRIVILEGED_ORG_ROLE}`);
+      }
       const updated = await organizationRolesService.update({
         applicationId: app.id,
         name: String(args.name),
@@ -473,7 +521,8 @@ export const operatorWriteTools: OperatorTool[] = [
       'If memberships or pending invitations still reference the role, pass `reassignTo` ' +
       'with another role name, and holders are moved and the role dropped in one transaction. ' +
       'Reassigning an OWNER-tier role to a lower tier is refused, because it would leave ' +
-      'organizations without an owner.',
+      'organizations without an owner. Deleting an OWNER- or ADMIN-tier role, or reassigning ' +
+      'holders onto one, needs admin access (the mcp:operator:admin scope).',
     write: true,
     inputSchema: {
       type: 'object',
@@ -486,8 +535,12 @@ export const operatorWriteTools: OperatorTool[] = [
       additionalProperties: false,
     },
     handler: async (ctx, args) => {
-      const app = await loadAppInTenant(ctx, String(args.applicationId));
+      const app = await loadAppInTenant(ctx, String(args.applicationId), 'write');
       assertOrganizationsEnabled(app);
+      await assertWriteTierMayTouchRole(ctx, app.id, String(args.name), 'Deleting');
+      if (args.reassignTo !== undefined) {
+        await assertWriteTierMayTouchRole(ctx, app.id, String(args.reassignTo), 'Reassigning members onto');
+      }
       const result = await organizationRolesService.remove({
         applicationId: app.id,
         name: String(args.name),
@@ -530,7 +583,7 @@ export const operatorWriteTools: OperatorTool[] = [
       additionalProperties: false,
     },
     handler: async (ctx, args) => {
-      const app = await loadAppInTenant(ctx, String(args.applicationId));
+      const app = await loadAppInTenant(ctx, String(args.applicationId), 'write');
       const meter = await usageService.createMeter({
         applicationId: app.id,
         slug: String(args.slug),
@@ -556,7 +609,7 @@ export const operatorWriteTools: OperatorTool[] = [
       additionalProperties: false,
     },
     handler: async (ctx, args) => {
-      const app = await loadAppInTenant(ctx, String(args.applicationId));
+      const app = await loadAppInTenant(ctx, String(args.applicationId), 'read');
       return { meters: await usageService.listMeters(app.id) };
     },
   },
@@ -588,7 +641,7 @@ export const operatorWriteTools: OperatorTool[] = [
       additionalProperties: false,
     },
     handler: async (ctx, args) => {
-      const app = await loadAppInTenant(ctx, String(args.applicationId));
+      const app = await loadAppInTenant(ctx, String(args.applicationId), 'billing-write');
       const plan = await plansService.getBySlug(app.id, String(args.planSlug));
       const ent = await entitlementsService.upsert({
         planId: plan.id,
@@ -625,76 +678,9 @@ export const operatorWriteTools: OperatorTool[] = [
       additionalProperties: false,
     },
     handler: async (ctx, args) => {
-      const app = await loadAppInTenant(ctx, String(args.applicationId));
+      const app = await loadAppInTenant(ctx, String(args.applicationId), 'read');
       const plan = await plansService.getBySlug(app.id, String(args.planSlug));
       return { planSlug: plan.slug, entitlements: await entitlementsService.listForPlan(plan.id) };
-    },
-  },
-  {
-    name: 'list_plans',
-    description:
-      'Plans on an application, including inactive ones. Slugs for the other tools. Each plan ' +
-      'carries `checkout.ready`, false means a buyer sent to checkout for it is refused, and ' +
-      '`checkout.blockers` says by which provider and how to repair it. Check it after ' +
-      'configuring a billing provider: plans register with the provider when they are CREATED, ' +
-      'so any plan created before the credentials existed has no price behind it and connecting ' +
-      'the provider afterwards does not repair it.',
-    write: false,
-    inputSchema: {
-      type: 'object',
-      properties: { applicationId: { type: 'string', minLength: 1 } },
-      required: ['applicationId'],
-      additionalProperties: false,
-    },
-    handler: async (ctx, args) => {
-      const app = await loadAppInTenant(ctx, String(args.applicationId));
-      const plans = await plansService.listForApplication(app.id, true);
-      const readiness = await planCheckoutReadiness(app.id, plans);
-      return {
-        plans: plans.map((plan) => ({
-          ...plan,
-          checkout: readiness.get(plan.id) ?? { ready: true, blockers: [] },
-        })),
-      };
-    },
-  },
-  {
-    name: 'register_plan_with_provider',
-    description:
-      'Register an existing plan with the billing provider, giving it a price so it can be ' +
-      'bought. The repair for `checkout.ready: false` on a plan created before the provider ' +
-      'was configured. Idempotent: a plan that already has a price is answered from the row ' +
-      'without calling the provider. A plan the provider previously refused is reactivated on ' +
-      'success, because it was deactivated by Rekey rather than by you; a plan you retired on ' +
-      'purpose keeps its `active: false`, since this registers rather than publishes.',
-    write: true,
-    inputSchema: {
-      type: 'object',
-      properties: {
-        applicationId: { type: 'string', minLength: 1 },
-        planSlug: { type: 'string', minLength: 1 },
-      },
-      required: ['applicationId', 'planSlug'],
-      additionalProperties: false,
-    },
-    handler: async (ctx, args) => {
-      const app = await loadAppInTenant(ctx, String(args.applicationId));
-      const plan = await plansService.registerWithProvider(app.id, String(args.planSlug));
-      // Its REST twin records `app.plan_updated` and this file's header claims
-      // every write tool leaves a trail. A tool that mints a live price at a
-      // payment provider is not the one to be missing from the audit log.
-      //
-      // Through `audit` like every other write tool here, not a hand-rolled
-      // call. The hand-rolled one omitted `ip` and `userAgent`, so the single
-      // most consequential entry in this file was also the only one that could
-      // not be traced to a request, and it wrote `via: 'mcp'` where the rest
-      // of the file writes `via: 'operator_mcp'`, which quietly breaks any
-      // query that filters on it.
-      audit(ctx, 'app.plan_updated', app.id, {
-        planSlug: plan.slug,
-        registrationStatus: plan.registrationStatus,
-      });
-      return { plan, checkout: await planCheckoutReadinessFor(app.id, plan) };
     },
   },
   {
@@ -710,7 +696,7 @@ export const operatorWriteTools: OperatorTool[] = [
       additionalProperties: false,
     },
     handler: async (ctx, args) => {
-      const app = await loadAppInTenant(ctx, String(args.applicationId));
+      const app = await loadAppInTenant(ctx, String(args.applicationId), 'read');
       return { apiKeys: await apiKeysService.listForApplication(app.id) };
     },
   },
@@ -731,7 +717,7 @@ export const operatorWriteTools: OperatorTool[] = [
       additionalProperties: false,
     },
     handler: async (ctx, args) => {
-      const app = await loadAppInTenant(ctx, String(args.applicationId));
+      const app = await loadAppInTenant(ctx, String(args.applicationId), 'write');
       await apiKeysService.revoke(app.id, String(args.apiKeyId));
       audit(ctx, 'app.api_key.revoked', app.id, { apiKeyId: String(args.apiKeyId) });
       return { revoked: true, apiKeyId: String(args.apiKeyId) };
@@ -770,7 +756,7 @@ export const operatorWriteTools: OperatorTool[] = [
       additionalProperties: false,
     },
     handler: async (ctx, args) => {
-      const app = await loadAppInTenant(ctx, String(args.applicationId));
+      const app = await loadAppInTenant(ctx, String(args.applicationId), 'write');
 
       // Empty scopes mean full access in the service, which is the same default
       // the panel's mint form applies. Passing a list narrows the key.
@@ -797,6 +783,7 @@ export const operatorWriteTools: OperatorTool[] = [
         name: String(args.name),
         scopes,
         revealsEndUserIps: mayReadRawIps(ctx.role, accessContextFromTool(ctx).scopes),
+        createdByTenantUserId: ctx.tenantUserId,
         ...(expiresAt !== undefined && { expiresAt }),
       });
 
@@ -818,7 +805,7 @@ export const operatorWriteTools: OperatorTool[] = [
         expiresAt: result.apiKey.expiresAt,
         // Shown once. There is no endpoint that can return it again.
         rawKey: result.rawKey,
-        warning: 'Store this now — the raw key is hashed at rest and cannot be retrieved again.',
+        warning: 'Store this now. The raw key is hashed at rest and cannot be retrieved again.',
       };
     },
   },
@@ -858,8 +845,13 @@ export const operatorWriteTools: OperatorTool[] = [
       "the enabled sign-in methods (e.g. ['password','oauth']), `mfa` for the MFA policy, " +
       'and `signupMode` to control public sign-up. It deliberately cannot turn this ' +
       'application into a public OpenID Provider (`oidcEnabled`) or reopen client ' +
-      'registration (`dynamicClientRegistration`); those stay operator-console decisions.',
+      'registration (`dynamicClientRegistration`); those stay operator-console decisions. ' +
+      'Needs admin access (the mcp:operator:admin scope).',
     write: true,
+    // Security: `appUrl` and `redirectUrls` decide where magic-link and reset
+    // tokens land, and this tool can switch off MFA and verification, so a
+    // write-tier token holding it could take over every end-user account.
+    admin: true,
     inputSchema: {
       type: 'object',
       properties: {
@@ -935,6 +927,22 @@ export const operatorWriteTools: OperatorTool[] = [
             'records a device when the client sends one; "required" refuses sign-in without ' +
             'one. Refresh is never gated.',
         },
+        deviceRelease: {
+          type: 'string',
+          enum: ['self_service', 'server_only'],
+          description:
+            'Who may release a device. "self_service" (default) lets the end-user release ' +
+            'their own; "server_only" refuses that from a browser key, so releases go through ' +
+            'the operator or a secret key. Only meaningful with deviceBinding "required".',
+        },
+        accountDeletion: {
+          type: 'string',
+          enum: ['self_service', 'server_only', 'off'],
+          description:
+            'Who may erase an account with DELETE /users/me. "self_service" (default): the end-user ' +
+            'from a browser with a password or MFA code, or a secret key. "server_only": a secret key ' +
+            'only. "off": nobody; only an operator erasure removes an account.',
+        },
         passwordBreachCheckEnabled: { type: 'boolean' },
         sendVerificationEmailOnSignUp: {
           type: 'boolean',
@@ -956,7 +964,7 @@ export const operatorWriteTools: OperatorTool[] = [
       additionalProperties: false,
     },
     handler: async (ctx, args) => {
-      const app = await loadAppInTenant(ctx, String(args.applicationId));
+      const app = await loadAppInTenant(ctx, String(args.applicationId), 'write');
       const patch = {
         ...(args.methods !== undefined && { methods: args.methods as string[] }),
         ...(args.passwordMinLength !== undefined && {
@@ -988,6 +996,12 @@ export const operatorWriteTools: OperatorTool[] = [
         ...(args.deviceBinding !== undefined && {
           deviceBinding: args.deviceBinding as 'optional' | 'required',
         }),
+        ...(args.deviceRelease !== undefined && {
+          deviceRelease: args.deviceRelease as 'self_service' | 'server_only',
+        }),
+        ...(args.accountDeletion !== undefined && {
+          accountDeletion: args.accountDeletion as 'self_service' | 'server_only' | 'off',
+        }),
         ...(args.passwordBreachCheckEnabled !== undefined && {
           passwordBreachCheckEnabled: args.passwordBreachCheckEnabled === true,
         }),
@@ -1001,238 +1015,30 @@ export const operatorWriteTools: OperatorTool[] = [
           welcomeEmail: parseWelcomeEmail(args.welcomeEmail),
         }),
       };
-      const updated = await applicationsService.updateAuthConfig({ applicationId: app.id, patch });
-      audit(ctx, 'app.auth_config_updated', app.id, { fields: Object.keys(patch) });
-      return { id: updated.id, slug: updated.slug, authConfig: updated.authConfig };
-    },
-  },
-  {
-    name: 'create_plan',
-    description:
-      'Create a billing Plan on an application. `amount` is in the smallest currency unit ' +
-      '(e.g. cents). Defaults: currency USD, interval MONTH, kind SUBSCRIPTION.\n\n' +
-      'Each `kind` needs its own fields, and the API refuses the plan without them:\n' +
-      '- SUBSCRIPTION: nothing extra. `interval` applies. Free trials are held in this ' +
-      'release and a plan cannot carry one.\n' +
-      '- CREDIT: `creditsAmount`. A one-off pack of credits, not a recurring charge.\n' +
-      '- LICENSE: `licenseKind`, plus `licenseDurationDays` for TIMED and ' +
-      '`licenseSeatsAllowed` for SEATS.\n' +
-      '- USAGE: `meterSlug` (see list_usage_meters) and `pricePerUnitCents`.',
-    write: true,
-    inputSchema: {
-      type: 'object',
-      properties: {
-        applicationId: { type: 'string', minLength: 1 },
-        slug: { type: 'string', minLength: 1, maxLength: 40 },
-        name: { type: 'string', minLength: 1, maxLength: 120 },
-        amount: { type: 'integer', minimum: 0, maximum: 2147483647 },
-        currency: { type: 'string', minLength: 3, maxLength: 3 },
-        interval: { type: 'string', enum: ['MONTH', 'YEAR'] },
-        kind: {
-          type: 'string',
-          enum: ['SUBSCRIPTION', 'LICENSE', 'USAGE', 'CREDIT'],
-          description:
-            'Defaults to SUBSCRIPTION. Without this, a credit pack or a license cannot be ' +
-            'created at all, only a recurring subscription.',
-        },
-        creditsAmount: {
-          // 1, not 0. The service refuses `creditsAmount <= 0` with
-          // PLAN_CREDITS_AMOUNT_REQUIRED and the REST body says `minimum: 1`,
-          // so advertising 0 would tell an agent a value is valid and then
-          // refuse it, the exact defect this pass narrowed passwordMinLength
-          // to remove.
-          type: 'integer',
-          minimum: 1,
-          maximum: 2147483647,
-          description: 'CREDIT plans: how many credits the purchase grants. Required for that kind.',
-        },
-        licenseKind: {
-          type: 'string',
-          enum: ['PERPETUAL', 'TIMED', 'SEATS'],
-          description: 'LICENSE plans: required for that kind.',
-        },
-        licenseDurationDays: {
-          type: 'integer',
-          minimum: 1,
-          maximum: 2147483647,
-          description: 'LICENSE plans with licenseKind TIMED: required for that combination.',
-        },
-        licenseSeatsAllowed: {
-          type: 'integer',
-          minimum: 1,
-          maximum: 2147483647,
-          description: 'LICENSE plans with licenseKind SEATS: required for that combination.',
-        },
-        meterSlug: {
-          type: 'string',
-          minLength: 1,
-          maxLength: 40,
-          description: 'USAGE plans: the usage meter this plan bills against. Required for that kind.',
-        },
-        pricePerUnitCents: {
-          type: 'integer',
-          minimum: 0,
-          maximum: 2147483647,
-          description: 'USAGE plans: charge per metered unit past the included quota.',
-        },
-        metadata: {
-          type: 'object',
-          additionalProperties: true,
-          // Provider-reserved keys (stripe / paypal / razorpay) are stripped by
-          // the service: naming a price id here would otherwise make the plan
-          // charge for someone else's product.
-          description: 'Free-form operator metadata stored on the plan.',
-        },
-      },
-      required: ['applicationId', 'slug', 'name', 'amount'],
-      additionalProperties: false,
-    },
-    handler: async (ctx, args) => {
-      const app = await loadAppInTenant(ctx, String(args.applicationId));
-      const plan = await plansService.create({
+      const updated = await applicationsService.updateAuthConfig({
         applicationId: app.id,
-        slug: String(args.slug),
-        name: String(args.name),
-        amount: Number(args.amount),
-        ...(args.currency !== undefined && { currency: String(args.currency) }),
-        ...(args.interval !== undefined && {
-          interval: args.interval as 'MONTH' | 'YEAR',
-        }),
-        ...(args.kind !== undefined && {
-          kind: args.kind as 'SUBSCRIPTION' | 'LICENSE' | 'USAGE' | 'CREDIT',
-        }),
-        ...(args.creditsAmount !== undefined && { creditsAmount: Number(args.creditsAmount) }),
-        ...(args.licenseKind !== undefined && {
-          licenseKind: args.licenseKind as 'PERPETUAL' | 'TIMED' | 'SEATS',
-        }),
-        ...(args.licenseDurationDays !== undefined && {
-          licenseDurationDays: Number(args.licenseDurationDays),
-        }),
-        ...(args.licenseSeatsAllowed !== undefined && {
-          licenseSeatsAllowed: Number(args.licenseSeatsAllowed),
-        }),
-        ...(args.meterSlug !== undefined && { meterSlug: String(args.meterSlug) }),
-        ...(args.pricePerUnitCents !== undefined && {
-          pricePerUnitCents: Number(args.pricePerUnitCents),
-        }),
-        ...(args.metadata !== undefined && {
-          metadata: args.metadata as Record<string, unknown>,
-        }),
+        patch,
+        actorTenantUserId: ctx.tenantUserId,
       });
-      audit(ctx, 'app.plan_created', app.id, {
-        planSlug: plan.slug,
-        amount: plan.amount,
-        kind: plan.kind,
-      });
-      return {
-        id: plan.id,
-        slug: plan.slug,
-        name: plan.name,
-        // Echo the kind and its per-kind field, so the caller can see that a
-        // credit pack really was created as a credit pack rather than silently
-        // defaulting to a subscription.
-        kind: plan.kind,
-        amount: plan.amount,
-        currency: plan.currency,
-        interval: plan.interval,
-        creditsAmount: plan.creditsAmount,
-        trialDays: plan.trialDays,
-        licenseKind: plan.licenseKind,
-        licenseDurationDays: plan.licenseDurationDays,
-        licenseSeatsAllowed: plan.licenseSeatsAllowed,
-        meterSlug: plan.meterSlug,
-        pricePerUnitCents: plan.pricePerUnitCents,
-        active: plan.active,
-      };
-    },
-  },
-  {
-    name: 'set_plan_active',
-    description:
-      'Activate or ARCHIVE a plan by slug. Deactivating (active=false) archives it: existing ' +
-      "subscriptions keep billing, but no new sign-ups. This is how you retire a plan, you " +
-      "CANNOT change a plan's price in place (the price is registered with the payment provider " +
-      'and is immutable), so to change pricing you archive the old plan here and create a ' +
-      'replacement with create_plan UNDER A DIFFERENT SLUG. Archiving does not release the slug: ' +
-      'it is the identifier integrations pass to checkout, so reusing it is refused with ' +
-      'PLAN_SLUG_TAKEN. Reversible.',
-    write: true,
-    inputSchema: {
-      type: 'object',
-      properties: {
-        applicationId: { type: 'string', minLength: 1 },
-        slug: { type: 'string', minLength: 1 },
-        active: { type: 'boolean' },
-      },
-      required: ['applicationId', 'slug', 'active'],
-      additionalProperties: false,
-    },
-    handler: async (ctx, args) => {
-      const app = await loadAppInTenant(ctx, String(args.applicationId));
-      const plan = await plansService.setActive(app.id, String(args.slug), args.active === true);
-      audit(ctx, 'app.plan_active_changed', app.id, { planSlug: plan.slug, active: plan.active });
-      return { slug: plan.slug, active: plan.active };
-    },
-  },
-  {
-    name: 'update_plan',
-    description:
-      "Edit a plan's ENTITLEMENTS ONLY, its display name, LICENSE seats/duration, or CREDIT " +
-      'amount. You CANNOT change price, currency, or interval here: those are registered with ' +
-      'the payment provider (Stripe/PayPal/Razorpay) and are immutable. To change pricing, ' +
-      'ARCHIVE this plan (set_plan_active active=false) and CREATE a replacement (create_plan) ' +
-      'under a DIFFERENT slug, because archiving does not release the old one. Existing ' +
-      'subscribers keep their old price, new sign-ups get the new plan.',
-    write: true,
-    inputSchema: {
-      type: 'object',
-      properties: {
-        applicationId: { type: 'string', minLength: 1 },
-        slug: { type: 'string', minLength: 1 },
-        name: { type: 'string', minLength: 1, maxLength: 120 },
-        licenseSeatsAllowed: { type: 'integer', minimum: 0, description: 'LICENSE plans only.', maximum: 2147483647 },
-        licenseDurationDays: { type: 'integer', minimum: 0, description: 'LICENSE plans only.', maximum: 2147483647 },
-        creditsAmount: { type: 'integer', minimum: 0, description: 'CREDIT plans only.', maximum: 2147483647 },
-      },
-      required: ['applicationId', 'slug'],
-      additionalProperties: false,
-    },
-    handler: async (ctx, args) => {
-      const app = await loadAppInTenant(ctx, String(args.applicationId));
-      const patch = {
-        ...(args.name !== undefined && { name: String(args.name) }),
-        ...(args.licenseSeatsAllowed !== undefined && {
-          licenseSeatsAllowed: Number(args.licenseSeatsAllowed),
-        }),
-        ...(args.licenseDurationDays !== undefined && {
-          licenseDurationDays: Number(args.licenseDurationDays),
-        }),
-        ...(args.creditsAmount !== undefined && { creditsAmount: Number(args.creditsAmount) }),
-      };
-      const plan = await plansService.updateEntitlements(app.id, String(args.slug), patch);
-      audit(ctx, 'app.plan_entitlements_updated', app.id, {
-        planSlug: plan.slug,
+      audit(ctx, 'app.auth_config_updated', app.id, {
         fields: Object.keys(patch),
+        ...(patch.deviceRelease !== undefined && { deviceRelease: patch.deviceRelease }),
+        ...(patch.accountDeletion !== undefined && { accountDeletion: patch.accountDeletion }),
       });
-      return {
-        slug: plan.slug,
-        name: plan.name,
-        licenseSeatsAllowed: plan.licenseSeatsAllowed,
-        licenseDurationDays: plan.licenseDurationDays,
-        creditsAmount: plan.creditsAmount,
-        // Echo the (immutable) price so the agent sees what it can't change here.
-        amount: plan.amount,
-        currency: plan.currency,
-        interval: plan.interval,
-      };
+      return { id: updated.id, slug: updated.slug, authConfig: updated.authConfig };
     },
   },
   {
     name: 'create_webhook_endpoint',
     description:
       'Register an outbound webhook endpoint for an application. Returns the endpoint id ' +
-      'and the signing secret, the secret is shown ONCE here and cannot be retrieved later.',
+      'and the signing secret, the secret is shown ONCE here and cannot be retrieved later. ' +
+      'Needs admin access (the mcp:operator:admin scope).',
     write: true,
+    // Security: the URL receives every subscribed event with its end-user
+    // data, and the signing secret is returned, so a write-tier token holding
+    // this could copy the Application's event stream to a host of its choosing.
+    admin: true,
     inputSchema: {
       type: 'object',
       properties: {
@@ -1244,11 +1050,12 @@ export const operatorWriteTools: OperatorTool[] = [
       additionalProperties: false,
     },
     handler: async (ctx, args) => {
-      const app = await loadAppInTenant(ctx, String(args.applicationId));
+      const app = await loadAppInTenant(ctx, String(args.applicationId), 'write');
       const { endpoint, secret } = await webhookService.createEndpoint({
         applicationId: app.id,
         url: String(args.url),
         events: (args.events as string[]) ?? [],
+        createdByTenantUserId: ctx.tenantUserId,
       });
       audit(ctx, 'app.webhook_endpoint_created', app.id, {
         endpointId: endpoint.id,
@@ -1267,8 +1074,11 @@ export const operatorWriteTools: OperatorTool[] = [
     name: 'update_webhook_endpoint',
     description:
       'Update an outbound webhook endpoint, its URL, subscribed events, or enabled flag. ' +
-      'Only the fields you pass change. Does not rotate the signing secret.',
+      'Only the fields you pass change. Does not rotate the signing secret. Needs admin ' +
+      'access (the mcp:operator:admin scope).',
     write: true,
+    // Security: re-pointing the URL redirects the event stream, see create_webhook_endpoint.
+    admin: true,
     inputSchema: {
       type: 'object',
       properties: {
@@ -1282,10 +1092,11 @@ export const operatorWriteTools: OperatorTool[] = [
       additionalProperties: false,
     },
     handler: async (ctx, args) => {
-      const app = await loadAppInTenant(ctx, String(args.applicationId));
+      const app = await loadAppInTenant(ctx, String(args.applicationId), 'write');
       const endpoint = await webhookService.updateEndpoint({
         applicationId: app.id,
         endpointId: String(args.endpointId),
+        actorTenantUserId: ctx.tenantUserId,
         ...(args.url !== undefined && { url: String(args.url) }),
         ...(args.events !== undefined && { events: args.events as string[] }),
         ...(args.enabled !== undefined && { enabled: args.enabled === true }),
@@ -1302,29 +1113,39 @@ export const operatorWriteTools: OperatorTool[] = [
 
   // ── Member management (write), reuses tenantWorkspacesService, whose
   //    ensureCanManage enforces OWNER-manages-anyone / ADMIN-manages-MEMBER. ──
-  {
+  defineTool({
     name: 'invite_member',
     description:
       'Invite a teammate to the workspace by email with a role (OWNER / ADMIN / MEMBER). ' +
-      'Sends an invitation email with a secure link. An ADMIN can only invite MEMBERs; ' +
-      'inviting an OWNER/ADMIN requires the OWNER role.',
+      'Sends an invitation email with a secure link. Write access invites MEMBERs with no apps only: ' +
+      'inviting an OWNER or ADMIN, or a MEMBER with `appGrants`, needs admin access (the ' +
+      'mcp:operator:admin scope), and an OWNER or ADMIN invitation also needs the OWNER role. ' +
+      '`appGrants` are the apps a MEMBER gets on joining, each with APP_ADMIN, APP_BILLING or ' +
+      'APP_VIEWER; an OWNER or ADMIN already reaches every app and is refused them.',
     write: true,
-    inputSchema: {
-      type: 'object',
-      properties: {
-        email: { type: 'string', minLength: 3, maxLength: 254 },
-        role: { type: 'string', enum: ['OWNER', 'ADMIN', 'MEMBER'] },
-      },
-      required: ['email', 'role'],
-      additionalProperties: false,
-    },
-    handler: async (ctx, args) => {
+    args: z
+      .object({
+        email: z.string().min(3).max(254),
+        role: z.enum(['OWNER', 'ADMIN', 'MEMBER']),
+        appGrants: InvitationAppGrantsSchema.optional().describe(
+          'MEMBER only. Application ids come from list_applications.',
+        ),
+      })
+      .strict(),
+    run: async (ctx, args) => {
+      // Security: an OWNER or ADMIN invitation to an address the caller picks is a new admin seat.
+      if (args.role !== 'MEMBER') assertAdminTierFor(ctx, 'Inviting an OWNER or ADMIN');
+      // Security: app grants hand an address the caller picks the end-user data, billing or app admin of those apps.
+      if (args.appGrants !== undefined && args.appGrants.length > 0) {
+        assertAdminTierFor(ctx, 'Inviting a member with appGrants');
+      }
       const result = await tenantWorkspacesService.createInvitation({
         tenantId: ctx.tenantId,
         invitedById: ctx.tenantUserId,
         invitedByRole: ctx.role,
-        email: String(args.email),
-        role: String(args.role) as TenantRole,
+        email: args.email,
+        role: args.role,
+        ...(args.appGrants !== undefined && { appGrants: args.appGrants }),
         // PANEL_URL has no default (a Rekey default would email a self-hoster's
         // operators a link to OUR panel). Without it we cannot build a usable
         // invite link, so omit the key entirely rather than send a broken one
@@ -1345,11 +1166,12 @@ export const operatorWriteTools: OperatorTool[] = [
         invitationId: result.invitation.id,
         email: result.invitation.email,
         role: result.invitation.role,
+        appGrants: result.invitation.appGrants,
         status: result.invitation.status,
         emailSent: result.emailSent,
       };
     },
-  },
+  }),
   {
     name: 'revoke_invitation',
     description:
@@ -1374,11 +1196,15 @@ export const operatorWriteTools: OperatorTool[] = [
   },
   {
     name: 'change_member_role',
+    confirmedOperatorOnly: 'change what a member of the workspace can do',
     description:
       "Change a workspace member's role (OWNER / ADMIN / MEMBER). Identify the member by " +
       'tenantUserId (from list_members). Guards against demoting the last OWNER; an ADMIN ' +
-      'can only manage MEMBERs.',
+      'can only manage MEMBERs. Needs admin access (the mcp:operator:admin scope).',
     write: true,
+    // Security: every useful role change grants or removes OWNER or ADMIN
+    // authority, so nothing of this tool is left for write tier.
+    admin: true,
     inputSchema: {
       type: 'object',
       properties: {
@@ -1407,7 +1233,9 @@ export const operatorWriteTools: OperatorTool[] = [
     name: 'remove_member',
     description:
       'Remove a member from the workspace by tenantUserId (from list_members). Reversible by ' +
-      're-inviting. Guards against removing the last OWNER; an ADMIN can only remove MEMBERs.',
+      're-inviting. Guards against removing the last OWNER; an ADMIN can only remove MEMBERs. ' +
+      'Write access removes MEMBERs only: removing an OWNER or ADMIN needs admin access (the ' +
+      'mcp:operator:admin scope).',
     write: true,
     inputSchema: {
       type: 'object',
@@ -1417,7 +1245,10 @@ export const operatorWriteTools: OperatorTool[] = [
     },
     handler: async (ctx, args) => {
       const tenantUserId = String(args.tenantUserId);
-      const membershipId = await membershipIdInTenant(ctx.tenantId, tenantUserId);
+      const membership = await membershipInTenant(ctx.tenantId, tenantUserId);
+      // Security: removing the other owners and admins leaves the token's holder in sole control.
+      if (membership.role !== 'MEMBER') assertAdminTierFor(ctx, 'Removing an OWNER or ADMIN');
+      const membershipId = membership.id;
       await tenantWorkspacesService.removeMember({
         tenantId: ctx.tenantId,
         membershipId,
@@ -1430,10 +1261,10 @@ export const operatorWriteTools: OperatorTool[] = [
   },
 
   // ── Admin tools (mcp:operator:admin), financial / secret-handling ──────────
-  // These require the admin scope AND an OWNER/ADMIN role. The connector denies
-  // them by default; the operator opts in per-tool. Still re-scoped by tenant.
+  // These require the admin scope AND an OWNER/ADMIN role. Still re-scoped by tenant.
   {
     name: 'configure_billing_provider',
+    confirmedOperatorOnly: 'store billing provider credentials',
     description:
       "Set an application's billing-provider credentials. Providers: " +
       registryNames.map((n) => `${n} (${getModule(n)!.credentialSchema.map((f) => f.key).join(', ')})`).join('; ') +
@@ -1464,13 +1295,19 @@ export const operatorWriteTools: OperatorTool[] = [
         webhookId: { type: 'string' },
         mode: { type: 'string', enum: ['test', 'live'] },
         countries: { type: 'array', items: { type: 'string' } },
+        currencies: {
+          type: 'array',
+          items: { type: 'string' },
+          description:
+            'ISO 4217 currencies this provider account can charge (Razorpay without international payments: ["INR"]). Empty means none: the provider is not used for any checkout. Left out on a new provider, it starts with the currencies that provider usually charges; left out on an existing one, the list stays as it is. A price in another currency is never routed to it.',
+        },
         enabled: { type: 'boolean' },
       },
       required: ['applicationId', 'provider'],
       additionalProperties: false,
     },
     handler: async (ctx, args) => {
-      const app = await loadAppInTenant(ctx, String(args.applicationId));
+      const app = await loadAppInTenant(ctx, String(args.applicationId), 'write');
       const provider = String(args.provider) as BillingProviderName;
       const module = getModule(provider);
       if (!module) {
@@ -1484,8 +1321,10 @@ export const operatorWriteTools: OperatorTool[] = [
       const mode = args.mode === 'test' || args.mode === 'live' ? (args.mode as BillingMode) : undefined;
       const options = {
         ...(args.countries !== undefined && { countries: args.countries as string[] }),
+        ...(args.currencies !== undefined && { currencies: currencyCodes(args.currencies) }),
         ...(args.enabled !== undefined && { enabled: args.enabled === true }),
         ...(mode !== undefined && { mode }),
+        operatorId: ctx.tenantUserId,
       };
       // The field set is whatever the module declares, so a fourth provider is
       // not a fourth branch. A field the caller omits is omitted from the
@@ -1498,10 +1337,12 @@ export const operatorWriteTools: OperatorTool[] = [
         const value = args[field.key];
         if (value !== undefined) data[field.key] = String(value);
       }
+      const before = await webhookStateBeforeEdit(app.id, provider);
       await billingCredentialsService.upsertCredentials(app.id, provider, data, options);
+      const webhook = await refreshWebhookAfterEdit(app.id, provider, app.slug, before, data);
       // Audit records only that creds were set, NEVER the secret values.
-      audit(ctx, 'app.billing_credentials_configured', app.id, { provider, mode: mode ?? 'inferred' });
-      return { applicationId: app.id, provider, configured: true };
+      audit(ctx, 'app.billing_credentials_configured', app.id, { provider, mode: mode ?? 'inferred', webhook });
+      return { applicationId: app.id, provider, configured: true, webhook };
     },
   },
   {
@@ -1547,10 +1388,11 @@ export const operatorWriteTools: OperatorTool[] = [
           fix: 'Use recent_subscriptions to find a subscription id in this workspace.',
         });
       }
-      const app = await loadAppInTenant(ctx, sub.applicationId);
+      const app = await loadAppInTenant(ctx, sub.applicationId, 'write');
       const atPeriodEnd = args.atPeriodEnd !== false;
       const updated = await billingService.cancelSubscriptionById(app, subscriptionId, {
         atPeriodEnd,
+        operatorId: ctx.tenantUserId,
       });
       audit(ctx, 'app.subscription_canceled', app.id, {
         subscriptionId,

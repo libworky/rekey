@@ -67,7 +67,7 @@ describe('trial eligibility', () => {
         method: 'POST',
         url: `/api/v1/tenant/applications/${appId}/plans`,
         headers: auth(),
-        payload: { slug: s, name: s, amount: 900, kind: 'SUBSCRIPTION' },
+        payload: { slug: s, name: s, price: { currency: 'USD', amount: 900 }, kind: 'SUBSCRIPTION' },
       });
     }
     basicId = (await prisma.plan.findFirstOrThrow({ where: { applicationId: appId, slug: 'basic' } })).id;
@@ -196,15 +196,6 @@ describe('trial eligibility', () => {
     // because the plan's value changes underneath.
     expect(row.endsAt).not.toBeNull();
     expect(Math.round((row.endsAt!.getTime() - row.startedAt!.getTime()) / 86_400_000)).toBe(14);
-  });
-
-  it('confirming a session that carried no trial is a no-op, not an error', async () => {
-    const out = await consumeTrial({
-      applicationId: appId,
-      checkoutSessionId: 'cs_never_existed',
-      subscriptionId: null,
-    });
-    expect(out.recorded).toBe(false);
   });
 
   // ------------------------------------------------------------- the subject

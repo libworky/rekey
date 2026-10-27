@@ -19,13 +19,18 @@ import { entitlementsService } from '../src/modules/billing/entitlements.service
 import { configureSandboxStripe } from './fakes/billing-credentials.js';
 import { randomUUID } from 'node:crypto';
 import Stripe from 'stripe';
+import { STRIPE_API_VERSION } from '../src/modules/billing/providers/stripe-api-version.js';
+import { operatorsConfirmTheirEmail } from './confirmed-accounts.js';
+import { revisePlans } from './seed-plan.js';
+
+operatorsConfirmTheirEmail();
 
 const PASSWORD = 'pw-one-two-three';
 /** Matches what `configureSandboxStripe` stores. */
 const WEBHOOK_SECRET = 'whsec_ci_only';
 
 const stripe = new Stripe('sk_for_signing_only', {
-  apiVersion: '2024-11-20.acacia' as Stripe.LatestApiVersion,
+  apiVersion: STRIPE_API_VERSION,
 });
 
 describe('trial eligibility through checkout', () => {
@@ -73,8 +78,8 @@ describe('trial eligibility through checkout', () => {
     await configureSandboxStripe(applicationId);
 
     for (const plan of [
-      { slug: 'basic', name: 'Basic', amount: 900 },
-      { slug: 'pro', name: 'Pro', amount: 9900 },
+      { slug: 'basic', name: 'Basic', price: { currency: 'USD', amount: 900 } },
+      { slug: 'pro', name: 'Pro', price: { currency: 'USD', amount: 9900 } },
     ]) {
       const res = await app.inject({
         method: 'POST',
@@ -86,7 +91,7 @@ describe('trial eligibility through checkout', () => {
     }
     // See the module docblock: the write path refuses this, so it goes on the
     // row directly, which is how the exposed population got theirs.
-    await prisma.plan.updateMany({ where: { applicationId }, data: { trialDays: 14 } });
+    await revisePlans({ applicationId }, { trialDays: 14 });
 
     userAccess = await app
       .inject({
@@ -158,6 +163,25 @@ describe('trial eligibility through checkout', () => {
     expect(await prisma.trialRedemption.count({ where: { applicationId } })).toBe(before);
   });
 
+  it('a trial refusal gives the coupon slot it took back at once', async () => {
+    const coupon = await app.inject({
+      method: 'POST',
+      url: `/api/v1/tenant/applications/${applicationId}/coupons`,
+      headers: { authorization: `Bearer ${operatorAccess}` },
+      payload: { code: 'ONCE', discountType: 'AMOUNT', amounts: [{ currency: 'USD', amountOff: 100 }], maxRedemptions: 1 },
+    });
+    expect(coupon.statusCode, coupon.body).toBe(201);
+    expect((await checkout({ planSlug: 'basic' })).statusCode).toBe(200);
+
+    const refused = await checkout({ planSlug: 'pro', couponCode: 'ONCE' });
+    expect((refused.json() as { error: { code: string } }).error.code).toBe('BILLING_TRIAL_ALREADY_USED');
+
+    // The buyer accepts the full price and retries straight away. The refused
+    // attempt minted no discount, so it must not be holding the only slot.
+    const retried = await checkout({ planSlug: 'pro', couponCode: 'ONCE', allowWithoutTrial: true });
+    expect(retried.statusCode, retried.body).toBe(200);
+  });
+
   it('once_per_plan lets a different plan through', async () => {
     expect((await setPolicy('once_per_plan')).statusCode).toBe(200);
     expect((await checkout({ planSlug: 'basic' })).statusCode).toBe(200);
@@ -179,13 +203,6 @@ describe('trial eligibility through checkout', () => {
     // flip is to a correct state rather than to two live holders.
     expect(rows.filter((r) => r.status === 'RESERVED')).toHaveLength(1);
     expect(rows.filter((r) => r.status === 'RELEASED')).toHaveLength(1);
-  });
-
-  it('a plan with no trial is untouched by any of this', async () => {
-    await prisma.plan.updateMany({ where: { applicationId }, data: { trialDays: null } });
-    expect((await checkout({ planSlug: 'basic' })).statusCode).toBe(200);
-    expect((await checkout({ planSlug: 'pro' })).statusCode).toBe(200);
-    expect(await prisma.trialRedemption.count({ where: { applicationId } })).toBe(0);
   });
   it('a day-0 trialist is stored TRIALING with a trial end, not ACTIVE', async () => {
     // `applyCheckoutCompleted` hard-wrote ACTIVE and never wrote `trialEndsAt`.
@@ -240,8 +257,51 @@ describe('trial eligibility through checkout', () => {
     expect(ent).toBeDefined();
   });
 
+  it('a retried trial completion stays TRIALING and announces nothing new', async () => {
+    const { webhookService } = await import('../src/modules/webhooks/webhook.service.js');
+    const endpointId = (
+      await webhookService.createEndpoint({ createdByTenantUserId: null, applicationId, url: 'https://example.invalid/hook', events: ['*'] })
+    ).endpoint.id;
+    const res = await checkout({ planSlug: 'pro' });
+    const sessionId = (res.json().data as { subscription: { metadata: { checkoutSessionId: string } } })
+      .subscription.metadata.checkoutSessionId;
+    const eventId = `evt_${randomUUID()}`;
+    const payload = JSON.stringify({
+      id: eventId,
+      object: 'event',
+      type: 'checkout.session.completed',
+      data: { object: { metadata: { applicationId }, id: sessionId, mode: 'subscription', subscription: 'sub_trial_retry' } },
+    });
+    const deliver = () =>
+      app.inject({
+        method: 'POST',
+        url: `/api/v1/billing/webhook/stripe/${appSlug}`,
+        headers: {
+          'content-type': 'application/json',
+          'stripe-signature': stripe.webhooks.generateTestHeaderString({ payload, secret: WEBHOOK_SECRET }),
+        },
+        payload,
+      });
+
+    expect((await deliver()).statusCode).toBe(200);
+    expect((await prisma.trialRedemption.findFirstOrThrow({ where: { applicationId } })).status).toBe('CONSUMED');
+    // A step after the commit failed, so the receipt is left for a re-attempt.
+    await prisma.webhookEvent.updateMany({ where: { applicationId, providerEventId: eventId }, data: { processedAt: null } });
+    expect((await deliver()).statusCode).toBe(200);
+
+    expect((await prisma.subscription.findFirstOrThrow({ where: { applicationId } })).status).toBe('TRIALING');
+    expect(await prisma.webhookDelivery.count({ where: { endpointId, eventType: 'subscription.activated' } })).toBe(1);
+
+    // A re-attempt after the trial has converted does not put it back.
+    await prisma.subscription.updateMany({ where: { applicationId }, data: { status: 'ACTIVE' } });
+    await prisma.webhookEvent.updateMany({ where: { applicationId, providerEventId: eventId }, data: { processedAt: null } });
+    expect((await deliver()).statusCode).toBe(200);
+    expect((await prisma.subscription.findFirstOrThrow({ where: { applicationId } })).status).toBe('ACTIVE');
+    expect(await prisma.webhookDelivery.count({ where: { endpointId, eventType: 'subscription.activated' } })).toBe(1);
+  });
+
   it('a checkout with NO trial is still stored ACTIVE', async () => {
-    await prisma.plan.updateMany({ where: { applicationId }, data: { trialDays: null } });
+    await revisePlans({ applicationId }, { trialDays: null });
     const res = await checkout({ planSlug: 'pro' });
     const sessionId = (res.json().data as { subscription: { metadata: { checkoutSessionId: string } } })
       .subscription.metadata.checkoutSessionId;

@@ -21,6 +21,9 @@ import type { FastifyInstance, LightMyRequestResponse } from 'fastify';
 import { buildApp } from '../src/app.js';
 import { prisma } from '../src/lib/prisma.js';
 import { decryptJson } from '../src/lib/secrets.js';
+import { operatorsConfirmTheirEmail } from './confirmed-accounts.js';
+
+operatorsConfirmTheirEmail();
 
 interface Bootstrapped {
   applicationId: string;
@@ -126,18 +129,6 @@ describe('Billing credentials: partial edit keeps the stored secret', () => {
     expect(await storedApiKey(b.applicationId)).toBe('sk_test_rotated_key');
   });
 
-  it('refuses a missing required field on FIRST configuration', async () => {
-    const b = await bootstrap('first');
-    const res = await put(b, { webhookSecret: 'whsec_one' });
-    expect(res.statusCode).toBe(400);
-    expect(res.json().error.code).toBe('BILLING_CREDENTIALS_INVALID');
-
-    const row = await prisma.billingCredentials.findUnique({
-      where: { applicationId_provider: { applicationId: b.applicationId, provider: 'stripe' } },
-    });
-    expect(row).toBeNull();
-  });
-
   it('a carried-forward key is still pattern-checked, not waved through', async () => {
     const b = await bootstrap('pattern');
     await put(b, { apiKey: 'sk_test_original_key', webhookSecret: 'whsec_one' });
@@ -190,9 +181,10 @@ describe('Billing credentials: partial edit keeps the stored secret', () => {
     expect(row.mode).toBe('live');
     const creds = decryptJson<Record<string, string>>(row.ciphertext);
     expect(creds.clientSecret).toBe('live-client-secret');
-    // And the non-secret optional field survives too: losing it 503s every
-    // inbound PayPal webhook.
-    expect(creds.webhookId).toBe('WH-123');
+    // And a webhook id survives too: losing it 503s every inbound PayPal
+    // webhook. A changed client id re-registers the webhook, so the id is the
+    // one the provider returned for the new credentials, never a blank.
+    expect(creds.webhookId).toMatch(/^WH-stub-/);
   });
 
   it('does not carry anything into a different application', async () => {

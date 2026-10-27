@@ -159,7 +159,7 @@ export default async function OrganizationsPage({
         {created && <SavedBanner params={['created']} message={`Organization ${created} created.`} />}
         {error && !newOrgError && (
           <Banner tone="error">
-            <ApiErrorText code={error} detail={errorDetail} fix={errorFix} map={ERR} fallback={error} />
+            <ApiErrorText code={error} detail={errorDetail} fix={errorFix} map={ERR} />
           </Banner>
         )}
 
@@ -205,12 +205,12 @@ export default async function OrganizationsPage({
                     <div className="flex items-center justify-end gap-3">
                       <Link
                         href={`/applications/${id}/organizations/${o.id}`}
-                        className="text-xs font-medium text-[var(--color-fg)] hover:underline"
+                        className="inline-block py-1.5 text-xs font-medium text-[var(--color-fg)] hover:underline"
                       >
                         Manage
                       </Link>
                       <ActionForm action={deleteOrg.bind(null, id, o.id)} className="inline">
-                        <ConfirmButton
+                        <ConfirmButton title="Delete organization?"
                           confirm={`Delete organization "${o.name}"? This removes all ${o.memberCount} membership${o.memberCount === 1 ? '' : 's'} and any pending invitations. End-user accounts themselves are not deleted.`}
                         >
                           Delete
@@ -266,7 +266,7 @@ function NewOrgModal({
       <ActionForm action={createOrg.bind(null, applicationId)} className="space-y-3">
         {error && !slugError && (
           <Banner tone="error">
-            <ApiErrorText code={error} detail={errorDetail} fix={errorFix} map={ERR} fallback={error} />
+            <ApiErrorText code={error} detail={errorDetail} fix={errorFix} map={ERR} />
           </Banner>
         )}
         <label className="block space-y-1">

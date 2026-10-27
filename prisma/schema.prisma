@@ -9,7 +9,7 @@
 
 generator client {
   provider = "prisma-client-js"
-  // Match LeadSaaS targets. Linux ARM and Debian OpenSSL 3 cover prod containers.
+  // Linux ARM and Debian OpenSSL 3 cover prod containers.
   binaryTargets = ["native", "linux-arm64-openssl-3.0.x", "debian-openssl-3.0.x"]
 }
 
@@ -95,12 +95,8 @@ model TenantUser {
   emailVerified Boolean  @default(false) @map("email_verified")
   // Display name for member lists / UI. Optional at sign-up.
   name          String?
-  // DEPRECATED / unused. Operator lockout moved to the Redis brute-force
-  // limiter (lib/brute-force.ts) — counters no longer live here, so the hot
-  // auth path doesn't write Postgres. Columns retained to avoid a destructive
-  // migration; safe to drop in a later cleanup once confirmed unused in prod.
-  failedSignInAttempts Int       @default(0) @map("failed_sign_in_attempts")
-  lockedUntil          DateTime? @map("locked_until")
+  // No failed-sign-in or lockout columns: operator lockout lives in the Redis
+  // brute-force limiter (lib/brute-force.ts).
   // See EndUser.sessionsInvalidBefore: stamped only when every session ends
   // (password change or reset, sign-out everywhere, reuse detection); the
   // session middleware refuses older access tokens.
@@ -113,6 +109,7 @@ model TenantUser {
   refreshTokens       TenantRefreshToken[]
   resetTokens         TenantPasswordResetToken[]
   magicLinkTokens     TenantMagicLinkToken[]
+  emailVerificationTokens TenantEmailVerificationToken[]
   mfaCredential       TenantMfaCredential?
   webauthnCredentials TenantWebAuthnCredential[]
   apiTokens           TenantApiToken[]
@@ -247,10 +244,27 @@ model TenantInvitation {
 
   tenant     Tenant      @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   acceptedBy TenantUser? @relation("acceptedBy", fields: [acceptedById], references: [id], onDelete: SetNull)
+  appGrants  TenantInvitationGrant[]
 
   @@index([tenantId])
   @@index([expiresAt])
   @@map("tenant_invitations")
+}
+
+// The ApplicationGrant rows a MEMBER invitation creates when it is accepted or
+// used to sign up. A row per app, so deleting the app drops it from the invite.
+model TenantInvitationGrant {
+  id            String               @id @default(cuid())
+  invitationId  String               @map("invitation_id")
+  applicationId String               @map("application_id")
+  role          ApplicationGrantRole
+
+  invitation  TenantInvitation @relation(fields: [invitationId], references: [id], onDelete: Cascade)
+  application Application      @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+
+  @@unique([invitationId, applicationId])
+  @@index([applicationId])
+  @@map("tenant_invitation_grants")
 }
 
 // Deploy-time operator-registration control (OPERATOR_SIGNUP_MODE='invite').
@@ -366,6 +380,27 @@ model TenantMagicLinkToken {
 
   @@index([tenantUserId])
   @@map("tenant_magic_link_tokens")
+}
+
+// The link in an operator's "confirm your email" mail. Opening it sets
+// `TenantUser.emailVerified` and changes nothing else: it ratifies the
+// sign-up, password included, where a sign-in link or a reset on an
+// unconfirmed account replaces what was there. Hash-only, single use.
+model TenantEmailVerificationToken {
+  id           String    @id @default(cuid())
+  tenantUserId String    @map("tenant_user_id")
+  // The address the link was mailed to. A link is refused once the account's
+  // address is no longer this one.
+  email        String
+  tokenHash    String    @unique @map("token_hash")
+  expiresAt    DateTime  @map("expires_at")
+  consumedAt   DateTime? @map("consumed_at")
+  createdAt    DateTime  @default(now()) @map("created_at")
+
+  tenantUser TenantUser @relation(fields: [tenantUserId], references: [id], onDelete: Cascade)
+
+  @@index([tenantUserId])
+  @@map("tenant_email_verification_tokens")
 }
 
 // Operator personal-access-tokens (PATs). A long-lived, revocable, SCOPED
@@ -681,10 +716,15 @@ model Application {
   magicLinkTokens     MagicLinkToken[]
   webauthnCredentials WebAuthnCredential[]
   plans               Plan[]
+  planPrices          PlanPrice[]
   subscriptions       Subscription[]
   payments            Payment[]
+  refunds             Refund[]
+  billingEvents       BillingEvent[]
+  billingEventOutbox  BillingEventOutbox[]
   unappliedPayments   UnappliedPayment[]
   coupons             Coupon[]
+  couponAmounts       CouponAmount[]
   oauthIdentities     OAuthIdentity[]
   licenses            License[]
   licenseActivations  LicenseActivation[]
@@ -697,6 +737,7 @@ model Application {
   emailLogs           EmailLog[]
   emailEventSettings  EmailEventSetting[]
   emailSuppressions   EmailSuppression[]
+  emailTopicOptOuts   EmailTopicOptOut[]
   customEmailTemplates        CustomEmailTemplate[]
   customEmailTemplateVersions CustomEmailTemplateVersion[]
   contactLists        ContactList[]
@@ -711,6 +752,7 @@ model Application {
   oauthAuthCodes      OAuthAuthCode[]
   dunningCases        DunningCase[]
   applicationGrants   ApplicationGrant[]
+  invitationGrants    TenantInvitationGrant[]
   trialRedemptions    TrialRedemption[]
   freeTierClaims      FreeTierClaim[]
   orgFreeTierClaims   OrganizationFreeTierClaim[]
@@ -774,6 +816,11 @@ model CustomEmailTemplate {
   name           String
   /** critical | notification. Only notification mail carries List-Unsubscribe. */
   category       String
+  /**
+   * What a recipient unsubscribes from when they leave this notification mail.
+   * Null means the template key. Copied onto each version at publish.
+   */
+  topic          String?
   fromName       String?   @map("from_name")
   subject        String
   designJson     Json?     @map("design_json")
@@ -809,6 +856,8 @@ model CustomEmailTemplateVersion {
   applicationId  String   @map("application_id")
   version        Int
   category       String
+  /** The template's topic at publish. Null on versions published before topics existed: the key. */
+  topic          String?
   fromName       String?  @map("from_name")
   subject        String
   bodyHtml       String   @map("body_html")
@@ -895,6 +944,25 @@ model EmailSuppression {
   @@unique([applicationId, address])
   @@index([applicationId, createdAt])
   @@map("email_suppressions")
+}
+
+/**
+ * One recipient left one topic of notification mail, through a one-click
+ * unsubscribe or the email-preferences API. Narrower than EmailSuppression,
+ * which stops a whole category or every email. Read through `sendableTo`.
+ */
+model EmailTopicOptOut {
+  id            String   @id @default(cuid())
+  applicationId String   @map("application_id")
+  /** Lowercased, matching EmailSuppression. */
+  address       String
+  topic         String
+  createdAt     DateTime @default(now()) @map("created_at")
+
+  application Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+
+  @@unique([applicationId, address, topic])
+  @@map("email_topic_opt_outs")
 }
 
 // ============================================================================
@@ -1180,7 +1248,7 @@ model EmailLog {
   eventKey      String?  @map("event_key")
   /** Transport used: byo_resend | default_resend | byo_smtp | none. */
   via           String
-  /** Outcome: sent | error | no_transport | suppressed | pending (a custom send in flight) | unknown (pending past its cutoff). */
+  /** Outcome: sent | error | no_transport | suppressed | pending (a custom send in flight) | unknown (pending past its cutoff) | scheduled | canceled. */
   status        String
   /** Provider message id when status=sent (nullable — some providers omit). */
   messageId     String?  @map("message_id")
@@ -1196,6 +1264,11 @@ model EmailLog {
   idempotencyFingerprint String? @map("idempotency_fingerprint")
   customTemplateKey      String? @map("custom_template_key")
   customTemplateVersion  Int?    @map("custom_template_version")
+  /** When a scheduled custom send is due. Null for a send that went at once. */
+  sendAt                 DateTime? @map("send_at")
+  /** What a scheduled send was asked to send: `to` and `variables`. Cleared once it fires or is canceled. */
+  scheduledRequest       Json?   @map("scheduled_request")
+  /** For a scheduled row, the moment it was scheduled until it fires, then the moment it fired. */
   createdAt     DateTime @default(now()) @map("created_at")
 
   application Application? @relation(fields: [applicationId], references: [id], onDelete: Cascade)
@@ -1206,6 +1279,8 @@ model EmailLog {
   @@index([applicationId, createdAt])
   @@index([tenantId, createdAt])
   @@index([status])
+  // The scheduled-send poller: due rows, oldest first.
+  @@index([status, sendAt])
   // Erasure scrubs every row sent to one person's address inside its
   // transaction; without this that is a scan of the Application's whole log.
   @@index([applicationId, toAddress])
@@ -1482,6 +1557,86 @@ model ImpersonationAudit {
   @@map("impersonation_audits")
 }
 
+// ============================================================================
+// Support mode. An operator opens a case on an end-user with a set of
+// capabilities; while it is OPEN the application reads them through
+// `/auth/me?include=support`. FK-free like ImpersonationAudit, so the case
+// history outlives the end-user and the devices it named.
+// ============================================================================
+
+enum SupportCaseStatus {
+  OPEN
+  CLOSED
+}
+
+enum SupportCaseScope {
+  USER
+  DEVICES
+}
+
+model SupportCase {
+  id            String            @id @default(cuid())
+  applicationId String            @map("application_id")
+  tenantId      String            @map("tenant_id")
+  endUserId     String            @map("end_user_id")
+  status        SupportCaseStatus @default(OPEN)
+  // Names from the Application's SupportCapability catalogue, sorted.
+  capabilities  String[]
+  scope         SupportCaseScope  @default(USER)
+  // Device ids the case is limited to. Empty unless scope is DEVICES.
+  deviceIds     String[]          @default([]) @map("device_ids")
+  // Operator-only. Never copied to a webhook, a security event or the data
+  // export, and set to null when the end-user is erased.
+  reason        String?
+  openedBy      String?           @map("opened_by")
+  openedAt      DateTime          @default(now()) @map("opened_at")
+  // Set by the service on a change to capabilities or devices, not by Prisma:
+  // clients cache on it, so nulling the reason at erasure must not move it.
+  updatedAt     DateTime          @default(now()) @map("updated_at")
+  closedBy      String?           @map("closed_by")
+  closedAt      DateTime?         @map("closed_at")
+  // One of SUPPORT_CASE_CLOSED_CAUSES in @rekey.dev/shared-types.
+  closedCause   String?           @map("closed_cause")
+
+  @@index([applicationId, status, openedAt])
+  @@index([applicationId, endUserId, openedAt])
+  // `support_cases_end_user_open_key`, UNIQUE (application_id, end_user_id)
+  // WHERE status = 'OPEN': at most one open case per end-user. Partial, so it
+  // lives only in migration 20261011024313_support_cases.
+  @@map("support_cases")
+}
+
+// An operator's note on a support case. Append-only: the row is the record,
+// so there is no webhook and no security event for one. Free text about a
+// person, so it is operator-only like the case's reason and is deleted when
+// the end-user is erased or deleted. FK-free like SupportCase.
+model SupportCaseNote {
+  id            String   @id @default(cuid())
+  applicationId String   @map("application_id")
+  caseId        String   @map("case_id")
+  endUserId     String   @map("end_user_id")
+  // Operator (TenantUser) id.
+  authorId      String   @map("author_id")
+  body          String
+  createdAt     DateTime @default(now()) @map("created_at")
+
+  @@index([caseId, createdAt])
+  @@index([applicationId, endUserId])
+  @@map("support_case_notes")
+}
+
+model SupportCapability {
+  id            String   @id @default(cuid())
+  applicationId String   @map("application_id")
+  name          String
+  description   String?
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
+
+  @@unique([applicationId, name])
+  @@map("support_capabilities")
+}
+
 model WebAuthnCredential {
   id            String   @id @default(cuid())
   applicationId String   @map("application_id")
@@ -1594,6 +1749,9 @@ model BillingCredentials {
   ciphertext    String
   countries     String[] @default([])
   priority      Int      @default(100)
+  // The currencies this account can charge, as the operator declares them.
+  // Empty means none. A provider is never routed a price it cannot charge.
+  currencies    String[] @default([])
   createdAt     DateTime @default(now()) @map("created_at")
   updatedAt     DateTime @updatedAt @map("updated_at")
   // When the secret material or its mode last changed: the start of the
@@ -1627,12 +1785,17 @@ model ApiKey {
   // key), false otherwise (masked to /24 or /48). Null for keys minted before
   // this was recorded, which keep reading them in full.
   revealsEndUserIps Boolean? @map("reveals_end_user_ips")
+  // The operator who minted the key, when one did. Lets a claim of that
+  // operator's unconfirmed account revoke the keys it minted. Null for keys
+  // from before the column, and for keys nobody signed in to create.
+  createdByTenantUserId String? @map("created_by_tenant_user_id")
   createdAt     DateTime  @default(now()) @map("created_at")
 
   application Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
 
   // keyHash lookups ride the @unique's index — a separate @@index([keyHash])
   // was a duplicate, pure write amplification on a hot-insert table.
+  @@index([createdByTenantUserId])
   @@index([applicationId])
   @@map("api_keys")
 }
@@ -1844,11 +2007,8 @@ model MfaCredential {
   usedBackupCodeHashes String[] @default([]) @map("used_backup_code_hashes")
   // Verified at /mfa/setup-confirm. Sign-in challenges only fire when this is true.
   enrolledAt          DateTime? @map("enrolled_at")
-  // DEPRECATED / unused. MFA throttle moved to the Redis brute-force limiter
-  // (lib/brute-force.ts, scope `eu:mfa:<id>`). Columns retained to avoid a
-  // destructive migration; safe to drop in a later cleanup.
-  failedAttempts      Int       @default(0) @map("failed_attempts")
-  lockedUntil         DateTime? @map("locked_until")
+  // The MFA throttle lives in the Redis brute-force limiter
+  // (lib/brute-force.ts, scope `eu:mfa:<id>`), not on this row.
   createdAt           DateTime  @default(now()) @map("created_at")
   updatedAt           DateTime  @updatedAt @map("updated_at")
 
@@ -1863,10 +2023,7 @@ model TenantMfaCredential {
   secretCiphertext    String    @map("secret_ciphertext")
   backupCodesCiphertext String  @map("backup_codes_ciphertext")
   enrolledAt          DateTime? @map("enrolled_at")
-  // DEPRECATED / unused — see MfaCredential. Throttle moved to Redis
-  // (lib/brute-force.ts, scope `op:mfa:<id>`).
-  failedAttempts      Int       @default(0) @map("failed_attempts")
-  lockedUntil         DateTime? @map("locked_until")
+  // The MFA throttle lives in Redis (lib/brute-force.ts, scope `op:mfa:<id>`).
   createdAt           DateTime  @default(now()) @map("created_at")
   updatedAt           DateTime  @updatedAt @map("updated_at")
 
@@ -2402,6 +2559,15 @@ enum PlanKind {
 // for it. Written AHEAD of the provider call, never after — see
 // `plans.service.ts`. A plan is only purchasable in NOT_REQUIRED (the provider
 // registers lazily at first checkout) or REGISTERED.
+/// INHERIT follows the Application's `billingConfig.localPrices`. TRUSTED
+/// believes only a country the operator's server or the CDN vouches for,
+/// whatever the Application says. OFF always charges the default price.
+enum PlanLocalPrices {
+  INHERIT
+  TRUSTED
+  OFF
+}
+
 enum PlanRegistrationStatus {
   // No eager registration is owed. PayPal- and Razorpay-only Applications, and
   // Applications with no billing configured at all, register at first checkout.
@@ -2424,12 +2590,6 @@ model Plan {
   slug          String
   name          String
   kind          PlanKind     @default(SUBSCRIPTION)
-  // Smallest currency unit (cents for USD/EUR, paise for INR, …) — never floats.
-  // For SUBSCRIPTION + LICENSE plans, this is the headline price. For USAGE
-  // plans, it's the base/recurring fee (often 0); per-unit pricing lives in
-  // `pricePerUnitCents`.
-  amount        Int
-  currency      String       @default("USD")
   interval      PlanInterval @default(MONTH)
   active        Boolean      @default(true)
 
@@ -2459,7 +2619,6 @@ model Plan {
   // catalog. We don't enforce a FK here because meters can be archived
   // independently — service-layer validation handles it.
   meterSlug          String?     @map("meter_slug")
-  pricePerUnitCents  Int?        @map("price_per_unit_cents")
   // ── CREDIT-kind config ──────────────────────────────────────────
   // Set when kind = CREDIT. Credits granted to the buyer's CreditBalance
   // on successful payment (one-off prepaid "lead pack" / top-up).
@@ -2473,20 +2632,78 @@ model Plan {
   // the operator can see why without reading server logs.
   registrationStatus PlanRegistrationStatus @default(NOT_REQUIRED) @map("registration_status")
   registrationError  String?                @map("registration_error")
+  /// The plan's default price: the `PlanPrice` row a buyer pays when no other
+  /// price applies, and the only place the plan's price is stored. Null for a
+  /// plan with no flat price (free, or metered with no base fee). The foreign key is on (defaultPriceId, id), so a plan can
+  /// only point at one of its own prices.
+  defaultPriceId String?        @map("default_price_id")
+  /// Whether the plan charges nothing at all. Explicit, because a metered plan
+  /// with no base fee has no price row either and is not free. A free plan
+  /// has no default price: `plans_free_has_no_price` in migration
+  /// plan_prices_live_on_price_rows holds that.
+  isFree        Boolean         @default(false) @map("is_free")
+  /// Whether a buyer's country may select one of this plan's other prices.
+  localPrices   PlanLocalPrices @default(INHERIT) @map("local_prices")
   createdAt     DateTime     @default(now()) @map("created_at")
   updatedAt     DateTime     @updatedAt @map("updated_at")
 
   application   Application    @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  // NoAction, not Restrict: deleting an Application cascades to both tables,
+  // and Restrict is checked before the plan row itself has gone.
+  defaultPrice  PlanPrice?     @relation("PlanDefaultPrice", fields: [defaultPriceId, id], references: [id, planId], onDelete: NoAction, onUpdate: NoAction)
   subscriptions Subscription[]
   licenses      License[]
   entitlements  PlanEntitlement[]
   trialRedemptions TrialRedemption[]
   freeTierClaims   FreeTierClaim[]
   orgFreeTierClaims OrganizationFreeTierClaim[]
+  prices        PlanPrice[]    @relation("PlanPrices")
 
   @@unique([applicationId, slug])
   @@index([applicationId])
   @@map("plans")
+}
+
+/// One price of a plan: its default price (`Plan.defaultPriceId`) or a price
+/// in another currency. A price a subscription, payment or ledger row refers
+/// to is archived, never deleted.
+model PlanPrice {
+  id            String   @id @default(cuid())
+  applicationId String   @map("application_id")
+  planId        String   @map("plan_id")
+  /// Upper-case ISO 4217.
+  currency      String
+  /// Minor units of `currency`.
+  amount        Int
+  /// Upper-case ISO 3166-1 alpha-2. Empty means wherever `currency` is local.
+  countries     String[] @default([])
+  /// This price's provider registrations, shaped like `Plan.metadata`.
+  metadata      Json     @default("{}")
+  registrationStatus PlanRegistrationStatus @default(NOT_REQUIRED) @map("registration_status")
+  registrationError  String?                @map("registration_error")
+  /// Set when the price was retired while something still referred to it.
+  archivedAt    DateTime? @map("archived_at")
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
+
+  application Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  plan        Plan        @relation("PlanPrices", fields: [planId], references: [id], onDelete: Cascade)
+  defaultFor  Plan[]      @relation("PlanDefaultPrice")
+  subscriptions    Subscription[]
+  checkoutSessions CheckoutSession[]
+  payments         Payment[]
+  creditLedger     CreditLedger[]
+  couponRedemptions CouponRedemption[]
+
+  // `plan_prices_plan_id_currency_live_key`, UNIQUE (plan_id, currency) WHERE
+  // archived_at IS NULL: one live price per currency. Partial, so it lives
+  // only in migration money_v2_01. `plan_prices_amount_positive` (amount > 0)
+  // and `plan_prices_currency_code` (three upper-case letters) are CHECKs in
+  // the same migration.
+  @@unique([id, planId])
+  @@index([planId, currency])
+  @@index([applicationId])
+  @@map("plan_prices")
 }
 
 // ============================================================================
@@ -2564,6 +2781,15 @@ model Subscription {
   // create a new sub. Null only for legacy rows from before multi-provider.
   provider      String?
   status        SubscriptionStatus @default(PENDING)
+  // What this subscription costs and the price row it pays, fixed when a
+  // payment completed its checkout: the plan's price can change and this
+  // buyer keeps theirs. All three are set or all three are null
+  // (`subscriptions_price_snapshot` in migration subscription_price_snapshot_constraints). Null
+  // means the subscription has no price of its own; nothing is borrowed
+  // from the plan.
+  currency      String?
+  unitAmount    Int?               @map("unit_amount")
+  planPriceId   String?            @map("plan_price_id")
   // When the current period ends. Null until the provider tells us.
   currentPeriodEnd DateTime?       @map("current_period_end")
   // When the trial ends, for a subscription that started in one. Kept even
@@ -2578,6 +2804,10 @@ model Subscription {
   trialWillEndNotifiedFor DateTime? @map("trial_will_end_notified_for")
   cancelAt         DateTime?       @map("cancel_at")
   canceledAt       DateTime?       @map("canceled_at")
+  /** Why the subscriber cancelled, when they said: one of CANCEL_REASONS. */
+  cancelReason     String?         @map("cancel_reason")
+  /** The subscriber's own words. Nulled by erasure. */
+  cancelFeedback   String?         @map("cancel_feedback")
   // Provider's id for this subscription (sub_..., I-...., etc.). Scoped by
   // applicationId, NOT globally unique — see @@unique below.
   providerSubId String?            @map("provider_sub_id")
@@ -2599,6 +2829,9 @@ model Subscription {
   application Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
   endUser     EndUser     @relation(fields: [endUserId], references: [id], onDelete: Cascade)
   plan        Plan        @relation(fields: [planId], references: [id])
+  // On (planPriceId, planId): a subscription can only name one of its own
+  // plan's prices, and that row cannot be deleted from under it.
+  planPrice   PlanPrice?  @relation(fields: [planPriceId, planId], references: [id, planId], onDelete: Restrict)
   beneficiaryOrg Organization? @relation("SubscriptionBeneficiary", fields: [beneficiaryOrgId], references: [id], onDelete: SetNull)
   payments    Payment[]
   dunningCases DunningCase[]
@@ -2627,6 +2860,7 @@ model Subscription {
   @@index([applicationId, status])
   // The trial-ending sweep: TRIALING rows by trial end.
   @@index([status, trialEndsAt])
+  @@index([planPriceId])
   @@map("subscriptions")
 }
 
@@ -2654,6 +2888,19 @@ model CheckoutSession {
   successUrl        String                @map("success_url")
   cancelUrl         String                @map("cancel_url")
   locale            String?
+  // The buyer's country as resolved for this checkout, whether or not it
+  // decided the provider, and how far it can be believed: declared (secret
+  // key), vouched (trusted proxy or portal), or hint.
+  buyerCountry      String?               @map("buyer_country")
+  buyerCountrySource String?              @map("buyer_country_source")
+  // The plan price this checkout was opened at, before any discount. Copied to
+  // the subscription when the checkout completes.
+  currency          String?
+  unitAmount        Int?                  @map("unit_amount")
+  planPriceId       String?               @map("plan_price_id")
+  /// What the buyer is asked to pay: `unitAmount` less `discountAmount`.
+  chargeAmount      Int?                  @map("charge_amount")
+  discountAmount    Int?                  @map("discount_amount")
   status            CheckoutSessionStatus @default(OPEN)
   expiresAt         DateTime              @map("expires_at")
   // Browser-safe processor config for the page (client id, subscription id)
@@ -2665,7 +2912,9 @@ model CheckoutSession {
   application  Application  @relation(fields: [applicationId], references: [id], onDelete: Cascade)
   endUser      EndUser      @relation(fields: [endUserId], references: [id], onDelete: Cascade)
   subscription Subscription @relation(fields: [subscriptionId], references: [id], onDelete: Cascade)
+  planPrice    PlanPrice?   @relation(fields: [planPriceId], references: [id], onDelete: SetNull)
 
+  @@index([planPriceId])
   @@index([applicationId, status])
   @@index([applicationId, providerSessionId])
   @@index([subscriptionId])
@@ -2680,7 +2929,7 @@ model Payment {
   endUserId       String?       @map("end_user_id")
   subscriptionId  String?       @map("subscription_id")
   amount          Int
-  currency        String        @default("USD")
+  currency        String
   status          PaymentStatus @default(PENDING)
   // The provider's charge/sale id. Scoped by applicationId, NOT globally
   // unique — see @@unique below.
@@ -2700,6 +2949,17 @@ model Payment {
   // refunds and reports its own running total (PayPal literally calls it
   // `total_refunded_amount`). `status` alone cannot express "40 of 100 back".
   refundedAmount  Int           @default(0) @map("refunded_amount")
+  /// The price this payment was for, and that price's amount when it was
+  /// taken. Null when the charge could not be matched to a price.
+  planPriceId     String?       @map("plan_price_id")
+  unitAmount      Int?          @map("unit_amount")
+  /// What a coupon took off, in `currency`'s minor unit.
+  discountAmount  Int           @default(0) @map("discount_amount")
+  /// The processor that took the money, and its own id for the charge.
+  provider        String?
+  providerChargeId String?      @map("provider_charge_id")
+  /// UNVERIFIED: the provider confirmed the money, and it matched no price.
+  verification    PaymentVerification @default(VERIFIED)
   description     String?
   metadata        Json          @default("{}")
   createdAt       DateTime      @default(now()) @map("created_at")
@@ -2707,7 +2967,10 @@ model Payment {
 
   application  Application   @relation(fields: [applicationId], references: [id], onDelete: Cascade)
   subscription Subscription? @relation(fields: [subscriptionId], references: [id], onDelete: SetNull)
+  planPrice    PlanPrice?    @relation(fields: [planPriceId], references: [id], onDelete: Restrict)
   unapplied    UnappliedPayment?
+  refunds      Refund[]
+  creditLedger CreditLedger[]
 
   // Payment idempotency, scoped to the Application that owns the row.
   //
@@ -2735,7 +2998,51 @@ model Payment {
   // was the low-selectivity [status] index. Single-column is enough: a
   // subscription has few payments.
   @@index([subscriptionId])
+  @@index([planPriceId])
   @@map("payments")
+}
+
+enum PaymentVerification {
+  VERIFIED
+  UNVERIFIED
+}
+
+enum RefundStatus {
+  PENDING
+  SUCCEEDED
+  FAILED
+}
+
+enum RefundInitiator {
+  OPERATOR
+  PROVIDER
+  SYSTEM
+}
+
+/// One refund of one payment. `Payment.refundedAmount` stays the running
+/// total; a row here says which refund, who asked for it and why.
+model Refund {
+  id               String          @id @default(cuid())
+  applicationId    String          @map("application_id")
+  paymentId        String          @map("payment_id")
+  providerRefundId String?         @map("provider_refund_id")
+  /// Minor units of `currency`, which is always the payment's.
+  amount           Int
+  currency         String
+  status           RefundStatus    @default(PENDING)
+  reason           String?
+  initiatedBy      RefundInitiator @map("initiated_by")
+  createdAt        DateTime        @default(now()) @map("created_at")
+
+  application Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  payment     Payment     @relation(fields: [paymentId], references: [id], onDelete: Cascade)
+
+  // A provider reports one refund more than once (the API response, then a
+  // webhook). NULLs are distinct, so a refund not yet at the provider repeats.
+  @@unique([applicationId, providerRefundId])
+  @@index([paymentId])
+  @@index([applicationId, createdAt])
+  @@map("refunds")
 }
 
 // ============================================================================
@@ -2860,6 +3167,9 @@ model DunningCase {
   @@index([applicationId, status])
   @@index([status, nextActionAt])
   @@index([subscriptionId, status])
+  // `dunning_cases_subscription_open_key`, UNIQUE (subscription_id) WHERE
+  // status = 'OPEN': at most one open case per subscription. Partial, so it
+  // lives only in migration 20261002182512_dunning_one_open_case.
   @@map("dunning_cases")
 }
 
@@ -2933,6 +3243,10 @@ model CreditLedger {
   // Dedups replays. "purchase:<paymentId>" for grants; client key for consume.
   // NULL allowed to repeat (keyless operator adjustments).
   idempotencyKey String?      @map("idempotency_key")
+  /// On a purchase or refill row: the payment that bought the credits and the
+  /// price it was charged at.
+  paymentId      String?      @map("payment_id")
+  planPriceId    String?      @map("plan_price_id")
   description    String?
   metadata       Json         @default("{}")
   createdAt      DateTime     @default(now()) @map("created_at")
@@ -2940,9 +3254,13 @@ model CreditLedger {
   application  Application   @relation(fields: [applicationId], references: [id], onDelete: Cascade)
   endUser      EndUser?      @relation(fields: [endUserId], references: [id], onDelete: Cascade)
   organization Organization? @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  payment      Payment?      @relation(fields: [paymentId], references: [id], onDelete: SetNull)
+  planPrice    PlanPrice?    @relation(fields: [planPriceId], references: [id], onDelete: Restrict)
 
   @@unique([applicationId, subjectKey, idempotencyKey])
   @@index([createdAt])
+  @@index([paymentId])
+  @@index([planPriceId])
   @@map("credit_ledger")
 }
 
@@ -2975,11 +3293,15 @@ model Coupon {
   applicationId         String             @map("application_id")
   code                  String             // Stored lowercase; unique per app.
   discountType          CouponDiscountType @map("discount_type")
-  amountOff             Int                @map("amount_off") // see enum comment
-  // Optional currency restriction for AMOUNT coupons. Null = any currency.
-  currency              String?
+  /// PERCENT only: hundredths of a percent, 1500 is 15%. An AMOUNT coupon's
+  /// discount is its `amounts` rows. `coupons_rate_by_kind` in migration
+  /// coupon_terms_live_on_rate_and_amount_rows holds that a PERCENT coupon has a rate and an AMOUNT
+  /// coupon has none.
+  basisPoints           Int?               @map("basis_points")
   // Optional restriction to specific plan slugs. Null/empty = any plan.
   planSlugs             String[]           @map("plan_slugs")
+  /// Upper-case ISO 4217 currencies the coupon applies in. Empty means any.
+  currencies            String[]           @default([])
   active                Boolean            @default(true)
   startsAt              DateTime?          @map("starts_at")
   endsAt                DateTime?          @map("ends_at")
@@ -2991,10 +3313,32 @@ model Coupon {
 
   application Application        @relation(fields: [applicationId], references: [id], onDelete: Cascade)
   redemptions CouponRedemption[]
+  amounts     CouponAmount[]
 
   @@unique([applicationId, code])
   @@index([applicationId])
   @@map("coupons")
+}
+
+/// What a fixed-amount coupon takes off in one currency. Local prices may be
+/// purchasing-power prices, so an amount is stated per currency and never
+/// converted.
+model CouponAmount {
+  id            String   @id @default(cuid())
+  applicationId String   @map("application_id")
+  couponId      String   @map("coupon_id")
+  /// Upper-case ISO 4217.
+  currency      String
+  /// Minor units of `currency`.
+  amountOff     Int      @map("amount_off")
+  createdAt     DateTime @default(now()) @map("created_at")
+
+  application Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  coupon      Coupon      @relation(fields: [couponId], references: [id], onDelete: Cascade)
+
+  @@unique([couponId, currency])
+  @@index([applicationId])
+  @@map("coupon_amounts")
 }
 
 model CouponRedemption {
@@ -3035,11 +3379,20 @@ model CouponRedemption {
   /// (app, end-user, plan) row overwrites — so the operator's redemption
   /// totals silently restated history.
   discountAmount Int?     @map("discount_amount")
+  /// The currency `discountAmount` is in: the price the checkout charged.
+  /// A percentage coupon is redeemed in whatever currency the buyer paid, so
+  /// the coupon's own currency cannot answer this. Null on rows older than
+  /// the column that the backfill could not place.
+  currency       String?
+  /// The price row the discount was taken off.
+  planPriceId    String?  @map("plan_price_id")
   redeemedAt     DateTime @default(now()) @map("redeemed_at")
 
-  coupon Coupon @relation(fields: [couponId], references: [id], onDelete: Cascade)
+  coupon    Coupon     @relation(fields: [couponId], references: [id], onDelete: Cascade)
+  planPrice PlanPrice? @relation(fields: [planPriceId], references: [id], onDelete: SetNull)
 
   @@index([couponId])
+  @@index([planPriceId])
   @@index([applicationId, endUserId])
   // Webhook-replay idempotency: a coupon may only be recorded once per
   // successful payment. The Stripe handler's catch-on-P2002 relies on
@@ -3217,6 +3570,97 @@ model OrganizationFreeTierClaim {
 // invoice.paid was then lost permanently and silently. An event id is only
 // ever unique WITHIN the account it came from, which is the Application.
 // ============================================================================
+enum BillingEventTier {
+  /// Lives as long as the Application.
+  PERMANENT
+  /// Refusals and opened checkouts: pruned after 90 days.
+  DIAGNOSTIC
+}
+
+enum BillingEventActor {
+  SYSTEM
+  OPERATOR
+  END_USER
+  PROVIDER
+}
+
+/// The billing log: an append-only index of money changes and of decisions
+/// that leave no row of their own. `Payment`, `Refund`, `Subscription` and
+/// `CreditLedger` stay the truth.
+///
+/// Only `applicationId` is a foreign key. The other ids are plain columns, so
+/// an event outlives the row it describes and an erased end user's events
+/// keep pointing at the tombstone.
+///
+/// The trigger `billing_events_append_only` (migration money_v2_03) refuses
+/// UPDATE and DELETE unless the session sets
+/// `rekey.billing_events_maintenance` to 'on', which only the erasure and
+/// retention paths do.
+model BillingEvent {
+  id            String            @id @default(cuid())
+  /// Ordering and the read cursor. Gaps are possible and mean nothing.
+  seq           BigInt            @unique @default(autoincrement())
+  applicationId String            @map("application_id")
+  type          String
+  tier          BillingEventTier
+  occurredAt    DateTime          @map("occurred_at")
+  recordedAt    DateTime          @default(now()) @map("recorded_at")
+  /// The provider's event id where there is one, so a redelivery writes once.
+  dedupeKey     String            @map("dedupe_key")
+  actorType     BillingEventActor @map("actor_type")
+  actorId       String?           @map("actor_id")
+  endUserId         String?       @map("end_user_id")
+  subscriptionId    String?       @map("subscription_id")
+  checkoutSessionId String?       @map("checkout_session_id")
+  paymentId         String?       @map("payment_id")
+  refundId          String?       @map("refund_id")
+  planId            String?       @map("plan_id")
+  planPriceId       String?       @map("plan_price_id")
+  couponId          String?       @map("coupon_id")
+  provider          String?
+  providerEventId   String?       @map("provider_event_id")
+  currency          String?
+  amount            Int?
+  /// Shaped per `type` by the `BillingEventSchema` union in shared-types.
+  data          Json              @default("{}")
+
+  application Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+
+  @@unique([applicationId, type, dedupeKey])
+  @@index([applicationId, seq])
+  @@index([applicationId, endUserId, occurredAt])
+  @@index([tier, recordedAt])
+  // The log readers page on `seq` inside one Application, by entity or type.
+  @@index([applicationId, endUserId, seq])
+  @@index([applicationId, subscriptionId, seq])
+  @@index([applicationId, paymentId, seq])
+  @@index([applicationId, type, seq])
+  @@index([applicationId, occurredAt])
+  @@map("billing_events")
+}
+
+/// Events for changes applied after their transaction committed. A row is
+/// written with the change that can be written with it, and drained into
+/// `BillingEvent` afterwards.
+model BillingEventOutbox {
+  id            String    @id @default(cuid())
+  applicationId String    @map("application_id")
+  /// The event as queued. Cleared once it is in the log.
+  payload       Json?
+  createdAt     DateTime  @default(now()) @map("created_at")
+  processedAt   DateTime? @map("processed_at")
+  /// How many drains have failed to write this event.
+  attempts      Int       @default(0)
+  /// Why the last one failed.
+  lastError     String?   @map("last_error")
+  /// A row that failed is not tried again before this.
+  nextAttemptAt DateTime  @default(now()) @map("next_attempt_at")
+
+  application Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+
+  @@index([processedAt, nextAttemptAt, createdAt])
+  @@map("billing_event_outbox")
+}
 
 model WebhookEvent {
   id              String    @id @default(cuid())
@@ -3271,12 +3715,16 @@ model WebhookEndpoint {
   // customers verify via `X-Rekey-Signature: sha256=<hex>`.
   secret        String
   enabled       Boolean  @default(true)
+  // The operator who created the endpoint, when one did. Lets a claim of
+  // that operator's unconfirmed account switch off the endpoints it created.
+  createdByTenantUserId String? @map("created_by_tenant_user_id")
   createdAt     DateTime @default(now()) @map("created_at")
   updatedAt     DateTime @updatedAt @map("updated_at")
 
   application Application       @relation(fields: [applicationId], references: [id], onDelete: Cascade)
   deliveries  WebhookDelivery[]
 
+  @@index([createdByTenantUserId])
   @@index([applicationId, enabled])
   @@map("webhook_endpoints")
 }

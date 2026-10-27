@@ -14,6 +14,9 @@ import { entitlementsService } from '../src/modules/billing/entitlements.service
 import { creditsService } from '../src/modules/credits/credits.service.js';
 import { billingService } from '../src/modules/billing/billing.service.js';
 import { accountTools } from '../src/modules/mcp/account-tools.js';
+import { operatorsConfirmTheirEmail } from './confirmed-accounts.js';
+
+operatorsConfirmTheirEmail();
 
 describe('Org-beneficiary billing', () => {
   let app: FastifyInstance;
@@ -66,7 +69,7 @@ describe('Org-beneficiary billing', () => {
       method: 'POST',
       url: `/api/v1/tenant/applications/${appId}/plans`,
       headers: auth(),
-      payload: { slug: 'team', name: 'Team', amount: 0, kind: 'SUBSCRIPTION' },
+      payload: { slug: 'team', name: 'Team', kind: 'SUBSCRIPTION' },
     });
     await app.inject({
       method: 'PUT',
@@ -194,7 +197,7 @@ describe('Org-beneficiary billing', () => {
         method: 'POST',
         url: `/api/v1/tenant/applications/${appId}/plans`,
         headers: auth(),
-        payload: { slug, name: slug, amount: 0, kind: 'SUBSCRIPTION' },
+        payload: { slug, name: slug, kind: 'SUBSCRIPTION' },
       });
     }
     const personalPlan = await prisma.plan.findFirstOrThrow({ where: { applicationId: appId, slug: 'solo' } });

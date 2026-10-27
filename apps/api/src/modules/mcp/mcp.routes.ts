@@ -38,7 +38,23 @@ import {
 import { organizationsService } from '../organizations/organizations.service.js';
 import { AuthConfigSchema } from '@rekey.dev/shared-types';
 import { prisma } from '../../lib/prisma.js';
-import { sessionIssuedBefore } from '../../lib/session-stamp.js';
+import { unanchoredTokenEnded } from '../../lib/session-stamp.js';
+import { sessionBasis } from '../../lib/session-basis.js';
+
+const SIGN_IN_EXPIRED = 'Your sign-in expired. Sign in again to continue.';
+
+/** Thrown when the account's sessions were all ended between the form's sign-in and its code. */
+class SignInExpired extends Error {}
+const signInExpired = (): Error => new SignInExpired(SIGN_IN_EXPIRED);
+
+function sessionEndedSinceAdmitted(): RekeyError {
+  return new RekeyError({
+    statusCode: 401,
+    code: 'USER_TOKEN_INVALID',
+    message: 'This access token predates a password change, sign-out everywhere, or a revocation of every session.',
+    fix: 'Sign in again.',
+  });
+}
 import { hasScope } from './oidc.service.js';
 import { authRateLimit } from '../../lib/rate-limit.js';
 import { authService } from '../auth/auth.service.js';
@@ -88,15 +104,15 @@ const GrantBody = z.object({
 // ---------------------------------------------------------------------------
 
 const MCP_GATE_404 = {
-  404: 'MCP_NOT_FOUND — the Application does not exist, or `authConfig.mcpEnabled` is off.',
+  404: 'MCP_NOT_FOUND: the Application does not exist, or `authConfig.mcpEnabled` is off.',
 };
 const AUTH_SERVER_GATE_404 = {
   404:
-    'MCP_NOT_FOUND — the Application does not exist, or neither `authConfig.mcpEnabled` nor ' +
+    'MCP_NOT_FOUND: the Application does not exist, or neither `authConfig.mcpEnabled` nor ' +
     '`authConfig.oidcEnabled` is on.',
 };
 const OIDC_GATE_404 = {
-  404: 'OIDC_NOT_FOUND — the Application does not exist, or `authConfig.oidcEnabled` is off.',
+  404: 'OIDC_NOT_FOUND: the Application does not exist, or `authConfig.oidcEnabled` is off.',
 };
 
 /** RFC 9728 protected-resource metadata. No registered component covers this shape. */
@@ -566,7 +582,7 @@ button{flex:1;padding:.5625rem 1rem;border-radius:.375rem;border:0;cursor:pointe
         <button class="deny" type="submit" name="consent" value="deny">Deny</button>
       </div>
     </form>
-    <!-- The form works without this. It is a plain POST and always has been —
+    <!-- The form works without this. It is a plain POST and always has been:
          which is why the page must not depend on script to submit. All this
          adds is the acknowledgement a click deserves: the pressed button says
          what it is doing and both are disabled, so a slow round-trip does not
@@ -584,7 +600,7 @@ button{flex:1;padding:.5625rem 1rem;border-radius:.375rem;border:0;cursor:pointe
               buttons[i].textContent =
                 pressed.value === 'allow' ? 'Signing in\u2026' : 'Cancelling\u2026';
             }
-            // Disabled AFTER the value is read for submission — disabling a
+            // Disabled AFTER the value is read for submission: disabling a
             // submitter before the browser serialises the form drops its
             // name/value, and the consent value is what this page decides.
             setTimeout(function (b) {
@@ -927,12 +943,12 @@ export async function mcpRoutes(app: FastifyInstance): Promise<void> {
           201: { description: 'The registered public client.', ...ClientRegistrationResponse },
           ...errs({
             400:
-              'INVALID_REDIRECT_URI — a `redirect_uris` entry is not an https URL, an http(s) ' +
-              'loopback URL, or a well-formed custom scheme; or VALIDATION_ERROR — the body ' +
+              'INVALID_REDIRECT_URI: a `redirect_uris` entry is not an https URL, an http(s) ' +
+              'loopback URL, or a well-formed custom scheme; or VALIDATION_ERROR: the body ' +
               'failed schema validation.',
-            403: 'CLIENT_REGISTRATION_DISABLED — the operator has turned off dynamic client registration.',
+            403: 'CLIENT_REGISTRATION_DISABLED: the operator has turned off dynamic client registration.',
             ...AUTH_SERVER_GATE_404,
-            429: 'RATE_LIMITED — too many requests. Honour the `Retry-After` header.',
+            429: 'RATE_LIMITED: too many requests. Honour the `Retry-After` header.',
           }),
         },
       },
@@ -967,7 +983,7 @@ export async function mcpRoutes(app: FastifyInstance): Promise<void> {
       schema: {
         tags: ['MCP · OAuth'],
         security: [],
-        summary: 'Authorization endpoint — login + consent page',
+        summary: 'Authorization endpoint: login + consent page',
         description:
           'Renders an HTML sign-in + consent form for a browser. No Rekey credential, ' +
           'the end user authenticates by submitting the form below.',
@@ -981,8 +997,8 @@ export async function mcpRoutes(app: FastifyInstance): Promise<void> {
               '`error` (+ `state`).',
           },
           400: raw(
-            'Invalid authorization request, or unknown `client_id` / unregistered `redirect_uri` ' +
-              '— rendered as an HTML error page, not JSON (there is no validated redirect target ' +
+            'Invalid authorization request, or unknown `client_id` / unregistered `redirect_uri`. ' +
+              'Rendered as an HTML error page, not JSON (there is no validated redirect target ' +
               'to bounce the browser to yet).',
             'text/html',
           ),
@@ -1069,7 +1085,7 @@ export async function mcpRoutes(app: FastifyInstance): Promise<void> {
         response: {
           200: raw(
             'Consent was allowed but sign-in failed (bad credentials, MFA code required/wrong, ' +
-              'or MFA enrollment required) — the form is re-rendered with an inline error.',
+              'or MFA enrollment required). The form is re-rendered with an inline error.',
             'text/html',
           ),
           302: {
@@ -1079,13 +1095,13 @@ export async function mcpRoutes(app: FastifyInstance): Promise<void> {
               'was NOT "allow") cases, which redirect with `error` (+ `state`) instead.',
           },
           400: raw(
-            'Invalid authorization request, or unknown `client_id` / unregistered `redirect_uri` ' +
-              '— rendered as an HTML error page, not JSON.',
+            'Invalid authorization request, or unknown `client_id` / unregistered `redirect_uri`. ' +
+              'Rendered as an HTML error page, not JSON.',
             'text/html',
           ),
           ...errs({
             ...AUTH_SERVER_GATE_404,
-            429: 'RATE_LIMITED — too many requests. Honour the `Retry-After` header.',
+            429: 'RATE_LIMITED: too many requests. Honour the `Retry-After` header.',
           }),
         },
       },
@@ -1193,8 +1209,8 @@ export async function mcpRoutes(app: FastifyInstance): Promise<void> {
         // A password change or sign-out everywhere since the first step ends
         // the sign-in it proved, exactly as it ends a session. A ban placed in
         // between refuses here too, rather than only at code redemption.
-        if (!consent || !user || user.bannedAt || sessionIssuedBefore(consent, user.sessionsInvalidBefore)) {
-          return renderErr('Your sign-in expired. Sign in again to continue.');
+        if (!consent || !user || user.bannedAt || unanchoredTokenEnded(consent, user.sessionsInvalidBefore)) {
+          return renderErr(SIGN_IN_EXPIRED);
         }
         const options = await consentOrganizationChoices(application, user.id, granted);
         const picked = typeof body.organization === 'string' ? body.organization : 'personal';
@@ -1212,21 +1228,37 @@ export async function mcpRoutes(app: FastifyInstance): Promise<void> {
           }
           organizationId = picked;
         }
-        const code = await mcpOAuthService.createAuthCode({
-          applicationId: application.id,
-          clientId: client.id,
-          endUserId: user.id,
-          redirectUri: params.redirect_uri,
-          codeChallenge: params.code_challenge,
-          scope: granted,
-          nonce: params.nonce,
-          // The authentication is the first step's sign-in, not this click.
-          authTime: new Date(consent.iat * 1000),
-          organizationId,
-        });
+        let code: string;
+        try {
+          code = await mcpOAuthService.createAuthCode({
+            applicationId: application.id,
+            clientId: client.id,
+            endUserId: user.id,
+            redirectUri: params.redirect_uri,
+            codeChallenge: params.code_challenge,
+            scope: granted,
+            nonce: params.nonce,
+            // The authentication is the first step's sign-in, not this click.
+            authTime: new Date(consent.iat_ms),
+            organizationId,
+            // The stamp the consent was just checked against, a few lines up.
+            basis: sessionBasis(user, signInExpired),
+          });
+        } catch (err) {
+          if (err instanceof SignInExpired) return renderErr(SIGN_IN_EXPIRED);
+          throw err;
+        }
         return redirectWith({ code });
       }
 
+      // Read before the password is checked. If every session on the account
+      // is ended between here and the code below (the owner's sign-in link
+      // claims an account someone else registered), the stamp moves and the
+      // code is not written.
+      const beforeSignIn = await prisma.endUser.findUnique({
+        where: { applicationId_email: { applicationId: application.id, email: email.toLowerCase() } },
+        select: { sessionsInvalidBefore: true },
+      });
       let endUserId: string;
       try {
         const ua = req.headers['user-agent'];
@@ -1281,20 +1313,28 @@ export async function mcpRoutes(app: FastifyInstance): Promise<void> {
         );
       }
 
-      const code = await mcpOAuthService.createAuthCode({
-        applicationId: application.id,
-        clientId: client.id,
-        endUserId,
-        redirectUri: params.redirect_uri,
-        codeChallenge: params.code_challenge,
+      const signedInAt = new Date();
+      let code: string;
+      try {
+        code = await mcpOAuthService.createAuthCode({
+          basis: sessionBasis({ sessionsInvalidBefore: beforeSignIn?.sessionsInvalidBefore ?? null }, signInExpired),
+          applicationId: application.id,
+          clientId: client.id,
+          endUserId,
+          redirectUri: params.redirect_uri,
+          codeChallenge: params.code_challenge,
         // The GRANTED scope, not the requested one, everything downstream
         // (the access token, the ID Token, `/userinfo`, the refresh chain)
         // reads this row, so an unsupported scope must not survive past here.
         scope: granted,
         nonce: params.nonce,
-        // The sign-in above is the authentication event this code attests to.
-        authTime: new Date(),
-      });
+          // The sign-in above is the authentication event this code attests to.
+          authTime: signedInAt,
+        });
+      } catch (err) {
+        if (err instanceof SignInExpired) return renderErr(SIGN_IN_EXPIRED);
+        throw err;
+      }
       return redirectWith({ code });
     },
   );
@@ -1402,7 +1442,7 @@ export async function mcpRoutes(app: FastifyInstance): Promise<void> {
               '`:slug`, or the session is impersonated; ORGANIZATION_NOT_MEMBER / ' +
               'ORGANIZATION_ROLE_DISABLED: `organization_id` names an organization the end-user ' +
               'cannot act for.',
-            429: 'RATE_LIMITED — too many requests. Honour the `Retry-After` header.',
+            429: 'RATE_LIMITED: too many requests. Honour the `Retry-After` header.',
           }),
         },
       },
@@ -1427,6 +1467,9 @@ export async function mcpRoutes(app: FastifyInstance): Promise<void> {
         scope: granted,
         nonce: body.nonce,
         organizationId,
+        // The stamp the session middleware admitted this request's user token
+        // against: a session ended since cannot leave a code behind.
+        basis: { sessionsInvalidBefore: req.sessionStamp ?? null, refusal: sessionEndedSinceAdmitted },
         // The authentication this code attests to is the one that minted the
         // access token presented above, not this call. We do not know when
         // that happened, so `auth_time` is the moment we last SAW proof of it
@@ -1558,7 +1601,7 @@ export async function mcpRoutes(app: FastifyInstance): Promise<void> {
       schema: {
         tags: ['MCP · OAuth'],
         security: [],
-        summary: 'Token endpoint (RFC 6749 — authorization_code + refresh_token)',
+        summary: 'Token endpoint (RFC 6749: authorization_code + refresh_token)',
         description:
           'No Rekey credential and no client secret: clients here are public and prove ' +
           'themselves with PKCE. The `code` + `code_verifier` (or `refresh_token`) in the ' +
@@ -1568,12 +1611,12 @@ export async function mcpRoutes(app: FastifyInstance): Promise<void> {
         response: {
           200: { description: 'Tokens issued.', ...TokenResponse },
           400: oauthError(
-            'invalid_request — a required parameter is missing; invalid_grant — the code/PKCE ' +
+            'invalid_request: a required parameter is missing; invalid_grant: the code/PKCE ' +
               'verifier/refresh_token is invalid, expired, already used, erased, or not valid for ' +
-              'this client; or unsupported_grant_type — `grant_type` is neither ' +
+              'this client; or unsupported_grant_type: `grant_type` is neither ' +
               '`authorization_code` nor `refresh_token`.',
           ),
-          401: oauthError('invalid_client — unknown `client_id`.'),
+          401: oauthError('invalid_client: unknown `client_id`.'),
           500: {
             description: 'server_error, an unexpected failure. Logged; `error_description` is omitted.',
             type: 'object',
@@ -1582,7 +1625,7 @@ export async function mcpRoutes(app: FastifyInstance): Promise<void> {
           },
           ...errs({
             ...AUTH_SERVER_GATE_404,
-            429: 'RATE_LIMITED — too many requests. Honour the `Retry-After` header.',
+            429: 'RATE_LIMITED: too many requests. Honour the `Retry-After` header.',
           }),
         },
       },
@@ -1659,12 +1702,12 @@ export async function mcpRoutes(app: FastifyInstance): Promise<void> {
         response: {
           200: { description: 'Token state (RFC 7662).', ...ref('OAuthIntrospectionResponse') },
           401: oauthError(
-            "invalid_client — the Authorization header is missing this Application's secret key, " +
+            "invalid_client: the Authorization header is missing this Application's secret key, " +
               'or the key belongs to a different Application.',
           ),
           ...errs({
             ...AUTH_SERVER_GATE_404,
-            429: 'RATE_LIMITED — too many requests. Honour the `Retry-After` header.',
+            429: 'RATE_LIMITED: too many requests. Honour the `Retry-After` header.',
           }),
         },
       },
@@ -1715,11 +1758,11 @@ export async function mcpRoutes(app: FastifyInstance): Promise<void> {
         response: {
           200: { description: 'Identity claims.', ...UserInfoClaims },
           401: oauthError(
-            'invalid_token — the bearer token is missing, malformed, expired, revoked ' +
+            'invalid_token: the bearer token is missing, malformed, expired, revoked ' +
               '(token generation bumped), issued by a different Application, or its subject ' +
               'has been erased or (with `requireEmailVerification`) is unverified.',
           ),
-          403: oauthError('insufficient_scope — the access token was not granted the `openid` scope.'),
+          403: oauthError('insufficient_scope: the access token was not granted the `openid` scope.'),
           ...errs(OIDC_GATE_404),
         },
       },
@@ -1786,12 +1829,12 @@ export async function mcpRoutes(app: FastifyInstance): Promise<void> {
               'The request body contained only JSON-RPC notifications (no `id`), accepted, no reply body.',
           },
           401: oauthError(
-            'invalid_token — the bearer token is missing, malformed, expired, revoked (token ' +
+            'invalid_token: the bearer token is missing, malformed, expired, revoked (token ' +
               'generation bumped), issued for a different Application, or its end-user has ' +
               'since been erased or (with `requireEmailVerification`) is unverified.',
           ),
           403: oauthError(
-            'insufficient_scope — the access token is valid but was not granted the `mcp:account` ' +
+            'insufficient_scope: the access token is valid but was not granted the `mcp:account` ' +
               'scope (e.g. an OIDC sign-in-only token).',
           ),
           ...errs(MCP_GATE_404),
@@ -1879,12 +1922,12 @@ export async function mcpRoutes(app: FastifyInstance): Promise<void> {
       schema: {
         tags: ['MCP'],
         security: [],
-        summary: 'MCP endpoint — use POST (JSON-RPC)',
+        summary: 'MCP endpoint. Use POST (JSON-RPC)',
         description:
           'Always 405 with `Allow: POST`. Checks no credential, because it never does any ' +
           'work, it exists so a GET-typer sees the method violation instead of a 404.',
         response: {
-          405: oauthError('method_not_allowed — use POST for MCP JSON-RPC.'),
+          405: oauthError('method_not_allowed: use POST for MCP JSON-RPC.'),
           ...errs(MCP_GATE_404),
         },
       },

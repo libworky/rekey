@@ -57,9 +57,9 @@ export default async function OnboardingPage({
     getApplication(id),
     api<{ fields: ProfileField[]; version: number }>({ method: 'GET', path: schemaPath(id) }),
   ]);
-  const scopes = app.access?.scopes ?? null;
+  const scopes = app.access.scopes;
   const canWrite = hasScope(scopes, 'end-users:write');
-  const showCounts = hasScope(scopes, 'overview:read') && app.reportingTimezone !== undefined;
+  const showCounts = hasScope(scopes, 'overview:read');
   const fields = schema.fields;
   const required = fields.filter((f) => f.requiredForOnboarding).length;
   const snippets = onboardingSnippets(fields);
@@ -100,7 +100,7 @@ export default async function OnboardingPage({
         {sp.saved === '1' && <SavedBanner message="Questions saved." />}
         {error && (
           <Banner tone="error">
-            <ApiErrorText code={error} detail={errorDetail} fix={errorFix} map={ERR} fallback={error} />
+            <ApiErrorText code={error} detail={errorDetail} fix={errorFix} map={ERR} />
           </Banner>
         )}
         {!canWrite && (

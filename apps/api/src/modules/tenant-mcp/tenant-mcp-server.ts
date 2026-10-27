@@ -12,11 +12,25 @@ import { type Scope } from '../../lib/operator-scopes.js';
 import { isWorkspaceAdmin } from '../../lib/access-context.js';
 import { recordSecurityEvent } from '../../lib/security-events.js';
 import { RekeyError } from '../../lib/error.js';
+import { adminTierRequired } from './admin-tier.js';
 import { effectiveToolScopes, operatorTools, type OperatorTool, type OperatorToolContext } from './operator-tools.js';
 import { operatorWriteTools } from './operator-write-tools.js';
 import { operatorOrganizationTools } from './operator-organization-tools.js';
 import { operatorContactTools } from './operator-contact-tools.js';
+import { operatorListTools } from './operator-list-tools.js';
+import { operatorProfileTools } from './operator-profile-tools.js';
 import { operatorAnalyticsTools } from './operator-analytics-tools.js';
+import { operatorPlanPriceTools } from './operator-plan-price-tools.js';
+import { operatorSupportTools } from './operator-support-tools.js';
+import { operatorBillingLogTools } from './operator-billing-log-tools.js';
+import { operatorPlanTools } from './operator-plan-tools.js';
+import { operatorCouponTools } from './operator-coupon-tools.js';
+import { operatorBillingReadTools } from './operator-billing-read-tools.js';
+import { operatorBillingWriteTools } from './operator-billing-write-tools.js';
+import { operatorEndUserReadTools } from './operator-end-user-read-tools.js';
+import { operatorWebhookReadTools } from './operator-webhook-read-tools.js';
+import { operatorMemberReadTools } from './operator-member-read-tools.js';
+import { assertOperatorVerifiedForCredential } from '../tenant-auth/operator-confirmation.js';
 
 const PROTOCOL_VERSION = '2025-06-18';
 const SERVER_INFO = { name: 'rekey-operator', version: '1.0.0' };
@@ -27,7 +41,19 @@ export const allOperatorTools: readonly OperatorTool[] = [
   ...operatorWriteTools,
   ...operatorOrganizationTools,
   ...operatorContactTools,
+  ...operatorListTools,
+  ...operatorProfileTools,
   ...operatorAnalyticsTools,
+  ...operatorPlanPriceTools,
+  ...operatorSupportTools,
+  ...operatorBillingLogTools,
+  ...operatorPlanTools,
+  ...operatorCouponTools,
+  ...operatorBillingReadTools,
+  ...operatorBillingWriteTools,
+  ...operatorEndUserReadTools,
+  ...operatorWebhookReadTools,
+  ...operatorMemberReadTools,
 ];
 
 /**
@@ -43,11 +69,31 @@ export const TOOL_SCOPES: Readonly<Record<string, Scope>> = {
   get_user_analytics: 'overview:read',
   recent_payments: 'billing:read',
   recent_subscriptions: 'billing:read',
+  recent_billing_events: 'billing:read',
+  preview_checkout_routing: 'billing:read',
+  list_price_fallbacks: 'billing:read',
+  get_billing_reconciliation: 'billing:read',
+  get_payment: 'billing:read',
+  list_payment_refunds: 'billing:read',
+  get_reporting_currency: 'billing:read',
+  get_billing_stats: 'billing:read',
+  list_licenses: 'billing:read',
+  list_subscription_imports: 'billing:read',
+  list_unapplied_payments: 'billing:read',
+  get_dunning_status: 'billing:read',
+  get_end_user_credits: 'billing:read',
+  list_coupons: 'billing:read',
+  create_coupon: 'billing:write',
+  update_coupon: 'billing:write',
+  set_reporting_currency: 'billing:write',
+  create_refund: 'billing:write',
   cancel_subscription: 'billing:write',
   configure_billing_provider: 'billing:write',
   list_plans: 'billing:read',
   create_plan: 'billing:write',
   update_plan: 'billing:write',
+  set_plan_price: 'billing:write',
+  remove_plan_price: 'billing:write',
   set_plan_active: 'billing:write',
   register_plan_with_provider: 'billing:write',
   list_plan_entitlements: 'billing:read',
@@ -57,26 +103,43 @@ export const TOOL_SCOPES: Readonly<Record<string, Scope>> = {
   recent_security_events: 'activity:read',
   recent_webhook_events: 'developer:read',
   recent_failed_webhook_deliveries: 'developer:read',
+  list_webhook_deliveries: 'developer:read',
   create_webhook_endpoint: 'developer:write',
   update_webhook_endpoint: 'developer:write',
   list_api_keys: 'developer:read',
   revoke_api_key: 'developer:write',
   mint_api_key: 'developer:write',
   get_end_user: 'end-users:read',
+  list_end_users: 'end-users:read',
   list_devices: 'end-users:read',
   release_device: 'end-users:write',
   block_device: 'end-users:write',
   unblock_device: 'end-users:write',
+  list_support_cases: 'end-users:read',
+  close_support_case: 'end-users:write',
   list_organization_roles: 'organizations:read',
   create_organization_role: 'organizations:write',
   update_organization_role: 'organizations:write',
   delete_organization_role: 'organizations:write',
   list_organizations: 'organizations:read',
+  get_organization: 'organizations:read',
   add_organization_member: 'organizations:write',
   set_organization_member_role: 'organizations:write',
   update_auth_config: 'auth-config:write',
   list_contact_lists: 'audience:read',
   get_contact_list_stats: 'audience:read',
+  create_contact_list: 'audience:write',
+  update_contact_list: 'audience:write',
+  archive_contact_list: 'audience:write',
+  restore_contact_list: 'audience:write',
+  list_list_members: 'audience:read',
+  list_list_submissions: 'audience:read',
+  unsubscribe_list_member: 'audience:write',
+  get_profile_schema: 'end-users:read',
+  set_profile_schema: 'end-users:write',
+  update_end_user_profile: 'end-users:write',
+  complete_onboarding: 'end-users:write',
+  skip_onboarding: 'end-users:write',
 };
 
 /** Tools that are workspace-level floors: role-gated, scoped by nothing. */
@@ -84,6 +147,7 @@ export const WORKSPACE_TOOLS: ReadonlySet<string> = new Set([
   'list_applications',
   'list_members',
   'list_invitations',
+  'list_member_grants',
   'invite_member',
   'revoke_invitation',
   'change_member_role',
@@ -148,6 +212,20 @@ function error(id: string | number | null, code: number, message: string): objec
   return { jsonrpc: '2.0', id, error: { code, message } };
 }
 
+/** A RekeyError keeps its code and fix, so an agent gets the same remediation a REST caller does. */
+function toolError(id: string | number | null, e: unknown): object {
+  const body =
+    e instanceof RekeyError
+      ? {
+          error: e.message,
+          code: e.code,
+          ...(e.fix !== undefined && { fix: e.fix }),
+          ...(e.details !== undefined && { details: e.details }),
+        }
+      : { error: (e as Error).message };
+  return result(id, { content: [{ type: 'text', text: JSON.stringify(body) }], isError: true });
+}
+
 /**
  * Handle a single JSON-RPC message. Returns the response object, or `null` for
  * notifications (no `id`) which get no reply.
@@ -199,11 +277,9 @@ export async function handleOperatorMcpMessage(
       // scope (or with an insufficient role) gets an explicit, non-leaky
       // refusal rather than the tool silently running.
       if (!toolAllowed(ctx, tool)) {
+        if (tool.admin && !ctx.canAdmin) return toolError(id, adminTierRequired('This tool'));
         let reason: string;
-        if (tool.admin && !ctx.canAdmin) {
-          reason =
-            'This tool requires admin access (destructive/financial). Re-authorize the connector with the "mcp:operator:admin" scope.';
-        } else if (tool.write && !ctx.canWrite) {
+        if (tool.write && !ctx.canWrite) {
           reason =
             'This tool requires write access. Re-authorize the connector with the "mcp:operator:write" scope (or use a PAT with the "applications:write" scope).';
         } else if (TOOL_SCOPES[tool.name] !== undefined && !effectiveToolScopes(ctx).has(TOOL_SCOPES[tool.name]!)) {
@@ -248,19 +324,13 @@ export async function handleOperatorMcpMessage(
       });
 
       try {
+        if (tool.confirmedOperatorOnly !== undefined) {
+          await assertOperatorVerifiedForCredential(ctx.tenantUserId, tool.confirmedOperatorOnly);
+        }
         const data = await tool.handler(ctx, args);
         return result(id, { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] });
       } catch (e) {
-        // A RekeyError keeps its code and fix, so an agent gets the same
-        // remediation a REST caller does instead of the prose alone.
-        const body =
-          e instanceof RekeyError
-            ? { error: e.message, code: e.code, ...(e.fix !== undefined && { fix: e.fix }) }
-            : { error: (e as Error).message };
-        return result(id, {
-          content: [{ type: 'text', text: JSON.stringify(body) }],
-          isError: true,
-        });
+        return toolError(id, e);
       }
     }
 

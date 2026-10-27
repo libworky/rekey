@@ -1,5 +1,5 @@
 /**
- * Users > Overview: who uses this application, how often, and how they got
+ * Users > Insights: who uses this application, how often, and how they got
  * here. Aggregates only; per-person detail stays on End-users.
  *
  * Two API calls, in parallel, each behind its own Suspense boundary so the
@@ -30,7 +30,7 @@ import { KpiRow, ActivitySection } from './top-sections';
 import { RestSkeleton, TopSkeleton } from './skeletons';
 import { MixSection, MoneySections, OnboardingSection, PeopleLinks, RetentionSection, SecuritySection } from './rest-sections';
 
-export default async function UsersOverviewPage({
+export default async function UsersInsightsPage({
   params,
   searchParams,
 }: {
@@ -40,13 +40,13 @@ export default async function UsersOverviewPage({
   const { id } = await params;
   const sp = await searchParams;
   const app = await getApplication(id);
-  const scopes = app.access?.scopes ?? null;
+  const scopes = app.access.scopes;
 
   if (!hasScope(scopes, 'overview:read')) {
     return (
       <EmptyState
         variant="inline"
-        title="Users overview is not visible to your role"
+        title="User insights are not visible to your role"
         description="It needs the Overview scope on this application. End-users is still open to you if your access includes it."
       />
     );
@@ -58,7 +58,7 @@ export default async function UsersOverviewPage({
   return (
     <div className="space-y-5">
       <SectionHeader
-        title="Users overview"
+        title="User insights"
         description="How many people use this application, how often they come back, and how they got here."
       />
       <FilterBar
@@ -102,24 +102,6 @@ async function TopHalf({
   endUsersHref: string | null;
 }): Promise<React.JSX.Element> {
   const result = await getUsersAnalytics(appId, filters, TOP_SECTIONS);
-  if (result.kind === 'not_served') {
-    return (
-      <EmptyState
-        title="This API does not serve the Users overview yet"
-        description="The panel is newer than the API it talks to. Upgrade the API to the same release; until then, End-users has the per-person view."
-        action={
-          endUsersHref ? (
-            <Link
-              href={endUsersHref}
-              className="rounded-md bg-[var(--color-primary)] px-3 py-2 text-sm font-medium text-[var(--color-primary-fg)] hover:bg-[var(--color-primary-hover)]"
-            >
-              Open End-users
-            </Link>
-          ) : undefined
-        }
-      />
-    );
-  }
   if (result.kind === 'refused') {
     return (
       <Banner tone="error">
@@ -209,8 +191,6 @@ async function RestHalf({
   };
   const wanted = REST_SECTIONS.filter(allowed);
   const result = await getUsersAnalytics(appId, filters, wanted, view.field);
-  // The top half already explains an older API.
-  if (result.kind === 'not_served') return null;
   if (result.kind === 'refused') {
     return (
       <Banner tone="error">

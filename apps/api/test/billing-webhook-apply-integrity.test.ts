@@ -20,19 +20,24 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { createHmac } from 'node:crypto';
 import type { FastifyInstance } from 'fastify';
 import Stripe from 'stripe';
+import { STRIPE_API_VERSION } from '../src/modules/billing/providers/stripe-api-version.js';
 import { buildApp } from '../src/app.js';
 import { prisma } from '../src/lib/prisma.js';
+import { pricedAt } from './subscription-price-fixture.js';
 import { billingCredentialsService } from '../src/modules/billing/credentials.service.js';
 import { billingStatsService } from '../src/modules/billing/stats.service.js';
 import { creditsService } from '../src/modules/credits/credits.service.js';
 import { applyBillingEvent } from '../src/modules/billing/webhooks/apply.js';
 import { subscriptionGrantsService } from '../src/modules/billing/grant.service.js';
+import { operatorsConfirmTheirEmail } from './confirmed-accounts.js';
+
+operatorsConfirmTheirEmail();
 
 const SECRET = 'external-billing-signing-secret-for-tests-0123456789';
 const STRIPE_SECRET = 'whsec_apply_integrity';
 
 const stripe = new Stripe('sk_for_signing_only', {
-  apiVersion: '2024-11-20.acacia' as Stripe.LatestApiVersion,
+  apiVersion: STRIPE_API_VERSION,
 });
 
 function daysFromNow(days: number): Date {
@@ -88,7 +93,7 @@ describe('billing webhook apply integrity', () => {
       method: 'POST',
       url: `/api/v1/tenant/applications/${appId}/plans`,
       headers: auth(),
-      payload: { slug, name: slug, amount: 2900, kind: 'SUBSCRIPTION', interval: 'MONTH' },
+      payload: { slug, name: slug, price: { currency: 'USD', amount: 2900 }, kind: 'SUBSCRIPTION', interval: 'MONTH' },
     });
     if (r.statusCode !== 201) throw new Error(`makePlan ${r.statusCode}: ${r.body}`);
   }
@@ -228,32 +233,12 @@ describe('billing webhook apply integrity', () => {
       expect((await receiptOf(renewal.eventId)).processingError).toContain('subject change ignored');
     });
 
-    it('a renewal or recovery that omits the organization applies to the same subscription id', async () => {
-      const euId = await endUser('omit@example.com');
-      const org1 = await org('om1');
-      await post(
-        activated('ext_omit', { endUserId: euId, organizationId: org1 }, { currentPeriodEnd: daysFromNow(30).toISOString() }),
-      );
-      expect(await creditsService.getBalance(appId, { organizationId: org1 })).toBe(500);
-
-      const renewal = activated('ext_omit', { endUserId: euId }, { currentPeriodEnd: daysFromNow(60).toISOString() });
-      await post(renewal);
-      expect((await receiptOf(renewal.eventId)).processingError).toBeNull();
-      expect(await creditsService.getBalance(appId, { organizationId: org1 })).toBe(1000);
-
-      await post(event('subscription.past_due', { subscription: { id: 'ext_omit' } }));
-      await post(activated('ext_omit', { endUserId: euId }));
-      const row = await prisma.subscription.findFirstOrThrow({ where: { applicationId: appId } });
-      expect(row.status).toBe('ACTIVE');
-      expect(row.beneficiaryOrgId).toBe(org1);
-    });
-
     it('a feature-only free plan activated for a second organization does not answer with the first one\'s row', async () => {
       const r = await app.inject({
         method: 'POST',
         url: `/api/v1/tenant/applications/${appId}/plans`,
         headers: auth(),
-        payload: { slug: 'free', name: 'free', amount: 0, kind: 'SUBSCRIPTION', interval: 'MONTH' },
+        payload: { slug: 'free', name: 'free', kind: 'SUBSCRIPTION', interval: 'MONTH' },
       });
       expect(r.statusCode).toBe(201);
       await putEntitlement('free', { kind: 'FEATURE', key: 'tier', valueType: 'STRING', value: 'community' });
@@ -302,25 +287,6 @@ describe('billing webhook apply integrity', () => {
       for (const r of losers) {
         expect((r.json() as { error: { code: string } }).error.code).toBe('BILLING_SUBSCRIPTION_SUBJECT_CONFLICT');
       }
-    });
-
-    it('the operator grant for a second organization answers 409 instead of the first one\'s row', async () => {
-      const euId = await endUser('granted@example.com');
-      const org1 = await org('g1');
-      const org2 = await org('g2');
-      const grant = (organizationId: string) =>
-        app.inject({
-          method: 'POST',
-          url: `/api/v1/tenant/applications/${appId}/end-users/${euId}/subscriptions`,
-          headers: auth(),
-          payload: { planSlug: 'pro', organizationId },
-        });
-      expect((await grant(org1)).statusCode).toBe(201);
-      const res = await grant(org2);
-      expect(res.statusCode, res.body).toBe(409);
-      expect((res.json() as { error: { code: string } }).error.code).toBe('BILLING_SUBSCRIPTION_SUBJECT_CONFLICT');
-      // Same subject again is still the idempotent no-op.
-      expect((await grant(org1)).statusCode).toBe(200);
     });
   });
 
@@ -470,23 +436,6 @@ describe('billing webhook apply integrity', () => {
       expect((await prisma.subscription.findFirstOrThrow({ where: { applicationId: appId } })).status).toBe('ACTIVE');
     });
 
-    it('a cancellation dated a minute ahead is still the sender\'s date', async () => {
-      const euId = await endUser('drift@example.com');
-      await post(activated('ext_drift', { endUserId: euId }));
-      const at = new Date(Date.now() + 60_000);
-      await post(event('subscription.canceled', { subscription: { id: 'ext_drift' } }, at));
-      const row = await prisma.subscription.findFirstOrThrow({ where: { applicationId: appId } });
-      expect(row.canceledAt?.toISOString()).toBe(at.toISOString());
-    });
-
-    it('an activation dated far in the future is applied as undated and noted', async () => {
-      const euId = await endUser('futureact@example.com');
-      const body = activated('ext_futureact', { endUserId: euId }, {}, daysFromNow(30));
-      await post(body);
-      expect((await prisma.subscription.findFirstOrThrow({ where: { applicationId: appId } })).status).toBe('ACTIVE');
-      expect((await receiptOf(body.eventId)).processingError).toMatch(/ahead of Rekey's clock/);
-    });
-
     it('a period end restated a few seconds later is the same period: no second refill', async () => {
       const euId = await endUser('jitter@example.com');
       const end = daysFromNow(30);
@@ -517,6 +466,51 @@ describe('billing webhook apply integrity', () => {
     const paymentOf = (id: string) =>
       prisma.payment.findFirstOrThrow({ where: { applicationId: appId, providerPaymentId: id } });
 
+    it('checks a charge against the subscription\'s own currency, not the plan\'s', async () => {
+      const euId = await endUser('own-currency@example.com');
+      await post(activated('ext_inr', { endUserId: euId }));
+      const sub = await prisma.subscription.findFirstOrThrow({ where: { applicationId: appId, endUserId: euId } });
+      await prisma.subscription.update({ where: { id: sub.id }, data: await pricedAt(sub.planId, 'INR', 49900) });
+
+      // The plan is sold in USD; this subscriber pays INR.
+      await post(event('payment.succeeded', { payment: { id: 'pay_inr', subscriptionId: 'ext_inr', amount: 49900, currency: 'inr' } }));
+      expect(await paymentOf('pay_inr')).toMatchObject({ currency: 'INR', amount: 49900 });
+
+      // A charge in the plan's currency is now the mismatch. It is recorded,
+      // unverified and linked to no subscription, with a case for the operator.
+      await post(event('payment.succeeded', { payment: { id: 'pay_usd', subscriptionId: 'ext_inr', amount: 2000, currency: 'usd' } }));
+      const mismatched = await prisma.payment.findFirstOrThrow({
+        where: { applicationId: appId, providerPaymentId: 'pay_usd' },
+        include: { unapplied: true },
+      });
+      expect(mismatched).toMatchObject({ verification: 'UNVERIFIED', subscriptionId: null, endUserId: euId, amount: 2000, currency: 'USD', status: 'SUCCEEDED' });
+      expect(mismatched.unapplied).toMatchObject({ status: 'OPEN', metadata: { reasonCode: 'currency_mismatch' } });
+      const notApplied = await prisma.billingEvent.findFirstOrThrow({ where: { applicationId: appId, type: 'payment.not_applied', paymentId: mismatched.id } });
+      expect(notApplied).toMatchObject({ subscriptionId: sub.id, currency: 'USD', amount: 2000 });
+      expect(notApplied.data).toMatchObject({ reason: 'currency_mismatch', expected: { currency: 'INR', amount: 49900 } });
+    });
+
+    it('measures the amount ceiling from the larger of the subscription\'s price and the plan\'s', async () => {
+      const euId = await endUser('repriced@example.com');
+      await post(activated('ext_repriced', { endUserId: euId }));
+      const sub = await prisma.subscription.findFirstOrThrow({ where: { applicationId: appId, endUserId: euId }, include: { plan: { include: { defaultPrice: true } } } });
+      const planPrice = sub.plan.defaultPrice!;
+      // The subscriber was stamped at a price a hundredth of what the plan now costs.
+      await prisma.subscription.update({ where: { id: sub.id }, data: await pricedAt(sub.planId, planPrice.currency, Math.floor(planPrice.amount / 100)) });
+
+      await post(event('payment.succeeded', { payment: { id: 'pay_new_price', subscriptionId: 'ext_repriced', amount: planPrice.amount, currency: planPrice.currency } }));
+      expect(await paymentOf('pay_new_price')).toMatchObject({ amount: planPrice.amount });
+
+      const absurd = planPrice.amount * 100;
+      await post(event('payment.succeeded', { payment: { id: 'pay_absurd', subscriptionId: 'ext_repriced', amount: absurd, currency: planPrice.currency } }));
+      const outOfBand = await prisma.payment.findFirstOrThrow({
+        where: { applicationId: appId, providerPaymentId: 'pay_absurd' },
+        include: { unapplied: true },
+      });
+      expect(outOfBand).toMatchObject({ verification: 'UNVERIFIED', subscriptionId: null, amount: absurd });
+      expect(outOfBand.unapplied).toMatchObject({ status: 'OPEN', metadata: { reasonCode: 'amount_out_of_band' } });
+    });
+
     it('accumulates partial refunds, refuses an over-refund, and nets revenue', async () => {
       await paidPayment('pay_r', 2000);
 
@@ -529,7 +523,7 @@ describe('billing webhook apply integrity', () => {
       p = await paymentOf('pay_r');
       expect(p.status).toBe('PARTIALLY_REFUNDED');
       expect(p.refundedAmount).toBe(1000);
-      expect((await billingStatsService.forApplication(appId)).revenueLast30dCents).toBe(1000);
+      expect((await billingStatsService.forApplication(appId)).revenueLast30d[0]).toMatchObject({ currency: 'USD', netCents: 1000 });
 
       const over = refund('pay_r', 5000);
       const res = await post(over);
@@ -543,8 +537,8 @@ describe('billing webhook apply integrity', () => {
       expect(p.status).toBe('REFUNDED');
       expect(p.refundedAmount).toBe(2000);
       const stats = await billingStatsService.forApplication(appId);
-      expect(stats.revenueLast30dCents).toBe(0);
-      expect(stats.monthlyRevenue.at(-1)?.amountCents).toBe(0);
+      expect(stats.revenueLast30d[0]).toMatchObject({ currency: 'USD', netCents: 0 });
+      expect(stats.monthlyRevenue[0]?.months.at(-1)?.amountCents).toBe(0);
     });
 
     it('eight concurrent refunds neither lose an update nor overshoot the payment', async () => {

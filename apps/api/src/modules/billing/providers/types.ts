@@ -15,7 +15,28 @@
  * from `test/fakes/billing-providers.ts`.
  */
 
-import type { Plan, EndUser, Subscription } from '@prisma/client';
+import type { Plan, EndUser, Prisma, Subscription } from '@prisma/client';
+
+/**
+ * A plan as one checkout charges it: `amount` and `currency` are the price
+ * selected, taken from the `PlanPrice` row `planPriceId` names. A plan row holds no
+ * price of its own.
+ *
+ * `registration` is the metadata object holding THAT price's provider ids
+ * (`stripe.priceId`, `paypal.planId`, `razorpay.planId`). Adapters read
+ * provider ids from it and never from `metadata`. Build one with `pricedPlan`
+ * in `billing/priced-plan.ts`.
+ */
+export type PricedPlan = Plan & {
+  /** Minor units of `currency`. 0 for a plan with no flat price. */
+  amount: number;
+  currency: string;
+  /** The price row charged. Null only for a plan with no flat price. */
+  planPriceId: string | null;
+  /** Whether that row is the plan's default price. */
+  isDefaultPrice: boolean;
+  registration: Prisma.JsonValue;
+};
 
 /** A provider-side identifier (Stripe `price_*`, PayPal plan id, etc.). */
 export interface ProviderPlanRef {
@@ -55,7 +76,7 @@ export interface CheckoutDiscount {
 export interface CheckoutSessionInput {
   application: { id: string; slug: string };
   endUser: EndUser;
-  plan: Plan;
+  plan: PricedPlan;
   /** Where the customer's site wants the user sent on success / cancellation. */
   successUrl: string;
   cancelUrl: string;
@@ -89,7 +110,7 @@ export interface EmbeddedCheckoutInput extends CheckoutSessionInput {
 }
 
 /** Browser configuration the page needs for PayPal's subscription Buttons. */
-export interface PaypalEmbeddedClient {
+export interface PaypalEmbeddedSubscriptionClient {
   provider: 'paypal';
   /** Public by design: PayPal's JS SDK takes it in the script URL. */
   clientId: string;
@@ -97,15 +118,95 @@ export interface PaypalEmbeddedClient {
   sdk: 'v5-subscription';
 }
 
+/** Browser configuration the page needs for PayPal's one-time order Buttons. */
+export interface PaypalEmbeddedOrderClient {
+  provider: 'paypal';
+  /** Public by design: PayPal's JS SDK takes it in the script URL. */
+  clientId: string;
+  orderId: string;
+  sdk: 'v5-order';
+  /** PayPal's script is loaded per currency for orders. */
+  currency: string;
+}
+
+export type PaypalEmbeddedClient = PaypalEmbeddedSubscriptionClient | PaypalEmbeddedOrderClient;
+
+/** Browser configuration the page needs to open Razorpay's Standard Checkout modal. */
+export interface RazorpayEmbeddedClient {
+  provider: 'razorpay';
+  /** Public by design: checkout.js takes it as `key`. */
+  keyId: string;
+  sdk: 'razorpay-checkout';
+  target: { kind: 'subscription'; subscriptionId: string } | { kind: 'order'; orderId: string };
+}
+
+/**
+ * Browser configuration for Stripe's Payment Element on a Checkout Session in
+ * `ui_mode: 'elements'`. The client secret belongs to this one session and is
+ * meant for the browser; the secret key never leaves the server.
+ */
+export interface StripeEmbeddedClient {
+  provider: 'stripe';
+  /** The Application's `pk_test_` / `pk_live_` key, matching the secret key's mode. */
+  publishableKey: string;
+  clientSecret: string;
+  sdk: 'elements';
+}
+
 export interface EmbeddedCheckoutResult {
   /** Same meaning as `CheckoutSessionResult.sessionId`, persisted to the Subscription. */
   sessionId: string;
   /** Everything here is sent to the buyer's browser, so it must never hold a secret. */
-  client: PaypalEmbeddedClient;
-  /** The provider's own hosted page for this same session, for the page's fallback link. */
-  fallbackUrl: string;
-  /** Provider-side plan id the session was created against, checked again on confirmation. */
-  providerPlanId: string;
+  client: PaypalEmbeddedClient | RazorpayEmbeddedClient | StripeEmbeddedClient;
+  /**
+   * The provider's own hosted page for this same session, for the page's
+   * fallback link. Null when the provider has none until asked for one
+   * (Stripe, see `createHostedFallback`).
+   */
+  fallbackUrl: string | null;
+  /**
+   * Provider-side plan id the session was created against, checked again on
+   * confirmation. Null for a one-time order, which has no provider plan.
+   */
+  providerPlanId: string | null;
+}
+
+/** A provider's own account of one Checkout Session, for checking a browser's "paid". */
+export interface ProviderCheckoutSessionSnapshot {
+  id: string;
+  /** Stripe's `open`, `complete` or `expired`. */
+  status: string;
+  /** Stripe's `paid`, `unpaid` or `no_payment_required`. */
+  paymentStatus: string;
+  /** What Rekey stamped at creation: `${applicationId}:${endUserId}`. */
+  clientReferenceId: string | null;
+  metadata: { applicationId: string | null; endUserId: string | null; planId: string | null };
+  /** What the session charges today, smallest currency unit; null when Stripe gives none. */
+  amountTotal: number | null;
+  /** Upper-case ISO 4217 code, or null alongside a null amount. */
+  currency: string | null;
+  /** The hosted page, for a hosted session; null for an elements one. */
+  url: string | null;
+}
+
+/**
+ * Replace an embedded session that has no hosted page of its own with the
+ * provider's hosted page for the same purchase. The embedded session is
+ * closed first, so the buyer can never hold two payable sessions.
+ */
+export interface HostedFallbackInput extends CheckoutSessionInput {
+  kind: 'recurring' | 'one_time';
+  /** The embedded session being replaced. */
+  embeddedSessionId: string;
+  /** Same for every attempt at one replacement, so a retry returns the same hosted session. */
+  idempotencyKey: string;
+  /**
+   * The price the embedded session was created against (recurring), so the
+   * hosted one charges the same even if the plan was re-priced since.
+   */
+  priceId: string | null;
+  /** When the Rekey checkout expires; the hosted session must not outlive it. */
+  expiresAt: Date;
 }
 
 /** A provider's own account of one subscription, for checking a browser's "approved". */
@@ -116,6 +217,30 @@ export interface ProviderSubscriptionSnapshot {
   planId: string | null;
   /** What Rekey stamped at creation: `${applicationId}:${endUserId}`. */
   customId: string | null;
+}
+
+/** A provider's own account of one one-time order, for checking a browser's "approved". */
+export interface ProviderOrderSnapshot {
+  id: string;
+  /** The provider's status string, e.g. PayPal `CREATED`, `APPROVED`, `COMPLETED`. */
+  status: string;
+  /** What Rekey stamped at creation: `${applicationId}:${endUserId}`. */
+  customId: string | null;
+  /** Smallest currency unit, or null when the provider's record has no single readable amount. */
+  amount: number | null;
+  /** Upper-case ISO 4217 code, or null alongside a null amount. */
+  currency: string | null;
+}
+
+/** A provider's own account of one payment, for checking a browser's "paid". */
+export interface ProviderPaymentSnapshot {
+  id: string;
+  /** The provider's status string, e.g. Razorpay `authorized`, `captured`, `failed`. */
+  status: string;
+  orderId: string | null;
+  /** Smallest currency unit. */
+  amount: number;
+  currency: string;
 }
 
 export interface CancelSubscriptionInput {
@@ -242,6 +367,22 @@ export interface ExternalSubscription {
 }
 
 /**
+ * What a provider holds for our webhook.
+ *
+ * - `registered`: it exists at our URL, is active, and has every event we consume.
+ * - `missing`: nothing by the stored id, or at our URL, on this account.
+ * - `wrong_url`: the stored id points somewhere else.
+ * - `disabled`: it exists and the provider has switched it off.
+ * - `missing_events`: it exists and lacks events whose handlers complete purchases.
+ */
+export type WebhookInspection =
+  | { state: 'registered' }
+  | { state: 'missing' }
+  | { state: 'wrong_url'; url: string }
+  | { state: 'disabled' }
+  | { state: 'missing_events'; events: string[] };
+
+/**
  * The methods every BillingProvider must implement. Synchronous failures
  * should throw `RekeyError` with a `BILLING_*` code; asynchronous state
  * changes (subscription activated, payment succeeded) flow through the
@@ -255,9 +396,10 @@ export interface BillingProvider {
    * Bootstrap a provider-side Plan record from our local Plan row. Called
    * by the admin "create plan" flow. Stripe creates a `Product` + `Price`;
    * PayPal creates a `Plan`; Razorpay creates a `Plan`. Returns the
-   * provider id we store back into `Plan.metadata`.
+   * provider id we store back into `Plan.metadata`, or into
+   * `PlanPrice.metadata` for an additional price.
    */
-  ensurePlanRegistered(plan: Plan): Promise<ProviderPlanRef>;
+  ensurePlanRegistered(plan: PricedPlan): Promise<ProviderPlanRef>;
 
   /**
    * Mint a hosted-checkout session for a RECURRING subscription. Returns a
@@ -294,6 +436,40 @@ export interface BillingProvider {
    */
   getSubscription?(providerSubscriptionId: string): Promise<ProviderSubscriptionSnapshot | null>;
 
+  /** Read one payment back from the provider; null when it has no such payment. Read-only. */
+  getPayment?(providerPaymentId: string): Promise<ProviderPaymentSnapshot | null>;
+
+  /**
+   * Capture an authorized payment for exactly this amount (Razorpay, for an
+   * account set to manual capture). Already captured is success, not an error.
+   */
+  capturePayment?(providerPaymentId: string, amount: number, currency: string): Promise<void>;
+
+  /**
+   * Read one one-time order back from the provider, for the same check on a
+   * one-time purchase. Read-only, and null when the provider has no such order.
+   */
+  getOrder?(providerOrderId: string): Promise<ProviderOrderSnapshot | null>;
+
+  /**
+   * Read one Checkout Session back from the provider (Stripe), for the same
+   * check on the page's "paid". Read-only, and null when there is no such session.
+   */
+  getCheckoutSession?(providerSessionId: string): Promise<ProviderCheckoutSessionSnapshot | null>;
+
+  /**
+   * Close an embedded session and open the provider's hosted page for the same
+   * purchase, for the page's fallback link. Throws `CHECKOUT_SESSION_COMPLETE`
+   * when the embedded session was already paid.
+   */
+  createHostedFallback?(input: HostedFallbackInput): Promise<CheckoutSessionResult>;
+
+  /**
+   * Close a Checkout Session nobody will be sent to, so it cannot be paid.
+   * Used for a hosted fallback session that lost the race to be recorded.
+   */
+  expireCheckoutSession?(providerSessionId: string): Promise<void>;
+
   /**
    * Capture an approved one-time order (PayPal Orders v2 only, Stripe/Razorpay
    * one-time flows auto-capture). Optional: providers that don't need an
@@ -311,6 +487,14 @@ export interface BillingProvider {
    * Optional, providers without a create-webhook API (Razorpay) omit it.
    */
   registerWebhook?(publicUrl: string): Promise<{ secret?: string; webhookId?: string }>;
+
+  /**
+   * Ask the provider what it holds for the webhook at `publicUrl`, using the
+   * stored credentials. This is how readiness proves a webhook exists without
+   * waiting for a paid event. Optional: Razorpay has no API to read one.
+   * Throws when the provider cannot be asked (refused credentials, outage).
+   */
+  inspectWebhook?(publicUrl: string): Promise<WebhookInspection>;
 
   /** Cancel a subscription. Default = at period end. */
   cancelSubscription(input: CancelSubscriptionInput): Promise<void>;

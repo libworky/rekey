@@ -14,6 +14,7 @@
 import { createHash } from 'node:crypto';
 import type { FastifyInstance, FastifyRequest } from 'fastify';
 import { z } from 'zod';
+import { PAYPAL_RESOURCE_ID_PATTERN } from '@rekey.dev/shared-types/checkout';
 import { env } from '../../../config/env.js';
 import { RekeyError } from '../../../lib/error.js';
 import { errs, ok, ref } from '../../../lib/openapi.js';
@@ -22,8 +23,15 @@ import { globalRateLimitMax, rateLimitedAfter, skipUnvouchedIp } from '../../../
 import { confirmProbeNonce } from './portal-probe.js';
 import { checkoutFallbackUrl, checkoutPageView, checkoutStatus } from './sessions.service.js';
 import { confirmPaypalApproval } from './paypal-approval.js';
+import { registerStripeConfirmedRoute } from './stripe-confirmed.routes.js';
+import { registerRazorpayApprovedRoute } from './razorpay-approval.routes.js';
 
-const ApprovedBody = z.object({ subscriptionId: z.string().regex(/^[A-Za-z0-9-]{1,64}$/) }).strict();
+const PAYPAL_ID = z.string().regex(PAYPAL_RESOURCE_ID_PATTERN);
+const ApprovedBody = z.union([
+  z.object({ subscriptionId: PAYPAL_ID }).strict(),
+  z.object({ orderId: PAYPAL_ID }).strict(),
+]);
+const PAYPAL_ID_SCHEMA = { type: 'string', minLength: 1, maxLength: 64, pattern: '^[A-Za-z0-9-]+$' } as const;
 
 const TokenParam = z.object({ token: z.string().min(1).max(200) });
 const NonceParam = z.object({ nonce: z.string().min(1).max(100) });
@@ -34,8 +42,8 @@ const TOKEN_PARAM_SCHEMA = {
   properties: { token: { type: 'string', description: 'The `chk_test_…` / `chk_live_…` token from the page URL.' } },
 } as const;
 
-const NOT_FOUND = 'CHECKOUT_SESSION_NOT_FOUND — no checkout page exists for this token.';
-const RATE_LIMITED = 'RATE_LIMITED — too many requests for this checkout or from this address. Honour Retry-After.';
+const NOT_FOUND = 'CHECKOUT_SESSION_NOT_FOUND: no checkout page exists for this token.';
+const RATE_LIMITED = 'RATE_LIMITED: too many requests for this checkout or from this address. Honour Retry-After.';
 
 /** A bucket key that never holds the raw token. */
 function tokenBucket(prefix: string) {
@@ -95,7 +103,7 @@ export async function checkoutSessionRoutes(app: FastifyInstance): Promise<void>
           200: ok(ref('CheckoutPageView'), 'The checkout page view.'),
           ...errs({
             404: NOT_FOUND,
-            409: 'CHECKOUT_MODE_MISMATCH — the session was started in test mode and the credentials are now live, or the reverse.',
+            409: 'CHECKOUT_MODE_MISMATCH: the session was started in test mode and the credentials are now live, or the reverse.',
             429: RATE_LIMITED,
           }),
         },
@@ -128,7 +136,7 @@ export async function checkoutSessionRoutes(app: FastifyInstance): Promise<void>
             },
             'The session status.',
           ),
-          ...errs({ 404: NOT_FOUND, 409: 'CHECKOUT_MODE_MISMATCH — see GET /:token.', 429: RATE_LIMITED }),
+          ...errs({ 404: NOT_FOUND, 409: 'CHECKOUT_MODE_MISMATCH: see GET /:token.', 429: RATE_LIMITED }),
         },
       },
     },
@@ -148,8 +156,10 @@ export async function checkoutSessionRoutes(app: FastifyInstance): Promise<void>
         security: [],
         summary: "The processor's own page for this checkout",
         description:
-          'For the "Continue on PayPal" link when the processor\'s script does not load. Only an ' +
-          "https URL on the processor's own host is returned.",
+          'For the "Continue on PayPal", "Continue on Razorpay" or "Continue on Stripe" link when the processor\'s script does ' +
+          "not load. Only an https URL on the processor's own host is returned. For Stripe, the first " +
+          'call expires the embedded Checkout Session and opens a hosted one for the same purchase; ' +
+          'later calls return that same hosted session.',
         params: TOKEN_PARAM_SCHEMA,
         response: {
           200: ok(
@@ -157,11 +167,11 @@ export async function checkoutSessionRoutes(app: FastifyInstance): Promise<void>
             "The processor's hosted page for this order.",
           ),
           ...errs({
-            403: 'ORIGIN_NOT_ALLOWED — a browser called this from a site other than the hosted portal.',
+            403: 'ORIGIN_NOT_ALLOWED: a browser called this from a site other than the hosted portal.',
             404: NOT_FOUND,
             409:
-              'CHECKOUT_SESSION_COMPLETE / CHECKOUT_SESSION_EXPIRED — the checkout can no longer be ' +
-              'paid; CHECKOUT_FALLBACK_UNAVAILABLE — no processor page was recorded; or CHECKOUT_MODE_MISMATCH.',
+              'CHECKOUT_SESSION_COMPLETE / CHECKOUT_SESSION_EXPIRED: the checkout can no longer be ' +
+              'paid; CHECKOUT_FALLBACK_UNAVAILABLE: no processor page was recorded; or CHECKOUT_MODE_MISMATCH.',
             429: RATE_LIMITED,
           }),
         },
@@ -170,7 +180,7 @@ export async function checkoutSessionRoutes(app: FastifyInstance): Promise<void>
     async (req) => {
       assertPortalOrigin(req);
       const { token } = TokenParam.parse(req.params);
-      return { success: true, data: await checkoutFallbackUrl(token) };
+      return { success: true, data: await checkoutFallbackUrl(token, req.log) };
     },
   );
 
@@ -184,15 +194,18 @@ export async function checkoutSessionRoutes(app: FastifyInstance): Promise<void>
         security: [],
         summary: "Report PayPal's approval from the checkout page",
         description:
-          'Reads the subscription back from PayPal and moves the session to `confirming` only when ' +
-          "it is this session's subscription, on this session's plan and buyer, approved at PayPal. " +
-          "Activates nothing: the subscription activates from PayPal's webhook. Idempotent.",
+          'Send `{ subscriptionId }` for a subscription checkout or `{ orderId }` for a one-time one. ' +
+          'Reads it back from PayPal and moves the session to `confirming` only when it is this ' +
+          "session's subscription or order, for this session's buyer and plan (subscription) or exact " +
+          'amount and currency (order), approved at PayPal. Activates and captures nothing: both ' +
+          "complete from PayPal's webhooks. Idempotent.",
         params: TOKEN_PARAM_SCHEMA,
         body: {
           type: 'object',
-          required: ['subscriptionId'],
+          minProperties: 1,
+          maxProperties: 1,
           additionalProperties: false,
-          properties: { subscriptionId: { type: 'string', minLength: 1, maxLength: 64, pattern: '^[A-Za-z0-9-]+$' } },
+          properties: { subscriptionId: PAYPAL_ID_SCHEMA, orderId: PAYPAL_ID_SCHEMA },
         },
         response: {
           200: ok(
@@ -204,12 +217,12 @@ export async function checkoutSessionRoutes(app: FastifyInstance): Promise<void>
             'The session status after the approval was checked.',
           ),
           ...errs({
-            400: 'VALIDATION_ERROR — the body is not `{ subscriptionId }`.',
-            403: 'ORIGIN_NOT_ALLOWED — a browser called this from a site other than the hosted portal.',
+            400: 'VALIDATION_ERROR: the body is not `{ subscriptionId }` or `{ orderId }`.',
+            403: 'ORIGIN_NOT_ALLOWED: a browser called this from a site other than the hosted portal.',
             404: NOT_FOUND,
             409:
-              'CHECKOUT_CONFIRMATION_REFUSED — PayPal does not confirm this approval for this checkout; ' +
-              'CHECKOUT_CONFIRMATION_LIMIT — too many refused confirmations, start again; ' +
+              'CHECKOUT_CONFIRMATION_REFUSED: PayPal does not confirm this approval for this checkout; ' +
+              'CHECKOUT_CONFIRMATION_LIMIT: too many refused confirmations, start again; ' +
               'CHECKOUT_SESSION_EXPIRED; or CHECKOUT_MODE_MISMATCH.',
             429: RATE_LIMITED,
           }),
@@ -219,10 +232,28 @@ export async function checkoutSessionRoutes(app: FastifyInstance): Promise<void>
     async (req) => {
       assertPortalOrigin(req);
       const { token } = TokenParam.parse(req.params);
-      const { subscriptionId } = ApprovedBody.parse(req.body);
-      return { success: true, data: await confirmPaypalApproval(token, subscriptionId) };
+      const approval = ApprovedBody.parse(req.body);
+      return { success: true, data: await confirmPaypalApproval(token, approval) };
     },
   );
+
+  registerRazorpayApprovedRoute(app, {
+    onRequest: ipCeiling,
+    bucket: tokenBucket('ckapprove'),
+    assertPortalOrigin,
+    tokenParamSchema: TOKEN_PARAM_SCHEMA,
+    notFound: NOT_FOUND,
+    rateLimited: RATE_LIMITED,
+  });
+
+  registerStripeConfirmedRoute(app, {
+    onRequest: ipCeiling,
+    bucket: tokenBucket('ckstripe'),
+    assertPortalOrigin,
+    tokenParamSchema: TOKEN_PARAM_SCHEMA,
+    notFound: NOT_FOUND,
+    rateLimited: RATE_LIMITED,
+  });
 }
 
 /** The portal's half of readiness check 1. Registered under /api/v1/checkout. */
@@ -241,7 +272,7 @@ export async function checkoutProbeRoutes(app: FastifyInstance): Promise<void> {
         params: { type: 'object', required: ['nonce'], properties: { nonce: { type: 'string' } } },
         response: {
           200: ok({ type: 'object', required: ['slug'], properties: { slug: { type: 'string' } } }, 'The probed slug.'),
-          ...errs({ 404: 'CHECKOUT_PROBE_NOT_FOUND — unknown, expired or already used.', 429: RATE_LIMITED }),
+          ...errs({ 404: 'CHECKOUT_PROBE_NOT_FOUND: unknown, expired or already used.', 429: RATE_LIMITED }),
         },
       },
     },

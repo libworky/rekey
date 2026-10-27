@@ -56,9 +56,10 @@ REDIS_URL=redis://:<REDIS_PASSWORD>@localhost:6379
 (The leading colon in `REDIS_URL` is not a typo — Redis `AUTH` with
 `requirepass` has no username.)
 
-`ENCRYPTION_KEY` is optional in development and **required in production**: the
-API refuses to boot without it, and also refuses to boot on the value
-`docker-compose.yml` shipped as a default before 2.0.0-rc.1. Generate your own.
+`ENCRYPTION_KEY` is **required everywhere but the test suite**, development
+included: the API refuses to boot without it. In production it also refuses the
+value `docker-compose.yml` shipped as a default before 2.0.0-rc.1. Generate your
+own.
 
 ## 2 — Boot
 
@@ -296,6 +297,7 @@ If you do not want that, set `signupMode: 'invite_only'` on the Application.
 Magic link then respects it exactly: unknown addresses get `delivered: false`,
 a `null` token, and no user is created.
 
+<!-- snippet: no-check a fragment: no imports, and values from the surrounding code -->
 ```ts
 const result = await rekey.auth.requestPasswordReset({
   email,

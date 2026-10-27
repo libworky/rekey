@@ -26,6 +26,7 @@ import { refuseWhileImpersonating } from '../../middleware/impersonation.js';
 import { authRateLimit } from '../../lib/rate-limit.js';
 import { ok, okFlag, errs } from '../../lib/openapi.js';
 import { CREDENTIAL_BODY_LIMIT } from '../../lib/body-limits.js';
+import { assertVerifiedForCredential } from '../auth/user-lifecycle.js';
 
 const CodeBody = z.object({ code: z.string().min(1).max(64) });
 
@@ -36,17 +37,17 @@ const CodeBody = z.object({ code: z.string().min(1).max(64) });
  */
 const USER_SESSION_ERRORS = {
   401:
-    'API_KEY_MISSING — no `Authorization: Bearer` header; or API_KEY_INVALID — the secret ' +
-    'key is unknown, revoked, or expired; or PUBLISHABLE_KEY_INVALID — the publishable key ' +
-    'is unknown or was rotated out; or USER_TOKEN_MISSING — no `X-Rekey-User-Token` header; ' +
-    'or USER_TOKEN_INVALID — the user token is invalid, expired, or wrongly signed; or ' +
-    'USER_TOKEN_WRONG_APPLICATION — the token was issued by a different Application; or ' +
-    'IMPERSONATION_SESSION_ENDED — the impersonation session behind this token has ended.',
+    'API_KEY_MISSING: no `Authorization: Bearer` header; or API_KEY_INVALID: the secret ' +
+    'key is unknown, revoked, or expired; or PUBLISHABLE_KEY_INVALID: the publishable key ' +
+    'is unknown or was rotated out; or USER_TOKEN_MISSING: no `X-Rekey-User-Token` header; ' +
+    'or USER_TOKEN_INVALID: the user token is invalid, expired, or wrongly signed; or ' +
+    'USER_TOKEN_WRONG_APPLICATION: the token was issued by a different Application; or ' +
+    'IMPERSONATION_SESSION_ENDED: the impersonation session behind this token has ended.',
   403:
-    'IP_NOT_ALLOWED — caller IP is outside the secret key\'s IP allowlist; or ' +
-    'ORIGIN_NOT_ALLOWED — the browser `Origin` is outside the publishable key\'s CORS ' +
+    'IP_NOT_ALLOWED: caller IP is outside the secret key\'s IP allowlist; or ' +
+    'ORIGIN_NOT_ALLOWED: the browser `Origin` is outside the publishable key\'s CORS ' +
     'allowlist; or API_KEY_SCOPE_INSUFFICIENT: the secret key lacks the scope the method needs (`auth:read` for GET, `auth:write` for every other method).',
-  429: 'RATE_LIMITED — too many requests. Honour the `Retry-After` header.',
+  429: 'RATE_LIMITED: too many requests. Honour the `Retry-After` header.',
 } as const;
 
 /**
@@ -54,7 +55,7 @@ const USER_SESSION_ERRORS = {
  * `preHandler` hook, `refuseWhileImpersonating`.
  */
 const IMPERSONATION_DESC =
-  "IMPERSONATION_ACTION_FORBIDDEN — an impersonated session cannot change this account's " +
+  "IMPERSONATION_ACTION_FORBIDDEN: an impersonated session cannot change this account's " +
   'two-factor settings.';
 
 /** End-user MFA is gated by the Application's `authConfig.mfa` policy. */
@@ -187,13 +188,14 @@ export async function mfaRoutes(app: FastifyInstance): Promise<void> {
           ...errs({
             ...USER_SESSION_ERRORS,
             401: `${USER_SESSION_ERRORS[401]}; or MFA_CODE_INVALID: re-enrolling from a browser over an existing enrollment requires a current TOTP or backup code; or MFA_CODE_REUSED: the TOTP code was already accepted, wait for the next one.`,
-            403: `${USER_SESSION_ERRORS[403]}; or MFA_NOT_ENABLED — this Application's authConfig.mfa policy is "off"; or ${IMPERSONATION_DESC}`,
+            403: `${USER_SESSION_ERRORS[403]}; or MFA_NOT_ENABLED: this Application's authConfig.mfa policy is "off"; or EMAIL_NOT_VERIFIED: this account has not confirmed its email address, so it cannot enrol MFA yet; or ${IMPERSONATION_DESC}`,
           }),
         },
       },
     },
     async (req, reply) => {
       assertMfaEnabled(req.application!);
+      assertVerifiedForCredential(req.endUser!, 'turn on two-factor authentication');
       // Only for a browser caller, and only over a COMPLETED enrollment,
       // matching `mfaService.disable`'s posture field for field. `verify`
       // returns false for `enrolledAt: null`, so demanding a code
@@ -229,7 +231,7 @@ export async function mfaRoutes(app: FastifyInstance): Promise<void> {
           otpauthUrl: result.otpauthUrl,
           backupCodes: result.backupCodes,
           warning:
-            'Show backupCodes ONCE. Only SHA-256 hashes are stored — they cannot be recovered.',
+            'Show backupCodes ONCE. Only SHA-256 hashes are stored, so they cannot be recovered.',
         },
       });
     },
@@ -257,7 +259,7 @@ export async function mfaRoutes(app: FastifyInstance): Promise<void> {
         response: {
           200: okFlag('MFA is now enrolled. A confirmation notification was also dispatched.'),
           ...errs({
-            400: 'MFA_NOT_INITIATED — call POST /mfa/setup before /mfa/setup-confirm.',
+            400: 'MFA_NOT_INITIATED: call POST /mfa/setup before /mfa/setup-confirm.',
             ...USER_SESSION_ERRORS,
             403: `${USER_SESSION_ERRORS[403]}; or ${IMPERSONATION_DESC}`,
             422:
@@ -268,6 +270,7 @@ export async function mfaRoutes(app: FastifyInstance): Promise<void> {
     },
     async (req) => {
       const body = CodeBody.parse(req.body);
+      assertVerifiedForCredential(req.endUser!, 'turn on two-factor authentication');
       const result = await mfaService.confirm({
         endUserId: req.endUser!.id,
         code: body.code,
@@ -313,7 +316,7 @@ export async function mfaRoutes(app: FastifyInstance): Promise<void> {
           ...errs({
             ...USER_SESSION_ERRORS,
             403: `${USER_SESSION_ERRORS[403]}; or ${IMPERSONATION_DESC}`,
-            429: `${USER_SESSION_ERRORS[429]}; or MFA_TOO_MANY_ATTEMPTS — too many recent failed attempts for this user (separate, tighter limiter than the general RATE_LIMITED cap).`,
+            429: `${USER_SESSION_ERRORS[429]}; or MFA_TOO_MANY_ATTEMPTS: too many recent failed attempts for this user (separate, tighter limiter than the general RATE_LIMITED cap).`,
           }),
         },
       },

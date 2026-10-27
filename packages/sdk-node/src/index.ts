@@ -21,8 +21,13 @@
  */
 
 import type {
+  CancelReason,
+  EmailDryRunResult,
+  EmailPreferences,
+  EmailSendRecord,
   EmailSendRequest,
   EmailSendResult,
+  EmailTopicState,
   ApplicationDto,
   AuthResultDto,
   MeInclude,
@@ -51,6 +56,7 @@ import type {
   LicenseDeactivateResultDto,
   DeviceDto,
   EndUserDeviceDto,
+  SupportModeDto,
   TrialEligibilityDto,
   DeviceStatusType,
   MfaVerifyRequest,
@@ -91,8 +97,13 @@ import { RekeyError } from '@rekey.dev/shared-types/error';
 import { ListsClient } from './lists.js';
 
 export type {
+  CancelReason,
+  EmailDryRunResult,
+  EmailPreferences,
+  EmailSendRecord,
   EmailSendRequest,
   EmailSendResult,
+  EmailTopicState,
   ContactListPublicDto,
   ContactListSummaryDto,
   ListMemberDto,
@@ -115,6 +126,11 @@ export type {
   MeIncluded,
   MeIncludedFor,
   MeIncludedFields,
+  SupportModeDto,
+  SupportCaseDto,
+  SupportCapabilityDto,
+  SupportCaseClosedCause,
+  SupportWebhookState,
   ResolvedEntitlementsDto,
   ApiKeyDto,
   AuthResultDto,
@@ -261,6 +277,21 @@ export interface RekeyConfig {
    * {@link Rekey.with}: `rekey.with({ clientIp, clientUserAgent }).auth.signIn(...)`.
    */
   clientUserAgent?: string | undefined;
+  /**
+   * Where your hosting platform says the visitor is, sent as
+   * `X-Rekey-Visitor-Country-Hint`. Take it from `cf-ipcountry` or
+   * `x-vercel-ip-country` on the incoming request.
+   *
+   * It is a hint: it picks which payment provider the buyer is routed to. It
+   * does not select a local price unless the Application's
+   * `billingConfig.localPrices` is `any`, because a visitor who reaches your
+   * origin directly can write that header. To charge a local price under the
+   * default (`trusted`), pass `country` to the billing call yourself; that one
+   * is trusted, and it wins over this.
+   * Anything that is not a two-letter country (Cloudflare's `XX` and `T1`
+   * included) is not sent.
+   */
+  visitorCountryHint?: string | undefined;
 }
 
 /**
@@ -271,6 +302,47 @@ export const CLIENT_IP_HEADER = 'X-Rekey-Client-Ip';
 
 /** The header {@link RekeyConfig.clientUserAgent} travels in. Believed only from a secret-key caller. */
 export const CLIENT_USER_AGENT_HEADER = 'X-Rekey-Client-User-Agent';
+
+/**
+ * The header {@link RekeyConfig.visitorCountryHint} travels in. The API reads
+ * it from a secret-key caller that declared no country, and only as a hint: it
+ * routes the provider, and selects a local price only under
+ * `billingConfig.localPrices: 'any'`.
+ */
+export const VISITOR_COUNTRY_HINT_HEADER = 'X-Rekey-Visitor-Country-Hint';
+
+/**
+ * `value` as an upper-case ISO 3166-1 alpha-2 country, or null. Cloudflare's
+ * `XX` (unknown) and `T1` (Tor) are not countries.
+ *
+ * @example
+ * normalizeCountryHint(request.headers.get('cf-ipcountry')); // 'IN', or null
+ */
+export function normalizeCountryHint(value: string | null | undefined): string | null {
+  if (typeof value !== 'string') return null;
+  const code = value.trim().toUpperCase();
+  return /^[A-Z]{2}$/.test(code) && code !== 'XX' ? code : null;
+}
+
+/**
+ * The visitor's country as the hosting platform reports it on an incoming
+ * request: Cloudflare's `cf-ipcountry`, else Vercel's `x-vercel-ip-country`.
+ * Undefined when neither names a country. Pass the result as
+ * {@link RekeyConfig.visitorCountryHint}.
+ *
+ * @example
+ * const scoped = rekey.with({ visitorCountryHint: visitorCountryHintFrom(request.headers) });
+ * await scoped.billing.createCheckout(userAccessToken, { planSlug: 'pro', successUrl, cancelUrl });
+ */
+export function visitorCountryHintFrom(headers: {
+  get(name: string): string | null | undefined;
+}): string | undefined {
+  return (
+    normalizeCountryHint(headers.get('cf-ipcountry')) ??
+    normalizeCountryHint(headers.get('x-vercel-ip-country')) ??
+    undefined
+  );
+}
 
 /**
  * `value` as a single IP address, or null. Deliberately strict: a list
@@ -318,12 +390,23 @@ export interface RekeyCallOptions {
   clientIp?: string | undefined;
   /** The visitor's User-Agent for this call. See {@link RekeyConfig.clientUserAgent}. */
   clientUserAgent?: string | undefined;
+  /** The platform's country for the visitor, as a hint. See {@link RekeyConfig.visitorCountryHint}. */
+  visitorCountryHint?: string | undefined;
 }
 
 // RekeyError is the shared class (imported above), re-exported so the public
 // API name is preserved and `instanceof` is consistent with @rekey.dev/react.
 export { RekeyError };
 export { ListsClient, type ListMembersOptions, type ListSubscribeOptions } from './lists.js';
+export {
+  RekeyOperator,
+  type RekeyOperatorConfig,
+  type BillingLogListOptions,
+  type BillingLogTrailOptions,
+  type BillingLogPeriod,
+  type OperatorPaymentsListOptions,
+  type RoutingPreviewInput,
+} from './operator/index.js';
 
 /**
  * Outbound webhook event registry, the events Rekey can POST to your app
@@ -339,6 +422,25 @@ export { ListsClient, type ListMembersOptions, type ListSubscribeOptions } from 
  *
  * const event = req.body as WebhookEventEnvelope; // after verifyWebhookSignature(...)
  * if (event.type === 'subscription.activated') unlockPlan(event.data);
+ * ```
+ *
+ * The money events have typed payloads. `PaymentWebhookData` is `data` of
+ * `payment.succeeded`, `payment.failed` and `payment.refunded`;
+ * `SubscriptionWebhookData` is `data` of every `subscription.*` event.
+ *
+ * @example
+ * ```ts
+ * import { formatMoney, type PaymentWebhookData, type WebhookEventEnvelope } from '@rekey.dev/node';
+ *
+ * const event = req.body as WebhookEventEnvelope<PaymentWebhookData>;
+ * if (event.type === 'payment.refunded' && event.data.refund) {
+ *   const { payment, refund } = event.data;
+ *   console.log(`Refunded ${formatMoney(refund.amount, refund.currency)}`);
+ *   console.log(`${formatMoney(payment.refundedAmount, payment.currency)} refunded in all`);
+ * }
+ * if (event.type === 'payment.succeeded' && event.data.payment.verification === 'unverified') {
+ *   // Recorded, not applied: nothing was granted for it. See the unapplied payments in the panel.
+ * }
  * ```
  */
 export { WEBHOOK_EVENTS, KNOWN_WEBHOOK_EVENTS, isKnownWebhookEvent } from '@rekey.dev/shared-types';
@@ -364,6 +466,110 @@ export type { WebhookEventType, WebhookEventEnvelope } from '@rekey.dev/shared-t
  */
 export { cancelEffect, isCancelScheduled } from '@rekey.dev/shared-types';
 export type { CancellationTimingInput } from '@rekey.dev/shared-types';
+
+/**
+ * Money helpers from the currency registry, so nothing in your code divides
+ * by 100 or keeps its own list of zero-decimal currencies.
+ *
+ * - `formatMoney(amount, currency)` writes an integer amount in minor units
+ *   for a person.
+ * - `minorUnitExponent(currency)` is how many decimals the currency has.
+ * - `validatePriceAmount(currency, amount)` says whether a price may be
+ *   stored, and why not.
+ * - `sellableCurrencies()` lists every currency a price may be in.
+ * - `priceFallbackMessage(fallback)` is the sentence to show a buyer whose
+ *   checkout charges the default price.
+ * - `refundBlockedMessage(reason)` is the sentence for a payment's
+ *   `refundBlockedReason`: why it cannot be refunded through Rekey.
+ *
+ * @example
+ * ```ts
+ * import { formatMoney, minorUnitExponent, validatePriceAmount } from '@rekey.dev/node';
+ *
+ * formatMoney(149900, 'INR'); // '₹1,499.00'
+ * formatMoney(5000, 'JPY'); // '¥5,000'
+ * minorUnitExponent('JPY'); // 0
+ * validatePriceAmount('HUF', 500050).ok; // false: HUF is sold in whole units
+ * ```
+ */
+export {
+  formatMoney,
+  isSellableCurrency,
+  minorUnitExponent,
+  priceFallbackMessage,
+  refundBlockedMessage,
+  sellableCurrencies,
+  validatePriceAmount,
+  BILLING_MONEY_ERROR_CODES,
+  REFUND_BLOCKED_REASONS,
+  isBillingMoneyError,
+} from '@rekey.dev/shared-types';
+export type {
+  BillingMoneyErrorCode,
+  PriceAmountRule,
+  PriceAmountValidation,
+  PriceFallbackSides,
+  // Prices
+  PublicPlanPriceDto,
+  PlanPriceDto,
+  PlanPriceRegistrationDto,
+  PlanCheckoutReadinessDto,
+  PlanCheckoutBlockerDto,
+  ResolvedPriceDto,
+  PriceFallbackDto,
+  PriceReason,
+  SetPlanPriceRequest,
+  CreatePlanRequest,
+  UpdatePlanRequest,
+  PlanPriceInput,
+  // Coupons
+  CouponAmountDto,
+  CouponWithStatsDto,
+  CreateCouponRequest,
+  UpdateCouponRequest,
+  PublicCouponDto,
+  // Payments and refunds
+  TenantPaymentDto,
+  TenantPaymentsListQuery,
+  PaymentStatusType,
+  RefundBlockedReason,
+  RefundDto,
+  RefundResultDto,
+  RefundedPaymentDto,
+  CreateRefundRequest,
+  PaymentWebhookData,
+  SubscriptionWebhookData,
+  // The billing log
+  BillingLogEntry,
+  BillingLogPage,
+  BillingLogActors,
+  BillingLogEndUser,
+  BillingLogInclude,
+  BillingLogOperator,
+  BillingEventType,
+  BillingEventTier,
+  ReconciliationFinding,
+  ReconciliationFindingKind,
+  ReconciliationReport,
+  PriceFallbackSummary,
+  // Reporting
+  ReportingCurrencyDto,
+  BillingStatsDto,
+  CurrencyMrrDto,
+  CurrencyRevenueDto,
+  CurrencyUnverifiedDto,
+  MonthlyRevenuePoint,
+  // Routing preview and provider currencies
+  RoutingPreviewDto,
+  RoutingPreviewRequest,
+  RoutingPreviewItem,
+  BillingOutboxStatus,
+  RoutingPreviewCoupon,
+  BillingProviderModuleDto,
+  BillingProviderModulesDto,
+  BillingCredentialDto,
+  BillingCredentialStatusDto,
+} from '@rekey.dev/shared-types';
 
 /**
  * Top-level Rekey client. Auth and billing live as namespaces
@@ -476,12 +682,14 @@ export class Rekey {
         : (options.signal ?? this.signal);
     const clientIp = options.clientIp ?? this.config.clientIp;
     const clientUserAgent = options.clientUserAgent ?? this.config.clientUserAgent;
+    const visitorCountryHint = options.visitorCountryHint ?? this.config.visitorCountryHint;
     return new Rekey({
       ...this.config,
       timeoutMs: options.timeoutMs ?? this.config.timeoutMs,
       ...(signal !== undefined && { signal }),
       ...(clientIp !== undefined && { clientIp }),
       ...(clientUserAgent !== undefined && { clientUserAgent }),
+      ...(visitorCountryHint !== undefined && { visitorCountryHint }),
     });
   }
 
@@ -629,13 +837,17 @@ export class Rekey {
     return json as T;
   }
 
-  /** @internal The visitor headers for one call: address and User-Agent, each when known. */
+  /** @internal The visitor headers for one call: address, User-Agent and country hint, each when known. */
   private clientIpHeader(options?: RekeyCallOptions): Record<string, string> {
     const ip = normalizeClientIp(options?.clientIp ?? this.config.clientIp);
     const ua = (options?.clientUserAgent ?? this.config.clientUserAgent)?.trim().slice(0, 512);
+    const country = normalizeCountryHint(
+      options?.visitorCountryHint ?? this.config.visitorCountryHint,
+    );
     return {
       ...(ip ? { [CLIENT_IP_HEADER]: ip } : {}),
       ...(ua ? { [CLIENT_USER_AGENT_HEADER]: ua } : {}),
+      ...(country ? { [VISITOR_COUNTRY_HINT_HEADER]: country } : {}),
     };
   }
 
@@ -868,7 +1080,23 @@ class AuthClient {
    * `verifyMagicLink` set it only when that call created the account, so one
    * check routes new users to onboarding whichever way they arrived.
    *
+   * An account stays unverified until its owner confirms the address. Until
+   * then it cannot register a passkey, enrol MFA or link a provider, and the
+   * first magic-link sign-in, social sign-in or password reset for that
+   * address removes the password set here: whoever proves the mailbox owns
+   * the account. If your server has already verified the address, pass
+   * `emailVerified: true` (secret key only) and none of that applies.
+   *
    * @throws {RekeyError} `EMAIL_ALREADY_EXISTS` (409) if the email is taken in this Application.
+   *   A secret key always gets this. A publishable key gets it only while the
+   *   Application signs new accounts straight in; with
+   *   `authConfig.requireEmailVerification` on, a taken address answers
+   *   `EMAIL_NOT_VERIFIED` exactly like a new one, so show "check your inbox".
+   * @throws {RekeyError} `EMAIL_NOT_VERIFIED` (403) when the Application sets
+   *   `authConfig.requireEmailVerification`. The account exists (or already
+   *   did) and an email is on its way; no session is issued.
+   * @throws {RekeyError} `EMAIL_VERIFIED_REQUIRES_SECRET_KEY` (403) if a
+   *   publishable key sends `emailVerified: true`.
    * @throws {RekeyError} `PASSWORD_TOO_SHORT` (400) if shorter than the Application's `passwordMinLength`.
    * @throws {RekeyError} `AUTH_METHOD_DISABLED` (400) if the Application doesn't have `"password"` enabled.
    */
@@ -923,6 +1151,10 @@ class AuthClient {
    * shape whether the email exists or not. When the Application has
    * email transport configured, the link is sent and `magicLinkToken`
    * is null; otherwise the raw token is returned for you to forward.
+   *
+   * @throws {RekeyError} `AUTH_EMAIL_RECIPIENT_CAPPED` (429, secret key only)
+   *   when this address has been sent its hourly or daily share of sign-in
+   *   email. Wait `retryAfterSeconds`. A publishable key gets the usual body.
    */
   requestMagicLink(input: {
     email: string;
@@ -981,6 +1213,10 @@ class AuthClient {
    * Forward `options` to `navigator.credentials.create(...)`; store
    * `expectedChallenge` in session; POST both back via
    * `verifyPasskeyRegistration(...)`.
+   *
+   * @throws {RekeyError} `EMAIL_NOT_VERIFIED` (403) until the user has
+   *   confirmed their email address. Do not offer passkey enrolment straight
+   *   after sign-up: verify the address first.
    */
   startPasskeyRegistration(accessToken: string): Promise<{
     options: unknown;
@@ -1118,6 +1354,25 @@ class AuthClient {
   }
 
   /**
+   * Erase the signed-in user's own account, as an operator erasure does. It
+   * cannot be undone. With a secret key no confirmation is needed; your server
+   * is the gate. Throws ACCOUNT_HAS_ACTIVE_SUBSCRIPTION (409) while a
+   * subscription still bills through a provider: cancel it first, and
+   * ACCOUNT_SELF_DELETION_DISABLED (403) when the Application sets
+   * `authConfig.accountDeletion` to `off`.
+   *
+   * @example
+   * ```ts
+   * await rekey.auth.deleteCurrentUser(accessToken);
+   * ```
+   */
+  deleteCurrentUser(accessToken: string): Promise<{ erased: true; erasedAt: string }> {
+    return this.client.send('DELETE', '/api/v1/users/me/', undefined, {
+      'X-Rekey-User-Token': accessToken,
+    });
+  }
+
+  /**
    * Exchange a refresh token for a fresh {access, refresh} pair. The presented
    * refresh is revoked atomically, call this **once** and store the new
    * `refreshToken` from the response immediately.
@@ -1169,6 +1424,10 @@ class AuthClient {
    *   await sendgrid.send({ to: email, subject: 'Reset', text: `link: ${url(resetToken)}` });
    * }
    * ```
+   *
+   * @throws {RekeyError} `AUTH_EMAIL_RECIPIENT_CAPPED` (429, secret key only)
+   *   when this address has been sent its hourly or daily share of sign-in
+   *   email. Wait `retryAfterSeconds`. A publishable key gets the usual body.
    */
   requestPasswordReset(input: ForgotPasswordRequest): Promise<ForgotPasswordResultDto> {
     return this.client.send('POST', '/api/v1/auth/forgot-password', input);
@@ -1218,6 +1477,9 @@ class AuthClient {
    *
    * Pass `verifyUrl` containing `{token}` to template the link target
    * (e.g. `https://app.example.com/verify?t={token}`).
+   *
+   * @throws {RekeyError} `AUTH_EMAIL_RECIPIENT_CAPPED` (429) when this address
+   *   has been sent its hourly or daily share of sign-in email.
    */
   sendVerificationEmail(
     accessToken: string,
@@ -1260,6 +1522,10 @@ class AuthClient {
    * }
    * // Always render the same neutral "if that address needs verifying, we sent a link".
    * ```
+   *
+   * @throws {RekeyError} `AUTH_EMAIL_RECIPIENT_CAPPED` (429, secret key only)
+   *   when this address has been sent its hourly or daily share of sign-in
+   *   email. Wait `retryAfterSeconds`. A publishable key gets the usual body.
    */
   resendVerificationEmail(input: {
     email: string;
@@ -1333,6 +1599,9 @@ class AuthClient {
    * Begin TOTP enrollment: mints a secret (as an `otpauthUrl` for the QR) and
    * 10 single-show backup codes. **Not enrolled until `confirmMfaSetup(...)`.**
    * Only SHA-256 hashes of the backup codes are stored, show them once.
+   *
+   * @throws {RekeyError} `EMAIL_NOT_VERIFIED` (403) until the user has
+   *   confirmed their email address. Verify first, then offer enrolment.
    */
   mfaSetup(accessToken: string): Promise<{
     otpauthUrl: string;
@@ -1442,7 +1711,12 @@ class AuthClient {
     });
   }
 
-  /** Begin linking a provider to the *currently authenticated* user. */
+  /**
+   * Begin linking a provider to the *currently authenticated* user.
+   *
+   * @throws {RekeyError} `EMAIL_NOT_VERIFIED` (403) until the user has
+   *   confirmed their email address. Verify first, then offer linking.
+   */
   startOAuthLink(
     accessToken: string,
     provider: string,
@@ -1902,6 +2176,11 @@ class DevicesClient {
    * INCLUDING the current one when it is the same device, so treat a release of
    * `claims.dev` as a sign-out. Idempotent for an already-released device; a
    * BLOCKED device refuses with `DEVICE_BLOCKED` (only an operator can unblock).
+   * This client holds a secret key, so an Application's
+   * `deviceRelease: 'server_only'` does not refuse it: that setting is for
+   * browsers, and your backend deciding to release is the route it leaves open.
+   * Do not expose this call to end-users (a Server Action that releases
+   * whatever the visitor asks): that quietly undoes the operator's choice.
    *
    * @example
    * ```ts
@@ -1948,6 +2227,28 @@ class UsersClient {
   }
 
   /**
+   * Whether an operator has this end-user in support mode, and which
+   * capabilities the open support case turns on. Pass `deviceId` to ask about
+   * one device: a case limited to devices is active only for a device it
+   * names, so without `deviceId` only a case covering every device is active.
+   * Rekey reports the state; your backend decides what each capability means.
+   *
+   * @example
+   * ```ts
+   * const support = await rekey.users.getSupport(endUserId, { deviceId });
+   * if (support.active && support.capabilities.includes('diagnostics.debug')) {
+   *   enableVerboseLogs();
+   * }
+   * ```
+   *
+   * @throws {RekeyError} `END_USER_NOT_FOUND` (404) if the id is not in the calling Application.
+   */
+  getSupport(endUserId: string, options: { deviceId?: string } = {}): Promise<SupportModeDto> {
+    const query = options.deviceId === undefined ? '' : `?deviceId=${encodeURIComponent(options.deviceId)}`;
+    return this.client.send('GET', `/api/v1/users/${encodeURIComponent(endUserId)}/support${query}`);
+  }
+
+  /**
    * Import up to 500 users from another auth system in one call. Password
    * hashes (argon2id or bcrypt) are stored as given and verified as-is at
    * sign-in; bcrypt is upgraded to argon2id on first success. Existing
@@ -1978,6 +2279,35 @@ class UsersClient {
    */
   updateProfile(endUserId: string, patch: Record<string, ProfileValue | null>): Promise<ProfileStateDto> {
     return this.client.send('PATCH', `/api/v1/users/${encodeURIComponent(endUserId)}/profile`, patch);
+  }
+
+  /**
+   * Which notification email topics an end user receives. The one-click
+   * unsubscribe link writes the same records, so a settings page built on
+   * this matches the email. Needs `auth:read`.
+   *
+   * @example
+   * ```ts
+   * const { topics } = await rekey.users.getEmailPreferences(userId); // { onboarding: 'subscribed', ... }
+   * ```
+   */
+  getEmailPreferences(endUserId: string): Promise<EmailPreferences> {
+    return this.client.send('GET', `/api/v1/users/${encodeURIComponent(endUserId)}/email-preferences`);
+  }
+
+  /**
+   * Set notification topics to `subscribed` or `unsubscribed`. Lifting a topic
+   * never lifts "unsubscribe from all" or an operator's suppression. Needs
+   * the elevated `email:send` scope. Throws EMAIL_TOPIC_UNKNOWN for a topic
+   * no notification template was published with.
+   *
+   * @example
+   * ```ts
+   * await rekey.users.updateEmailPreferences(userId, { onboarding: 'unsubscribed' });
+   * ```
+   */
+  updateEmailPreferences(endUserId: string, topics: Record<string, EmailTopicState>): Promise<EmailPreferences> {
+    return this.client.send('PATCH', `/api/v1/users/${encodeURIComponent(endUserId)}/email-preferences`, { topics });
   }
 
   /**
@@ -2223,7 +2553,11 @@ class EmailClient {
    * whose first send never recorded an outcome throws `EMAIL_SEND_OUTCOME_UNKNOWN`
    * after five minutes: check whether it arrived before sending with a new key.
    *
-   * A recipient who used the one-click unsubscribe in a `notification` email
+   * `to` may be `{ endUserId }`: Rekey looks up the address and throws
+   * EMAIL_RECIPIENT_NOT_FOUND, EMAIL_RECIPIENT_BANNED or
+   * EMAIL_RECIPIENT_UNVERIFIED instead of sending to a user who should not get it.
+   *
+   * A recipient who left the template's topic, or every notification email,
    * resolves `suppressed` for notification templates only; `critical`
    * templates and Rekey's own account emails still reach them.
    *
@@ -2231,14 +2565,59 @@ class EmailClient {
    * ```ts
    * const { id, status } = await rekey.email.send({
    *   template: 'order_shipped',
-   *   to: 'buyer@example.com',
+   *   to: { endUserId: order.userId },
    *   variables: { orderNumber: 'A-1042', trackingUrl: 'https://track.example.com/A-1042' },
    *   idempotencyKey: `order-shipped:${order.id}`,
    * });
    * ```
    */
-  send(input: EmailSendRequest): Promise<EmailSendResult> {
+  send(input: Omit<EmailSendRequest, 'dryRun'>): Promise<EmailSendResult> {
     return this.client.send('POST', '/api/v1/email/send', input);
+  }
+
+  /**
+   * Run every check a send runs and render the template, without sending: no
+   * log row, no cap counted, no idempotency key used. `status: 'suppressed'`
+   * means a real send would not go out. Use it in CI to catch a template
+   * change that breaks your variables.
+   *
+   * @example
+   * ```ts
+   * const { status, subject } = await rekey.email.dryRun({ template: 'welcome', to: { endUserId }, variables });
+   * ```
+   */
+  dryRun(input: Omit<EmailSendRequest, 'dryRun' | 'idempotencyKey'>): Promise<EmailDryRunResult> {
+    return this.client.send('POST', '/api/v1/email/send', { ...input, dryRun: true });
+  }
+
+  /**
+   * Read a send back by the `id` it returned, or by the idempotency key it was
+   * sent with. Throws EMAIL_SEND_NOT_FOUND when nothing matches.
+   *
+   * @example
+   * ```ts
+   * const sent = await rekey.email.getSend({ idempotencyKey: `welcome:${userId}` });
+   * if (sent.status === 'unknown') { ... }
+   * ```
+   */
+  /**
+   * Cancel a send made with `sendAt` before it fires. Throws
+   * EMAIL_SEND_NOT_SCHEDULED once it has fired or was canceled.
+   *
+   * @example
+   * ```ts
+   * const { id } = await rekey.email.send({ template: 'finish_setup', to: { endUserId }, variables, sendAt: in24h });
+   * await rekey.email.cancelSend(id); // they finished setup first
+   * ```
+   */
+  cancelSend(id: string): Promise<EmailSendRecord> {
+    return this.client.send('DELETE', `/api/v1/email/sends/${encodeURIComponent(id)}`);
+  }
+
+  getSend(by: { id: string } | { idempotencyKey: string }): Promise<EmailSendRecord> {
+    return 'id' in by
+      ? this.client.send('GET', `/api/v1/email/sends/${encodeURIComponent(by.id)}`)
+      : this.client.send('GET', `/api/v1/email/sends?idempotencyKey=${encodeURIComponent(by.idempotencyKey)}`);
   }
 }
 
@@ -2771,16 +3150,49 @@ class BillingClient {
    * typically render straight from this. Application API key only; no
    * user JWT needed.
    *
-   * `amount` is in the smallest currency unit (cents/paise/sen), never
-   * a float. Format on display: `${amount / 100} ${currency}`.
+   * Each plan carries `price`: the price this buyer would be charged,
+   * resolved by the function checkout uses. Render `price.formatted` and do
+   * no arithmetic of your own. `price` is null for a plan with no flat price
+   * (a free plan, a usage plan). `prices` lists every price the plan sells
+   * at; it is there to show what exists, not for picking one yourself, because
+   * a price you pick is not the price checkout charges.
+   *
+   * Say who the buyer is and `price` follows:
+   *
+   * - `country` (ISO 3166-1 alpha-2): the price for a buyer there. Without it
+   *   the `visitorCountryHint` on the client is used, as at checkout.
+   * - `accessToken`: a signed-in buyer who already pays in a currency is shown
+   *   that currency, which is what their next checkout charges.
+   *
+   * `price.reason` says why: `bound`, `country`, `default`, or `fallback` when
+   * the price selected for the buyer cannot be charged and the default one is
+   * shown instead.
    *
    * `checkout.ready` is false when a buyer sent to checkout for the plan would
-   * be refused, so a pricing page can hide it. Why is on the operator plan
-   * list, not here. Keep the free tier in: with no provider connected it reads
-   * `ready: false` and still applies to every signed-in user.
+   * be refused, so a pricing page can show it as unavailable. Why is on the
+   * operator plan list, not here. Keep the free tier in: with no provider
+   * connected it reads `ready: false` and still applies to every signed-in user.
+   *
+   * @example
+   * ```ts
+   * const { items } = await rekey.billing.getPlans(undefined, { country: 'IN', accessToken });
+   * for (const plan of items) {
+   *   console.log(plan.name, plan.price ? plan.price.formatted : plan.isFree ? 'Free' : 'Usage based');
+   * }
+   * ```
    */
-  getPlans(page?: ListPage): Promise<Paged<PublicPlanDto>> {
-    return this.client.send('GET', `/api/v1/billing/plans${listQuery(page)}`);
+  getPlans(page?: ListPage, opts?: { country?: string; accessToken?: string }): Promise<Paged<PublicPlanDto>> {
+    const query = new URLSearchParams();
+    if (page?.limit !== undefined) query.set('limit', String(page.limit));
+    if (page?.offset !== undefined) query.set('offset', String(page.offset));
+    if (opts?.country) query.set('country', opts.country.toUpperCase());
+    const search = query.toString();
+    return this.client.send(
+      'GET',
+      `/api/v1/billing/plans${search ? `?${search}` : ''}`,
+      undefined,
+      opts?.accessToken ? { 'X-Rekey-User-Token': opts.accessToken } : undefined,
+    );
   }
 
   /**
@@ -2800,9 +3212,15 @@ class BillingClient {
    * `opts.organizationId` reads an organization's subscription instead of the
    * user's own on an org-billed app. The caller must be a member.
    *
-   * A buyer can hold several live subscriptions; this returns one (a paid
-   * plan before the free tier, then the newest). {@link listSubscriptions}
+   * A buyer can hold several live subscriptions; this returns one (a
+   * recurring paid plan, then a one-time purchase such as a credit pack, then
+   * the free tier; the newest within each). {@link listSubscriptions}
    * returns them all. No `metadata` on this end-user view.
+   *
+   * `price` is what this subscriber pays each period: the price their
+   * checkout, grant or import fixed, which can differ from the plan's default
+   * price. Render `price.formatted`. It is null for a plan with no flat price
+   * and for a checkout that has not been paid yet.
    */
   getSubscription(
     accessToken: string,
@@ -2858,7 +3276,7 @@ class BillingClient {
    * the trial the next checkout was about to grant.
    *
    * If the Application's billing subject is **org** (Panel → Application →
-   * Billing → Setup → Settings), an individual can't hold a subscription, you MUST
+   * Billing → Setup → Defaults), an individual can't hold a subscription, you MUST
    * pass `organizationId` of a team the user owns/admins. Omitting it throws
    * `RekeyError` `code: "BILLING_ORGANIZATION_REQUIRED"`.
    *
@@ -2867,9 +3285,52 @@ class BillingClient {
    * today but comes back in `warnings` as `CHECKOUT_RETURN_URL_UNREGISTERED`,
    * and the next minor release refuses it. A non-http(s) URL is refused now.
    *
+   * This call comes from your server, so Rekey cannot see where the buyer is.
+   * Tell it one of two ways, or the router ignores per-country provider
+   * settings and an Indian buyer is not sent to Razorpay:
+   *
+   * - `rekey.with({ visitorCountryHint })` with your platform's geo header.
+   *   It routes the provider. It selects the plan's local price only when the
+   *   Application's `billingConfig.localPrices` is `any`; under the default
+   *   (`trusted`) the buyer is charged the default price. In Astro,
+   *   `visitorClient(context)` from `@rekey.dev/astro` returns a client with
+   *   the hint already set. In Next.js nothing sets it for a checkout: call
+   *   `visitorCountryHint()` from `@rekey.dev/nextjs/server` and pass the
+   *   result to `rekey.with` yourself, as in the second example.
+   * - `country` (ISO 3166-1 alpha-2) here. It is trusted, so it also selects
+   *   the plan's local price under either setting. Pass it only from
+   *   something the buyer cannot write, such as a verified billing address: a
+   *   geo header can be forged by a buyer who reaches your origin directly.
+   *
+   * A plan can carry prices in more than one currency. Leave `currency` off and
+   * Rekey picks the price for the buyer's country, falling back to the plan's
+   * default price. Pass `currency` (ISO 4217) to choose the price yourself, for
+   * example to charge what your pricing page showed. It is honoured from a
+   * server holding the secret key only: the same field sent with a publishable
+   * key is refused with `BILLING_CURRENCY_NOT_ALLOWED`, so never forward a
+   * currency a browser posted. A buyer who already subscribes in one currency
+   * keeps it: asking for another is refused with `BILLING_CURRENCY_CONFLICT`.
+   *
+   * The result's `price` is always the price charged. When no enabled provider
+   * can charge the price selected for the buyer, the checkout charges the
+   * plan's default price instead and `priceFallback` says so, with both
+   * prices. Tell the buyer before you redirect them; `priceFallbackMessage`
+   * writes the sentence. When it is a `currency` you named that cannot be
+   * charged, `onUnavailableCurrency` decides: `'fallback'` charges the default
+   * price, `'refuse'` makes the call throw `BILLING_NO_PROVIDER_FOR_CURRENCY`.
+   * Leave it out and the Application's own default applies
+   * (`billingConfig.onUnavailableCurrency`, `'fallback'` unless the operator
+   * changed it). What you pass here wins over that default.
+   *
+   * The country travels in `country` or in the client's `visitorCountryHint`
+   * and nowhere else. A request carrying the removed `x-country` header is
+   * refused with `BILLING_FIELD_REMOVED`.
+   *
    * @example
    * ```ts
-   * const { url, discountAmount } = await rekey.billing.createCheckout(userAccessToken, {
+   * // Express behind Cloudflare. On Vercel read `x-vercel-ip-country`.
+   * const scoped = rekey.with({ visitorCountryHint: req.get('cf-ipcountry') });
+   * const { url, discountAmount } = await scoped.billing.createCheckout(userAccessToken, {
    *   planSlug: 'pro_monthly',
    *   successUrl: 'https://yourapp.com/billing?status=ok',
    *   cancelUrl:  'https://yourapp.com/billing?status=cancel',
@@ -2877,6 +3338,40 @@ class BillingClient {
    * });
    * res.redirect(url);
    * ```
+   *
+   * @example
+   * ```ts
+   * // Next.js server action. `rekey` is your own client:
+   * // new Rekey({ apiUrl: process.env.REKEY_URL!, secretKey: process.env.REKEY_SECRET! })
+   * import { visitorCountryHint } from '@rekey.dev/nextjs/server';
+   *
+   * const scoped = rekey.with({ visitorCountryHint: await visitorCountryHint() });
+   * const { url } = await scoped.billing.createCheckout(userAccessToken, {
+   *   planSlug: 'pro_monthly',
+   *   successUrl: 'https://yourapp.com/billing?status=ok',
+   *   cancelUrl:  'https://yourapp.com/billing?status=cancel',
+   * });
+   * ```
+   *
+   * @example
+   * ```ts
+   * // Charge the plan's INR price, decided on your server.
+   * const checkout = await rekey.billing.createCheckout(userAccessToken, {
+   *   planSlug: 'pro',
+   *   currency: 'INR',
+   *   successUrl: 'https://yourapp.com/billing?status=ok',
+   *   cancelUrl:  'https://yourapp.com/billing?status=cancel',
+   * });
+   * if (checkout.priceFallback) {
+   *   // 'Prices in INR are not available yet. You will pay $19.00.'
+   *   await confirmWithBuyer(priceFallbackMessage(checkout.priceFallback));
+   * }
+   * res.redirect(checkout.url);
+   * ```
+   *
+   * @throws {RekeyError} `BILLING_CURRENCY_CONFLICT` (409), `BILLING_NO_PROVIDER_FOR_CURRENCY`,
+   * `BILLING_PLAN_CURRENCY_UNAVAILABLE`, `BILLING_CURRENCY_NOT_ALLOWED`, `BILLING_FIELD_REMOVED`,
+   * `COUPON_CURRENCY_NOT_COVERED` and the other coupon codes {@link validateCoupon} lists.
    */
   createCheckout(
     accessToken: string,
@@ -2976,25 +3471,52 @@ class BillingClient {
     if (opts?.planSlug) q.set('planSlug', opts.planSlug);
     if (opts?.limit !== undefined) q.set('limit', String(opts.limit));
     if (opts?.offset !== undefined) q.set('offset', String(opts.offset));
+    if (opts?.country) q.set('country', opts.country.toUpperCase());
     const query = q.toString();
     return this.client.send(
       'GET',
       `/api/v1/billing/trial-eligibility${query ? `?${query}` : ''}`,
       undefined,
-      {
-        'X-Rekey-User-Token': accessToken,
-        ...(opts?.country ? { 'x-country': opts.country.toUpperCase() } : {}),
-      },
+      { 'X-Rekey-User-Token': accessToken },
     );
   }
 
   /**
    * Validate a coupon for the current user against a plan, *without*
-   * applying it. Render "$50 off" on a pricing page before submit.
+   * applying it. The quote is made at the price the checkout would charge:
+   * render `formatted.discount` and `formatted.total`, which are written in
+   * that price's currency.
+   *
+   * A coupon is judged in the currency charged. A fixed-amount coupon with no
+   * amount in that currency, or a percentage limited to other currencies, is
+   * refused with `COUPON_CURRENCY_NOT_COVERED`, here and at checkout. Nothing
+   * is converted and the discount is never dropped silently: the buyer may
+   * continue without the code. When `priceFallback` is set, the quote is for
+   * the plan's default price because the price selected could not be charged.
+   *
+   * Send the same `country`, `currency`, `provider` and `organizationId` as
+   * the checkout that follows. The preview is then priced and routed like that
+   * checkout. Leave one out and the quote can be in another currency, or for a
+   * provider the checkout will not use. The `visitorCountryHint` on the client
+   * counts here as it does at checkout, so preview and check out through the
+   * same scoped client.
+   *
+   * @example
+   * ```ts
+   * const buyer = { planSlug: 'pro', country: 'IN', organizationId: team.id };
+   * const quote = await rekey.billing.validateCoupon(userAccessToken, { ...buyer, code: 'LAUNCH50' });
+   * // quote.formatted.discount is '₹750.00' and quote.formatted.total is '₹749.00'
+   * const { url } = await rekey.billing.createCheckout(userAccessToken, {
+   *   ...buyer,
+   *   couponCode: 'LAUNCH50',
+   *   successUrl: 'https://yourapp.com/billing?status=ok',
+   *   cancelUrl:  'https://yourapp.com/billing?status=cancel',
+   * });
+   * ```
    *
    * @throws {RekeyError} with one of `COUPON_NOT_FOUND` / `COUPON_INACTIVE`
    *   / `COUPON_NOT_YET_STARTED` / `COUPON_EXPIRED` / `COUPON_NOT_APPLICABLE`
-   *   / `COUPON_CURRENCY_REQUIRED` / `COUPON_CURRENCY_MISMATCH` /
+   *   / `COUPON_CURRENCY_NOT_COVERED` / `COUPON_NO_DISCOUNT` /
    *   `COUPON_REDEMPTION_LIMIT_REACHED` /
    *   `COUPON_USER_LIMIT_REACHED`. Surface the message + fix to the user.
    */
@@ -3008,19 +3530,42 @@ class BillingClient {
   }
 
   /**
-   * List the billing providers configured + enabled for this Application,
-   * in the order the geo router would prefer them. Forward the end-user's
-   * `country` (ISO 3166-1 alpha-2) when you have it, the panel/SDK will
-   * surface India-specific providers (Razorpay) for IN-country users, etc.
+   * List the billing providers enabled for this Application, in the order the
+   * router prefers them for the buyer's country. `routedProvider` is the one a
+   * checkout that names no provider is sent to.
    *
-   * Returns the resolved country (echoed back from the server's view of
-   * `CF-IPCountry` etc.) plus the ordered provider list. Use this to render
-   * a "Pay with..." picker on your pricing page.
+   * Pass the buyer's `country` (ISO 3166-1 alpha-2), or set
+   * `visitorCountryHint` on the client with {@link Rekey.with}. This call
+   * comes from your server, so Rekey cannot see where the buyer is: without
+   * one of them, providers you restricted to a country (Razorpay for `IN`) are
+   * never preferred.
+   *
+   * Pass `planSlug` when the list is for one plan. It then holds only the
+   * providers a checkout of that plan accepts for this buyer, each judged at
+   * the price that checkout would charge, and `routedProvider` is the one a
+   * checkout of the plan that names no provider is sent to.
+   *
+   * Each provider lists `currencies`: the ones its account charges, chosen
+   * from the provider's own list. An empty list means none.
+   *
+   * @example
+   * ```ts
+   * const { providers, routedProvider } = await rekey.billing.getProviders('IN');
+   * // routedProvider === 'razorpay' when Razorpay's countries include IN
+   * ```
+   *
+   * @example
+   * ```ts
+   * const forPro = await rekey.billing.getProviders(undefined, { planSlug: 'pro' });
+   * ```
    */
-  getProviders(country?: string): Promise<ProvidersListDto> {
-    const headers: Record<string, string> = {};
-    if (country) headers['x-country'] = country.toUpperCase();
-    return this.client.send('GET', '/api/v1/billing/providers', undefined, headers);
+  getProviders(country?: string, opts?: { planSlug?: string }): Promise<ProvidersListDto> {
+    const query = new URLSearchParams();
+    const code = country ? country.toUpperCase() : undefined;
+    if (code) query.set('country', code);
+    if (opts?.planSlug) query.set('planSlug', opts.planSlug);
+    const search = query.toString();
+    return this.client.send('GET', `/api/v1/billing/providers${search ? `?${search}` : ''}`);
   }
 
   /**
@@ -3132,16 +3677,26 @@ class BillingClient {
    * must be its OWNER or ADMIN. Pass `subscriptionId` to cancel one of several
    * live subscriptions ({@link listSubscriptions}).
    *
+   * Pass `reason` (one of `CANCEL_REASONS`) and `feedback` from your cancel
+   * survey: they are kept on the subscription, shown in the panel and carried
+   * on its webhooks as `data.subscription.cancellation`.
+   *
    * @example
    * ```ts
-   * const sub = await rekey.billing.cancelSubscription(userAccessToken);
+   * const sub = await rekey.billing.cancelSubscription(userAccessToken, { reason: 'too_expensive' });
    * // Tell them what they actually get: access until the date they paid through.
    * console.log(`Access until ${sub.cancelAt ?? sub.currentPeriodEnd}`);
    * ```
    */
   cancelSubscription(
     accessToken: string,
-    input?: { atPeriodEnd?: boolean; organizationId?: string; subscriptionId?: string },
+    input?: {
+      atPeriodEnd?: boolean;
+      organizationId?: string;
+      subscriptionId?: string;
+      reason?: CancelReason;
+      feedback?: string;
+    },
   ): Promise<SelfSubscriptionDto> {
     return this.client.send(
       'POST',
@@ -3152,6 +3707,8 @@ class BillingClient {
         ...(input?.atPeriodEnd !== undefined && { atPeriodEnd: input.atPeriodEnd }),
         ...(input?.organizationId && { organizationId: input.organizationId }),
         ...(input?.subscriptionId && { subscriptionId: input.subscriptionId }),
+        ...(input?.reason && { reason: input.reason }),
+        ...(input?.feedback && { feedback: input.feedback }),
       },
       { 'X-Rekey-User-Token': accessToken },
     );

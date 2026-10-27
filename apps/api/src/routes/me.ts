@@ -65,6 +65,10 @@ function toApplicationDto(app: Application): ApplicationDto {
     authConfig: AuthConfigSchema.parse(app.authConfig),
     billingConfig: BillingConfigSchema.parse(app.billingConfig),
     supportEmail: emailSenderIdentity(app).supportEmail,
+    reportingTimezone: app.reportingTimezone,
+    promotedAt: app.promotedAt?.toISOString() ?? null,
+    disabledAt: app.disabledAt?.toISOString() ?? null,
+    disabledReason: app.disabledReason,
     createdAt: app.createdAt.toISOString(),
   };
 }
@@ -94,12 +98,12 @@ export async function meRoutes(app: FastifyInstance): Promise<void> {
           200: ok(ref('Application'), 'The Application this secret key resolves to.'),
           ...errs({
             401:
-              'API_KEY_MISSING — no `Authorization: Bearer` header; or API_KEY_INVALID — the ' +
+              'API_KEY_MISSING: no `Authorization: Bearer` header; or API_KEY_INVALID: the ' +
               'secret key is unknown, revoked, or expired.',
             403:
-              "IP_NOT_ALLOWED — the caller IP is outside the Application's `ipAllowlist`; or " +
-              'API_KEY_SCOPE_INSUFFICIENT — the key lacks the `auth:read` scope.',
-            429: 'RATE_LIMITED — too many requests for this window. Honour the `Retry-After` header.',
+              "IP_NOT_ALLOWED: the caller IP is outside the Application's `ipAllowlist`; or " +
+              'API_KEY_SCOPE_INSUFFICIENT: the key lacks the `auth:read` scope.',
+            429: 'RATE_LIMITED: too many requests for this window. Honour the `Retry-After` header.',
           }),
         },
       },

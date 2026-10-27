@@ -14,6 +14,9 @@ import { prisma } from '../src/lib/prisma.js';
 import { flushApiRequestLogs } from '../src/lib/request-log.js';
 import { countQueries } from './query-counter.js';
 import { __resetForTests } from '../src/lib/operator-auth-cache.js';
+import { operatorsConfirmTheirEmail } from './confirmed-accounts.js';
+
+operatorsConfirmTheirEmail();
 
 const ADMIN_KEY = process.env.SUPER_ADMIN_KEY!;
 
@@ -175,11 +178,19 @@ describe('operator query budget', () => {
     );
     expect(apps61).toBe(apps31);
     expect(apps31).toBeLessThanOrEqual(6);
+    // 11: the tenant count, the ranking (every tenant ordered by MRR in the
+    // headline currency, which the same statement picks), the page of
+    // tenants with their applications (two), and five grouped metrics, MRR
+    // per currency among them. The ranking and the MRR read each first check
+    // that no plan is out of step with its default price row, one statement
+    // each, because MRR is summed from the row. Fixed, whatever the number
+    // of rows.
     expect(
-      await measure('admin tenants', () => admin('/api/v1/admin/metrics/tenants?sort=mrrCents')),
-    ).toBeLessThanOrEqual(7);
-    // Uncached here (no Redis under test); in production a hit costs 0.
-    expect(await measure('admin overview', () => admin('/api/v1/admin/metrics/overview'))).toBeLessThanOrEqual(5);
+      await measure('admin tenants', () => admin('/api/v1/admin/metrics/tenants?sort=mrr')),
+    ).toBeLessThanOrEqual(11);
+    // Uncached here (no Redis under test); in production a hit costs 0. One
+    // of the 6 is the platform MRR read checking plans against their price rows.
+    expect(await measure('admin overview', () => admin('/api/v1/admin/metrics/overview'))).toBeLessThanOrEqual(6);
 
     console.log('QUERY_BUDGET ' + JSON.stringify(out));
   });

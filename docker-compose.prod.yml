@@ -87,16 +87,14 @@ services:
         "--appendonly",
         "yes",
         "--requirepass",
-        "${REDIS_PASSWORD}",
+        "${REDIS_PASSWORD:?set REDIS_PASSWORD in .env (openssl rand -hex 24)}",
       ]
     environment:
       # valkey-cli reads this, so the healthcheck doesn't put the password in an
       # argv element visible via `docker inspect`.
       #
-      # Plain ${VAR} rather than ${VAR:?err}: the fail-fast form is reserved for
-      # the three hostnames, where a wrong value is silently wrong rather than
-      # loudly broken. A missing password fails the container start with a clear
-      # Postgres/Redis error of its own.
+      # The --requirepass above uses ${VAR:?err} because Valkey treats an empty
+      # password as no password and boots open, with nothing to notice.
       #
       # NOTE: the password lands in REDIS_URL unencoded, so keep it URL-safe.
       # `openssl rand -hex 24` is; a password containing @ : / or # would not be.
@@ -249,6 +247,8 @@ services:
       RESEND_DEFAULT_FROM_NAME: ${RESEND_DEFAULT_FROM_NAME:-}
       EMAIL_SEND_DAILY_CAP: ${EMAIL_SEND_DAILY_CAP:-}
       EMAIL_SEND_RECIPIENT_HOURLY_CAP: ${EMAIL_SEND_RECIPIENT_HOURLY_CAP:-}
+      AUTH_EMAIL_RECIPIENT_HOURLY_CAP: ${AUTH_EMAIL_RECIPIENT_HOURLY_CAP:-}
+      AUTH_EMAIL_RECIPIENT_DAILY_CAP: ${AUTH_EMAIL_RECIPIENT_DAILY_CAP:-}
       EMAIL_UNSUBSCRIBE_SECRET: ${EMAIL_UNSUBSCRIBE_SECRET:-}
       EMAIL_UNSUBSCRIBE_SECRET_ID: ${EMAIL_UNSUBSCRIBE_SECRET_ID:-}
       EMAIL_UNSUBSCRIBE_PREVIOUS_SECRETS: ${EMAIL_UNSUBSCRIBE_PREVIOUS_SECRETS:-}
@@ -390,7 +390,6 @@ services:
         # cannot change these after the build.
         NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-https://${API_HOST}}
         NEXT_PUBLIC_APP_URL: ${NEXT_PUBLIC_APP_URL:-https://${PANEL_HOST}}
-        NEXT_PUBLIC_PORTAL_URL: ${NEXT_PUBLIC_PORTAL_URL:-https://${PORTAL_HOST}}
         # Your analytics property, not ours. No default: a default here would
         # report a self-hoster's operators to Rekey's GA4.
         NEXT_PUBLIC_GA_MEASUREMENT_ID: ${NEXT_PUBLIC_GA_MEASUREMENT_ID:-}
@@ -456,9 +455,9 @@ services:
   # (fetched via /api/v1/portal/config/:slug) and authorizes users with their
   # own token. See docs/portal.md.
   #
-  # Not running a customer portal? Delete this service AND the three PORTAL_HOST
-  # references above — the api's `PUBLIC_PORTAL_URL`, its `CORS_ALLOWED_ORIGINS`
-  # entry, and the panel's `NEXT_PUBLIC_PORTAL_URL` build arg. Leaving them with
+  # Not running a customer portal? Delete this service AND the two PORTAL_HOST
+  # references above: the api's `PUBLIC_PORTAL_URL` and its `CORS_ALLOWED_ORIGINS`
+  # entry. Leaving them with
   # PORTAL_HOST unset would hand the API the string `https://`, which is not a
   # URL and fails the boot.
   portal:

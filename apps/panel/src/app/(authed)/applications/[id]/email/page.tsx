@@ -208,7 +208,7 @@ export default async function EmailPage({
       )}
       {error && (
         <Banner tone="error">
-          <ApiErrorText code={error} detail={errorDetail} fix={errorFix} map={ERR} fallback={error} />
+          <ApiErrorText code={error} detail={errorDetail} fix={errorFix} map={ERR} />
         </Banner>
       )}
 
@@ -323,7 +323,7 @@ export default async function EmailPage({
           </div>
           {config.hasCustomCredentials && (
             <ActionForm action={removeCredsBound}>
-              <ConfirmButton
+              <ConfirmButton title="Remove email credentials?"
                 confirm="Remove BYO credentials? The Application will fall back to the default transport."
                 triggerClassName={dangerButtonClass('sm')}
               >

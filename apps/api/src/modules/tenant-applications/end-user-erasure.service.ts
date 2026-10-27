@@ -22,7 +22,10 @@
  *      suppressions (deleted), outbound webhook delivery payloads and inbound
  *      billing receipts (rows kept, personal fields rewritten).
  *   5. ERASES the contact at the same address (lists), with its memberships,
- *      submissions and webhook payloads.
+ *      submissions and webhook payloads, and the organization invitations
+ *      sent to the address (pending ones deleted, the rest tombstoned).
+ *   6. NULLS the buyer's country on their billing events, in the log and in
+ *      the outbox. Amounts and ids stay.
  *
  * WHY tombstone instead of hard-delete + null FKs: the retained financial
  * rows FK to EndUser with `onDelete: Cascade`. Deleting the EndUser would
@@ -39,6 +42,8 @@ import { prisma } from '../../lib/prisma.js';
 import { enqueueEvent, kickDeliveries } from '../webhooks/webhook.service.js';
 import { clearFailures, euLoginLockScope } from '../../lib/brute-force.js';
 import { eraseContactsByAddress } from '../contacts/contact-erasure.service.js';
+import { closeOpenCaseIn } from '../support-cases/support-case-writes.js';
+import { eraseEndUserFromBillingLog } from '../billing-log/index.js';
 
 /** Non-routable tombstone address. `.invalid` is reserved (RFC 2606) so it can never deliver. */
 export function tombstoneEmail(endUserId: string): string {
@@ -71,6 +76,8 @@ export interface EraseResult {
     webhookDeliveriesScrubbed: number;
     webhookEventsScrubbed: number;
     contactsErased: number;
+    organizationInvitationsErased: number;
+    billingEventsScrubbed: number;
   };
 }
 
@@ -120,7 +127,7 @@ const SCRUB_CHUNK = 500;
  * free-form fields and `session.created`'s `country` are nulled the way
  * erasure nulls them on the source rows.
  */
-const DELIVERY_NULLED_KEYS = new Set(['metadata', 'label', 'description', 'country']);
+const DELIVERY_NULLED_KEYS = new Set(['metadata', 'label', 'description', 'country', 'feedback']);
 
 function escapeRegExp(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -212,21 +219,22 @@ async function scrubPayloads(
 
 /**
  * Erase one end-user. Caller MUST have already authorized + confirmed the user
- * belongs to `applicationId` (the route does this). `operatorUserId` is
- * recorded on the tombstone for the audit trail.
+ * belongs to `applicationId` (the route does this). `actor` (the operator,
+ * or the end user deleting their own account) is recorded on the tombstone
+ * for the audit trail.
  */
 export async function eraseEndUser(args: {
   applicationId: string;
   endUserId: string;
-  operatorUserId: string;
+  actor: { type: 'operator' | 'end_user'; id: string };
 }): Promise<EraseResult> {
-  const { applicationId, endUserId, operatorUserId } = args;
+  const { applicationId, endUserId, actor } = args;
 
   // Captured inside the tx, used after it commits: the brute-force limiter is
   // in Redis, so clearing the lock cannot join the transaction.
   let erasedEmail: string | null = null;
-  // `user.erased` rows, written as the last statement of the erasure's own
-  // transaction and kicked after it commits.
+  // `support.closed` and `user.erased` rows, written at the end of the
+  // erasure's own transaction and kicked after it commits.
   let erasedDeliveryIds: string[] = [];
 
   const result = await prisma.$transaction(async (tx) => {
@@ -247,10 +255,10 @@ export async function eraseEndUser(args: {
           oauthAuthCodes: 0,
           subscriptionsScrubbed: 0, paymentsScrubbed: 0, licensesScrubbed: 0,
           devicesDeleted: 0, licenseActivationsScrubbed: 0,
-          creditLedgerScrubbed: 0, usageRecordsScrubbed: 0,
+          creditLedgerScrubbed: 0, usageRecordsScrubbed: 0, billingEventsScrubbed: 0,
           emailLogsScrubbed: 0, emailSuppressionsDeleted: 0,
           webhookDeliveriesScrubbed: 0, webhookEventsScrubbed: 0,
-          contactsErased: 0,
+          contactsErased: 0, organizationInvitationsErased: 0,
         },
       } satisfies EraseResult;
     }
@@ -357,7 +365,7 @@ export async function eraseEndUser(args: {
     const [subs, payments, licenses, ledger, usage] = await Promise.all([
       tx.subscription.updateMany({
         where: { applicationId, endUserId },
-        data: { metadata: {} },
+        data: { metadata: {}, cancelFeedback: null },
       }),
       tx.payment.updateMany({
         where: { applicationId, endUserId },
@@ -379,6 +387,7 @@ export async function eraseEndUser(args: {
     ]);
     // CreditBalance carries no free-form PII (just a numeric balance), retained
     // as-is via its FK to the tombstone.
+    const billingLog = await eraseEndUserFromBillingLog(tx, { applicationId, endUserId });
 
     // ── 2b. EMAIL and WEBHOOK logs: the address outlives the account ────────
     // Every table below duplicates the address (or other personal fields) at
@@ -400,6 +409,15 @@ export async function eraseEndUser(args: {
     // address. `to_address` is stored lowercased by both writers in
     // lib/email-transport.ts, so an exact match on the lowercased address is
     // the complete match and can use the (application_id, to_address) index.
+    // A scheduled send to them must not go out after they are gone, and its
+    // stored request holds what would have been mailed: delete it.
+    await tx.emailLog.deleteMany({
+      where: {
+        applicationId,
+        status: 'scheduled',
+        OR: [{ toAddress: { in: addresses } }, { scheduledRequest: { path: ['to', 'endUserId'], equals: endUserId } }],
+      },
+    });
     const emailLogs =
       addresses.length === 0
         ? 0
@@ -418,11 +436,33 @@ export async function eraseEndUser(args: {
     const suppressions = await tx.emailSuppression.deleteMany({
       where: { applicationId, address: { in: addresses } },
     });
+    await tx.emailTopicOptOut.deleteMany({ where: { applicationId, address: { in: addresses } } });
 
     // Contacts: the same person when they joined a list at one of these
     // addresses. Deleted with their memberships and submissions, and their
     // webhook deliveries scrubbed, see contacts/contact-erasure.service.ts.
     const contacts = await eraseContactsByAddress(tx, applicationId, addresses);
+
+    // Organization invitations name the invitee by address. A pending one is
+    // deleted, so nobody can accept it after the erasure; an accepted or
+    // revoked one stays as the record of who joined, with the address
+    // tombstoned.
+    const theirInvitations = {
+      organization: { applicationId },
+      OR: [{ email: { in: addresses } }, { acceptedById: endUserId }],
+    } satisfies Prisma.OrganizationInvitationWhereInput;
+    const [pendingInvitations, pastInvitations] = await Promise.all([
+      tx.organizationInvitation.deleteMany({
+        where: { ...theirInvitations, acceptedAt: null, revokedAt: null },
+      }),
+      tx.organizationInvitation.updateMany({
+        where: {
+          ...theirInvitations,
+          NOT: { acceptedAt: null, revokedAt: null },
+        },
+        data: { email: tombstone },
+      }),
+    ]);
 
     // Outbound deliveries: rows and status KEPT, payload scrubbed. Matched by
     // the end-user id at the fixed places Rekey's own emit sites put it, not
@@ -449,6 +489,28 @@ export async function eraseEndUser(args: {
     const deliveriesScrubbed = await scrubPayloads(tx, 'webhook_deliveries', deliveryIds, {
       ...scrubCtx,
       personalKeys: true,
+    });
+    // Events that name the person only by address, such as
+    // `organization.invitation.*` (`data.invitation.email`). Matched by the
+    // address like the inbound receipts below, and only whole occurrences of
+    // it are replaced, so another user's payload that merely contains the
+    // string keeps its own fields.
+    const addressOnlyDeliveryIds =
+      addresses.length === 0
+        ? []
+        : (
+            await tx.$queryRaw<Array<{ id: string }>>`
+              SELECT id FROM webhook_deliveries
+              WHERE application_id = ${applicationId}
+                AND NOT (id = ANY(${deliveryIds}::text[]))
+                AND EXISTS (
+                  SELECT 1 FROM unnest(${addresses}::text[]) AS a(address)
+                  WHERE strpos(lower(payload::text), a.address) > 0
+                )`
+          ).map((r) => r.id);
+    const addressOnlyDeliveriesScrubbed = await scrubPayloads(tx, 'webhook_deliveries', addressOnlyDeliveryIds, {
+      ...scrubCtx,
+      personalKeys: false,
     });
 
     // Inbound billing receipts: the provider's own event body, which carries
@@ -495,7 +557,7 @@ export async function eraseEndUser(args: {
         onboardingSkippedAt: null,
         role: 'user',
         erasedAt,
-        erasedBy: operatorUserId,
+        erasedBy: actor.id,
         // Free text an operator wrote about this person. `bannedAt` and
         // `bannedBy` stay: they say nothing about the person.
         banReason: null,
@@ -510,10 +572,27 @@ export async function eraseEndUser(args: {
         AND type IN ('end_user.banned', 'end_user.device_blocked')
         AND metadata ? 'reason'`;
 
+    // Support cases: rows KEPT as the record of what operators did, the open
+    // one closed, and the operators' free text about this person (the reason
+    // and the notes) removed from all of them. After the tombstone update on purpose: that update holds
+    // the end-user row lock a case is opened under, so no case can be opened
+    // on this account once this statement has looked.
+    const supportDeliveryIds = await closeOpenCaseIn(tx, {
+      applicationId,
+      endUserId,
+      cause: 'erased',
+      actor: { actorType: actor.type, actorId: actor.id, tenantId: null },
+    });
+    await tx.supportCase.updateMany({
+      where: { applicationId, endUserId, reason: { not: null } },
+      data: { reason: null },
+    });
+    await tx.supportCaseNote.deleteMany({ where: { applicationId, endUserId } });
+
     // Outbound webhook, only on a real transition (the no-op returned above).
     // Enqueued AFTER the delivery scrub in step 2, so this row is not one the
     // scrub rewrites; it carries the id and the time and nothing personal.
-    erasedDeliveryIds = await enqueueEvent(tx, {
+    const userErasedDeliveryIds = await enqueueEvent(tx, {
       applicationId,
       type: 'user.erased',
       data: {
@@ -523,6 +602,7 @@ export async function eraseEndUser(args: {
         },
       },
     });
+    erasedDeliveryIds = [...supportDeliveryIds, ...userErasedDeliveryIds];
 
     return {
       erased: true,
@@ -545,9 +625,11 @@ export async function eraseEndUser(args: {
         usageRecordsScrubbed: usage.count,
         emailLogsScrubbed: emailLogs,
         emailSuppressionsDeleted: suppressions.count,
-        webhookDeliveriesScrubbed: deliveriesScrubbed + contacts.deliveriesScrubbed,
+        webhookDeliveriesScrubbed: deliveriesScrubbed + addressOnlyDeliveriesScrubbed + contacts.deliveriesScrubbed,
         webhookEventsScrubbed: eventsScrubbed,
         contactsErased: contacts.contactIds.length,
+        organizationInvitationsErased: pendingInvitations.count + pastInvitations.count,
+        billingEventsScrubbed: billingLog.events + billingLog.queued,
       },
     } satisfies EraseResult;
     // Prisma's 5-second default is sized for a handful of statements. A

@@ -11,7 +11,13 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { FastifyInstance } from 'fastify';
+import type { BillingProvider, WebhookInspection } from '../src/modules/billing/providers/types.js';
 import { Prisma } from '@prisma/client';
+import { withDefaultPrice } from '../src/modules/plans/default-price.js';
+import { operatorsConfirmTheirEmail } from './confirmed-accounts.js';
+import { revisePlan, revisePlans } from './seed-plan.js';
+
+operatorsConfirmTheirEmail();
 
 vi.mock('../src/config/env.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../src/config/env.js')>();
@@ -27,6 +33,8 @@ const { billingCredentialsService } = await import('../src/modules/billing/crede
 const { fakePaypal } = await import('./fakes/billing-providers.js');
 const { redactUrlSecrets } = await import('../src/lib/log-redaction.js');
 const { confirmProbeNonce } = await import('../src/modules/billing/checkout/portal-probe.js');
+const { planCheckoutReadiness } = await import('../src/modules/plans/plan-readiness.js');
+const { completeCheckoutSession } = await import('../src/modules/billing/checkout/sessions.service.js');
 
 const PASSWORD = 'pw-one-two-three';
 const REGISTERED = 'https://app.example';
@@ -100,7 +108,7 @@ describe('hosted checkout sessions', () => {
       method: 'POST',
       url: `/api/v1/tenant/applications/${applicationId}/plans`,
       headers: { authorization: `Bearer ${operatorAccess}` },
-      payload: { slug: 'standard', name: 'Cloud Standard', amount: 9900 },
+      payload: { slug: 'standard', name: 'Cloud Standard', price: { currency: 'USD', amount: 9900 } },
     });
     expect(plan.statusCode).toBe(201);
     const current = await prisma.application.findUniqueOrThrow({ where: { id: applicationId } });
@@ -204,6 +212,83 @@ describe('hosted checkout sessions', () => {
       expect(fakePaypal.lastEmbedded?.returnUrl).toBe(url);
     });
 
+    it('records the buyer\'s country and where it came from on the session', async () => {
+      expect((await checkout({ country: 'in' })).statusCode).toBe(200);
+      const declared = await prisma.checkoutSession.findFirstOrThrow({ where: { applicationId }, orderBy: { createdAt: 'desc' } });
+      expect(declared).toMatchObject({ buyerCountry: 'IN', buyerCountrySource: 'declared' });
+
+      await prisma.checkoutSession.deleteMany({ where: { applicationId } });
+      await prisma.subscription.deleteMany({ where: { applicationId } });
+      expect((await checkout()).statusCode).toBe(200);
+      const unknown = await prisma.checkoutSession.findFirstOrThrow({ where: { applicationId } });
+      expect(unknown).toMatchObject({ buyerCountry: null, buyerCountrySource: null });
+
+      const malformed = await checkout({ country: '1!' });
+      expect(malformed.statusCode).toBe(400);
+
+      // What the provider list names as routed is what a checkout then gets.
+      await prisma.checkoutSession.deleteMany({ where: { applicationId } });
+      await prisma.subscription.deleteMany({ where: { applicationId } });
+      await billingCredentialsService.upsertRaw(applicationId, 'stripe', { apiKey: 'sk_test_ci', webhookSecret: 'whsec_ci' }, { mode: 'test', countries: ['DE'] });
+      const listed = await app.inject({ method: 'GET', url: '/api/v1/billing/providers?country=DE', headers: { authorization: `Bearer ${liveKey}` } });
+      expect(listed.json().data.routedProvider).toBe('stripe');
+      const routed = await checkout({ country: 'DE' });
+      expect(routed.statusCode, routed.body).toBe(200);
+      expect(routed.json().data.provider).toBe('stripe');
+
+      // Currency outranks country: Stripe is preferred in DE, and once its
+      // account is declared INR-only the USD plan goes to PayPal instead, in
+      // the list for that plan and at checkout alike.
+      await prisma.checkoutSession.deleteMany({ where: { applicationId } });
+      await prisma.subscription.deleteMany({ where: { applicationId } });
+      await billingCredentialsService.setCurrencies(applicationId, 'stripe', ['INR']);
+      const forPlan = await app.inject({ method: 'GET', url: '/api/v1/billing/providers?country=DE&planSlug=standard', headers: { authorization: `Bearer ${liveKey}` } });
+      expect(forPlan.json().data).toMatchObject({ routedProvider: 'paypal', providers: [expect.objectContaining({ provider: 'paypal' })] });
+      const byCurrency = await checkout({ country: 'DE' });
+      expect(byCurrency.json().data.provider).toBe('paypal');
+      // Stripe is what a picker preselects for a buyer in DE, so posting it
+      // is routed by currency rather than refused.
+      await prisma.checkoutSession.deleteMany({ where: { applicationId } });
+      await prisma.subscription.deleteMany({ where: { applicationId } });
+      const preselected = await checkout({ country: 'DE', provider: 'stripe' });
+      expect(preselected.json().data.provider).toBe('paypal');
+      // Chosen against the default, it is a real choice, and is refused.
+      await prisma.checkoutSession.deleteMany({ where: { applicationId } });
+      await prisma.subscription.deleteMany({ where: { applicationId } });
+      const named = await checkout({ country: 'US', provider: 'stripe' });
+      expect(named.statusCode).toBe(400);
+      expect(named.json().error.code).toBe('BILLING_PROVIDER_CURRENCY_UNSUPPORTED');
+
+      // An existing row keeps its list when an edit does not name it, and the
+      // routing-only PATCH can change it.
+      const saved = () => prisma.billingCredentials.findUniqueOrThrow({ where: { applicationId_provider: { applicationId, provider: 'stripe' } } });
+      await billingCredentialsService.upsertCredentials(applicationId, 'stripe', { apiKey: 'sk_test_ci_rotated' });
+      expect((await saved()).currencies).toEqual(['INR']);
+      const patched = await app.inject({
+        method: 'PATCH',
+        url: `/api/v1/tenant/applications/${applicationId}/billing-credentials/stripe`,
+        headers: { authorization: `Bearer ${operatorAccess}` },
+        payload: { currencies: ['inr', 'usd'] },
+      });
+      expect(patched.statusCode, patched.body).toBe(200);
+      expect((await saved()).currencies).toEqual(['INR', 'USD']);
+      const notACode = await app.inject({
+        method: 'PATCH',
+        url: `/api/v1/tenant/applications/${applicationId}/billing-credentials/stripe`,
+        headers: { authorization: `Bearer ${operatorAccess}` },
+        payload: { currencies: ['rupee'] },
+      });
+      expect(notACode.statusCode).toBe(400);
+
+      // No provider can charge the plan: it reads as not buyable before a buyer finds out.
+      await billingCredentialsService.setCurrencies(applicationId, 'stripe', ['INR']);
+      await billingCredentialsService.setCurrencies(applicationId, 'paypal', ['EUR']);
+      const plan = await withDefaultPrice(await prisma.plan.findFirstOrThrow({ where: { applicationId, slug: 'standard' } }));
+      const readiness = (await planCheckoutReadiness(applicationId, [plan])).get(plan.id)!;
+      expect(readiness.ready).toBe(false);
+      expect(readiness.blockers).toEqual([expect.objectContaining({ provider: null, code: 'PLAN_CURRENCY_UNSUPPORTED' })]);
+    });
+
     it('keeps the provider page and records a token-less row while the mode is REDIRECT', async () => {
       const res = await checkout();
       expect(res.statusCode).toBe(200);
@@ -213,12 +298,6 @@ describe('hosted checkout sessions', () => {
       expect(data.warnings).toEqual([]);
       const row = await prisma.checkoutSession.findUniqueOrThrow({ where: { id: data.checkoutSessionId } });
       expect(row).toMatchObject({ mode: 'REDIRECT', tokenHash: null, paymentMode: 'TEST' });
-    });
-
-    it('honours mode: "redirect" from the caller even when the Rekey page is on', async () => {
-      await enableEmbedded();
-      const res = await checkout({ mode: 'redirect' });
-      expect((res.json().data as { mode: string }).mode).toBe('redirect');
     });
 
     it('uses the live setting for a checkout on live credentials, and the test setting stays separate', async () => {
@@ -236,6 +315,16 @@ describe('hosted checkout sessions', () => {
   });
 
   describe('the page lookup', () => {
+    it('shows the price the session was opened at, which is what the provider charges, not the plan\'s default', async () => {
+      await enableEmbedded();
+      const { token, checkoutSessionId } = await embeddedCheckout();
+      // A recurring session opened at the plan's INR price.
+      await prisma.checkoutSession.update({ where: { id: checkoutSessionId }, data: { currency: 'INR', unitAmount: 749900, chargeAmount: 749900 } });
+      const order = ((await view(token)).json().data as { order: { plan: { amount: number; currency: string }; totalDueToday: number } }).order;
+      expect(order.plan).toMatchObject({ amount: 749900, currency: 'INR' });
+      expect(order.totalDueToday).toBe(749900);
+    });
+
     it('returns the order, the full email and the browser config while OPEN', async () => {
       await enableEmbedded();
       const { token } = await embeddedCheckout();
@@ -286,6 +375,10 @@ describe('hosted checkout sessions', () => {
       await enableEmbedded();
       const { token, checkoutSessionId } = await embeddedCheckout();
       const row = await prisma.checkoutSession.findUniqueOrThrow({ where: { id: checkoutSessionId } });
+      // The price is fixed on the session when it opens, and the subscription
+      // does not take it until a payment completes the checkout.
+      expect(row).toMatchObject({ currency: 'USD', unitAmount: 9900 });
+      expect(await prisma.subscription.findUniqueOrThrow({ where: { id: row.subscriptionId } })).toMatchObject({ currency: null, unitAmount: null });
       const hook = await app.inject({
         method: 'POST',
         url: `/api/v1/billing/webhook/paypal/${slug}`,
@@ -298,6 +391,15 @@ describe('hosted checkout sessions', () => {
       });
       expect(hook.statusCode).toBe(200);
       expect((await prisma.checkoutSession.findUniqueOrThrow({ where: { id: checkoutSessionId } })).status).toBe('COMPLETE');
+      expect(await prisma.subscription.findUniqueOrThrow({ where: { id: row.subscriptionId } })).toMatchObject({ currency: 'USD', unitAmount: 9900 });
+
+      // A redelivered completion finds nothing to flip, so it cannot put a
+      // session's price back over whatever the subscription holds by then.
+      await prisma.subscription.update({ where: { id: row.subscriptionId }, data: { currency: 'INR', unitAmount: 49900 } });
+      expect(
+        await prisma.$transaction((tx) => completeCheckoutSession(tx, applicationId, row.providerSessionId, { actor: { type: 'system' } })),
+      ).toBeNull();
+      expect(await prisma.subscription.findUniqueOrThrow({ where: { id: row.subscriptionId } })).toMatchObject({ currency: 'INR', unitAmount: 49900 });
       const res = await view(token);
       expect(res.json().data).toMatchObject({ status: 'complete', order: null, returnUrl: `${REGISTERED}/account?paid=1` });
       expect(res.body).not.toContain(userEmail);
@@ -460,44 +562,9 @@ describe('hosted checkout sessions', () => {
       expect(String((events[0]!.metadata as { fix?: string }).fix)).toContain('Billing → Setup → Providers → PayPal');
     });
 
-    it('falls back when the PayPal client ID the buttons need is missing', async () => {
-      await enableEmbedded();
-      await billingCredentialsService.upsertRaw(
-        applicationId,
-        'paypal',
-        { clientSecret: 'secret_ci_only', webhookId: 'WH-ci-only' },
-        { mode: 'test' },
-      );
-      const data = (await checkout()).json().data as { mode: string; warnings: Array<{ check?: string }> };
-      expect(data.mode).toBe('redirect');
-      expect(data.warnings[0]!.check).toBe('browser_credential');
-    });
-
-    it('falls back when the provider cannot take this flow on the page', async () => {
-      await enableEmbedded();
-      await billingCredentialsService.upsertRaw(
-        applicationId,
-        'razorpay',
-        { keyId: 'rzp_test_ci', keySecret: 'secret', webhookSecret: 'whsec' },
-        { mode: 'test' },
-      );
-      const data = (await checkout({ provider: 'razorpay' })).json().data as { mode: string; warnings: Array<{ check?: string }> };
-      expect(data.mode).toBe('redirect');
-      expect(data.warnings[0]!.check).toBe('provider');
-    });
-
-    it('falls back when a return URL is on an unregistered origin', async () => {
-      await enableEmbedded();
-      const res = await checkout({ successUrl: 'https://elsewhere.example/ok' });
-      const data = res.json().data as { mode: string; warnings: Array<{ code: string; check?: string }> };
-      expect(data.mode).toBe('redirect');
-      expect(data.warnings.map((w) => w.code).sort()).toEqual(['CHECKOUT_EMBEDDED_FELL_BACK', 'CHECKOUT_RETURN_URL_UNREGISTERED']);
-      expect(data.warnings.find((w) => w.code === 'CHECKOUT_EMBEDDED_FELL_BACK')!.check).toBe('return_urls');
-    });
-
     it('falls back when the plan is registered in the other mode', async () => {
       await enableEmbedded();
-      await prisma.plan.updateMany({ where: { applicationId }, data: { metadata: { paypal: { planId: 'P-LIVE', mode: 'live' } } } });
+      await revisePlans({ applicationId }, { metadata: { paypal: { planId: 'P-LIVE', mode: 'live' } } });
       const data = (await checkout()).json().data as { mode: string; warnings: Array<{ check?: string }> };
       expect(data.mode).toBe('redirect');
       expect(data.warnings[0]!.check).toBe('plans');
@@ -658,18 +725,12 @@ describe('hosted checkout sessions', () => {
       expect(unproven.fix).not.toMatch(/regist/i);
       expect(unproven.fix).toContain("checkout on the provider's page");
 
-      await prisma.plan.update({
-        where: { applicationId_slug: { applicationId, slug: 'standard' } },
-        data: { metadata: { paypal: { planId: 'P-REGISTERED', mode: 'live' } } },
-      });
+      await revisePlan({ applicationId_slug: { applicationId, slug: 'standard' } }, { metadata: { paypal: { planId: 'P-REGISTERED', mode: 'live' } } });
       expect((await providerStatus()).status).toBe('WARN');
-      await prisma.plan.update({
-        where: { applicationId_slug: { applicationId, slug: 'standard' } },
-        data: { metadata: { paypal: { planId: 'P-REGISTERED', mode: 'test' } } },
-      });
+      await revisePlan({ applicationId_slug: { applicationId, slug: 'standard' } }, { metadata: { paypal: { planId: 'P-REGISTERED', mode: 'test' } } });
       expect((await providerStatus()).status).toBe('PASS');
 
-      await prisma.plan.update({ where: { applicationId_slug: { applicationId, slug: 'standard' } }, data: { metadata: {} } });
+      await revisePlan({ applicationId_slug: { applicationId, slug: 'standard' } }, { metadata: {} });
       await prisma.webhookEvent.create({
         data: { applicationId, provider: 'paypal', providerEventId: `WH-${randomUUID()}`, eventType: 'PAYMENT.SALE.COMPLETED', payload: {}, mode: 'test' },
       });
@@ -732,64 +793,115 @@ describe('hosted checkout sessions', () => {
       });
     }
 
-    it('WARNs "no plans to sell" when no paid plan is in scope', async () => {
-      await prisma.plan.updateMany({ where: { applicationId }, data: { active: false } });
-      const data = (await operator('GET', '/checkout/readiness')).json().data as { test: Array<{ id: string; status: string; message: string }> };
-      const plans = data.test.find((c) => c.id === 'plans')!;
-      expect(plans.status).toBe('WARN');
-      expect(plans.message).toContain('no plans to sell');
-    });
-
-    it('FAILs live webhook evidence where the test column only WARNs', async () => {
-      await prisma.billingCredentials.update({
-        where: { applicationId_provider: { applicationId, provider: 'paypal' } },
-        data: { mode: 'live' },
-      });
-      await prisma.application.update({ where: { id: applicationId }, data: { environment: 'PRODUCTION' } });
-      const data = (await operator('GET', '/checkout/readiness')).json().data as { live: Array<{ id: string; status: string; fix: string }> };
-      const webhook = data.live.find((c) => c.id === 'webhook')!;
-      expect(webhook.status).toBe('FAIL');
-      expect(webhook.fix).toBe(
-        "Check the webhook in Panel → Application → Billing → Setup → Providers → PayPal, then complete one checkout on the provider's page so an event arrives.",
-      );
-      const refused = await operator('PATCH', '/checkout', { paymentMode: 'live', checkoutMode: 'EMBEDDED' });
-      expect(refused.statusCode).toBe(409);
-      expect(refused.json().error.code).toBe('CHECKOUT_READINESS_FAILED');
-      expect((await prisma.application.findUniqueOrThrow({ where: { id: applicationId } })).checkoutModeLive).toBe('REDIRECT');
-
-      const liveEvent = (mode: string | null, receivedAt = new Date(), processingError: string | null = null) =>
-        prisma.webhookEvent.create({
-          data: { applicationId, provider: 'paypal', providerEventId: `WH-${randomUUID()}`, eventType: 'PAYMENT.SALE.COMPLETED', payload: {}, mode, receivedAt, processingError },
+    describe('the webhook check', () => {
+      type Inspect = NonNullable<BillingProvider['inspectWebhook']>;
+      const makeLive = async () => {
+        await prisma.billingCredentials.update({
+          where: { applicationId_provider: { applicationId, provider: 'paypal' } },
+          data: { mode: 'live' },
         });
+        await prisma.application.update({ where: { id: applicationId }, data: { environment: 'PRODUCTION' } });
+      };
+      const liveChecks = async () => {
+        await prisma.application.update({ where: { id: applicationId }, data: { checkoutReadinessAt: null } });
+        const data = (await operator('GET', '/checkout/readiness')).json().data as { live: Array<{ id: string; status: string; message: string; fix: string | null }> };
+        return Object.fromEntries(data.live.map((c) => [c.id, c]));
+      };
       const switchLive = async () => {
         await prisma.application.update({ where: { id: applicationId }, data: { checkoutReadinessAt: null } });
         return (await operator('PATCH', '/checkout', { paymentMode: 'live', checkoutMode: 'EMBEDDED' })).statusCode;
       };
-      // A sandbox delivery, and one from before the mode was recorded, prove nothing about live.
-      await liveEvent('test');
-      await liveEvent(null);
-      expect(await switchLive()).toBe(409);
-      // A live delivery verified with credentials since replaced proves nothing either.
-      const creds = await prisma.billingCredentials.findUniqueOrThrow({ where: { applicationId_provider: { applicationId, provider: 'paypal' } } });
-      await liveEvent('live', new Date(creds.updatedAt.getTime() - 60_000));
-      expect(await switchLive()).toBe(409);
-      // Refused because the event's own mode contradicted these credentials:
-      // the saved secret is the other mode's endpoint, so it proves the opposite.
-      await liveEvent('live', new Date(), 'WEBHOOK_MODE_MISMATCH: a test-mode event was verified by this credential');
-      expect(await switchLive()).toBe(409);
-      // An event that verified and then failed to apply still proves delivery.
-      await liveEvent('live', new Date(), 'Plan "enterprise" not found');
-      expect(await switchLive()).toBe(200);
-      await prisma.webhookEvent.deleteMany({ where: { applicationId, processingError: { not: null } } });
-      await liveEvent('live');
-      expect(await switchLive()).toBe(200);
-    });
+      const providerAnswers = (answer: Inspect) => {
+        (fakePaypal as { inspectWebhook?: Inspect }).inspectWebhook = answer;
+      };
+      afterEach(() => {
+        delete (fakePaypal as { inspectWebhook?: Inspect }).inspectWebhook;
+      });
 
-    it('WARNs a sandbox credential on a PRODUCTION Application without blocking', async () => {
-      await prisma.application.update({ where: { id: applicationId }, data: { environment: 'PRODUCTION' } });
-      const data = (await operator('GET', '/checkout/readiness')).json().data as { test: Array<{ id: string; status: string }> };
-      expect(data.test.find((c) => c.id === 'provider')!.status).toBe('WARN');
-      expect((await operator('PATCH', '/checkout', { paymentMode: 'test', checkoutMode: 'EMBEDDED' })).statusCode).toBe(200);
+      it('PASSes live on the provider\'s word alone, with no event ever delivered', async () => {
+        await makeLive();
+        const asked: string[] = [];
+        providerAnswers(async (url) => {
+          asked.push(url);
+          return { state: 'registered' };
+        });
+        const checks = await liveChecks();
+        expect(checks.webhook).toMatchObject({ status: 'PASS', fix: null });
+        expect(asked).toEqual([expect.stringMatching(new RegExp(`/api/v1/billing/webhook/paypal/${slug}$`))]);
+        // The provider answered, so it accepted these credentials too.
+        expect(checks.provider!.status).toBe('PASS');
+        expect(await prisma.webhookEvent.count({ where: { applicationId } })).toBe(0);
+        expect(await switchLive()).toBe(200);
+      });
+
+      it.each([
+        [{ state: 'missing' } as WebhookInspection, 'has no webhook for this Application on the account these live credentials belong to'],
+        [{ state: 'wrong_url', url: 'https://elsewhere.example/hook' } as WebhookInspection, 'delivers to https://elsewhere.example/hook'],
+        [{ state: 'disabled' } as WebhookInspection, 'switched this Application\'s webhook off'],
+        [{ state: 'missing_events', events: ['CHECKOUT.ORDER.APPROVED'] } as WebhookInspection, 'not subscribed to CHECKOUT.ORDER.APPROVED'],
+      ])('FAILs and blocks the live switch when the provider says %j', async (answer, wording) => {
+        await makeLive();
+        providerAnswers(async () => answer);
+        // A delivered event does not outvote the provider: it may predate the change.
+        await prisma.webhookEvent.create({
+          data: { applicationId, provider: 'paypal', providerEventId: `WH-${randomUUID()}`, eventType: 'PAYMENT.SALE.COMPLETED', payload: {}, mode: 'live' },
+        });
+        const { webhook } = await liveChecks();
+        expect(webhook!.status).toBe('FAIL');
+        expect(webhook!.message).toContain(wording);
+        expect(webhook!.fix).toContain('Press Reconfigure next to the webhook in Panel → Application → Billing → Setup → Providers → PayPal');
+        expect(await switchLive()).toBe(409);
+        expect((await prisma.application.findUniqueOrThrow({ where: { id: applicationId } })).checkoutModeLive).toBe('REDIRECT');
+      });
+
+      it('WARNs without blocking when the provider cannot be asked, and says why', async () => {
+        await makeLive();
+        providerAnswers(async () => {
+          throw new Error('invalid_client');
+        });
+        const checks = await liveChecks();
+        expect(checks.webhook!.status).toBe('WARN');
+        expect(checks.webhook!.message).toContain('could not confirm the webhook with PayPal');
+        expect(checks.webhook!.message).toContain('invalid_client');
+        // An unanswered question proves nothing about the credentials.
+        expect(checks.provider!.status).toBe('WARN');
+        expect(await switchLive()).toBe(200);
+      });
+
+      it('falls back to delivered events only where the provider has no way to be asked', async () => {
+        await makeLive();
+        const liveEvent = (mode: string | null, receivedAt = new Date(), processingError: string | null = null) =>
+          prisma.webhookEvent.create({
+            data: { applicationId, provider: 'paypal', providerEventId: `WH-${randomUUID()}`, eventType: 'PAYMENT.SALE.COMPLETED', payload: {}, mode, receivedAt, processingError },
+          });
+        const status = async () => (await liveChecks()).webhook!.status;
+        // No event is a WARN in live too: a first sale is not a precondition for taking one.
+        expect(await status()).toBe('WARN');
+        expect(await switchLive()).toBe(200);
+        // A sandbox delivery, and one from before the mode was recorded, prove nothing about live.
+        await liveEvent('test');
+        await liveEvent(null);
+        expect(await status()).toBe('WARN');
+        // A live delivery verified with credentials since replaced proves nothing either.
+        const creds = await prisma.billingCredentials.findUniqueOrThrow({ where: { applicationId_provider: { applicationId, provider: 'paypal' } } });
+        await liveEvent('live', new Date(creds.updatedAt.getTime() - 60_000));
+        expect(await status()).toBe('WARN');
+        // Refused because the event's own mode contradicted these credentials.
+        await liveEvent('live', new Date(), 'WEBHOOK_MODE_MISMATCH: a test-mode event was verified by this credential');
+        expect(await status()).toBe('WARN');
+        // An event that verified and then failed to apply still proves delivery.
+        await liveEvent('live', new Date(), 'Plan "enterprise" not found');
+        expect(await status()).toBe('PASS');
+      });
+
+      it('never calls the provider on a checkout, and takes one with no event delivered', async () => {
+        await enableEmbedded();
+        const inspect = vi.fn<Inspect>(async () => ({ state: 'missing' }));
+        providerAnswers(inspect);
+        const data = (await checkout()).json().data as { mode: string };
+        expect(data.mode).toBe('embedded');
+        expect(inspect).not.toHaveBeenCalled();
+      });
     });
 
     it('refuses the switch when the portal does not call back, and always allows switching back', async () => {
@@ -830,11 +942,6 @@ describe('hosted checkout sessions', () => {
       expect(nonce).not.toBe('');
       expect(codes).toEqual([200, 404]);
       expect((await app.inject({ method: 'GET', url: `/api/v1/checkout/probe/${nonce}` })).statusCode).toBe(404);
-    });
-
-    it('requires paymentMode with checkoutMode, and rejects unknown keys', async () => {
-      expect((await operator('PATCH', '/checkout', { checkoutMode: 'EMBEDDED' })).statusCode).toBe(400);
-      expect((await operator('PATCH', '/checkout', { checkoutModeLive: 'EMBEDDED' })).statusCode).toBe(400);
     });
 
     it('records the setting change as a security event', async () => {

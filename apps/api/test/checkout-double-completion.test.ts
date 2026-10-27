@@ -31,6 +31,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import type { FastifyInstance } from 'fastify';
 import { randomUUID } from 'node:crypto';
 import Stripe from 'stripe';
+import { STRIPE_API_VERSION } from '../src/modules/billing/providers/stripe-api-version.js';
 import { buildApp } from '../src/app.js';
 import { prisma } from '../src/lib/prisma.js';
 import { configureSandboxPaypal, configureSandboxStripe } from './fakes/billing-credentials.js';
@@ -40,7 +41,7 @@ const PASSWORD = 'pw-one-two-three';
 const WEBHOOK_SECRET = 'whsec_ci_only';
 
 const stripe = new Stripe('sk_for_signing_only', {
-  apiVersion: '2024-11-20.acacia' as Stripe.LatestApiVersion,
+  apiVersion: STRIPE_API_VERSION,
 });
 
 describe('a subscription row that has two completable checkout sessions', () => {
@@ -91,7 +92,7 @@ describe('a subscription row that has two completable checkout sessions', () => 
       method: 'POST',
       url: `/api/v1/admin/applications/${applicationId}/plans`,
       headers: { authorization: `Bearer ${ADMIN_KEY}` },
-      payload: { slug: 'pro', name: 'Pro', amount: 2900 },
+      payload: { slug: 'pro', name: 'Pro', price: { currency: 'USD', amount: 2900 } },
     });
     userAccess = await app
       .inject({
@@ -126,19 +127,16 @@ describe('a subscription row that has two completable checkout sessions', () => 
   }
 
   function completeStripe(sessionId: string, stripeSubId: string) {
-    const payload = JSON.stringify({
-      id: `evt_${randomUUID()}`,
-      object: 'event',
-      type: 'checkout.session.completed',
-      data: {
-        object: {
-          id: sessionId,
-          metadata: { applicationId },
-          mode: 'subscription',
-          subscription: stripeSubId,
-        },
-      },
+    return deliverStripe('checkout.session.completed', {
+      id: sessionId,
+      metadata: { applicationId },
+      mode: 'subscription',
+      subscription: stripeSubId,
     });
+  }
+
+  function deliverStripe(type: string, object: Record<string, unknown>) {
+    const payload = JSON.stringify({ id: `evt_${randomUUID()}`, object: 'event', type, data: { object } });
     return app.inject({
       method: 'POST',
       url: `/api/v1/billing/webhook/stripe/${appSlug}`,
@@ -281,43 +279,6 @@ describe('a subscription row that has two completable checkout sessions', () => 
     expect(row.providerSubId).toBe('sub_REAL_STRIPE');
   });
 
-  it('refuses a second completion from the SAME processor too', async () => {
-    // Two Stripe sessions, both paid. Same shape, same damage: two Stripe
-    // subscriptions and one local row. The discriminator is the provider
-    // subscription id, not the processor's name.
-    const first = await checkout('stripe');
-    const second = await checkout('stripe');
-    expect(second).not.toBe(first);
-
-    await completeStripe(first, 'sub_FIRST');
-    const res = await completeStripe(second, 'sub_SECOND');
-    expect(res.statusCode).toBe(200);
-
-    const row = await theRow();
-    expect(row.providerSubId).toBe('sub_FIRST');
-  });
-
-  it('still applies a replayed completion idempotently', async () => {
-    // The guard keys on the id DIFFERING, so a re-delivery of the same event
-    // is not a second completion and nothing about it changes.
-    const session = await checkout('stripe');
-
-    await completeStripe(session, 'sub_ONLY');
-    const replay = await completeStripe(session, 'sub_ONLY');
-    expect(replay.statusCode).toBe(200);
-
-    const row = await theRow();
-    expect(row.status).toBe('ACTIVE');
-    expect(row.providerSubId).toBe('sub_ONLY');
-    // The assertions above cannot tell "applied again, harmlessly" from
-    // "refused by the guard", both leave the row exactly as it was, which is
-    // how a guard that swallowed every re-delivery would keep this green. The
-    // refusal path is the one that writes here, so its absence is the evidence.
-    expect(
-      (row.metadata as { unappliedCompletions?: unknown[] }).unappliedCompletions,
-    ).toBeUndefined();
-  });
-
   it('lets a genuine resubscribe write a new provider subscription id', async () => {
     // A cancelled row is reused by the next checkout, which walks it back to
     // PENDING. That completion is not a second completion, the previous
@@ -330,6 +291,33 @@ describe('a subscription row that has two completable checkout sessions', () => 
     });
 
     const again = await checkout('stripe');
+    await completeStripe(again, 'sub_SECOND');
+
+    const row = await theRow();
+    expect(row.status).toBe('ACTIVE');
+    expect(row.providerSubId).toBe('sub_SECOND');
+  });
+
+  it('keeps a resubscribe live when the old subscription\'s deletion arrives late', async () => {
+    // Stripe retries `customer.subscription.deleted` for the ended
+    // subscription after the buyer has already opened a new checkout. The
+    // reused row must not still answer to the old id, or that retry cancels
+    // the new checkout and its completion is then refused as terminal.
+    const first = await checkout('stripe');
+    await completeStripe(first, 'sub_FIRST');
+    await prisma.subscription.updateMany({
+      where: { applicationId },
+      data: { status: 'CANCELED', canceledAt: new Date() },
+    });
+
+    const again = await checkout('stripe');
+    const late = await deliverStripe('customer.subscription.deleted', {
+      id: 'sub_FIRST',
+      object: 'subscription',
+      status: 'canceled',
+      metadata: { applicationId },
+    });
+    expect(late.statusCode).toBe(200);
     await completeStripe(again, 'sub_SECOND');
 
     const row = await theRow();

@@ -30,6 +30,9 @@ import { requestIdFor } from "./lib/request-id.js";
 import {
   authCeilingOptions,
   authClientIpCeilingOptions,
+  signUpHourlyKey,
+  SIGN_UP_HOURLY_MAX_PER_IP,
+  wantsSignUpHourlyCap,
   wantsAuthClientIpCeiling,
   wantsUnattributedFailureCap,
   unattributedFailureKey,
@@ -139,14 +142,22 @@ import {
 import { portalConfigRoutes } from "./modules/portal/index.js";
 import { tenantEndUserBanRoutes } from "./modules/end-user-bans/index.js";
 import {
+  tenantSupportCapabilityRoutes,
+  tenantSupportCaseRoutes,
+} from "./modules/support-cases/index.js";
+import {
   checkoutProbeRoutes,
   checkoutSessionRoutes,
 } from "./modules/billing/checkout/checkout-sessions.routes.js";
 import { tenantCheckoutRoutes } from "./modules/billing/checkout/tenant-checkout.routes.js";
+import { refundsRoutes } from "./modules/billing/refunds.routes.js";
+import { paymentsRoutes } from "./modules/billing/payments.routes.js";
+import { planPricesRoutes } from "./modules/plans/plan-prices.routes.js";
 import { usagePublicRoutes, usageSelfRoutes } from "./modules/usage/index.js";
 import { creditsPublicRoutes, creditsSelfRoutes } from "./modules/credits/index.js";
 import {
   customEmailTemplateRoutes,
+  emailPreferencesRoutes,
   emailSendRoutes,
   emailUnsubscribeRoutes,
   tenantEmailRoutes,
@@ -163,6 +174,18 @@ import {
   startWebhookWorker,
   stopWebhookWorker,
 } from "./modules/webhooks/index.js";
+import { pollBillingEventOutbox } from "./modules/billing-log/index.js";
+import { fireDueScheduledSends } from "./modules/email/custom/scheduled-sends.js";
+import {
+  startBillingEventOutboxWorker,
+  stopBillingEventOutboxWorker,
+} from "./modules/billing-log/outbox.queue.js";
+import {
+  startBillingLogMaintenance,
+  stopBillingLogMaintenance,
+} from "./modules/billing-log/maintenance.queue.js";
+import { tenantBillingLogRoutes } from "./modules/billing-log/billing-log.routes.js";
+import { tenantBillingReportingRoutes } from "./modules/billing/reporting.routes.js";
 import {
   organizationsAuthenticatedRoutes,
   organizationsAcceptInvitationRoutes,
@@ -170,6 +193,7 @@ import {
 import { securityEventsRoutes } from "./modules/security-events/index.js";
 import { mcpRoutes, mcpWellKnownRoutes } from "./modules/mcp/index.js";
 import { adminMetricsRoutes } from "./modules/admin-metrics/index.js";
+import { adminBillingOutboxRoutes } from "./modules/admin-metrics/billing-outbox.routes.js";
 import { operatorInvitesRoutes } from "./modules/operator-invites/index.js";
 import {
   tenantMcpRoutes,
@@ -188,6 +212,7 @@ import { insightsTenantRoutes } from "./modules/end-users/insights.routes.js";
 import { applicationSettingsRoutes } from "./modules/analytics/settings.routes.js";
 import { analyticsTenantRoutes } from "./modules/analytics/analytics.routes.js";
 import { ROLLUP_TICK_MS, runAnalyticsRollup } from "./modules/analytics/rollup/job.js";
+import { triggeredRollupsSettled } from "./modules/analytics/rollup/trigger.js";
 
 export interface BuildAppOptions {
   /** Override the default logger config (e.g. silence in tests). */
@@ -247,7 +272,7 @@ export function trustProxyConfig(
   if (!Number.isNaN(hops)) {
     if (Number.isInteger(hops) && hops > 0) return hops;
     throw new Error(
-      `[CONFIG] TRUSTED_PROXIES="${value}" is not a valid hop count — use a positive integer, an IP/CIDR list, or leave it unset.`,
+      `[CONFIG] TRUSTED_PROXIES="${value}" is not a valid hop count. Use a positive integer, an IP/CIDR list, or leave it unset.`,
     );
   }
 
@@ -322,7 +347,11 @@ export async function buildApp(
     // believe), deleting it otherwise, along with any forwarded host or scheme
     // that did not come from our proxy. So `request.ip` and every log line see
     // the decided address and never a header a client chose.
-    trustProxy: 1,
+    //
+    // A function, not `1`: since Fastify 5.12 a numeric hop count trusts
+    // nobody, so `request.ip` would become the proxy's address for every
+    // client and every per-IP limit would collapse into one bucket.
+    trustProxy: (_address, hop) => hop === 0,
     // Not a URL rewrite: the one hook Fastify runs on the raw request before
     // routing and logging, for inject() as well as the server. Returns the URL
     // unchanged.
@@ -680,6 +709,19 @@ export async function buildApp(
   // Driven through `createRateLimit` rather than a second `rateLimit()` hook on
   // purpose: the hook form sets a per-request "already ran" flag that the
   // route's own limiter shares, so it would silently disable the tight cap.
+  const signUpHourly = app.createRateLimit({
+    max: globalRateLimitMax(SIGN_UP_HOURLY_MAX_PER_IP),
+    timeWindow: 60 * 60_000,
+    keyGenerator: signUpHourlyKey,
+    skipOnError: false,
+  });
+  app.addHook("preValidation", async (req) => {
+    if (!wantsSignUpHourlyCap(req)) return;
+    const result = await signUpHourly(req);
+    if (result.isAllowed || !result.isExceeded) return;
+    throw rateLimitedAfter(result.ttl, result.max);
+  });
+
   const authCeiling = app.createRateLimit(
     authCeilingOptions(
       { perApplication: budgets.authCeiling, perClientIp: budgets.anonymous },
@@ -852,6 +894,14 @@ export async function buildApp(
     await stopScheduledDeliveries();
   });
 
+  // A reporting-timezone change starts a rollup the request does not wait
+  // for. Let it finish before the process lets go of the database: cut off
+  // inside its read transaction, it holds that transaction's locks until the
+  // transaction times out, half a minute later.
+  app.addHook("onClose", async () => {
+    await triggeredRollupsSettled();
+  });
+
   // Terminate the bcrypt verification workers, if an imported hash ever
   // started them. They are unref'd while idle, so this is tidiness on a normal
   // stop, not what lets the process exit.
@@ -986,7 +1036,29 @@ export async function buildApp(
     // without a working queue. The DB poller above stays as the crash backstop.
     if (isQueueEnabled()) {
       await startWebhookWorker(app.log);
+      await startBillingEventOutboxWorker(app.log);
+      await startBillingLogMaintenance(app.log);
     }
+
+    // Billing-event outbox poller. The queue above only makes a drain happen
+    // sooner; this is what guarantees a queued event reaches the log after a
+    // lost job or a Redis flush. Drains may overlap: each event is deduplicated.
+    // A minute, because the queue carries the ordinary case and the table is
+    // empty nearly always: an idle tick is one indexed existence check.
+    const BILLING_OUTBOX_POLL_INTERVAL_MS = 60 * 1000;
+    const billingOutboxTimer = setInterval(() => {
+      void pollBillingEventOutbox(app.log).catch((err) =>
+        app.log.warn({ err }, "billing event outbox poll failed"),
+      );
+    }, BILLING_OUTBOX_POLL_INTERVAL_MS);
+    billingOutboxTimer.unref();
+
+    // Scheduled custom sends fire within this long of their sendAt.
+    const SCHEDULED_EMAIL_POLL_INTERVAL_MS = 15 * 1000;
+    const scheduledEmailTimer = setInterval(() => {
+      void fireDueScheduledSends().catch((err) => app.log.warn({ err }, "scheduled email poll failed"));
+    }, SCHEDULED_EMAIL_POLL_INTERVAL_MS);
+    scheduledEmailTimer.unref();
 
     app.addHook("onClose", async () => {
       clearInterval(flushTimer);
@@ -995,7 +1067,11 @@ export async function buildApp(
       clearInterval(webhookRetryTimer);
       clearInterval(dunningTimer);
       clearInterval(trialTimer);
+      clearInterval(billingOutboxTimer);
+      clearInterval(scheduledEmailTimer);
       await stopWebhookWorker();
+      await stopBillingEventOutboxWorker();
+      await stopBillingLogMaintenance();
     });
   }
 
@@ -1028,6 +1104,7 @@ export async function buildApp(
   // AFTER /users/me so the literal segment wins over the :id parameter.
   await app.register(usersRoutes, { prefix: "/api/v1/users" });
   await app.register(profileServerRoutes, { prefix: "/api/v1/users" });
+  await app.register(emailPreferencesRoutes, { prefix: "/api/v1/users" });
   await app.register(profileSelfRoutes, { prefix: "/api/v1/users/me" });
   await app.register(profileSchemaPublicRoutes, { prefix: "/api/v1" });
   // Bulk import from another auth system (routes/users-import.ts).
@@ -1166,6 +1243,12 @@ export async function buildApp(
   await app.register(tenantEndUserBanRoutes, {
     prefix: "/api/v1/tenant/applications",
   });
+  await app.register(tenantSupportCaseRoutes, {
+    prefix: "/api/v1/tenant/applications",
+  });
+  await app.register(tenantSupportCapabilityRoutes, {
+    prefix: "/api/v1/tenant/applications",
+  });
   await app.register(profileTenantRoutes, {
     prefix: "/api/v1/tenant/applications",
   });
@@ -1182,6 +1265,21 @@ export async function buildApp(
     prefix: "/api/v1/tenant/applications",
   });
   await app.register(tenantCheckoutRoutes, {
+    prefix: "/api/v1/tenant/applications",
+  });
+  await app.register(refundsRoutes, {
+    prefix: "/api/v1/tenant/applications",
+  });
+  await app.register(paymentsRoutes, {
+    prefix: "/api/v1/tenant/applications",
+  });
+  await app.register(planPricesRoutes, {
+    prefix: "/api/v1/tenant/applications",
+  });
+  await app.register(tenantBillingLogRoutes, {
+    prefix: "/api/v1/tenant/applications",
+  });
+  await app.register(tenantBillingReportingRoutes, {
     prefix: "/api/v1/tenant/applications",
   });
   await app.register(tenantMfaRoutes, { prefix: "/api/v1/tenant/auth/mfa" });
@@ -1222,6 +1320,7 @@ export async function buildApp(
   // Read-only deployment-wide rollups for the super-admin dashboard.
   // GET-only; gated by SUPER_ADMIN_KEY.
   await app.register(adminMetricsRoutes, { prefix: "/api/v1/admin/metrics" });
+  await app.register(adminBillingOutboxRoutes, { prefix: "/api/v1/admin/metrics" });
 
   app.setNotFoundHandler((req, reply) => {
     // `requestId` here too: docs/errors.md documents it on every error envelope,

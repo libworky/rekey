@@ -1,8 +1,9 @@
 /**
  * Operator MCP read tools for lists: which lists an Application has, and one
- * list's numbers. They return counts, never addresses, and there is no export
- * or erase tool: bulk personal data should not flow into an agent's context,
- * and erasure has no undo.
+ * list's numbers. They return counts, never addresses. Addresses come only a
+ * page at a time from `operator-list-tools.ts`, and there is no export or
+ * erase tool: bulk personal data should not flow into an agent's context, and
+ * erasure has no undo.
  *
  * Access is the REST routes' own: `audience:read` in TOOL_SCOPES for a
  * restricted member, and, per Application, the grant preset through
@@ -24,7 +25,14 @@ const ID_ARG = { type: 'string', minLength: 1, maxLength: ID_MAX } as const;
 const ListArgs = z.object({ applicationId: z.string().min(1).max(ID_MAX) }).strict();
 const StatsArgs = z.object({ applicationId: z.string().min(1).max(ID_MAX), key: z.string().min(1).max(64) }).strict();
 
-function parseArgs<T extends z.ZodTypeAny>(schema: T, tool: string, args: Record<string, unknown>): z.infer<T> {
+/**
+ * Checked here because this server does not validate tool arguments against
+ * their schema.
+ *
+ * @example
+ *   const { applicationId } = parseArgs(ListArgs, 'list_contact_lists', raw);
+ */
+export function parseArgs<T extends z.ZodTypeAny>(schema: T, tool: string, args: Record<string, unknown>): z.infer<T> {
   const parsed = schema.safeParse(args);
   if (parsed.success) return parsed.data;
   throw new RekeyError({
@@ -36,7 +44,7 @@ function parseArgs<T extends z.ZodTypeAny>(schema: T, tool: string, args: Record
 }
 
 async function readableApp(ctx: OperatorToolContext, applicationId: string) {
-  const app = await loadAppInTenant(ctx, applicationId);
+  const app = await loadAppInTenant(ctx, applicationId, 'read');
   await applicationAccess(accessContextFromTool({ ...ctx, scopes: ctx.scopes }), app.id, 'read', {
     scope: 'audience:read',
   });

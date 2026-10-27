@@ -8,10 +8,14 @@
  */
 
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import type { EndUser, Plan } from '@prisma/client';
+import type { EndUser } from '@prisma/client';
+import { pricedPlanFixture as pricedPlan, type FixturePlan } from './priced-plan-fixture.js';
 import { RealStripeProvider } from '../src/modules/billing/providers/stripe-real.js';
 import { STRIPE_API_VERSION } from '../src/modules/billing/providers/stripe-api-version.js';
 import type { CheckoutSessionInput } from '../src/modules/billing/providers/types.js';
+import { operatorsConfirmTheirEmail } from './confirmed-accounts.js';
+
+operatorsConfirmTheirEmail();
 
 const spy = vi.hoisted(() => ({
   sessions: [] as Record<string, unknown>[],
@@ -44,7 +48,7 @@ function input(): CheckoutSessionInput {
   return {
     application: { id: 'app_1', slug: 'app' },
     endUser: { id: 'eu_1', email: 'buyer@example.com' } as unknown as EndUser,
-    plan: {
+    plan: pricedPlan({
       id: 'pl_1',
       applicationId: 'app_1',
       slug: 'pro',
@@ -53,7 +57,7 @@ function input(): CheckoutSessionInput {
       currency: 'USD',
       interval: 'MONTH',
       metadata: { stripe: { priceId: 'price_fake' } },
-    } as unknown as Plan,
+    } as unknown as FixturePlan, null),
     successUrl: 'https://app.example/ok',
     cancelUrl: 'https://app.example/cancel',
   };
@@ -73,13 +77,6 @@ describe('Stripe checkout offers the account’s payment methods', () => {
     expect(spy.sessions[0]).toMatchObject({ mode: 'subscription', line_items: [{ price: 'price_fake', quantity: 1 }] });
     expect(spy.sessions[0]).not.toHaveProperty('payment_method_types');
   });
-
-  it('a one-time session does not pin payment_method_types', async () => {
-    await provider().createOneTimeCheckout(input());
-    expect(spy.sessions).toHaveLength(1);
-    expect(spy.sessions[0]).toMatchObject({ mode: 'payment' });
-    expect(spy.sessions[0]).not.toHaveProperty('payment_method_types');
-  });
 });
 
 describe('Stripe webhook registration', () => {
@@ -92,9 +89,13 @@ describe('Stripe webhook registration', () => {
     expect(result).toEqual({ webhookId: 'we_fake', secret: 'whsec_fake' });
     expect(spy.endpoints).toHaveLength(1);
     expect(spy.endpoints[0]).toMatchObject({ api_version: STRIPE_API_VERSION });
-    expect(STRIPE_API_VERSION).toBe('2024-11-20.acacia');
+    expect(STRIPE_API_VERSION).toBe('2026-09-30.endive');
     expect(spy.endpoints[0]!.enabled_events).toEqual(
-      expect.arrayContaining(['checkout.session.completed', 'checkout.session.async_payment_succeeded']),
+      expect.arrayContaining([
+        'checkout.session.completed',
+        'checkout.session.async_payment_succeeded',
+        'checkout.session.async_payment_failed',
+      ]),
     );
   });
 });

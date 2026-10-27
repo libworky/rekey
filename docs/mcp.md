@@ -217,7 +217,7 @@ subscription. `organizationId` in their output says which subject answered.
 | Tool | Returns |
 |---|---|
 | `get_profile` | `{ id, email, emailVerified, role, metadata, createdAt, organization }`. `organization` is the bound organization with the user's role in it, `{ id, name, slug, role, baseRole }`, in any Application, or `null` for a personal grant. |
-| `get_subscription` | `{ status, provider, currentPeriodEnd, cancelAt, plan, organizationId } \| null`, the subscription `GET /billing/subscription` reports for the same subject, picked by the same ranking (`billingService.getCurrentSubscription`), without `providerCapabilities` |
+| `get_subscription` | `{ status, provider, currentPeriodEnd, cancelAt, price, plan, organizationId } \| null`. `price` is what the subscription is charged, `{ id, currency, amount, formatted }` or `null` when it records no price of its own; `plan` is `{ slug, name, interval, price }` with the plan's default price in the same shape (`null` for a plan with no flat price). Every `amount` is an integer in the minor units of its `currency`. It is the subscription `GET /billing/subscription` reports for the same subject, picked by the same ranking (`billingService.getCurrentSubscription`), without `providerCapabilities` |
 | `get_credits` | `{ balance, organizationId }`, the organization's shared pool or the user's own balance (`creditsService.getBalance`) |
 | `list_licenses` | `{ licenses: [{ id, kind, status, organizationId, seatsAllowed, expiresAt, createdAt }], organizationId, truncated }` (no keys): the same rows `GET /users/me/licenses` returns for the same subject (`licensesService.listForEndUser`), with fewer fields (no `keyPrefix`), the user's own plus, when bound in an org-billed Application, the organization's pool. Newest 100; `truncated: true` when there are more. |
 | `list_my_devices` | `{ devices: [{ id, label, status, firstSeenAt, lastSeenAt, releasedAt }] }` (no IPs, no operator notes). Always personal: a device belongs to a person. |
@@ -280,7 +280,7 @@ Mounted at `/api/v1/tenant/mcp`. JSON-RPC over HTTP POST. Bearer-authed by
 | Operator tool definitions (organization membership) | `apps/api/src/modules/tenant-mcp/operator-organization-tools.ts` |
 | Hybrid bearer guard (PAT **or** OAuth JWT) | `apps/api/src/modules/tenant-mcp/bearer-auth.ts` |
 | PAT resolution (shared with `/api/v1/tenant/operator/*`) | `apps/api/src/middleware/operator-token-auth.ts` |
-| Panel UI — connection guide | `apps/panel/src/app/(authed)/account/mcp/page.tsx` |
+| Panel UI — connection guide | `apps/panel/src/app/(authed)/account/(home)/mcp/page.tsx` |
 
 ### Auth model
 
@@ -316,17 +316,36 @@ being handed a long-lived secret to paste.
 | `list_applications` | per-app endUserCount, activeSubs, apiRequestsLast24h |
 | `list_members` | operators in workspace + role |
 | `list_invitations` | pending workspace invitations — **`minRole: ADMIN`** |
+| `list_member_grants` | a member's per-application grants (application and `APP_ADMIN`, `APP_BILLING` or `APP_VIEWER`), by `tenantUserId` from `list_members`. **`minRole: ADMIN`** |
 | `recent_payments` | filter by `status`, `limit` |
 | `recent_subscriptions` | filter by `status`, `limit` |
+| `recent_billing_events` | one Application's billing log, newest first; filter by `type`, `endUserId`, `subscriptionId`, `paymentId`, `currency`, `from`, `to`; page with `cursor`. See [billing-log.md](billing-log.md) |
+| `get_billing_stats` | one Application's figures, one entry per currency in every list (`mrr`, `revenueLast30d`, `monthlyRevenue`, `unverified`), the reporting currency first. No total across currencies. Needs `billing:read` |
+| `get_reporting_currency` | the currency an Application reports in. Needs `billing:read` |
+| `preview_checkout_routing` | which price and provider a buyer in a `country` would get, and why, for one `plan` or every active plan; with `couponCode`, what the coupon takes off or the refusal it would get. Opens no checkout. Needs `billing:read` |
+| `list_price_fallbacks` | how often a buyer was charged the default price because their currency could not be charged, grouped by plan, currencies and country. Counts only. Needs `billing:read` |
+| `get_billing_reconciliation` | where the billing log and the payments, refunds and subscriptions disagree, for a period of at most 31 days. Needs `billing:read` |
+| `get_payment` | one payment by id, with the `provider` that took it, whether it is `refundable` through Rekey and the `refundBlockedReason` when it is not: the judgement `create_refund` makes before it asks a provider. Needs `billing:read` |
+| `list_payment_refunds` | every refund recorded against one payment, oldest first. Needs `billing:read` |
+| `list_licenses` | an Application's licenses, newest first, paged with `limit` and `offset`. `keyPrefix` only, never the key. Needs `billing:read` |
+| `list_subscription_imports` | an Application's subscription import runs, newest first, with `counts` per outcome and `stale`. Needs `billing:read` |
+| `list_unapplied_payments` | money a provider took that Rekey never applied, oldest first, filter by `status`. Needs `billing:read` |
+| `get_dunning_status` | an Application's failed-payment recovery cases, newest first, filter by `status` or `subscriptionId`. Needs `billing:read` |
+| `list_coupons` | an Application's coupons with what each has taken off per currency. Needs `billing:read` |
 | `recent_security_events` | filter by `actorType`, `limit` — **`minRole: ADMIN`** |
 | `recent_webhook_events` | filter by `provider`, `onlyFailed`, `limit` |
 | `recent_failed_webhook_deliveries` | last-N FAILED outbound deliveries |
+| `list_webhook_deliveries` | one endpoint's delivery attempts, newest first, with the `payload` sent and the `responseBody` (4 KiB at most); filter by `status` or `eventType`. Needs `developer:read` |
 | `application_health` | per-app payment success rate (30d) + outbound webhook success rate (24h), sorted by failure count |
-| `get_user_analytics` | one app's Users overview (`overview:read`): the `GET .../analytics/users` sections and filters, counts only |
+| `get_user_analytics` | one app's user insights (`overview:read`): the `GET .../analytics/users` sections and filters, counts only |
 | `get_end_user` | one end-user: verification state, app environment, current subscription |
+| `list_end_users` | an Application's end-users, newest first, the rows the REST list returns; `search` matches the email, `limit` (max 100) and `offset` page. Needs `end-users:read` |
+| `get_end_user_credits` | an end-user's credit balance and 50 most recent ledger entries. Needs `billing:read` |
 | `list_devices` | an end-user's devices, newest activity first, optionally filtered by `status` |
+| `list_support_cases` | an application's support cases: open ones oldest first, or closed ones most recently opened first, optionally for one end-user. Each case has its `noteCount`; note bodies are not returned. See [support-mode.md](support-mode.md) |
 | `list_organization_roles` | an application's organization-role catalog + each role's `baseRole` tier. Also reports `organizationsEnabled`, and when it is false returns a note naming `update_auth_config`, so an agent asking about roles on an app without organizations gets the next step rather than an empty list |
 | `list_organizations` | an application's organizations, newest first, with member and pending-invitation counts. `query` matches name or slug; `limit` (max 100) and `offset` page, with `total` and `hasMore`. Lives in `operator-organization-tools.ts` and needs `organizations:read` |
+| `get_organization` | one organization with every member (email, catalog role, base tier) and its pending invitations. Needs `organizations:read` |
 | `list_contact_lists` | an application's lists (waitlists, newsletters, contact forms) with member and submission counts, Public capture and archived state. Needs `audience:read`, and a viewer or billing grant is refused as over REST |
 | `get_contact_list_stats` | one list by `key`: members by status, joined and left in the last 7 and 30 days, how people joined, and submissions. Needs `audience:read` |
 
@@ -342,19 +361,43 @@ credentials.
 Hidden from `tools/list` unless the caller has write capability **and** the role,
 and re-checked on `tools/call`:
 
-`create_application`, `update_auth_config`, `create_plan`, `update_plan`,
-`set_plan_active`, `create_webhook_endpoint`, `update_webhook_endpoint`,
-`invite_member`, `revoke_invitation`, `change_member_role`, `remove_member`,
+`create_application`, `create_plan`, `update_plan`,
+`set_plan_price`, `remove_plan_price`, `create_coupon`, `update_coupon`,
+`set_reporting_currency`, `set_plan_active`, `register_plan_with_provider`,
+`create_usage_meter`, `put_plan_entitlement`, `revoke_api_key`,
+`invite_member`, `revoke_invitation`, `remove_member`,
 `create_organization_role`, `update_organization_role`,
 `delete_organization_role`, `add_organization_member`,
-`set_organization_member_role`.
+`set_organization_member_role`, the three device tools and `close_support_case`.
+
+#### What write access cannot do
+
+Write access is for configuration that gives nobody authority. A write token
+(an OAuth grant without `mcp:operator:admin`, or any PAT) cannot make an
+OWNER or ADMIN, cannot change where sign-in links or events are sent, and
+cannot obtain a credential. Seven of the tools above are capped for that
+reason. Each still does MEMBER-level work with write access, and answers
+`OPERATOR_MCP_ADMIN_REQUIRED` for the rest:
+
+| Tool | With write access | Needs admin access |
+|---|---|---|
+| `invite_member` | invite a MEMBER with no apps | invite an OWNER or ADMIN, or a MEMBER with `appGrants` |
+| `remove_member` | remove a MEMBER | remove an OWNER or ADMIN |
+| `create_organization_role` | a role with `baseRole: MEMBER` | a role with `baseRole` OWNER or ADMIN |
+| `update_organization_role` | edit a MEMBER-tier role | edit an OWNER- or ADMIN-tier role, or raise a role to those tiers |
+| `delete_organization_role` | delete a MEMBER-tier role, reassigning onto a MEMBER-tier role | delete an OWNER- or ADMIN-tier role, or reassign onto one |
+| `add_organization_member` | add with a MEMBER-tier role | add with an OWNER- or ADMIN-tier role, including a default role of that tier |
+| `set_organization_member_role` | move a MEMBER-tier member between MEMBER-tier roles | promote to, or change a member who holds, an OWNER- or ADMIN-tier role |
+
+A PAT never carries admin access, so over MCP a PAT can never do the right-hand
+column. Use an OAuth connection with `mcp:operator:admin`, or the panel.
 
 The three `*_organization_role` tools author an application's **organization**
 role vocabulary: the names a member can hold inside one organization, each
 mapped to an OWNER/ADMIN/MEMBER tier that Rekey enforces on. They refuse with
 `ORGANIZATIONS_NOT_ENABLED` when the application has organizations switched
-off, and the `fix` names `update_auth_config` so the agent can offer to turn
-the feature on rather than dead-ending.
+off, and the `fix` names `update_auth_config` (an admin tool) so the agent
+knows what turns the feature on.
 
 `add_organization_member` and `set_organization_member_role` assign from that
 vocabulary: they put an existing end-user into an organization with a role, or
@@ -371,7 +414,8 @@ so the rules match the panel's:
   assigned.
 - Both need `organizations:write`, write capability and at least the ADMIN
   workspace role, and refuse with `ORGANIZATIONS_NOT_ENABLED` while the
-  application has organizations switched off.
+  application has organizations switched off. Giving or changing an OWNER- or
+  ADMIN-tier role also needs admin access (see the table above).
 - An Application, organization or end-user outside the caller's workspace
   reads as not found.
 - Each refusal names the tool that repairs it in `fix` (for example
@@ -384,7 +428,7 @@ so the rules match the panel's:
   `app.organization_member_role_changed`) are recorded by the service, so the
   panel and REST routes log the same writes; MCP ones carry `via: operator_mcp`.
 
-Note the axis: `change_member_role` above is a **workspace** (operator) role.
+Note the axis: `change_member_role` (an admin tool, below) is a **workspace** (operator) role.
 The organization tools act on an end-user's role inside one organization. An
 org OWNER/ADMIN can still do the same from your app with their own end-user
 session, without an operator.
@@ -394,14 +438,39 @@ slot back and revokes the device's sessions), `block_device` (refuses sign-in
 from that fingerprint until unblocked) and `unblock_device`. See
 [devices.md](devices.md).
 
-Two more are flagged `admin`, needing `mcp:operator:admin` rather than plain
-write: `configure_billing_provider` (the secret travels through the MCP client;
-its `provider` enum comes from the billing-provider registry, so it includes
-`external`, which takes only `webhookSecret`) and `cancel_subscription`
-(irreversible).
+`close_support_case` ends the open support case on an end-user, so its
+capabilities stop being reported. There is deliberately no tool to open or
+change a case: that is done in the panel or over REST. See
+[support-mode.md](support-mode.md).
 
-Still not exposed at any tier: delete application, refund, webhook-secret
-rotation.
+### Admin tools
+
+These need `mcp:operator:admin` rather than plain write. They are hidden from
+`tools/list` without it, and a call answers `OPERATOR_MCP_ADMIN_REQUIRED`:
+
+| Tool | Why it is admin |
+|---|---|
+| `update_auth_config` | `appUrl` and `redirectUrls` decide where magic-link and password-reset links land, and the tool can switch off MFA and email verification and open sign-up. |
+| `create_webhook_endpoint`, `update_webhook_endpoint` | The URL receives every subscribed event with its end-user data, and creating one returns the signing secret. |
+| `change_member_role` | Every role change gives or takes OWNER or ADMIN authority. |
+| `mint_api_key` | Returns a raw secret key. |
+| `configure_billing_provider` | The secret travels through the MCP client. Its `provider` enum comes from the billing-provider registry, so it includes `external`, which takes only `webhookSecret`. |
+| `cancel_subscription` | Irreversible. |
+| `create_refund` | Refunds a recorded payment in full or in part. It pays money out and cannot be undone. Repeating the same call is one refund. |
+
+`update_auth_config`, the two webhook tools and `change_member_role` were write
+tools before 2.2.0. An agent that used them with a write-only connection must
+reconnect and approve admin access; a PAT can no longer call them over MCP.
+
+Every amount a billing tool takes or returns is an integer in the minor unit
+of its currency. `create_coupon` and `update_coupon` take `basisPoints` for a
+percentage or `amounts` with one amount per currency; `amountOff` and
+`currency` at the top level are refused with `BILLING_FIELD_REMOVED`.
+`update_coupon` also takes `endsAt`, `maxRedemptions` and
+`maxRedemptionsPerUser`, each a value or null to remove it; a cap below the
+redemptions already held is refused with `COUPON_LIMIT_BELOW_REDEEMED`.
+
+Still not exposed at any tier: delete application, webhook-secret rotation.
 
 Each goes through the same service the panel uses — no MCP-only write path — and
 emits a security event on success, so an agent's writes are as auditable as a
@@ -461,6 +530,7 @@ Three new tables added in migration `20260531230000_operator_mcp_oauth`:
 
 #### Token shape
 
+<!-- snippet: no-check a shape written out for reading, not a program -->
 ```ts
 { typ: 'op_mcp_access', sub: tenantUserId, tid: tenantId, cid: clientId, scope, aud: '<issuer>', iat, exp }
 ```

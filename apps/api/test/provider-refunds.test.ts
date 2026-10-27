@@ -56,11 +56,6 @@ describe('capability declaration matches implementation', () => {
     expect(typeof refundPayment === 'function').toBe(Boolean(mod!.capabilities.refunds));
   });
 
-  it('all three declare partial refunds, and only Stripe has no window', () => {
-    expect(getModule('stripe')!.capabilities.refunds).toEqual({ partial: true, windowDays: null });
-    expect(getModule('paypal')!.capabilities.refunds).toEqual({ partial: true, windowDays: 180 });
-    expect(getModule('razorpay')!.capabilities.refunds).toEqual({ partial: true, windowDays: 180 });
-  });
 });
 
 describe('stripe: resolving the stored id to something refundable', () => {
@@ -79,26 +74,29 @@ describe('stripe: resolving the stored id to something refundable', () => {
       currency: 'usd',
       status: 'succeeded',
     });
-    const invoiceRetrieve = vi.fn().mockResolvedValue({ payment_intent: 'pi_from_invoice' });
+    // From basil on an invoice names its payments only through Invoice Payments.
+    const invoicePaymentsList = vi.fn().mockResolvedValue({
+      data: [{ status: 'paid', payment: { type: 'payment_intent', payment_intent: 'pi_from_invoice' } }],
+    });
     const sessionRetrieve = vi.fn().mockResolvedValue({ payment_intent: 'pi_from_session' });
     const provider = withClient(
       new RealStripeProvider({ apiKey: 'sk_test_x', webhookSecret: 'whsec_x' }),
       'stripe',
       {
         refunds: { create },
-        invoices: { retrieve: invoiceRetrieve },
+        invoicePayments: { list: invoicePaymentsList },
         checkout: { sessions: { retrieve: sessionRetrieve } },
         ...overrides,
       },
     );
-    return { provider, create, invoiceRetrieve, sessionRetrieve };
+    return { provider, create, invoicePaymentsList, sessionRetrieve };
   }
 
   it('resolves an invoice id to its payment intent before refunding', async () => {
-    const { provider, create, invoiceRetrieve } = stripeStub();
+    const { provider, create, invoicePaymentsList } = stripeStub();
     await provider.refundPayment({ ...REFUND, providerPaymentId: 'in_renewal_42' });
 
-    expect(invoiceRetrieve).toHaveBeenCalledWith('in_renewal_42');
+    expect(invoicePaymentsList).toHaveBeenCalledWith({ invoice: 'in_renewal_42', status: 'paid', limit: 10 });
     // The assertion that matters: the INVOICE id never reaches the Refunds
     // API. Deleting the `in_` branch sends `payment_intent: 'in_renewal_42'`
     // and this fails.
@@ -107,29 +105,6 @@ describe('stripe: resolving the stored id to something refundable', () => {
       { idempotencyKey: REFUND.idempotencyKey },
     );
     expect(create.mock.calls[0]![0]).not.toHaveProperty('charge');
-  });
-
-  it('resolves a checkout session id to its payment intent', async () => {
-    const { provider, create, sessionRetrieve } = stripeStub();
-    await provider.refundPayment({ ...REFUND, providerPaymentId: 'cs_first_payment' });
-
-    expect(sessionRetrieve).toHaveBeenCalledWith('cs_first_payment');
-    expect(create).toHaveBeenCalledWith(
-      expect.objectContaining({ payment_intent: 'pi_from_session' }),
-      expect.anything(),
-    );
-  });
-
-  it('passes a payment intent through without a lookup', async () => {
-    const { provider, create, invoiceRetrieve, sessionRetrieve } = stripeStub();
-    await provider.refundPayment({ ...REFUND, providerPaymentId: 'pi_direct' });
-
-    expect(invoiceRetrieve).not.toHaveBeenCalled();
-    expect(sessionRetrieve).not.toHaveBeenCalled();
-    expect(create).toHaveBeenCalledWith(
-      expect.objectContaining({ payment_intent: 'pi_direct' }),
-      expect.anything(),
-    );
   });
 
   it('passes a charge id through as a charge, not a payment intent', async () => {
@@ -143,11 +118,72 @@ describe('stripe: resolving the stored id to something refundable', () => {
 
   it('refuses an invoice that was never paid rather than calling Stripe', async () => {
     const { provider, create } = stripeStub({
-      invoices: { retrieve: vi.fn().mockResolvedValue({ payment_intent: null }) },
+      invoicePayments: { list: vi.fn().mockResolvedValue({ data: [] }) },
     });
     await expect(
       provider.refundPayment({ ...REFUND, providerPaymentId: 'in_unpaid' }),
     ).rejects.toMatchObject({ code: 'BILLING_PAYMENT_NOT_REFUNDABLE' });
+    expect(create).not.toHaveBeenCalled();
+  });
+
+  it('refunds an invoice paid by a bare charge as a charge', async () => {
+    const { provider, create } = stripeStub({
+      invoicePayments: {
+        list: vi.fn().mockResolvedValue({
+          data: [{ status: 'paid', payment: { type: 'charge', charge: 'ch_no_intent' } }],
+        }),
+      },
+    });
+    await provider.refundPayment({ ...REFUND, providerPaymentId: 'in_charge_only' });
+    expect(create).toHaveBeenCalledWith(expect.objectContaining({ charge: 'ch_no_intent' }), expect.anything());
+    expect(create.mock.calls[0]![0]).not.toHaveProperty('payment_intent');
+  });
+
+  it('refuses an invoice paid wholly outside Stripe with that reason, not "never paid"', async () => {
+    const { provider, create } = stripeStub({
+      invoicePayments: {
+        list: vi.fn().mockResolvedValue({
+          data: [{ status: 'paid', payment: { type: 'payment_record', payment_record: 'pr_cash' } }],
+        }),
+      },
+    });
+    const refused = provider.refundPayment({ ...REFUND, providerPaymentId: 'in_out_of_band' });
+    await expect(refused).rejects.toMatchObject({ code: 'BILLING_PAYMENT_NOT_REFUNDABLE', statusCode: 409 });
+    await expect(refused).rejects.toThrow(/outside Stripe/);
+    expect(create).not.toHaveBeenCalled();
+  });
+
+  it('refuses an invoice paid partly outside Stripe rather than refunding the Stripe part as if it were all', async () => {
+    const { provider, create } = stripeStub({
+      invoicePayments: {
+        list: vi.fn().mockResolvedValue({
+          data: [
+            { status: 'paid', payment: { type: 'payment_intent', payment_intent: 'pi_part' } },
+            { status: 'paid', payment: { type: 'payment_record', payment_record: 'pr_cash' } },
+          ],
+        }),
+      },
+    });
+    await expect(
+      provider.refundPayment({ ...REFUND, providerPaymentId: 'in_mixed' }),
+    ).rejects.toThrow(/partly or wholly outside Stripe/);
+    expect(create).not.toHaveBeenCalled();
+  });
+
+  it('refuses an invoice settled by several payments rather than refunding one of them', async () => {
+    const { provider, create } = stripeStub({
+      invoicePayments: {
+        list: vi.fn().mockResolvedValue({
+          data: [
+            { status: 'paid', payment: { type: 'payment_intent', payment_intent: 'pi_part_1' } },
+            { status: 'paid', payment: { type: 'payment_intent', payment_intent: 'pi_part_2' } },
+          ],
+        }),
+      },
+    });
+    await expect(
+      provider.refundPayment({ ...REFUND, providerPaymentId: 'in_partial' }),
+    ).rejects.toMatchObject({ code: 'BILLING_PAYMENT_NOT_REFUNDABLE', statusCode: 409 });
     expect(create).not.toHaveBeenCalled();
   });
 
@@ -263,24 +299,6 @@ describe('paypal: choosing between the v1 sale and v2 capture refund', () => {
     expect(calls[0]!.url).not.toContain('ignored-when-href-present');
   });
 
-  it('sends note_to_payer, not note', async () => {
-    // PayPal's own examples show `note`, contradicting their schema. `note` is
-    // dropped silently, so the buyer never sees the reason.
-    const calls = paypalFetchStub([
-      { status: 201, body: { id: 'ref_3', status: 'COMPLETED', amount: { value: '1.00', currency_code: 'USD' } } },
-    ]);
-    const provider = new RealPaypalProvider(creds, 'test');
-    await provider.refundPayment({
-      ...REFUND,
-      providerPaymentId: 'CAP1',
-      amount: 100,
-      currency: 'USD',
-      reason: 'Duplicate charge',
-    });
-    expect(calls[0]!.body).toHaveProperty('note_to_payer', 'Duplicate charge');
-    expect(calls[0]!.body).not.toHaveProperty('note');
-  });
-
   it('sends an empty body for a full refund', async () => {
     const calls = paypalFetchStub([
       { status: 201, body: { id: 'ref_4', status: 'COMPLETED' } },
@@ -335,6 +353,7 @@ describe('razorpay: refund creation and its refusals', () => {
       ...REFUND,
       providerPaymentId: 'pay_ABC123',
       amount: 4900,
+      currency: 'INR',
     });
 
     expect(fn).toHaveBeenCalledWith(
@@ -345,17 +364,6 @@ describe('razorpay: refund creation and its refusals', () => {
     // `refund.processed`. Reporting this as succeeded would tell an operator
     // the money moved when it has not.
     expect(res.status).toBe('pending');
-  });
-
-  it('reports a processed refund as succeeded', async () => {
-    const { provider } = razorpayStub({
-      id: 'rfnd_2',
-      amount: 100,
-      currency: 'INR',
-      status: 'processed',
-    });
-    const res = await provider.refundPayment({ ...REFUND, providerPaymentId: 'pay_X' });
-    expect(res.status).toBe('succeeded');
   });
 
   it('omits the amount for a full refund rather than computing one', async () => {

@@ -253,7 +253,7 @@ export default async function LicensesPage({
                 {error && (
                   <WhileUrlHas param="error">
                     <Banner tone="error">
-                      <ApiErrorText code={error} detail={errorDetail} fix={errorFix} map={ERR} fallback={error} />
+                      <ApiErrorText code={error} detail={errorDetail} fix={errorFix} map={ERR} />
                     </Banner>
                   </WhileUrlHas>
                 )}
@@ -363,7 +363,7 @@ export default async function LicensesPage({
                       </a>
                       {l.status === 'ACTIVE' && (
                         <ActionForm action={revokeLicense.bind(null, id, l.id)}>
-                          <ConfirmButton
+                          <ConfirmButton title="Revoke license?"
                             confirm={`Revoke license ${l.keyPrefix}…? Activations using this key will fail immediately.`}
                           >
                             Revoke

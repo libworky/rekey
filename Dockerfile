@@ -24,7 +24,7 @@
 # The api image runs `prisma migrate deploy` on start (idempotent) before
 # booting the server, so a fresh database is migrated automatically.
 
-ARG NODE_VERSION=24.15.0
+ARG NODE_VERSION=24.22.1
 
 # ─── base ─────────────────────────────────────────────────────────────
 FROM node:${NODE_VERSION}-slim AS base
@@ -76,24 +76,21 @@ RUN pnpm --filter @rekey.dev/api build
 # app's explicit unconfigured state.
 ARG NEXT_PUBLIC_API_URL=
 ARG NEXT_PUBLIC_APP_URL=
-# No defaults for these two, deliberately. NEXT_PUBLIC_GA_MEASUREMENT_ID must
-# never default to Rekey's own property (a self-hosted panel would ship its
-# operators' behaviour to us), and NEXT_PUBLIC_PORTAL_URL must never default to
-# Rekey's hosted portal (a self-hoster would be shown someone else's origin as
-# the place to send THEIR customers). Pass both as build args when you build
-# the panel image.
+# No default, deliberately. NEXT_PUBLIC_GA_MEASUREMENT_ID must never default to
+# Rekey's own property (a self-hosted panel would ship its operators'
+# behaviour to us). Pass it as a build arg when you build the panel
+# image.
 ARG NEXT_PUBLIC_GA_MEASUREMENT_ID=
-ARG NEXT_PUBLIC_PORTAL_URL=
-ARG NEXT_PUBLIC_CHATWOOT_TOKEN=
-ARG NEXT_PUBLIC_AHREFS_KEY=
+# The panel sidebar's Discord row. No default, for the same reason as GA.
+ARG NEXT_PUBLIC_DISCORD_INVITE_URL=
 # Names the "Continue with …" button when this deployment signs operators in
 # against one of its own Applications. No default: a self-hoster's button must
 # not say "Rekey.dev", and the app falls back to a generic label when unset.
 ARG NEXT_PUBLIC_PANEL_OAUTH_REKEY_LABEL=
 RUN NEXT_PUBLIC_API_URL=$NEXT_PUBLIC_API_URL NEXT_PUBLIC_APP_URL=$NEXT_PUBLIC_APP_URL \
     NEXT_PUBLIC_GA_MEASUREMENT_ID=$NEXT_PUBLIC_GA_MEASUREMENT_ID \
-    NEXT_PUBLIC_PORTAL_URL=$NEXT_PUBLIC_PORTAL_URL \
     NEXT_PUBLIC_PANEL_OAUTH_REKEY_LABEL=$NEXT_PUBLIC_PANEL_OAUTH_REKEY_LABEL \
+    NEXT_PUBLIC_DISCORD_INVITE_URL=$NEXT_PUBLIC_DISCORD_INVITE_URL \
     pnpm --filter @rekey.dev/panel build
 RUN pnpm --filter @rekey.dev/portal build
 
@@ -183,9 +180,10 @@ WORKDIR /app
 # node_modules. No pnpm install, no full dependency tree. The bundle is rooted
 # at the workspace root (outputFileTracingRoot), so it lands at /app as-is.
 COPY --from=build --chown=node:node /app/apps/panel/.next/standalone ./
-# Static assets + the server's runtime chunks aren't part of standalone — copy
-# them to the path Next expects. (panel has no public/ dir.)
+# Static assets and public/ (logo, brand fonts) aren't part of standalone, so
+# copy them to the paths Next expects.
 COPY --from=build --chown=node:node /app/apps/panel/.next/static apps/panel/.next/static
+COPY --from=build --chown=node:node /app/apps/panel/public apps/panel/public
 
 # The commit this image was built from, shown in the sidebar next to the API's
 # (apps/panel/src/lib/build-info.ts). Unset reads as `unknown`.

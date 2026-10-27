@@ -1,6 +1,6 @@
 /**
  * No dashboard statement may need a sequential scan of a big table. Every
- * query the Users overview sends on a cache miss is EXPLAINed with
+ * query the Insights page sends on a cache miss is EXPLAINed with
  * `enable_seqscan = off`; a Seq Scan that survives means no index serves it.
  */
 
@@ -12,6 +12,9 @@ import { seedUsers } from './analytics-seed.js';
 import { rollupApplication } from '../src/modules/analytics/rollup/job.js';
 import { recordStatements, seqScansOnBigTables } from './analytics-explain.js';
 import { bearer, operatorWorld } from './operator-world.js';
+import { operatorsConfirmTheirEmail } from './confirmed-accounts.js';
+
+operatorsConfirmTheirEmail();
 
 describe('analytics plan guard', () => {
   let app: FastifyInstance;

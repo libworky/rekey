@@ -25,6 +25,7 @@
  */
 
 import type {
+  CancelReason,
   CurrentUserDto,
   EndUserDto,
   EndUserLicenseDto,
@@ -40,6 +41,8 @@ import type {
   SelfSubscriptionDto,
   CreateCheckoutRequest,
   CheckoutResultDto,
+  ValidateCouponRequest,
+  ValidateCouponResultDto,
   OrganizationWithRoleDto,
   ProvidersListDto,
   OAuthProvidersListDto,
@@ -94,8 +97,8 @@ export interface PortalPaymentDto {
   amount: number;
   currency: string;
   status: 'PENDING' | 'SUCCEEDED' | 'FAILED' | 'REFUNDED' | 'PARTIALLY_REFUNDED';
-  /** How much of `amount` has been refunded, smallest currency unit. Absent from older servers. */
-  refundedAmount?: number;
+  /** How much of `amount` has been refunded, smallest currency unit. 0 when nothing has. */
+  refundedAmount: number;
   description: string | null;
   createdAt: string;
   subscriptionId: string | null;
@@ -298,12 +301,54 @@ export class RekeyBrowserClient {
    * and only `page.total` can tell you that happened. Pass `page.offset` for
    * the next window.
    *
+   * Each plan carries `price`: the price this buyer would be charged, resolved
+   * by the function checkout uses, from where the CDN in front of the API
+   * places them. Render `price.formatted`; `<PricingTable>` does. Pass
+   * `accessToken` for a signed-in buyer and a buyer who already pays in a
+   * currency is shown that currency. `price.reason` is `fallback` when the
+   * price for their country cannot be charged and the default one is shown.
+   *
    * Each plan carries `checkout.ready`: false when a buyer sent to checkout
-   * for it would be refused, so the page can hide it. Keep the free tier in:
-   * with no provider connected it reads `ready: false` and still applies.
+   * for it would be refused, so the page can show it as unavailable. Keep the
+   * free tier in: with no provider connected it reads `ready: false` and still
+   * applies.
+   *
+   * @example
+   * ```ts
+   * const { items } = await client.getPlans(undefined, { accessToken });
+   * const label = items[0]?.price?.formatted ?? 'Free';
+   * ```
    */
-  getPlans(page?: ListPage): Promise<Paged<PublicPlanDto>> {
-    return this.bootstrap<Paged<PublicPlanDto>>('GET', `/api/v1/billing/plans${listQuery(page)}`, undefined);
+  getPlans(page?: ListPage, opts?: { accessToken?: string }): Promise<Paged<PublicPlanDto>> {
+    const path = `/api/v1/billing/plans${listQuery(page)}`;
+    if (opts?.accessToken) return this.selfService<Paged<PublicPlanDto>>('GET', path, undefined, opts.accessToken);
+    return this.bootstrap<Paged<PublicPlanDto>>('GET', path, undefined);
+  }
+
+  /**
+   * Preview a coupon on a plan for the signed-in buyer, without applying it.
+   * The quote is made at the price their checkout would charge, and
+   * `formatted.discount` and `formatted.total` are written in that currency:
+   * render them, or hand the result to `<CouponQuote>`.
+   *
+   * A code that does not work in the currency charged is refused with
+   * `COUPON_CURRENCY_NOT_COVERED`. Show the error's `message`; the buyer may
+   * continue without the code. Send the same `provider` and `organizationId`
+   * the checkout will send. `currency` is for a server holding the secret key
+   * and is refused here.
+   *
+   * @example
+   * ```ts
+   * try {
+   *   const quote = await client.validateCoupon(accessToken, { code: 'LAUNCH50', planSlug: 'pro' });
+   *   show(`${quote.formatted.discount} off, you pay ${quote.formatted.total}`);
+   * } catch (err) {
+   *   if (err instanceof RekeyError) show(err.message);
+   * }
+   * ```
+   */
+  validateCoupon(accessToken: string, input: ValidateCouponRequest): Promise<ValidateCouponResultDto> {
+    return this.selfService<ValidateCouponResultDto>('POST', '/api/v1/billing/coupons/validate', input, accessToken);
   }
 
   /**
@@ -339,12 +384,31 @@ export class RekeyBrowserClient {
    * picker at checkout, feed the result straight into `<ProviderPicker>`.
    *
    * Public, like {@link getPlans}: needs only the publishable key, no user
-   * token. Pass `country` (ISO 3166-1 alpha-2) to bias the ordering when the
-   * request's geo can't be inferred from edge headers (e.g. a server-side call).
+   * token. Pass `country` (ISO 3166-1 alpha-2) as a hint when no trusted proxy
+   * in front of the API vouches for the visitor's country. `routedProvider` in
+   * the result is the provider a checkout that names none is sent to.
+   *
+   * Pass `planSlug` when the picker is for one plan: the list then holds only
+   * the providers a checkout of that plan accepts for this buyer, each judged
+   * at the price that checkout would charge, and `routedProvider` is the one a
+   * checkout of the plan that names no provider is sent to.
+   *
+   * @example
+   * ```ts
+   * const { providers, routedProvider } = await client.listBillingProviders({ planSlug: 'pro' });
+   * ```
    */
-  listBillingProviders(opts?: { country?: string }): Promise<ProvidersListDto> {
-    const headers = opts?.country ? { 'x-country': opts.country.toUpperCase() } : undefined;
-    return this.bootstrap<ProvidersListDto>('GET', '/api/v1/billing/providers', undefined, headers);
+  listBillingProviders(opts?: { country?: string; planSlug?: string }): Promise<ProvidersListDto> {
+    const query = new URLSearchParams();
+    const code = opts?.country?.toUpperCase();
+    if (code) query.set('country', code);
+    if (opts?.planSlug) query.set('planSlug', opts.planSlug);
+    const search = query.toString();
+    return this.bootstrap<ProvidersListDto>(
+      'GET',
+      `/api/v1/billing/providers${search ? `?${search}` : ''}`,
+      undefined,
+    );
   }
 
   /**
@@ -552,11 +616,18 @@ export class RekeyBrowserClient {
    * Cancel the current subscription (default: at period end). Pass
    * `opts.organizationId` to cancel an org's subscription (caller must be
    * OWNER/ADMIN of that org), and `opts.subscriptionId` to cancel one of
-   * several live subscriptions ({@link listSubscriptions}).
+   * several live subscriptions ({@link listSubscriptions}). `reason` and
+   * `feedback` are kept with the cancellation and carried on its webhooks.
    */
   cancelSubscription(
     accessToken: string,
-    opts?: { atPeriodEnd?: boolean; organizationId?: string; subscriptionId?: string },
+    opts?: {
+      atPeriodEnd?: boolean;
+      organizationId?: string;
+      subscriptionId?: string;
+      reason?: CancelReason;
+      feedback?: string;
+    },
   ): Promise<SelfSubscriptionDto> {
     return this.selfService<SelfSubscriptionDto>(
       'POST',
@@ -565,6 +636,8 @@ export class RekeyBrowserClient {
         ...(opts?.atPeriodEnd !== undefined && { atPeriodEnd: opts.atPeriodEnd }),
         ...(opts?.organizationId && { organizationId: opts.organizationId }),
         ...(opts?.subscriptionId && { subscriptionId: opts.subscriptionId }),
+        ...(opts?.reason && { reason: opts.reason }),
+        ...(opts?.feedback && { feedback: opts.feedback }),
       },
       accessToken,
     );
@@ -699,7 +772,12 @@ export class RekeyBrowserClient {
    * Revokes every session minted on that device, INCLUDING the current one when
    * it is the same device, so treat releasing the token's own `dev` as a sign
    * out. Idempotent for an already-released device; a BLOCKED device refuses
-   * with `DEVICE_BLOCKED`, which only an operator can lift.
+   * with `DEVICE_BLOCKED`, which only an operator can lift. An Application that
+   * sets `deviceRelease: 'server_only'` refuses this call with
+   * `DEVICE_SELF_RELEASE_DISABLED` (and its `DEVICE_LIMIT_REACHED` carries
+   * `details.selfRelease: false`): point the user at support instead. There is
+   * no read of the policy ahead of time; your own app set it, so render the
+   * release button from that, or catch the code and swap in support copy.
    */
   releaseMyDevice(
     accessToken: string,
@@ -738,6 +816,21 @@ export class RekeyBrowserClient {
    */
   skipOnboarding(accessToken: string): Promise<ProfileStateDto> {
     return this.selfService<ProfileStateDto>('POST', '/api/v1/users/me/onboarding/skip', undefined, accessToken);
+  }
+
+  /**
+   * Erase the signed-in user's own account. It cannot be undone. From the
+   * browser the user confirms with their `password`, or `code` when MFA is on.
+   * Throws STEP_UP_REQUIRED (401) without a valid one,
+   * ACCOUNT_HAS_ACTIVE_SUBSCRIPTION (409) while a subscription still bills, and
+   * ACCOUNT_SELF_DELETION_DISABLED (403) when the Application keeps deletion on
+   * its server (`authConfig.accountDeletion` `server_only` or `off`).
+   *
+   * @example
+   *   await client.deleteAccount(accessToken, { password });
+   */
+  deleteAccount(accessToken: string, proof: { password?: string; code?: string }): Promise<{ erased: true; erasedAt: string }> {
+    return this.selfService<{ erased: true; erasedAt: string }>('DELETE', '/api/v1/users/me/', proof, accessToken);
   }
 
   // ---------- internals ----------
@@ -833,6 +926,17 @@ export type {
   PublicPlanDto,
   SelfSubscriptionDto,
   PublicPlanCheckoutDto,
+  // A plan's prices, the one resolved for the buyer, and what `createCheckout()`
+  // and `validateCoupon()` resolve to.
+  PublicPlanPriceDto,
+  ResolvedPriceDto,
+  PriceFallbackDto,
+  PriceReason,
+  CheckoutResultDto,
+  CreateCheckoutRequest,
+  ValidateCouponRequest,
+  ValidateCouponResultDto,
+  PublicCouponDto,
   // `getMe({ include })`: the accepted values and what each one adds.
   MeInclude,
   MeIncluded,

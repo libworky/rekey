@@ -7,16 +7,23 @@
  * inside the returned page URL; the row keeps its hash.
  */
 
+import type { BuyerCountrySource } from '../buyer-country.js';
 import type { BillingProvider, CheckoutSessionInput } from '../providers/types.js';
 import type { BillingMode } from '../credentials.service.js';
 import { mintCheckoutToken } from './token.js';
-import { checkoutPageUrl, recordCheckoutSession, type EmbeddedSessionMetadata } from './sessions.service.js';
+import {
+  checkoutPageUrl,
+  recordCheckoutSession,
+  type EmbeddedSessionMetadata,
+  type RedirectSessionMetadata,
+} from './sessions.service.js';
+import type { PriceFallback } from '../checkout-price.js';
 
 export interface IssuedCheckout {
   sessionId: string;
   url: string;
   tokenHash: string | null;
-  metadata: EmbeddedSessionMetadata | Record<string, never>;
+  metadata: EmbeddedSessionMetadata | RedirectSessionMetadata;
 }
 
 /**
@@ -32,7 +39,12 @@ export async function issueProviderCheckout(
     const session = opts.isOneTime
       ? await provider.createOneTimeCheckout(input)
       : await provider.createCheckoutSession(input);
-    return { sessionId: session.sessionId, url: session.url, tokenHash: null, metadata: {} };
+    return {
+      sessionId: session.sessionId,
+      url: session.url,
+      tokenHash: null,
+      metadata: {},
+    };
   }
   if (!provider.createEmbeddedCheckout) {
     throw new Error(`provider ${provider.name} declares embedded checkout but does not implement it`);
@@ -74,6 +86,14 @@ export async function recordIssuedCheckout(
     isOneTime: boolean;
     successUrl: string;
     cancelUrl: string;
+    buyerCountry: string | null;
+    buyerCountrySource: BuyerCountrySource | null;
+    price: { currency: string; unitAmount: number };
+    discountAmount: number;
+    planPriceId: string | null;
+    plan: { id: string; slug: string };
+    /** The price selected first, when this checkout charges the default instead. */
+    priceFallback: PriceFallback | null;
   },
 ): Promise<{ id: string }> {
   return recordCheckoutSession({
@@ -89,5 +109,12 @@ export async function recordIssuedCheckout(
     cancelUrl: ctx.cancelUrl,
     tokenHash: issued.tokenHash,
     metadata: issued.metadata,
+    buyerCountry: ctx.buyerCountry,
+    buyerCountrySource: ctx.buyerCountrySource,
+    price: ctx.price,
+    discountAmount: ctx.discountAmount,
+    planPriceId: ctx.planPriceId,
+    plan: ctx.plan,
+    priceFallback: ctx.priceFallback,
   });
 }

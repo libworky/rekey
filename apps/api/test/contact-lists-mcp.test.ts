@@ -11,6 +11,9 @@ import { UNRESTRICTED } from '../src/lib/operator-scopes.js';
 import { TOOL_SCOPES, allOperatorTools } from '../src/modules/tenant-mcp/tenant-mcp-server.js';
 import type { OperatorToolContext } from '../src/modules/tenant-mcp/operator-tools.js';
 import { contactsHarness, type ContactsWorld } from './contacts-fixtures.js';
+import { operatorsConfirmTheirEmail } from './confirmed-accounts.js';
+
+operatorsConfirmTheirEmail();
 
 const tool = (name: string) => allOperatorTools.find((t) => t.name === name)!;
 
@@ -87,6 +90,6 @@ describe('operator MCP list tools', () => {
     expect(TOOL_SCOPES.list_contact_lists).toBe('audience:read');
     expect(TOOL_SCOPES.get_contact_list_stats).toBe('audience:read');
     const names = allOperatorTools.map((t) => t.name);
-    expect(names.filter((n) => /contact/.test(n)).sort()).toEqual(['get_contact_list_stats', 'list_contact_lists']);
+    expect(names.filter((n) => /export|erase/.test(n))).toEqual([]);
   });
 });

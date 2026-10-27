@@ -133,7 +133,7 @@ export const env = createEnv({
       .optional()
       .transform((v) => v === 'true'),
     // The hourly analytics rollup (modules/analytics/rollup). On unless set to
-    // `false`: without it the Users overview can only answer the last 63 days
+    // `false`: without it the Insights page can only answer the last 63 days
     // and loses a day of per-day history every day. See docs/analytics.md.
     ANALYTICS_ROLLUP_ENABLED: z
       .union([z.literal('true'), z.literal('false'), z.literal('')])
@@ -208,8 +208,18 @@ export const env = createEnv({
     // Public halves are served at GET /.well-known/jwks.json either way.
     JWT_RS256_PRIVATE_KEY: z.string().min(1).optional(),
 
-    // 32 bytes hex = 64 chars. Required in production for token-at-rest encryption.
-    ENCRYPTION_KEY: z.string().length(64).optional(),
+    // Required outside the test suite for secrets at rest. Checked as hex, not
+    // just length: Node's hex decoder stops at the first non-hex character, so
+    // a 64-character password-style key would boot and then fail every
+    // encrypt with ERR_CRYPTO_INVALID_KEYLEN.
+    ENCRYPTION_KEY: z
+      .string()
+      .regex(
+        /^[0-9a-fA-F]{64}$/,
+        'ENCRYPTION_KEY must be exactly 64 hex characters (32 bytes). ' +
+          'fix: generate one with `openssl rand -hex 32`.',
+      )
+      .optional(),
 
     API_URL: z.string().url().default('http://localhost:3030'),
 
@@ -292,6 +302,12 @@ export const env = createEnv({
     // `email:send` leaks. Replays and suppressed sends are not counted.
     EMAIL_SEND_DAILY_CAP: z.coerce.number().int().positive().default(1000),
     EMAIL_SEND_RECIPIENT_HOURLY_CAP: z.coerce.number().int().positive().default(10),
+
+    // Caps on built-in auth email (reset, sign-in link, verification, welcome,
+    // invitation) to ONE mailbox, per Application, whoever asks and from
+    // whatever address. Security notices are not counted.
+    AUTH_EMAIL_RECIPIENT_HOURLY_CAP: z.coerce.number().int().positive().default(5),
+    AUTH_EMAIL_RECIPIENT_DAILY_CAP: z.coerce.number().int().positive().default(15),
 
     // Signs one-click unsubscribe links in custom notification email. The links
     // never expire, so the key rotates by id: set a new secret and id, and move
@@ -570,13 +586,12 @@ export const corsAllowedOrigins: string[] = (env.CORS_ALLOWED_ORIGINS ?? '')
   .map((s) => s.trim())
   .filter((s) => s.length > 0);
 
-if (env.NODE_ENV === 'production' && !env.ENCRYPTION_KEY) {
-  // Fail closed. Booting without ENCRYPTION_KEY would persist provider/OAuth
-  // secrets as plaintext (`plain.` prefix) at rest, a silent, hard-to-spot
-  // data-at-rest exposure. Better to refuse to start than to quietly store
-  // credentials in the clear; operators see the error immediately and fix it.
+// Fail closed everywhere but the test suite. Without a key, provider, OAuth and
+// SMTP secrets are written as readable `plain.` rows, and NODE_ENV defaults to
+// development, so a self-host that never sets it would do that silently.
+if (env.NODE_ENV !== 'test' && !env.ENCRYPTION_KEY) {
   throw new Error(
-    '[SECURITY] ENCRYPTION_KEY is required in production — refusing to boot. ' +
+    '[SECURITY] ENCRYPTION_KEY is required. Refusing to boot. ' +
       'Without it, provider credentials and tokens are stored in plaintext at rest. ' +
       'Generate one with: openssl rand -hex 32',
   );
@@ -608,9 +623,9 @@ if (
     /^(.)\1{63}$/.test(env.ENCRYPTION_KEY))
 ) {
   throw new Error(
-    '[SECURITY] ENCRYPTION_KEY is a publicly known value — refusing to boot. ' +
+    '[SECURITY] ENCRYPTION_KEY is a publicly known value. Refusing to boot. ' +
       'This key was published as a docker-compose default before 2.0.0-rc.1, so it ' +
-      'protects nothing. Generate a real one with: openssl rand -hex 32 — and note ' +
+      'protects nothing. Generate a real one with: openssl rand -hex 32. Note ' +
       'that anything already encrypted with the old key must be re-encrypted, since ' +
       'rotating the key alone leaves stored credentials unreadable. ' +
       'Treat any provider credentials stored under it as compromised and rotate them ' +
@@ -627,8 +642,17 @@ if (
   // no mail transport). In production it is an account-takeover handout: the
   // operator endpoints that return them are unauthenticated by necessity.
   throw new Error(
-    '[SECURITY] REKEY_DEV_ECHO_AUTH_TOKENS=true is not allowed in production — refusing to boot. ' +
+    '[SECURITY] REKEY_DEV_ECHO_AUTH_TOKENS=true is not allowed in production. Refusing to boot. ' +
       'It returns raw password-reset and magic-link tokens in API responses. Unset it and configure email transport.',
+  );
+}
+
+if (env.NODE_ENV === 'test' && !process.env.VITEST) {
+  // Test mode lifts the auth rate limits and returns raw reset and confirmation
+  // tokens in responses, so a reachable server started with it hands out accounts.
+  throw new Error(
+    '[SECURITY] NODE_ENV=test is only for the test suite. Refusing to boot. ' +
+      'Set NODE_ENV=production (or development for local work).',
   );
 }
 

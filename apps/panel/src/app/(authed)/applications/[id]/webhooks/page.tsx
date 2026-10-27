@@ -52,9 +52,8 @@ const ALL_EVENTS: readonly string[] = KNOWN_WEBHOOK_EVENTS;
  * There is no tenant-side aggregate to read. `/admin/metrics/webhook-endpoint-
  * health` computes exactly this, but it is `requireSuperAdmin` and
  * deployment-wide, so an operator cannot call it. The only tenant source is
- * `GET .../webhooks/:endpointId/deliveries`, which takes no query parameters at
- * all: no status filter, no time window, no limit (the route pins the service's
- * page size to 50). So the panel fans out one request per endpoint, bounded by
+ * `GET .../webhooks/:endpointId/deliveries`, which has no time window. So the
+ * panel fans out one request per endpoint for its newest 50 rows, bounded by
  * the endpoint count, not by volume, and counts the rows inside the window.
  *
  * The 50-row cap is a real limit and the UI does not hide it: when the page is
@@ -164,6 +163,7 @@ const ERR: Record<string, string> = {
   missing: 'A URL and at least one event are required.',
   WEBHOOK_URL_UNSAFE:
     'That URL is not allowed. Use a public HTTPS URL (private/internal hosts are blocked).',
+  URL_NOT_HTTPS: 'That URL is plain http. This deployment only delivers to https:// URLs.',
   TENANT_ROLE_INSUFFICIENT: 'Only owners and admins can manage webhook endpoints.',
   APPLICATION_NOT_FOUND: 'Application not found.',
 };
@@ -258,7 +258,7 @@ export default async function WebhooksPage({
   //, so route the error to whichever surface is actually visible.
   const addModalOpen = sp.newWebhook === '1';
   const lastUrl = typeof sp.url === 'string' ? sp.url : undefined;
-  const { items: endpoints } = await api<Page<EndpointRow>>({
+  const { items: endpoints, httpsRequired } = await api<Page<EndpointRow> & { httpsRequired: boolean }>({
     method: 'GET',
     path: `/api/v1/tenant/applications/${encodeURIComponent(id)}/webhooks`,
   });
@@ -276,7 +276,12 @@ export default async function WebhooksPage({
           <>
             Events Rekey sends to your backend when things happen (sign-ups, payments, dunning).
             Each endpoint gets a signing secret, and deliveries carry an HMAC-SHA256 signature in{' '}
-            <code className="font-mono">X-Rekey-Signature</code>.
+            <code className="font-mono">X-Rekey-Signature</code>. What payment providers send to
+            Rekey is under{' '}
+            <Link href={`/applications/${id}/billing/events`} className="underline hover:text-[var(--color-fg)]">
+              Incoming provider events
+            </Link>
+            .
           </>
         }
         action={
@@ -300,8 +305,18 @@ export default async function WebhooksPage({
                 required
                 defaultValue={lastUrl}
                 placeholder="https://your-app.example.com/api/rekey/webhook"
+                {...(httpsRequired && {
+                  pattern: 'https://.+',
+                  title: 'The URL must start with https://',
+                })}
                 className="w-full rounded-md border border-[var(--color-border)] bg-[var(--color-surface)] px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-[color-mix(in_srgb,var(--color-primary)_30%,transparent)] focus:border-[var(--color-primary)]"
               />
+              {httpsRequired && (
+                <span className="block text-xs text-[var(--color-muted-fg)]">
+                  Must start with https://. Events carry your users&apos; data, so this deployment
+                  does not send them over plain http.
+                </span>
+              )}
             </label>
             <fieldset className="space-y-2">
               <legend className="text-sm font-medium">Events</legend>
@@ -391,7 +406,14 @@ export default async function WebhooksPage({
           <TBody>
             {endpoints.map((e) => (
               <TR key={e.id} hover>
-                <TD mono className="max-w-[24rem] truncate" title={e.url}>{e.url}</TD>
+                <TD mono className="max-w-[24rem] truncate" title={e.url}>
+                  {e.url}
+                  {httpsRequired && e.url.startsWith('http://') && (
+                    <span className="ml-2 font-sans">
+                      <Badge tone="danger">Not delivering: plain http</Badge>
+                    </span>
+                  )}
+                </TD>
                 <TD className="text-xs">
                   {e.events.includes('*') ? (
                     <span className="text-[var(--color-muted-fg)]">All events</span>
@@ -411,20 +433,20 @@ export default async function WebhooksPage({
                   <div className="flex items-center justify-end gap-3">
                     <Link
                       href={`/applications/${id}/webhooks/${e.id}`}
-                      className="text-xs font-medium text-[var(--color-fg)] hover:underline"
+                      className="inline-block py-1.5 text-xs font-medium text-[var(--color-fg)] hover:underline"
                     >
                       Details
                     </Link>
                     <ActionForm action={toggleEndpoint.bind(null, id, e.id, !e.enabled)} className="inline">
                       <SubmitButton
                         pendingLabel={e.enabled ? 'Disabling…' : 'Enabling…'}
-                        className="text-xs text-[var(--color-muted-fg)] hover:text-[var(--color-fg)] hover:underline disabled:opacity-60"
+                        className="inline-block py-1.5 text-xs text-[var(--color-muted-fg)] hover:text-[var(--color-fg)] hover:underline disabled:opacity-60"
                       >
                         {e.enabled ? 'Disable' : 'Enable'}
                       </SubmitButton>
                     </ActionForm>
                     <ActionForm action={deleteEndpoint.bind(null, id, e.id)} className="inline">
-                      <ConfirmButton confirm="Delete this webhook endpoint? Pending deliveries are cancelled and history is removed.">
+                      <ConfirmButton title="Delete webhook endpoint?" confirm="Delete this webhook endpoint? Pending deliveries are cancelled and history is removed.">
                         Delete
                       </ConfirmButton>
                     </ActionForm>

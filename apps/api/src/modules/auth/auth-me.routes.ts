@@ -28,7 +28,7 @@ import { applicationDisabled } from '../../middleware/api-key-auth.js';
 import { resolveImpersonation } from '../../middleware/user-session.js';
 import { organizationsService } from '../organizations/organizations.service.js';
 import { ok, errs, ref } from '../../lib/openapi.js';
-import { sessionIssuedBefore } from '../../lib/session-stamp.js';
+import { accessTokenEndedByStamp } from '../../lib/session-stamp.js';
 import {
   ME_INCLUDED_PROPERTIES_SCHEMA,
   ME_INCLUDE_ERRORS,
@@ -47,15 +47,15 @@ const TOKEN_HEADER = 'x-rekey-user-token';
 const AUTH_ME_ERRORS = {
   400: ME_INCLUDE_ERRORS[400],
   401:
-    'USER_TOKEN_MISSING — no X-Rekey-User-Token header; or USER_TOKEN_INVALID — the token is ' +
+    'USER_TOKEN_MISSING: no X-Rekey-User-Token header; or USER_TOKEN_INVALID: the token is ' +
     'missing, expired, malformed, or the Application it names no longer exists; or ' +
     'IMPERSONATION_SESSION_ENDED: the operator impersonation behind the token has ended.',
   403:
     'APPLICATION_DISABLED: the Application that issued the token is frozen by its operator; or ' +
     ME_INCLUDE_ERRORS[403],
-  404: 'END_USER_NOT_FOUND — the end-user behind this token no longer exists in this Application.',
-  410: 'END_USER_ERASED — this end-user was erased (GDPR) and can no longer authenticate.',
-  429: 'RATE_LIMITED — too many requests for this window. Honour the `Retry-After` header.',
+  404: 'END_USER_NOT_FOUND: the end-user behind this token no longer exists in this Application.',
+  410: 'END_USER_ERASED: this end-user was erased (GDPR) and can no longer authenticate.',
+  429: 'RATE_LIMITED: too many requests for this window. Honour the `Retry-After` header.',
 } as const;
 
 /**
@@ -153,7 +153,7 @@ async function verifyTokenOnlySession(req: FastifyRequest): Promise<void> {
   // The same kill switches requireUserSession applies: a token that
   // predates the user's last revoke-everything, or whose own session or
   // device was ended, must not read their record here either.
-  if (sessionIssuedBefore(claims, sessionsInvalidBefore) || sessionEnded) throw invalid;
+  if (accessTokenEndedByStamp(claims, sessionsInvalidBefore) || sessionEnded) throw invalid;
 
   req.endUser = endUser;
   if (claims.dev) req.deviceId = claims.dev;
