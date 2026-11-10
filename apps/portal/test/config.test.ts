@@ -15,7 +15,7 @@
 import { describe, expect, it } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { brandTokens, followsColorScheme, safeCssColor, safeHttpUrl, supportLink } from '@/lib/config';
+import { brandScheme, brandTokens, followsColorScheme, safeCssColor, safeHttpUrl, supportLink } from '@/lib/config';
 import { MUTED_TEXT } from '@/lib/checkout-format';
 
 describe('safeCssColor', () => {
@@ -86,8 +86,20 @@ describe('brandTokens', () => {
     expect(globals.split('@media (prefers-color-scheme: dark)')[0]).toContain('--color-muted-fg: var(--rk-muted-fg);');
   });
 
-  it('drops a dark background so the default stands', () => {
-    expect(brandTokens({ backgroundColor: '#111111' })).toEqual({});
+  it('keeps a dark background and switches the page to the dark scheme', () => {
+    expect(brandTokens({ backgroundColor: '#111111' })).toEqual({ '--color-bg': '#111111' });
+    expect(brandScheme({ backgroundColor: '#111111' })).toBe('dark');
+    expect(brandScheme({ backgroundColor: '#fafafa' })).toBe('light');
+    expect(brandScheme({})).toBe('auto');
+  });
+
+  it('keeps a light accent on a dark background, and drops one too dim for it', () => {
+    expect(brandTokens({ backgroundColor: '#121212', primaryColor: 'rgb(129 140 248/1)' })).toEqual({
+      '--color-bg': '#121212',
+      '--color-primary': 'rgb(129 140 248/1)',
+      '--color-primary-hover': 'color-mix(in srgb, rgb(129 140 248/1) 85%, white)',
+    });
+    expect(brandTokens({ backgroundColor: '#121212', primaryColor: 'rgb(99 102 241/1)' })).toEqual({ '--color-bg': '#121212' });
   });
 
   it('drops a primary too faint for white button text', () => {
@@ -98,8 +110,12 @@ describe('brandTokens', () => {
     expect(brandTokens({ primaryColor: '#0f766e', surfaceColor: '#d4d4d4' })).toEqual({ '--color-surface': '#d4d4d4' });
   });
 
-  it('falls back for colours the contrast check cannot read', () => {
-    expect(brandTokens({ primaryColor: 'rgb(15, 118, 110)', backgroundColor: 'rebeccapurple', surfaceColor: 'white' })).toEqual({});
+  it('reads opaque rgb() and falls back for colours the contrast check cannot read', () => {
+    expect(brandTokens({ primaryColor: 'rgb(15, 118, 110)' })).toEqual({
+      '--color-primary': 'rgb(15, 118, 110)',
+      '--color-primary-hover': 'color-mix(in srgb, rgb(15, 118, 110) 85%, black)',
+    });
+    expect(brandTokens({ primaryColor: 'rgb(15 118 110 / 0.5)', backgroundColor: 'rebeccapurple', surfaceColor: 'white' })).toEqual({});
   });
 });
 

@@ -10,7 +10,7 @@ import 'server-only';
 import { cache } from 'react';
 import { rekeyApiUrl } from './env';
 import { API_TIMEOUT_MS, forwardedClientHeaders } from './client-ip';
-import { readableAccent, readableSurface } from './checkout-format';
+import { readableAccent, readableDarkAccent, readableDarkSurface, readableSurface } from './checkout-format';
 
 export interface PortalBranding {
   /** Overrides the Application name in the portal header. */
@@ -90,6 +90,8 @@ export function safeCssColor(value: string | undefined): string | undefined {
  * // { '--color-primary': '#0f766e', '--color-primary-hover': 'color-mix(in srgb, #0f766e 85%, black)' }
  */
 export function brandTokens(branding: PortalBranding): Record<string, string> {
+  const darkBackground = readableDarkSurface(safeCssColor(branding.backgroundColor) ?? null);
+  if (darkBackground) return darkBrandTokens(branding, darkBackground);
   const vars: Record<string, string> = {};
   const background = readableSurface(safeCssColor(branding.backgroundColor) ?? null);
   const surface = readableSurface(safeCssColor(branding.surfaceColor) ?? null);
@@ -111,6 +113,23 @@ export function brandTokens(branding: PortalBranding): Record<string, string> {
  */
 export function followsColorScheme(branding: PortalBranding): boolean {
   return !branding.primaryColor && !branding.backgroundColor && !branding.surfaceColor;
+}
+
+function darkBrandTokens(branding: PortalBranding, background: string): Record<string, string> {
+  const vars: Record<string, string> = { '--color-bg': background };
+  const surface = readableDarkSurface(safeCssColor(branding.surfaceColor) ?? null);
+  if (surface) vars['--color-surface'] = surface;
+  const primary = readableDarkAccent(safeCssColor(branding.primaryColor) ?? null, [background, surface]);
+  if (primary) {
+    vars['--color-primary'] = primary;
+    vars['--color-primary-hover'] = `color-mix(in srgb, ${primary} 85%, white)`;
+  }
+  return vars;
+}
+
+export function brandScheme(branding: PortalBranding): 'auto' | 'light' | 'dark' {
+  if (followsColorScheme(branding)) return 'auto';
+  return readableDarkSurface(safeCssColor(branding.backgroundColor) ?? null) ? 'dark' : 'light';
 }
 
 /**

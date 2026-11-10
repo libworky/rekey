@@ -47,15 +47,43 @@ export function renewalSentence(price: string, interval: string | null | undefin
 }
 
 /** WCAG relative luminance of a `#rgb` / `#rrggbb` colour, or null for anything else. */
-function luminance(hex: string): number | null {
-  const m = /^#([0-9a-f]{3}|[0-9a-f]{6})$/i.exec(hex);
-  if (!m) return null;
-  const full = m[1]!.length === 3 ? m[1]!.split('').map((c) => c + c).join('') : m[1]!;
-  const channel = (i: number): number => {
-    const v = parseInt(full.slice(i, i + 2), 16) / 255;
+function luminance(color: string): number | null {
+  const rgb = rgbOf(color.trim());
+  if (!rgb) return null;
+  const [r, g, b] = rgb.map((c) => {
+    const v = c / 255;
     return v <= 0.03928 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4;
-  };
-  return 0.2126 * channel(0) + 0.7152 * channel(2) + 0.0722 * channel(4);
+  }) as [number, number, number];
+  return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+}
+
+function rgbOf(color: string): [number, number, number] | null {
+  const hex = /^#([0-9a-f]{3}|[0-9a-f]{6})$/i.exec(color);
+  if (hex) {
+    const full = hex[1]!.length === 3 ? hex[1]!.split('').map((c) => c + c).join('') : hex[1]!;
+    return [0, 2, 4].map((i) => parseInt(full.slice(i, i + 2), 16)) as [number, number, number];
+  }
+  const fn = /^rgba?\(\s*(\d{1,3})[\s,]+(\d{1,3})[\s,]+(\d{1,3})\s*(?:[,/]\s*(?:1|1\.0+|100%)\s*)?\)$/i.exec(color);
+  if (!fn) return null;
+  const channels = [fn[1], fn[2], fn[3]].map(Number) as [number, number, number];
+  return channels.every((c) => c <= 255) ? channels : null;
+}
+
+const DARK_MUTED_TEXT = '#a3a3a3';
+const DARK_SURFACE = '#171717';
+
+export function readableDarkSurface(color: string | null): string | null {
+  if (color === null) return null;
+  const l = luminance(color);
+  const muted = luminance(DARK_MUTED_TEXT)!;
+  return l !== null && l < muted && contrast(l, muted) >= MIN_TEXT_CONTRAST ? color : null;
+}
+
+export function readableDarkAccent(color: string | null, surfaces: ReadonlyArray<string | null>): string | null {
+  const l = color === null ? null : luminance(color);
+  if (l === null) return null;
+  const behind = [DARK_SURFACE, ...surfaces].map((s) => (s === null ? null : luminance(s))).filter((s): s is number => s !== null);
+  return behind.every((s) => contrast(l, s) >= MIN_TEXT_CONTRAST) ? color : null;
 }
 
 const MIN_TEXT_CONTRAST = 4.5;

@@ -1,7 +1,7 @@
 import type { ReactNode } from 'react';
 import type { Metadata } from 'next';
 import { notFound } from 'next/navigation';
-import { brandTokens, followsColorScheme, safeHttpUrl, supportLink } from '@/lib/config';
+import { brandScheme, brandTokens, safeHttpUrl, supportLink } from '@/lib/config';
 import { getPortalConfigOrRefresh, getPortalUser } from '@/lib/session';
 import { signOutAction } from '@/lib/actions';
 import { portalNav } from '@/lib/portal-nav';
@@ -62,7 +62,7 @@ export default async function SlugLayout({
     <div
       className="min-h-screen bg-[var(--color-bg)] text-[var(--color-fg)]"
       style={brandStyle}
-      data-scheme={followsColorScheme(b) ? 'auto' : 'light'}
+      data-scheme={brandScheme(b)}
     >
       <div className="mx-auto max-w-3xl px-4 py-6 sm:px-5 sm:py-8">
         <header className="mb-8 space-y-3">
