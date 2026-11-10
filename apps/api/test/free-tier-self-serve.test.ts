@@ -212,6 +212,33 @@ describe('self-serve free tier', () => {
     expect(plan.slug).toBe('free');
   });
 
+  it('starts any free plan the buyer names, and only a free active one', async () => {
+    await nominate(await makePlan({ slug: 'free', name: 'Free', kind: 'SUBSCRIPTION' }));
+    await makePlan(
+      { slug: 'squad', name: 'Squad', kind: 'SUBSCRIPTION' },
+      { kind: 'FEATURE', key: 'plan', valueType: 'STRING', value: 'premium' },
+    );
+    await makePlan({ slug: 'paid', name: 'Paid', price: { currency: 'USD', amount: 1000 }, kind: 'SUBSCRIPTION' });
+    await makePlan({ slug: 'retired', name: 'Retired', kind: 'SUBSCRIPTION' });
+    await prisma.plan.update({
+      where: { applicationId_slug: { applicationId: appId, slug: 'retired' } },
+      data: { active: false },
+    });
+    const userToken = await signUp();
+
+    expect((await subscribe(userToken, { planSlug: 'squad' })).statusCode).toBe(201);
+    const sub = await prisma.subscription.findFirstOrThrow({ where: { applicationId: appId }, include: { plan: true } });
+    expect(sub.plan.slug).toBe('squad');
+
+    const paid = await subscribe(await signUp(), { planSlug: 'paid' });
+    expect(paid.statusCode).toBe(409);
+    expect((paid.json().error as { code: string }).code).toBe('BILLING_FREE_PLAN_NOT_FREE');
+
+    const retired = await subscribe(await signUp(), { planSlug: 'retired' });
+    expect(retired.statusCode).toBe(404);
+    expect((retired.json().error as { code: string }).code).toBe('PLAN_NOT_FOUND');
+  });
+
   it('needs the buyer, not just the Application key', async () => {
     const slug = await makePlan({ slug: 'free', name: 'Free', kind: 'SUBSCRIPTION' });
     await nominate(slug);

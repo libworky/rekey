@@ -407,9 +407,10 @@ export const subscriptionGrantsService = {
     endUserId: string;
     /** Beneficiary org, when the Application bills per organization. */
     organizationId?: string;
+    planSlug?: string;
   }): Promise<FreePlanActivation> {
     const billingConfig = BillingConfigSchema.parse(input.application.billingConfig);
-    const slug = billingConfig.defaultPlanSlug;
+    const slug = input.planSlug ?? billingConfig.defaultPlanSlug;
     if (!slug) {
       throw new RekeyError({
         statusCode: 404,
@@ -420,6 +421,14 @@ export const subscriptionGrantsService = {
     }
 
     const plan = await plansService.getBySlug(input.application.id, slug);
+    if (!plan.active) {
+      throw new RekeyError({
+        statusCode: 404,
+        code: 'PLAN_NOT_FOUND',
+        message: `Plan "${slug}" is not on offer.`,
+        fix: 'Pick an active free plan from GET /api/v1/billing/plans.',
+      });
+    }
     if (!costsNothing(plan)) throw freePlanNotFree(plan.slug, 'activate');
 
     // Mirrors the conditions under which `entitlementsService.provision`

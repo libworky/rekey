@@ -331,19 +331,19 @@ describe('the free plan', () => {
     expect(row).not.toContain('Subscribe');
   });
 
-  it('offers Start on exactly the plan the API names as the default, never on another free plan', async () => {
+  it('offers Start on every free plan, not only the default', async () => {
     const other = PublicPlanDtoSchema.parse({ ...PLANS.free, id: 'plan_free2', slug: 'hobby', name: 'Hobby' }) as PublicPlanDto;
     client.getPlans.mockResolvedValue({ items: [PLANS.free, other], defaultPlanSlug: 'hobby' });
     api();
     const html = await dashboard();
     expect(planRow(html, 'Hobby')).toContain('Start<span class="sr-only"> Hobby</span>');
-    expect(planRow(html, 'Free')).not.toContain('Start');
+    expect(planRow(html, 'Free')).toContain('Start<span class="sr-only"> Free</span>');
   });
 
-  it('offers no Start when the application has no default plan', async () => {
+  it('offers Start on a free plan when the application has no default plan', async () => {
     client.getPlans.mockResolvedValue({ items: [PLANS.free], defaultPlanSlug: null });
     api();
-    expect(planRow(await dashboard(), 'Free')).not.toContain('Start');
+    expect(planRow(await dashboard(), 'Free')).toContain('Start<span class="sr-only"> Free</span>');
   });
 
   it('shows a customer already on the free plan as current, with no Start', async () => {
@@ -364,15 +364,15 @@ describe('the free plan', () => {
 
   it('starts it through the free-tier route and says so', async () => {
     client.subscribe.mockResolvedValue({ subscription: null, activated: true });
-    expect(await redirectOf(() => startFreePlanAction('acme', null))).toBe('/acme?free=started');
-    expect(client.subscribe).toHaveBeenCalledWith('at', undefined);
+    expect(await redirectOf(() => startFreePlanAction('acme', null, 'free'))).toBe('/acme?free=started');
+    expect(client.subscribe).toHaveBeenCalledWith('at', { planSlug: 'free' });
     api();
     expect(await dashboard({ free: 'started' })).toContain('You are on the free plan.');
   });
 
   it('explains a refusal', async () => {
     client.subscribe.mockRejectedValue(new RekeyError({ code: 'BILLING_FREE_TIER_ALREADY_CLAIMED', message: 'x', statusCode: 409 }));
-    expect(await redirectOf(() => startFreePlanAction('acme', null))).toBe(
+    expect(await redirectOf(() => startFreePlanAction('acme', null, 'free'))).toBe(
       '/acme?free_error=BILLING_FREE_TIER_ALREADY_CLAIMED',
     );
     api();

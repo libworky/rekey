@@ -1460,6 +1460,13 @@ export async function billingRoutes(app: FastifyInstance): Promise<void> {
                 'The caller must be an OWNER or ADMIN of it. Defaults to the session\'s active ' +
                 'organization when one is set.',
             },
+            planSlug: {
+              type: 'string',
+              minLength: 1,
+              maxLength: 40,
+              description:
+                'The free plan to start: any active plan with `isFree` true. Defaults to `billingConfig.defaultPlanSlug`.',
+            },
           },
         },
         response: {
@@ -1491,7 +1498,7 @@ export async function billingRoutes(app: FastifyInstance): Promise<void> {
     },
     async (req, reply) => {
       const body = z
-        .object({ organizationId: z.string().min(1).optional() })
+        .object({ organizationId: z.string().min(1).optional(), planSlug: z.string().min(1).max(40).optional() })
         .parse(req.body ?? {});
       // Explicit beats the session's active org, and an absent one falls back to
       // it, matching how `GET /billing/entitlements` resolves the same subject.
@@ -1508,6 +1515,7 @@ export async function billingRoutes(app: FastifyInstance): Promise<void> {
         application: req.application!,
         endUserId: req.endUser!.id,
         ...(organizationId !== undefined && { organizationId }),
+        ...(body.planSlug !== undefined && { planSlug: body.planSlug }),
       });
       return reply.status(result.activated ? 201 : 200).send({
         success: true,

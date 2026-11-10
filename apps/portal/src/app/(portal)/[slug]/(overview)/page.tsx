@@ -180,10 +180,7 @@ export default async function DashboardPage({
   // Individual apps: always self-checkout. Org apps: only when we resolved a
   // team the user can manage. Members of org-billed apps get a read-only view.
   const canCheckout = !isOrgBilled || billingOrg?.canManage === true;
-  // Start appears only on the plan POST /billing/subscribe activates, and only
-  // for a customer with no subscription: starting it would add a second one.
-  const freeTierPlanId =
-    subscriptions.length === 0 ? (plans.find((p) => p.isFree && p.slug === planPage.defaultPlanSlug)?.id ?? null) : null;
+  const canStartFree = subscriptions.length === 0;
   const freeError = typeof sp.free_error === 'string' ? sp.free_error : undefined;
 
   const error = typeof sp.error === 'string' ? sp.error : undefined;
@@ -374,7 +371,7 @@ export default async function DashboardPage({
               // A free plan is started, never checked out: there is nothing to pay.
               const sells = offer.kind === 'buy' && !plan.isFree;
               const trial = sells ? trialNote(trials.get(plan.slug)) : null;
-              const startsFree = plan.isFree && !heldPlanIds.has(plan.id) && canCheckout && plan.id === freeTierPlanId;
+              const startsFree = plan.isFree && !heldPlanIds.has(plan.id) && canCheckout && canStartFree;
               const priceBeside = planPriceBesideName(plan);
               return (
                 <li key={plan.id} className="rounded-md border border-[var(--color-border)] px-3 py-2">
@@ -406,7 +403,7 @@ export default async function DashboardPage({
                       </a>
                     )}
                     {startsFree && (
-                      <form action={startFreePlanAction.bind(null, slug, orgId)}>
+                      <form action={startFreePlanAction.bind(null, slug, orgId, plan.slug)}>
                         <SubmitButton pendingLabel="Starting…" className="text-xs">
                           Start<span className="sr-only"> {plan.name}</span>
                         </SubmitButton>

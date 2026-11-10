@@ -794,12 +794,15 @@ export class RekeyBrowserClient {
    */
   async subscribe(
     accessToken: string,
-    opts?: { organizationId?: string },
+    opts?: { organizationId?: string; planSlug?: string },
   ): Promise<{ subscription: SelfSubscriptionDto | null; activated: boolean }> {
     const res = await this.selfServiceWithStatus<SelfSubscriptionDto | null>(
       'POST',
       '/api/v1/billing/subscribe',
-      { ...(opts?.organizationId ? { organizationId: opts.organizationId } : {}) },
+      {
+        ...(opts?.organizationId ? { organizationId: opts.organizationId } : {}),
+        ...(opts?.planSlug ? { planSlug: opts.planSlug } : {}),
+      },
       accessToken,
     );
     // 201 = just activated, 200 = already on it. Same body either way, so the

@@ -3638,12 +3638,15 @@ class BillingClient {
    */
   async subscribe(
     accessToken: string,
-    input: { organizationId?: string } = {},
+    input: { organizationId?: string; planSlug?: string } = {},
   ): Promise<{ subscription: SelfSubscriptionDto | null; activated: boolean }> {
     const { data, status } = await this.client.sendWithStatus<SelfSubscriptionDto | null>(
       'POST',
       '/api/v1/billing/subscribe',
-      { ...(input.organizationId !== undefined && { organizationId: input.organizationId }) },
+      {
+        ...(input.organizationId !== undefined && { organizationId: input.organizationId }),
+        ...(input.planSlug !== undefined && { planSlug: input.planSlug }),
+      },
       { 'X-Rekey-User-Token': accessToken },
     );
     // 201 = activated now, 200 = already on it. The body is the same row in
