@@ -4,6 +4,7 @@ import * as React from 'react';
 import { ActionForm } from '@/components/ActionForm';
 import { SubmitButton } from '@/components/SubmitButton';
 import { Banner } from '@/components/Banner';
+import { ApiErrorText } from '@/components/api-error';
 
 type Kind = 'FEATURE' | 'CREDIT' | 'LICENSE' | 'USAGE';
 
@@ -23,9 +24,14 @@ const ERR: Record<string, string> = {
 export function EntitlementForm({
   action,
   error,
+  errorDetail,
+  errorFix,
 }: {
   action: (formData: FormData) => void | Promise<void>;
-  error?: string;
+  error?: string | undefined;
+  /** The API's own message and fix for `error`, which say what to change. */
+  errorDetail?: string | undefined;
+  errorFix?: string | undefined;
 }): React.JSX.Element {
   const [kind, setKind] = React.useState<Kind>('FEATURE');
 
@@ -37,7 +43,12 @@ export function EntitlementForm({
       </p>
       {error && (
         <Banner tone="error">
-          {ERR[error] ?? 'Something went wrong. Please try again.'}
+          <ApiErrorText
+            code={error}
+            detail={errorDetail}
+            fix={errorFix}
+            fallback={ERR[error] ?? 'Something went wrong. Please try again.'}
+          />
         </Banner>
       )}
       <label className="block space-y-1">
@@ -68,6 +79,10 @@ export function EntitlementForm({
             <span className="text-xs font-medium">Value</span>
             <input type="text" name="value" required placeholder="true / 50 / pro" className={`${inputCls} font-mono`} />
           </label>
+          <p className="text-xs text-[var(--color-muted-fg)] sm:col-span-3">
+            A Boolean is <code className="font-mono">true</code> or <code className="font-mono">false</code>. For a
+            name such as <code className="font-mono">pro</code>, choose String.
+          </p>
         </div>
       )}
 

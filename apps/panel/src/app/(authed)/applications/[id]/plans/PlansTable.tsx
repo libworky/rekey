@@ -37,6 +37,28 @@ function entitlementLabel(e: PlanEntitlementRow): string {
   }
 }
 
+const FEATURE_TYPE = { BOOL: 'bool', INT: 'number', STRING: 'string' } as const;
+
+/**
+ * The stored type of a FEATURE entry, beside its `key=value`. The value alone
+ * does not say how it resolves: `plan=plus` stored as a Boolean reads as false.
+ * A Boolean holding anything but true/false predates the API refusing it, and
+ * is marked.
+ */
+function FeatureType({ e }: { e: PlanEntitlementRow }): React.JSX.Element | null {
+  if (e.kind !== 'FEATURE' || !e.valueType) return null;
+  const mistyped = e.valueType === 'BOOL' && e.value !== 'true' && e.value !== 'false';
+  return (
+    <span
+      title={mistyped ? 'A Boolean only reads true or false, so this value resolves to false. Save it again as String.' : undefined}
+      className={`font-mono text-[10px] ${mistyped ? 'text-red-700 dark:text-red-400' : 'text-[var(--color-muted-fg)]'}`}
+    >
+      {FEATURE_TYPE[e.valueType]}
+      {mistyped && ' (reads as false)'}
+    </span>
+  );
+}
+
 export function PlansTable({
   rows,
   applicationId,
@@ -44,6 +66,7 @@ export function PlansTable({
   editError,
   editSlug,
   priceFlash,
+  entFlash,
   reportingCurrency,
   providerLabel,
   unchargeable,
@@ -61,6 +84,8 @@ export function PlansTable({
   editSlug?: string | undefined;
   /** Result of the last price action, rendered inside that plan's edit modal. */
   priceFlash: PlanPriceFlash;
+  /** Failure from the last entitlement save, rendered inside that plan's dialog. */
+  entFlash: { slug?: string | undefined; error?: string | undefined; detail?: string | undefined; fix?: string | undefined };
 }): React.JSX.Element {
   return (
     <Table minWidth="min-w-[60rem]">
@@ -108,7 +133,10 @@ export function PlansTable({
               <TD>
                 <div className="flex max-w-[16rem] flex-wrap items-center gap-1">
                   {ents.slice(0, 4).map((e) => (
-                    <Badge key={e.id} tone="neutral">{entitlementLabel(e)}</Badge>
+                    <Badge key={e.id} tone="neutral">
+                      {entitlementLabel(e)}
+                      <FeatureType e={e} />
+                    </Badge>
                   ))}
                   {ents.length > 4 && (
                     <span className="text-[11px] text-[var(--color-faint-fg)]">+{ents.length - 4}</span>
@@ -224,7 +252,8 @@ export function PlansTable({
                     )}
                   </Modal>
                   <Modal
-                    modalKey={`ent_${p.slug}`}
+                    modalKey="entSlug"
+                    modalValue={p.slug}
                     size="lg"
                     title={`What's included: ${p.name}`}
                     description="What a buyer gets with this plan: licenses, credits, features and usage allowance. They receive it when their subscription starts."
@@ -238,7 +267,7 @@ export function PlansTable({
                             <li key={e.id} className="flex items-center justify-between gap-3 px-3 py-2 text-sm">
                               <span className="text-[var(--color-fg)]">
                                 <Badge tone="neutral" mono className="mr-1.5">{e.kind}</Badge>
-                                {entitlementLabel(e)}
+                                {entitlementLabel(e)} <FeatureType e={e} />
                               </span>
                               <ActionForm action={removeEntitlement.bind(null, applicationId, p.slug, e.id)}>
                                 <ConfirmButton title="Remove plan entitlement?" confirm={`Remove "${entitlementLabel(e)}" from ${p.slug}? Future purchases stop granting it; already-materialized grants on existing buyers are unaffected.`}>
@@ -253,7 +282,14 @@ export function PlansTable({
                           Nothing added yet. A plan with nothing here grants what its plan type gives by default.
                         </p>
                       )}
-                      <EntitlementForm action={addEntitlement.bind(null, applicationId, p.slug)} />
+                      <EntitlementForm
+                        action={addEntitlement.bind(null, applicationId, p.slug)}
+                        {...(entFlash.slug === p.slug && {
+                          error: entFlash.error,
+                          errorDetail: entFlash.detail,
+                          errorFix: entFlash.fix,
+                        })}
+                      />
                     </div>
                   </Modal>
                   {p.checkout?.ready === false &&
