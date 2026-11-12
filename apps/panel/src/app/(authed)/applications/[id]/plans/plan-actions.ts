@@ -80,7 +80,7 @@ export async function createPlan(applicationId: string, formData: FormData): Pro
       });
     } catch (err) {
       if (err instanceof PanelApiError) {
-        redirect(`/applications/${applicationId}/plans?created=${slug}&entError=${encodeURIComponent(err.code)}`);
+        redirect(`/applications/${applicationId}/plans?${await errorQuery(err, { created: slug, entError: err.code })}`);
       }
       throw err;
     }

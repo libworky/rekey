@@ -459,6 +459,14 @@ export const entitlementsService = {
           bad('FEATURE entitlement needs a `value`.', 'e.g. "true" or "50".');
         if (args.valueType === 'INT' && !Number.isFinite(Number(args.value)))
           bad('FEATURE INT value must be numeric.', 'Pass a number like "50".');
+        // `parseFeatureValue` reads a BOOL as `value === 'true'`, so any other
+        // text, a plan name typed under the wrong type, resolves to `false`
+        // while the stored row still looks right.
+        if (args.valueType === 'BOOL' && args.value !== 'true' && args.value !== 'false')
+          bad(
+            'FEATURE BOOL value must be "true" or "false".',
+            'For a text value such as a plan name, set `valueType` to STRING.',
+          );
         break;
       case 'CREDIT':
         if (!args.quantity || args.quantity <= 0)

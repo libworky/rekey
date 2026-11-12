@@ -107,6 +107,21 @@ describe('Plan entitlements + provisioner', () => {
     expect(r.json().error.code).toBe('PLAN_ENTITLEMENT_INVALID');
   });
 
+  it('refuses a BOOL feature whose value is not true or false', async () => {
+    await makePlan('team', { kind: 'SUBSCRIPTION' });
+    const feature = (valueType: string, value: string) =>
+      putEntitlement('team', { kind: 'FEATURE', key: 'plan', valueType, value });
+
+    const refused = await feature('BOOL', 'plus');
+    expect(refused.statusCode).toBe(400);
+    expect(refused.json().error.code).toBe('PLAN_ENTITLEMENT_INVALID');
+    expect(refused.json().error.fix).toContain('STRING');
+
+    expect((await feature('BOOL', 'true')).statusCode).toBe(200);
+    expect((await feature('BOOL', 'false')).statusCode).toBe(200);
+    expect((await feature('STRING', 'plus')).statusCode).toBe(200);
+  });
+
   it('provisions the bundle onto a subscriber + resolveForEndUser unions it (idempotent)', async () => {
     const planId = await makePlan('team', { kind: 'SUBSCRIPTION' });
     await putEntitlement('team', { kind: 'CREDIT', quantity: 500 });

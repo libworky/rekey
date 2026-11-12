@@ -17,6 +17,7 @@ import { currencyChoice, toChargingProviders, unchargeableReason } from '@/lib/p
 import { getBillingProviders, providerLabel } from '../billing/shared';
 import { registerCanHelp, repairText } from '@/lib/plan-blockers';
 import { Banner } from '@/components/Banner';
+import { ApiErrorText } from '@/components/api-error';
 
 const ERR: Record<string, string> = {
   missing: 'Every field is required, and the amount is typed as the currency is written (19.99), with no more decimals than the currency has.',
@@ -47,6 +48,10 @@ export default async function PlansPage({
   const created = typeof sp.created === 'string' ? sp.created : undefined;
   const entError = typeof sp.entError === 'string' ? sp.entError : undefined;
   const entSaved = typeof sp.entSaved === 'string' ? sp.entSaved : undefined;
+  // Set when the save came from a plan's "What's included" dialog, which then
+  // reopens and shows the failure itself.
+  const entSlug = typeof sp.entSlug === 'string' ? sp.entSlug : undefined;
+  const entErrorFlash = await readErrorFlash(entError);
   const editError = typeof sp.editError === 'string' ? sp.editError : undefined;
   const editSlug = typeof sp.editSlug === 'string' ? sp.editSlug : undefined;
   const priceError = typeof sp.priceError === 'string' ? sp.priceError : undefined;
@@ -147,9 +152,14 @@ export default async function PlansPage({
           Entitlement saved on <code className="font-mono">{entSaved}</code>.
         </Banner>
       )}
-      {entError && (
+      {entError && !entSlug && (
         <Banner tone="error">
-          {errorMessage(ERR, entError)}
+          <ApiErrorText
+            code={entError}
+            detail={entErrorFlash.detail}
+            fix={entErrorFlash.fix}
+            fallback={errorMessage(ERR, entError)}
+          />
         </Banner>
       )}
       {unbuyable.length > 0 && (
@@ -246,6 +256,7 @@ export default async function PlansPage({
           editError={editError}
           editSlug={editSlug}
           priceFlash={priceFlash}
+          entFlash={{ slug: entSlug, error: entError, detail: entErrorFlash.detail, fix: entErrorFlash.fix }}
           reportingCurrency={reportingCurrency}
           providerLabel={(name) => providerLabel(providers, name)}
           // With the provider list unreadable there is nothing to judge by, so nothing is claimed.

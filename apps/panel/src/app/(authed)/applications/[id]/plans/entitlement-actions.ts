@@ -6,7 +6,7 @@
  */
 
 import { redirect } from 'next/navigation';
-import { api, PanelApiError } from '@/lib/api';
+import { api, errorQuery, PanelApiError } from '@/lib/api';
 
 function entitlementsPath(applicationId: string, slug: string): string {
   return `/api/v1/tenant/applications/${encodeURIComponent(applicationId)}/plans/${encodeURIComponent(slug)}/entitlements`;
@@ -43,7 +43,10 @@ export async function addEntitlement(applicationId: string, slug: string, formDa
     await api({ method: 'PUT', path: entitlementsPath(applicationId, slug), body });
   } catch (err) {
     if (err instanceof PanelApiError) {
-      redirect(`/applications/${applicationId}/plans?entError=${encodeURIComponent(err.code)}`);
+      // `entSlug` reopens that plan's dialog, so the API's reason shows in the
+      // form the operator was filling in.
+      const query = await errorQuery(err, { entError: err.code, entSlug: slug });
+      redirect(`/applications/${applicationId}/plans?${query}`);
     }
     throw err;
   }
